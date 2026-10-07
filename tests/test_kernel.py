@@ -625,3 +625,128 @@ def test_a_domain_subscription_through_the_context_is_still_unwound() -> None:
     assert host.events.has_listeners(TurnStarted)
     host.unload("subscriber")
     assert not host.events.has_listeners(TurnStarted), "the scope owned the removal"
+
+
+# ── Scoped services: a mutation through ctx is reversible by construction ────
+
+
+class _Registry:
+    """A toy service whose mutations are reversible.
+
+    The convention the kernel relies on: a mutating method returns the undo, and
+    ``scoped(scope)`` hands back a view bound to one plugin's lifetime.  The
+    service itself stays a plain object -- the kernel never proxies it, because a
+    transparent proxy would break ``is`` and ``isinstance`` for every service that
+    did not need the behaviour.
+    """
+
+    def __init__(self) -> None:
+        self.items: list[str] = []
+
+    def scoped(self, scope):
+        return _ScopedRegistry(self, scope)
+
+    def add(self, item: str) -> None:
+        self.items.append(item)
+
+    def remove(self, item: str) -> None:
+        if item in self.items:
+            self.items.remove(item)
+
+
+class _ScopedRegistry:
+    def __init__(self, registry: _Registry, scope) -> None:
+        self._registry = registry
+        self._scope = scope
+
+    def register(self, item: str) -> str:
+        """Adds, **and returns the undo** -- which the scope then records."""
+        self._registry.add(item)
+        self._scope.on_unwind(lambda: self._registry.remove(item))
+        return item
+
+
+class _UsesRegistry:
+    name = "uses_registry"
+    inject = ("things",)
+
+    def setup(self, ctx):
+        self.ctx = ctx
+        ctx.things.register("mine")
+
+
+class _ProvidesThings:
+    name = "things_provider"
+
+    def __init__(self, registry: _Registry) -> None:
+        self._registry = registry
+
+    def setup(self, ctx):
+        # The service is provided under the name the consumer injects.
+        pass
+
+
+def _host_with_registry():
+    host = PluginHost()
+    registry = _Registry()
+    host.services.provide("things", registry)
+    return host, registry
+
+
+def test_a_mutating_service_returns_a_per_plugin_view() -> None:
+    host, registry = _host_with_registry()
+    install = host.load(_UsesRegistry())
+    assert registry.items == ["mine"]
+    assert install.ctx.things is install.ctx.things, "the view is cached"
+
+
+def test_a_registration_through_the_view_is_undone_on_unload() -> None:
+    """The whole point: the plugin never names a scope, and the entry still goes."""
+    host, registry = _host_with_registry()
+    host.load(_UsesRegistry())
+    assert registry.items == ["mine"]
+
+    host.unload("uses_registry")
+    assert registry.items == [], "the undo was recorded on the plugin's lifetime"
+
+
+def test_two_plugins_using_one_service_do_not_revoke_each_other() -> None:
+    """Each view records on its own plugin's scope, so unloads are independent."""
+    host, registry = _host_with_registry()
+
+    class Second:
+        name = "second"
+        inject = ("things",)
+
+        def setup(self, ctx):
+            ctx.things.register("theirs")
+
+    host.load(_UsesRegistry())
+    host.load(Second())
+    assert sorted(registry.items) == ["mine", "theirs"]
+
+    host.unload("uses_registry")
+    assert registry.items == ["theirs"], "only its own entry went"
+
+
+def test_a_service_without_scoped_keeps_its_identity() -> None:
+    """A plain service is handed over as-is, so ``is`` and ``isinstance`` work."""
+    host = PluginHost()
+    host.services.provide("plain", registry := {"a": 1})
+    install = host.load(Leaf())
+    assert install.ctx.get("plain") is registry
+
+
+def test_the_scoped_view_is_rebuilt_when_the_service_is_replaced() -> None:
+    """Otherwise a plugin would keep mutating a service that is no longer installed."""
+    host = PluginHost()
+    first = _Registry()
+    host.services.provide("things", first)
+    install = host.load(_UsesRegistry())
+    assert first.items == ["mine"]
+
+    second = _Registry()
+    host.services.provide("things", second, replace=True)
+    install.ctx.things.register("mine")
+    assert second.items == ["mine"], "the new service was used"
+    assert first.items == ["mine"], "and the old one was not touched again"

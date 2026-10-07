@@ -63,11 +63,14 @@ class Context:
     registration goes, and its name is what a diagnostic reports.
     """
 
-    __slots__ = ("_host", "_install", "_extra")
+    __slots__ = ("_host", "_install", "_extra", "_views")
 
     def __init__(self, *, host: Any, install: Any) -> None:
         self._host = host
         self._install = install
+        #: ``name -> (service, view)``, so a scoped view is built once and is only
+        #: reused while the underlying service is the same object.
+        self._views: dict[str, tuple[Any, Any]] = {}
         #: Names the injectable-attribute shortcut should not shadow.  A service
         #: called ``get`` would otherwise replace this class's own method.
         self._extra = frozenset(Context.__slots__) | frozenset(
@@ -103,10 +106,40 @@ class Context:
             self._install.provided_names.append(name)
 
     def get(self, name: str, default: Any = _MISSING) -> Any:
-        """Resolve a service, raising for a missing name unless given a default."""
-        if default is _MISSING:
-            return self.services.get(name)
-        return self.services.get(name, default)
+        """Resolve a service, raising for a missing name unless given a default.
+
+        The result is **scoped to this plugin** when the service supports it: a
+        service that exposes ``scoped(scope)`` is asked for a per-plugin view, and
+        a mutation made through that view registers its own undo on this plugin's
+        lifetime.  That is what makes ``ctx.tools.register(tool)`` reversible
+        without the plugin managing a scope -- see :meth:`_scoped`.
+
+        A service that does not expose ``scoped`` is returned as-is, so a plain
+        read-only service needs no ceremony and keeps its identity for an
+        ``is`` check or an ``isinstance`` test.
+        """
+        service = (
+            self.services.get(name) if default is _MISSING
+            else self.services.get(name, default)
+        )
+        return self._scoped(name, service)
+
+    def _scoped(self, name: str, service: Any) -> Any:
+        """A per-plugin view of *service*, cached, or the service itself.
+
+        Cached because a plugin reaches a service many times in a turn and a fresh
+        view per lookup would be waste; and because a view compares by identity with
+        itself, which is what lets a plugin hold one.
+        """
+        factory = getattr(service, "scoped", None)
+        if not callable(factory):
+            return service
+        cached = self._views.get(name)
+        if cached is not None and cached[0] is service:
+            return cached[1]
+        view = factory(self._install.scope)
+        self._views[name] = (service, view)
+        return view
 
     def has(self, name: str) -> bool:
         return self.services.has(name)
@@ -199,7 +232,11 @@ class Context:
             raise AttributeError(item)
         if item in self._install.inject:
             try:
-                return self.services.get(item)
+                # Through ``get``, not the registry, so an injected attribute is
+                # the same scoped view a ``ctx.get(name)`` would return.  Reading
+                # the registry directly here would hand over the raw service and
+                # silently drop the per-plugin accounting.
+                return self.get(item)
             except MissingServiceError as exc:
                 raise AttributeError(
                     f"{self._install.name!r} injected {item!r} but it is not "
