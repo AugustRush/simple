@@ -52,95 +52,69 @@ def _emit_plugin_event(name: str, plugin_name: str = "", **fields: Any) -> None:
         collector.emit(name, plugin_name=plugin_name, **fields)
 
 class AgentPlugin:
-    """Protocol that plugin objects may implement (duck-typed).
+    """What ``PluginCatalog`` loads: an object with a ``name`` and, optionally, a ``register()``.
 
-    All methods are optional — implement only the hooks you need.
-    ``PluginCatalog`` inspects each plugin with ``hasattr`` at dispatch time.
+    **This used to be a list of hooks to implement.  It is not any more.**  Six
+    ``on_*`` methods were documented here and dispatched by the catalog; no plugin
+    implemented the last of them, and the kernel's ``setup(ctx)`` plus event
+    subscriptions replaced every one of them.  Listing them again would be listing
+    methods that are never called.
 
-    Attributes:
-        name:    Unique identifier for the plugin (used in log messages).
-        version: Semver string (informational only).
+    What a plugin does now
+    ----------------------
+    ``setup(ctx)`` runs once, after the plugin's declarative assets are registered, and
+    everything it registers unwinds with the plugin.  The names are services the
+    composition provides, reached through the context:
 
-    Lifecycle hooks:
-        on_session_start(components: dict) -> None
-            Synchronous.  Called once after all core components are built.
-            Use it to capture references to client, model, memory, etc.
+        ctx.commands.add(name, handler, metadata={...})   # a slash command
+        ctx.agents.add(name, {"body": "..."})             # a sub-agent role
+        ctx.registry.register(tool_object)                # a tool
+        ctx.provide("my_service", value)                  # something for other plugins
+        ctx.on(TurnCompleted, handler)                    # a typed event
+        ctx.on_unwind(close_something)                    # anything with a lifetime
 
-            ``components`` is the runtime's component mapping.  Read a *service*
-            from it by name -- ``resolve(components, "skill_catalog")`` or
-            ``require_service(components, "agent")`` from
-            :mod:`agent.runtime.services` -- rather than with ``.get``, so the
-            lookup names a service the runtime declares
-            (``agent/runtime/core_services.py``) and a guard can see it.
+    ``ctx.provide`` and ``ctx.on`` are the two that make a plugin tree a tree: one
+    plugin offers a service, another declares ``inject = ("that_service",)`` and is
+    activated when it appears.  A plugin whose ``inject`` is unmet stays **pending**
+    and registers nothing.
 
-            **Open question, recorded here because this is where it matters:** a
-            plugin is handed the whole mapping, which means it can reach any
-            service rather than only the ones it declared.  The alternative is for
-            a plugin to declare ``inject = ("skill_catalog",)`` and be given the
-            service, the way ``ctx.provide`` / ``ctx.on`` already work.  Deciding
-            that changes the plugin API, so it is not decided here; what is decided
-            is that the reads are *named* either way.
+    Events are per *domain*, and ``Domain.attach(ctx, handler)`` is the subscription
+    form: ``TURN``, ``LLM``, ``TOOL`` and ``SESSION`` each name a set of event types
+    (``agent/core/event_domains.py``).  Use it rather than ``ctx.on`` for those --
+    a domain's bus is not the context's, and a handler on the wrong one is never
+    called, which is the failure with no symptom.
 
-        on_prompt_submit(text: str, metadata: dict) -> Optional[HookResult]
-            Async-compatible.  Fired when the user submits a message, BEFORE the
-            agent sees it.  Return ``HookResult(action="block")`` to prevent the
-            message from being processed, or inject ``context`` to prepend
-            guidance to the prompt.
-
-        on_turn_end(event: TurnEvent) -> Optional[HookResult]
-            Async-compatible.  Fired after every assistant turn.
-            Return ``HookResult(action="continue")`` to automatically run another
-            turn with ``message`` as the next user prompt (agent self-feedback loop).
-
-        on_session_end(event: SessionEvent) -> None
-            Async-compatible.  Fired when the interactive session ends.
-
-        on_pre_tool(event: PreToolEvent) -> Optional[HookResult]
-            Async-compatible.  Return HookResult(action="block") to prevent
-            the tool from executing.  Matchers in plugin.json can scope this
-            to specific tool names.
-
-        on_post_tool(event: PostToolEvent) -> Optional[HookResult]
-            Async-compatible.  Purely observational.  Matchers in plugin.json
-            can scope this to specific tool names.
-
-    Prompt contribution:
+    What is still a method on the plugin
+    ------------------------------------
         compose_system_prompt(current_prompt: str) -> str
-            Return a **suffix** to append to the system prompt, or ``""``
-            to contribute nothing.  The *current_prompt* argument is provided
-            for context only — do NOT return it back.
+            Return a **suffix** to append to the system prompt, or ``""``.  The
+            *current_prompt* argument is for context only -- do NOT return it back.
 
-    Slash commands:
         register_slash_commands() -> dict[str, Callable]
-            Return {name: async handler(raw_cmd, components)}.
-
-    Lifecycle (the resource-owning half):
-        setup(ctx) -> None
-            Synchronous.  Called once after the plugin's declarative assets are
-            registered.  Register everything through *ctx* and it unwinds with
-            the plugin: ``ctx.add_slash_command``, ``ctx.add_bundled_skill``,
-            ``ctx.add_bundled_mcp``, ``ctx.add_agent_definition``,
-            ``ctx.add_tool``, and ``ctx.on_unwind`` for anything else.
-
-            Prefer this to the ``register_*`` methods for anything with a
-            lifetime.  What is registered here is removed by
-            :meth:`PluginCatalog.unload_plugin` without the catalog needing to
-            know what kind of thing it was.
+            Return ``{name: async handler(raw_cmd, components)}``.  Prefer
+            ``ctx.commands.add`` in ``setup``, which unwinds with the plugin.
 
         teardown() -> None
-            Synchronous.  Called when the plugin unloads, after
-            ``on_session_end`` has fired and after the setup scope has unwound.
-            For what a scope cannot express: closing a subprocess handle,
-            flushing a file, joining a thread.
+            Synchronous.  Called when the plugin unloads, after the setup scope has
+            unwound.  For what a scope cannot express: closing a subprocess handle,
+            flushing a file, joining a thread.  This is the hook the old design had no
+            equivalent of, which is why a removed plugin's MCP subprocess used to stay
+            alive until shutdown.
 
-            This is the hook the old code had no equivalent of, which is why a
-            removed plugin's MCP subprocess used to stay alive until shutdown.
+    Declarative assets (``plugin.json``)
+    ------------------------------------
+    ``skills``, ``commands``, ``agents`` and ``mcpServers`` name paths the catalog reads
+    on the plugin's behalf.  There is no ``ctx.add_*`` for these: a skill root or an MCP
+    config is declared in the manifest, and a plugin's Python contributed one nowhere.
 
-    Command hooks (plugin.json):
-        Hooks may also be declared in ``plugin.json`` under a ``hooks`` key as
-        external commands.  These run as subprocesses with event data on stdin
-        and a JSON HookResult shape on stdout.  Each entry supports:
-        ``matcher`` (regex), ``timeout`` (seconds), and ``command`` (shell string).
+    Command hooks (``plugin.json``, ``hooks`` key)
+    ----------------------------------------------
+    External commands, run as subprocesses with event data on stdin and a JSON
+    ``HookResult`` on stdout.  Each entry supports ``matcher`` (regex), ``timeout``
+    (seconds) and ``command`` (shell string).  This is a *different* mechanism from the
+    plugin's own Python -- it is the operator's, not the author's -- and it is the one
+    the ``on_prompt_submit`` / ``on_pre_tool`` / ``on_post_tool`` / ``on_turn_end``
+    event names below still belong to.
     """
 
     name: str = ""
@@ -230,6 +204,13 @@ class PluginMeta:
 # ── Claude Code compatibility maps ──────────────────────────────────────────
 
 # Event names: Claude Code (PascalCase) → internal (snake_case w/ on_ prefix).
+#
+# **Four of these have a command-hook dispatcher; the rest do not run.**  A hook declared
+# in `plugin.json` for, say, `SessionStart` is translated, stored on the plugin's
+# metadata, and never invoked -- silently.  That is a pre-existing gap, not one this
+# table's last edit introduced, and `tests/test_plugin_hook_dispatch.py` now records
+# which names are wired and why the others are not.  Add a name here and that test tells
+# you it needs a decision.
 _CC_EVENT_MAP = {
     # Lifecycle
     "SessionStart": "on_session_start",
