@@ -40,6 +40,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from agent.core.retry import with_llm_retry
 from agent.core.stream_tracking import StreamEmissionTracker as _StreamEmissionTracker
 
 __all__ = ["LLMAttempt", "obtain_response"]
@@ -81,12 +82,15 @@ async def obtain_response(
     tool_calls_made: Optional[list] = None,
     active_sink: Any = None,
     cancel_token: Any = None,
+    retry: Any = None,
 ) -> LLMAttempt:
     """Obtain this step's response, by replay, by resubmission, or by calling.
 
-    ``agent`` is the collaborator providing ``_create``, ``_stream_response`` and
-    ``_with_llm_retry``; this module deliberately does not import
-    ``agent.core.agent``, which is where it is used from.
+    ``agent`` is the collaborator providing ``_create`` and ``_stream_response``;
+    this module deliberately does not import ``agent.core.agent``, which is where it
+    is used from.  ``retry`` is the injection point for the retry leg, defaulting to
+    the real one: a test needs to make the call raise without an agent in the way,
+    and swapping an attribute on the agent was how that used to be done.
     """
     # 1. A response recovered from a content-filtered turn: no call to make.
     if recovered is not None:
@@ -108,6 +112,11 @@ async def obtain_response(
             trace_error=trace_error,
         )
 
+    # The retry leg, defaulted rather than required: a test injects a replacement
+    # that raises, because swapping an attribute on the agent no longer reaches
+    # here -- the leg is a module function now.
+    retry = retry if retry is not None else with_llm_retry
+
     # 3. Call the model.  Wrapped as a task with a cleanup registered so a
     #    force-cancel aborts the HTTP request mid-flight; a graceful cancel lets
     #    the call finish on its own.
@@ -128,7 +137,8 @@ async def obtain_response(
             else None
         )
         llm_task = asyncio.create_task(
-            agent._with_llm_retry(
+            retry(
+                agent._retry_policy(),
                 agent._stream_response,
                 ctx,
                 tools,
@@ -140,7 +150,7 @@ async def obtain_response(
     else:
         tracked_callback = None
         llm_task = asyncio.create_task(
-            agent._with_llm_retry(agent._create, ctx, tools)
+            retry(agent._retry_policy(), agent._create, ctx, tools)
         )
 
     def _abort_llm(level: str) -> None:

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from agent.core.retry import with_llm_retry
 
 
 # The real 429 body, quoted from `scheduled_task_runs.error` (2026-09-23).
@@ -193,7 +194,7 @@ def test_a_spent_quota_is_not_replayed_or_slept_on(monkeypatch):
     monkeypatch.setattr(agent_module.asyncio, "sleep", record_sleep)
 
     with pytest.raises(Exception, match="AccountQuotaExceeded"):
-        asyncio.run(agent._with_llm_retry(spend_quota))
+        asyncio.run(with_llm_retry(agent._retry_policy(), spend_quota))
 
     assert len(calls) == 1, f"replayed an unrecoverable error {len(calls)} times"
     assert waits == [], f"backed off for {waits} on a closed quota window"
@@ -217,7 +218,7 @@ def test_a_throttled_request_is_replayed_with_backoff(monkeypatch):
     monkeypatch.setattr(agent_module.asyncio, "sleep", record_sleep)
 
     with pytest.raises(Exception, match="RateLimitReached"):
-        asyncio.run(agent._with_llm_retry(always_throttled))
+        asyncio.run(with_llm_retry(agent._retry_policy(), always_throttled))
 
     assert len(calls) == agent.llm_max_retries + 1
     assert waits == [1.0, 2.0, 4.0]

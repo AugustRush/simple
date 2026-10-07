@@ -820,10 +820,22 @@ _LOOP_OWNED = (
     "_retrieval_token_budget",
     "_run_turn_loop",
     "_synthesize_tool_only_response",
-    "_with_llm_retry",
+    "_retry_policy",
     "_inject_pending_interjections",
     "_assistant_message",
     "_tool_result_messages",
+)
+
+
+#: Members that were loop-owned and have already left ``BaseAgent``.  They stay in
+#: ``_LOOP_OWNED`` because the loop's dependency surface is measured against what the
+#: loop reads *now*: dropping them would silently change which members count as
+#: shared, and the struct assertion would then pass on a wrong struct.
+_ALREADY_MOVED = (
+    "_inject_pending_interjections",
+    "_assistant_message",
+    "_tool_result_messages",
+    "_with_llm_retry",
 )
 
 
@@ -935,8 +947,7 @@ def test_the_loop_owned_list_matches_the_source() -> None:
     already_moved = [
         name for name in _LOOP_OWNED
         if name not in methods
-        and name not in ("_inject_pending_interjections", "_assistant_message",
-                         "_tool_result_messages")
+        and name not in _ALREADY_MOVED
     ]
     assert not already_moved, (
         f"these are in _LOOP_OWNED but no longer exist on BaseAgent, so they have "
@@ -1025,4 +1036,58 @@ def test_the_turn_context_module_owns_the_contextvar() -> None:
     assert _active_agent_context is turn_context.active_agent_context, (
         "the re-export must be the same object, not a copy: two ContextVars with "
         "one name is the failure this move was supposed to make impossible"
+    )
+
+
+def test_the_retry_leg_takes_a_policy_not_an_agent() -> None:
+    """The retry leg is the case that showed a wide struct was the wrong shape.
+
+    The first attempt handed it the whole ``LoopDeps`` (twenty-three members), which
+    made ``agent/core/llm_attempt.py`` hold a complete agent surface -- a module whose
+    docstring promises it does not import ``agent.core.agent``.  A part of the loop
+    must be able to declare *its* dependencies and no more.
+    """
+    from agent.core.retry import RetryPolicy, with_llm_retry
+
+    params = list(with_llm_retry.__code__.co_varnames[: with_llm_retry.__code__.co_argcount])
+    assert params[0] == "policy", params
+    assert "agent" not in params, (
+        f"the retry leg must not take an agent: {params}"
+    )
+    fields = set(RetryPolicy.__dataclass_fields__)
+    assert fields <= {"max_retries", "base_delay", "event_bus", "is_retryable"}, (
+        f"the policy is meant to stay small; it has grown to {sorted(fields)}"
+    )
+
+
+def test_the_retry_predicate_is_part_of_the_policy() -> None:
+    """Not a module constant the call site reaches for.
+
+    "Is this transient?" is a judgement the composition makes: a provider with a
+    different notion of transient supplies its own.  When this lived only in
+    ``llm_errors``, a test that wanted a permissive predicate had to override a
+    method on the object under test -- reaching inside the thing being tested to
+    arrange the test.
+    """
+    from agent.core.retry import RetryPolicy
+
+    assert "is_retryable" in RetryPolicy.__dataclass_fields__
+    policy = RetryPolicy(max_retries=0, base_delay=0.0, is_retryable=lambda exc: True)
+    assert policy.is_retryable(ValueError("x")) is True
+
+
+def test_the_retry_method_is_no_longer_on_the_agent() -> None:
+    """And the agent reaches the module function through a policy it builds."""
+    tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "_with_llm_retry" not in methods, (
+        "_with_llm_retry is still defined on BaseAgent as well as in "
+        "agent/core/retry.py"
+    )
+    assert "_retry_policy" in methods, (
+        "the agent has to offer its policy for the retry leg to be callable"
     )

@@ -26,6 +26,15 @@ class _Ctx:
     metadata: dict = {}
 
 
+def _stub_retry_policy():
+    """The stub is standing in for an agent, so it owes the surface
+    ``obtain_response`` reads.  The *behaviour* under test is injected separately
+    (``retry=``), because these tests are about cancellation rather than backoff."""
+    from agent.core.retry import RetryPolicy
+
+    return RetryPolicy(max_retries=0, base_delay=0.0, event_bus=None)
+
+
 class _Agent:
     """A collaborator that records how it was asked."""
 
@@ -33,6 +42,7 @@ class _Agent:
         self.result = result if result is not None else "RESPONSE"
         self.raises = raises
         self.calls: list[str] = []
+        self._retry_policy = _stub_retry_policy
 
     async def _create(self, ctx, tools):
         self.calls.append("create")
@@ -48,13 +58,17 @@ class _Agent:
             callback("chunk")
         return (self.result, "streamed-text")
 
-    async def _with_llm_retry(self, fn, *args, **kwargs):
-        return await fn(*args, **kwargs)
+
+
+async def _passthrough(policy, fn, *args, **kwargs):
+    """The retry leg without retrying: these tests are about cancellation, not backoff."""
+    return await fn(*args, **kwargs)
 
 
 def _run(agent, **overrides):
     kwargs = dict(
         agent=agent,
+        retry=_passthrough,
         ctx=_Ctx(),
         tools=[],
         user_message="hello",
@@ -149,8 +163,7 @@ def test_a_user_cancellation_becomes_an_early_result() -> None:
         raise asyncio.CancelledError
 
     agent = _Agent()
-    agent._with_llm_retry = cancelling
-    outcome = _run(agent, cancel_token=token)
+    outcome = _run(agent, cancel_token=token, retry=cancelling)
 
     assert outcome.early_result is not None
     assert outcome.trace_status == "cancelled"
@@ -167,9 +180,8 @@ def test_a_cancellation_nobody_asked_for_is_reraised() -> None:
         raise asyncio.CancelledError
 
     agent = _Agent()
-    agent._with_llm_retry = cancelling
     with pytest.raises(asyncio.CancelledError):
-        _run(agent, cancel_token=token)
+        _run(agent, cancel_token=token, retry=cancelling)
 
 
 def test_the_llm_cleanup_is_registered_and_released() -> None:
@@ -207,8 +219,7 @@ def test_the_cancellation_text_falls_back_to_a_shared_message() -> None:
         raise asyncio.CancelledError
 
     agent = _Agent()
-    agent._with_llm_retry = cancelling
-    outcome = _run(agent, cancel_token=token, result_text="")
+    outcome = _run(agent, cancel_token=token, result_text="", retry=cancelling)
     assert outcome.early_result.content, "an empty reply would be useless"
 
 
@@ -219,8 +230,7 @@ def test_partial_text_is_kept_in_the_cancellation_result() -> None:
         raise asyncio.CancelledError
 
     agent = _Agent()
-    agent._with_llm_retry = cancelling
-    outcome = _run(agent, cancel_token=token, result_text="half an answer")
+    outcome = _run(agent, cancel_token=token, result_text="half an answer", retry=cancelling)
     assert outcome.early_result.content == "half an answer"
 
 

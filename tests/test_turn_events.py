@@ -31,6 +31,8 @@ from agent.core.event_domains import (
     TurnStarted,
 )
 from agent.core.events import EventBus, LLM_EVENTS, TURN_EVENTS
+from agent.core.retry import with_llm_retry
+import dataclasses
 
 
 def _response(stop_reason: str, text: str, tool_calls=None):
@@ -276,7 +278,9 @@ def test_a_retry_is_announced_between_the_failed_call_and_the_next() -> None:
     class _Transient(RuntimeError):
         pass
 
-    agent._is_llm_retryable = lambda exc: True
+    # Through the policy, which is where the judgement belongs, rather than by
+    # overriding a method on the object under test.
+    policy = dataclasses.replace(agent._retry_policy(), is_retryable=lambda exc: True)
     attempts = {"n": 0}
 
     async def flaky(*args, **kwargs):
@@ -285,7 +289,7 @@ def test_a_retry_is_announced_between_the_failed_call_and_the_next() -> None:
             raise _Transient("503 from upstream")
         return "ok"
 
-    result = asyncio.run(agent._with_llm_retry(flaky))
+    result = asyncio.run(with_llm_retry(policy, flaky))
     assert result == "ok"
     assert len(seen) == 1, "exactly one retry was scheduled"
     assert seen[0].attempt == 1
@@ -306,7 +310,7 @@ def test_a_call_that_succeeds_announces_no_retry() -> None:
     async def fine(*args, **kwargs):
         return "ok"
 
-    asyncio.run(agent._with_llm_retry(fine))
+    asyncio.run(with_llm_retry(agent._retry_policy(), fine))
     assert seen == []
 
 

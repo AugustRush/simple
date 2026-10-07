@@ -104,6 +104,7 @@ from agent.core.turn_context import (
     emit_domain_event as _emit_domain_event,
     schedule_domain_event as _schedule_domain_event,
 )
+from agent.core.retry import RetryPolicy, with_llm_retry
 from agent.core.turn_loop import assistant_message, tool_result_messages
 from agent.runtime.services import resolve
 from agent.tools.executor import RegularToolExecutor
@@ -1662,6 +1663,21 @@ class BaseAgent:
             "providers.<name>.stream_usage to false.[/yellow]"
         )
 
+    def _retry_policy(self) -> RetryPolicy:
+        """This agent's retry policy, in the shape the retry leg takes.
+
+        The policy is an object rather than three arguments because the retry leg is
+        a module function now: ``agent/core/llm_attempt.py`` calls it and documents
+        that it does not import ``agent.core.agent``, so handing it an agent would
+        have undone that.  Three values keep the promise.
+        """
+        return RetryPolicy(
+            max_retries=self.llm_max_retries,
+            base_delay=self.llm_retry_base_delay,
+            event_bus=self._llm_event_bus,
+            is_retryable=self._is_llm_retryable,
+        )
+
     def _next_structured_output_budget(
         self,
         ctx: "AgentContext",
@@ -1711,7 +1727,8 @@ class BaseAgent:
             if next_budget <= current_budget:
                 break
             current_budget = next_budget
-            response = await self._with_llm_retry(
+            response = await with_llm_retry(
+                self._retry_policy(),
                 self._create,
                 ctx,
                 tools,
@@ -2064,46 +2081,6 @@ class BaseAgent:
                 )
             return None
 
-    async def _with_llm_retry(self, fn, *args, can_retry=None, **kwargs):
-        """Call *fn* with retry on transient LLM API errors.
-
-        ``can_retry`` is an optional predicate consulted before each retry.
-        Streaming callers use it to veto a replay once output has already
-        reached the user (see ``_StreamEmissionTracker``).
-        """
-        last_exc = None
-        for attempt in range(self.llm_max_retries + 1):
-            try:
-                return await fn(*args, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-                if attempt >= self.llm_max_retries or not self._is_llm_retryable(exc):
-                    raise
-                if can_retry is not None and not can_retry():
-                    logger.warning(
-                        "LLM API error after partial output; not retrying "
-                        "(a replay would duplicate what the user already saw): %s",
-                        exc,
-                    )
-                    raise
-                delay = self.llm_retry_base_delay * (2 ** attempt)
-                logger.warning(
-                    "LLM API error (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1, self.llm_max_retries, delay, exc,
-                )
-                await _emit_domain_event(
-                    self._llm_event_bus,
-                    LLMRetryScheduled,
-                    agent_id=_active_agent_id(),
-                    model=_active_agent_context.get().metadata.get("_model", "")
-                    if _active_agent_context.get() is not None
-                    else "",
-                    attempt=attempt + 1,
-                    delay_seconds=delay,
-                    error=str(exc),
-                )
-                await asyncio.sleep(delay)
-        raise last_exc  # type: ignore[misc]
 
     @staticmethod
     def _extract_summary_text(raw_result: str) -> str:
