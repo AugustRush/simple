@@ -341,6 +341,38 @@ touch, where the hand-written version copied only the two it did.
 last-known-good config from anywhere, and refusing an absent section there would drop the
 posture exactly when the config was unreadable.
 
+## There are two plugin protocols, and the one real plugin uses the old one
+
+Measured while working out how to make `memory` a plugin, and it is the larger finding.
+
+| Protocol | Shape | Who uses it |
+|---|---|---|
+| **Kernel** (`agent/kernel/`) | `name` / `inject` / `setup(ctx)` | Ralph, Scheduler, the channel plugins, everything Phase 2-6 produced |
+| **Catalog hooks** (`AgentPlugin`) | `on_session_start(components)`, `on_turn_end(event)`, 16 names in all | **`EvolutionPlugin` -- the only real plugin in the tree** |
+
+The ratio is the finding: **16 hook names, 9 dispatch sites, and three implementations in
+production** -- `on_session_start`, `on_turn_end`, `on_session_end`, all three in
+`evolution`.  Nine more live in tests as doubles for the protocol itself.
+
+And `agent/plugins/catalog.py` already records the problem in the `AgentPlugin` docstring:
+
+    **Open question, recorded here because this is where it matters:** a plugin is
+    handed the whole mapping, which means it can reach any ...
+
+That is the same coupling the kernel was built to remove, in the module that loads
+plugins.  It is the reason `memory` cannot simply become a plugin either: a hook plugin
+is handed a mapping, so the question "which services does it need" has never been asked.
+
+**Every one of the three has a kernel counterpart.**  `on_session_start(components)` is
+`setup(ctx)`; `on_turn_end(event)` and `on_session_end(event)` are event subscriptions --
+`ctx.on(TurnFinished, handler)`, which Phase 1 built and the domains already carry.  The
+declarative `hooks_config` (external commands from `hooks.json`) is a *different*
+mechanism and stays.
+
+So the capstone is: migrate `EvolutionPlugin` to the kernel protocol, then delete the
+hook protocol -- 16 names and 9 dispatch sites with no remaining user.  After that there
+is one plugin protocol and no plugin receives a component mapping.
+
 ## What is still not a plugin
 
 The seven phases are done.  Measured against the objective's list rather than the phase
