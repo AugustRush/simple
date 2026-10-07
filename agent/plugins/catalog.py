@@ -2182,14 +2182,16 @@ class PluginCatalog:
     async def fire_prompt_submit(
         self, text: str, metadata: Optional[dict] = None
     ) -> HookResult:
-        """Fire before the user message reaches the agent.
+        """Run the ``on_prompt_submit`` command hooks before the message is submitted.
 
-        Returns the first blocking result, or the last non-noop result.
+        Returns the first blocking result, or the last non-noop one -- a gate, which is
+        why it is the last of the hook dispatchers to lose its Python half: a mistake here
+        changes whether a submission can be refused rather than whether a plugin is
+        notified.
         """
         meta_dict = metadata or {}
         result = HookResult()
-        for plugin, meta in self._plugins.values():
-            # Command hooks for this event
+        for _plugin, meta in self._plugins.values():
             cmd_results = await self._run_command_hooks(
                 "on_prompt_submit",
                 {"event": "on_prompt_submit", "text": text, "metadata": meta_dict},
@@ -2200,43 +2202,6 @@ class PluginCatalog:
                     return r
                 if r.action != "noop":
                     result = r
-
-            # Python in-process hooks
-            if not hasattr(plugin, "on_prompt_submit"):
-                continue
-            try:
-                r = await _call_hook_with_timeout(
-                    plugin.on_prompt_submit,
-                    text,
-                    meta_dict,
-                    timeout_seconds=self._hook_timeout(meta, "on_prompt_submit"),
-                    executor=self._hook_executor,
-                )
-                if isinstance(r, HookResult):
-                    if r.action == "block":
-                        _emit_plugin_event(
-                            "hook_blocked",
-                            plugin_name=meta.name,
-                            hook_name="on_prompt_submit",
-                            reason=r.message,
-                        )
-                        return r
-                    if r.action == "context":
-                        _emit_plugin_event(
-                            "hook_context_injected",
-                            plugin_name=meta.name,
-                            hook_name="on_prompt_submit",
-                        )
-                    if r.action != "noop":
-                        result = r
-            except asyncio.TimeoutError:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' prompt_submit timed out[/dim]"
-                )
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin prompt_submit error ({meta.name}): {exc}[/dim]"
-                )
         return result
 
     async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
@@ -2246,7 +2211,7 @@ class PluginCatalog:
         turn with ``message`` as the next user prompt.
         """
         results: list[HookResult] = []
-        for plugin, meta in self._plugins.values():
+        for _plugin, meta in self._plugins.values():
             cmd_results = await self._run_command_hooks(
                 "on_turn_end",
                 {
@@ -2278,51 +2243,19 @@ class PluginCatalog:
                         source="command",
                     )
             results.extend(cmd_results)
-
-            if not hasattr(plugin, "on_turn_end"):
-                continue
-            try:
-                r = await _call_hook_with_timeout(
-                    plugin.on_turn_end,
-                    event,
-                    timeout_seconds=self._hook_timeout(meta, "on_turn_end"),
-                    executor=self._hook_executor,
-                )
-                if isinstance(r, HookResult):
-                    if r.action != "noop":
-                        _emit_plugin_event(
-                            "hook_fired",
-                            plugin_name=meta.name,
-                            hook_name="on_turn_end",
-                            action=r.action,
-                            message=r.message[:200] if r.message else "",
-                        )
-                    if r.context:
-                        _emit_plugin_event(
-                            "hook_context_injected",
-                            plugin_name=meta.name,
-                            hook_name="on_turn_end",
-                        )
-                    results.append(r)
-            except asyncio.TimeoutError:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' turn_end timed out after "
-                    f"{self._hook_timeout(meta, 'on_turn_end'):.2f}s[/dim]"
-                )
-            except Exception as exc:
-                shared.CONSOLE.print(f"[dim]Plugin turn_end error ({meta.name}): {exc}[/dim]")
         return results
 
     async def fire_session_end(self, event: SessionEvent) -> None:
-        """Notify all plugins when the interactive session ends.
+        """Announce that the interactive session ended.
 
-        Both protocols are notified from here, and here is the only place: the hook
-        call below for a plugin that implements ``on_session_end``, and a typed
-        :class:`~agent.core.event_domains.SessionFinished` on the session bus for a
-        plugin that subscribes instead.  Emitting at the two call sites of this method
-        (``cli`` and the channel layer) would be the same event constructed twice, and
-        the day one of them stopped emitting would be a plugin that silently stops
-        scoring sessions.
+        This is the only place the typed event is published, and that matters: emitting
+        at the two call sites of this method (``cli`` and the channel layer) would be the
+        same event constructed twice, and the day one of them stopped emitting would be a
+        plugin that silently stops scoring sessions.
+
+        It used to notify two protocols from here -- the typed event, plus a Python
+        ``on_session_end`` hook.  No plugin implements that hook any more; the event is
+        what a plugin subscribes to.
         """
         # Emitted unconditionally: the bus does nothing when nobody listens, and a
         # session that ended is a fact whether or not this composition has plugins.
@@ -2335,27 +2268,6 @@ class PluginCatalog:
                 turn_count=int(getattr(event, "turn_count", 0) or 0),
             )
         )
-        for plugin, meta in self._plugins.values():
-            timeout = self._hook_timeout(meta, "on_session_end")
-            if not hasattr(plugin, "on_session_end"):
-                continue
-            try:
-                await _call_hook_with_timeout(
-                    plugin.on_session_end,
-                    event,
-                    timeout_seconds=timeout,
-                    executor=self._hook_executor,
-                )
-            except asyncio.TimeoutError:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' session_end timed out after "
-                    f"{timeout:.2f}s[/dim]"
-                )
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin session_end error ({meta.name}): {exc}[/dim]"
-                )
-
     async def _on_tool_pre_execute(self, event: ToolPreExecute) -> Optional[str]:
         """Bus listener for :class:`ToolPreExecute`.
 
