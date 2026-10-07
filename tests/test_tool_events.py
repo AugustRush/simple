@@ -261,13 +261,47 @@ def test_the_executor_keeps_working_with_no_listeners_at_all() -> None:
 
 
 def test_the_catalog_subscribes_to_the_bus_it_is_given(tmp_path) -> None:
-    """The wiring that replaces holding the catalog inside the executor."""
+    """The wiring that replaces holding the catalog inside the executor.
+
+    Now conditional on the catalog having a command hook to run -- see
+    ``PluginCatalog._ensure_event_bridge``.  A catalog with none has nothing for the
+    bridge to do, and subscribing anyway put a listener on a **process-wide** bus on
+    behalf of every catalog ever constructed.
+    """
     from agent.plugins.catalog import PluginCatalog
 
     bus = EventBus()
     catalog = PluginCatalog(builtin_dir=tmp_path, event_bus=bus)
     try:
-        assert bus.has_listeners(ToolPreExecute)
+        assert not bus.has_listeners(ToolPreExecute), "no command hooks, no bridge"
+    finally:
+        catalog.close()
+
+    # With one, the bus it was given is the bus it listens on.
+    plugin_dir = tmp_path / "with-hooks"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "with-hooks"}', encoding="utf-8"
+    )
+    (plugin_dir / "hooks").mkdir()
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {"hooks": [{"type": "command", "command": "true"}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bus = EventBus()
+    catalog = PluginCatalog(builtin_dir=tmp_path, event_bus=bus)
+    try:
+        catalog.discover_and_load()
+        assert bus.has_listeners(ToolPreExecute), "the bus it was given"
         assert bus.has_listeners(ToolPostExecute)
     finally:
         catalog.close()
@@ -350,18 +384,16 @@ def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
     assert calls == [("read_file", {})]
 
 
-def test_closing_a_catalog_releases_its_hold_on_the_shared_bus() -> None:
-    """A catalog gates tools globally, so a closed one must let go.
+def test_a_catalog_with_no_command_hooks_adds_no_listener_to_the_shared_bus() -> None:
+    """Laziness, asserted as a **delta** rather than as an absolute.
 
-    ``PluginCatalog`` subscribes its tool bridge to the **module-level** ``TOOL_EVENTS``,
-    which means every catalog in a process is a listener on one bus -- including the ones
-    a test creates.  ``close`` unsubscribes, and this asserts it, because the failure it
-    prevents is not local: a catalog left open with a denying command hook installs a gate
-    that outlives whoever created it, and ``emit_blocking`` stops at the first refusal, so
-    the leftover gate wins over the live one.
+    An absolute assertion -- "the process-wide bus has no listeners" -- is
+    order-dependent: another test that loaded a plugin without closing its catalog leaves
+    one behind, and this test then fails for a reason that has nothing to do with the
+    property.  That is how the first version of this test behaved, and it was the test
+    that was wrong.
 
-    That is how this was found: a test's ``PreToolUse: deny`` leaked into an unrelated
-    tool call and the assertion failed with the *other* test's reason string.
+    The property is about what *this* catalog does, so it is measured as before-and-after.
     """
     from agent.core.events import TOOL_EVENTS
     from agent.plugins.catalog import PluginCatalog
@@ -369,9 +401,54 @@ def test_closing_a_catalog_releases_its_hold_on_the_shared_bus() -> None:
     before = TOOL_EVENTS.has_listeners(ToolPreExecute)
     catalog = PluginCatalog(builtin_dir=Path(__file__).parent / "does-not-exist")
     try:
-        assert TOOL_EVENTS.has_listeners(ToolPreExecute), "it listens while it lives"
+        assert TOOL_EVENTS.has_listeners(ToolPreExecute) is before, (
+            "a catalog with no command hooks must add no listener: the default bus is "
+            "process-wide, so subscribing anyway installs a global gate on behalf of "
+            "every catalog ever constructed"
+        )
     finally:
         catalog.close()
+    assert TOOL_EVENTS.has_listeners(ToolPreExecute) is before
+
+
+def test_closing_a_catalog_releases_the_plugins_it_loaded(tmp_path) -> None:
+    """``close`` used to release only its own subscriptions.
+
+    A plugin's ``TOOL.attach`` stayed live, so a **closed** catalog went on gating tools
+    through plugins it no longer owned.  Found by asking who was still listening on the
+    process-wide tool bus after a catalog was closed, and the answer was a plugin the
+    catalog had loaded -- which is also how a stale ``PreToolUse: deny`` from one test
+    came to gate a tool call in another.
+    """
+    from agent.core.event_domains import TOOL
+    from agent.core.events import TOOL_EVENTS
+    from agent.plugins.catalog import PluginCatalog
+
+    plugin_dir = tmp_path / "plugins"
+    (plugin_dir / "sub").mkdir(parents=True)
+    (plugin_dir / "sub" / "__init__.py").write_text(
+        textwrap.dedent(
+            """
+            from agent.core.event_domains import TOOL
+
+            def register():
+                class P:
+                    name = "sub"
+
+                    def setup(self, ctx):
+                        TOOL.attach(ctx, lambda event: "blocked by the plugin")
+                return P()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    before = TOOL_EVENTS.has_listeners(ToolPreExecute)
+    catalog = PluginCatalog(builtin_dir=plugin_dir)
+    catalog.discover_and_load()
+    assert TOOL_EVENTS.has_listeners(ToolPreExecute), "the plugin gates while it lives"
+
+    catalog.close()
     assert TOOL_EVENTS.has_listeners(ToolPreExecute) is before, (
-        "closing must restore the bus to what it was"
+        "closing released the catalog but not its plugins"
     )

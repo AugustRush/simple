@@ -1089,6 +1089,9 @@ class _CatalogPlugin:
         # reads a removed plugin's hooks -- the catalog looks them up by name.
         for event_name, entries in _read_claude_hooks_json(plugin_dir).items():
             meta.hooks_config.setdefault(event_name, []).extend(entries)
+        if meta.hooks_config:
+            # The only thing the tool bridge is for.  See `_ensure_event_bridge`.
+            self._catalog._ensure_event_bridge()
 
         meta.path = plugin_dir
 
@@ -1225,10 +1228,9 @@ class PluginCatalog:
         # ToolPostExecute to a bus, and the plugin hooks run as listeners.
         # Defaults to the shared bus so production wiring needs no changes.
         self._event_bus = event_bus if event_bus is not None else TOOL_EVENTS
-        self._event_subscriptions: list[Callable[[], None]] = [
-            self._event_bus.on(ToolPreExecute, self._on_tool_pre_execute),
-            self._event_bus.on(ToolPostExecute, self._on_tool_post_execute),
-        ]
+        #: Subscribed lazily, by :meth:`_ensure_event_bridge`.  Empty until a plugin
+        #: declares a command hook -- see that method for why the timing matters.
+        self._event_subscriptions: list[Callable[[], None]] = []
         # One bus for the composition: the kernel host publishes the typed events a
         # plugin subscribes to through ``ctx.bus``, and the catalog's hook dispatch
         # listens on the same one.  Two buses would mean a plugin's subscription and
@@ -1823,10 +1825,42 @@ class PluginCatalog:
         be interrupted, so this does not wait for them — a plugin that hangs
         would otherwise hold up shutdown indefinitely.
         """
+        # The bridge first, so nothing routes a tool call into a hook chain while the
+        # plugins are coming down.
         for unsubscribe in self._event_subscriptions:
             unsubscribe()
         self._event_subscriptions.clear()
+        # Then the plugins themselves.  Without this, closing a catalog released its own
+        # subscriptions and nothing else: a plugin's `TOOL.attach` stayed live, so a
+        # **closed** catalog went on gating tools through plugins it no longer owned.
+        # Found by asking who was still listening on the process-wide tool bus after a
+        # catalog was closed -- the answer was a plugin the catalog had loaded.
+        self._host.unload_all()
         self._hook_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _ensure_event_bridge(self) -> None:
+        """Subscribe the tool bridge, once, for a catalog that has command hooks.
+
+        The bridge exists to run ``hooks_config`` commands -- external commands an
+        operator declares -- so a catalog whose plugins declare none has nothing for it to
+        do.  Subscribing anyway is not merely idle: the default bus is **process-wide**
+        (``TOOL_EVENTS``), so every catalog ever constructed installed two listeners on
+        one shared object.
+
+        That is how it was found: a test's ``PreToolUse: deny`` command hook outlived the
+        test, stayed a listener, and gated an unrelated tool call in a *different* test --
+        and because ``emit_blocking`` stops at the first refusal, the leftover gate won
+        and the failure named the wrong test's reason string.
+
+        Called when a plugin's ``hooks_config`` becomes non-empty, which is during loading
+        and therefore before any executor publishes.
+        """
+        if self._event_subscriptions:
+            return
+        self._event_subscriptions = [
+            self._event_bus.on(ToolPreExecute, self._on_tool_pre_execute),
+            self._event_bus.on(ToolPostExecute, self._on_tool_post_execute),
+        ]
 
     async def reload(self, components: dict) -> dict:
         """Serialize plugin reload transactions for this catalog instance."""
