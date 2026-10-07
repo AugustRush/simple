@@ -375,7 +375,11 @@ def test_the_recorded_row_carries_what_explains_a_miss(tmp_path):
 
 def test_a_call_with_no_reported_usage_writes_no_row_and_says_so_once(tmp_path, capsys):
     """Silence was the bug: the row vanished and nothing said why."""
-    agent_module.BaseAgent._missing_usage_warned = False
+    # The flag is module state now, not a class attribute: the loop code that reads
+    # it left BaseAgent, and resetting the attribute would reset a stale copy.
+    from agent.core import turn_context
+
+    turn_context.missing_usage_warned = False
     agent = _agent_with_store(tmp_path)
     ctx = agent_module.AgentContext(
         system_prompt="system prompt",

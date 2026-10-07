@@ -1204,6 +1204,45 @@ def test_the_model_call_facade_stays_a_facade() -> None:
     assert "self._model_call()" in source, source
 
 
+def test_every_deliberate_facade_is_only_a_delegation() -> None:
+    """The facades are a named list, and each must be one statement.
+
+    ``_create``, ``_stream_response``, ``_recover_from_content_filter``,
+    ``_prepare_provider_context`` and ``_observe_provider_usage`` all stay on
+    ``BaseAgent`` because tests reach them there -- patching or calling.  The rule the
+    other extractions followed (remove the method, migrate the call sites) was wrong
+    for them: for ``_create`` alone, thirty-eight sites replace it.
+
+    A facade is not a second implementation, and this is what keeps that true.  A
+    body of more than one statement is how a second implementation starts, and it
+    would drift from the module function with no test able to see the difference --
+    the two would agree until they did not.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name, target in (
+        ("_create", "create_turn_response"),
+        ("_stream_response", "stream_response"),
+        ("_recover_from_content_filter", "recover_from_content_filter"),
+        ("_prepare_provider_context", "prepare_provider_context"),
+        ("_observe_provider_usage", "observe_provider_usage"),
+    ):
+        assert name in methods, f"{name} is the facade tests reach; it must exist"
+        body = [
+            stmt for stmt in methods[name].body
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
+        ]
+        assert len(body) == 1 and isinstance(body[0], ast.Return), (
+            f"{name} has {len(body)} statements; a facade is one return of {target}"
+        )
+        source = ast.unparse(body[0])
+        assert target in source, source
+
+
 def test_the_model_call_surface_is_six_members() -> None:
     """And it stays narrow, for the reason the retry policy is narrow.
 

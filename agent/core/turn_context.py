@@ -34,6 +34,28 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: beside them rather than in ``agent.py``.
 TURN_REQUEST_KEY = "_turn_request_message"
 
+#: Whether the "provider reported no usage" line has been printed this process.
+#: Module state rather than a class attribute because it is a fact about the
+#: process, not about an agent -- and because the loop code that reads it no longer
+#: lives in ``BaseAgent``.
+missing_usage_warned = False
+
+
+def claim_missing_usage_warning() -> bool:
+    """True the first time this process asks, False afterwards.
+
+    A function rather than a flag the caller reads and sets, because the caller is a
+    module-level function in ``turn_loop``: assigning the flag there would make it a
+    local and ``UnboundLocalError`` on the read.  ``global`` in the caller would work
+    and would put the "once per process" rule in two places instead of one.
+    """
+    global missing_usage_warned
+    if missing_usage_warned:
+        return False
+    missing_usage_warned = True
+    return True
+
+
 #: This turn's orchestration run records; moves with the orchestration driver.
 active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
     contextvars.ContextVar("active_orchestration_runs", default=None)
@@ -43,6 +65,8 @@ __all__ = [
     "TURN_REQUEST_KEY",
     "active_orchestration_runs",
     "emit_event",
+    "claim_missing_usage_warning",
+    "missing_usage_warned",
     "active_agent_context",
     "active_agent_id",
     "emit_domain_event",

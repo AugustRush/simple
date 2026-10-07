@@ -100,6 +100,7 @@ from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.core.interjections import inject_pending_interjections
 from agent.core.turn_context import (
     TURN_REQUEST_KEY as _TURN_REQUEST_KEY,
+    missing_usage_warned as _missing_usage_warned,
     active_agent_context as _active_agent_context,
     active_orchestration_runs as _active_orchestration_runs,
     emit_event as _emit_event,
@@ -115,7 +116,9 @@ from agent.core.turn_loop import (
     build_summarized_tool_results,
     compact_body_for_turn,
     handle_end_turn,
+    observe_provider_usage,
     parse_response,
+    prepare_provider_context,
     prepare_turn,
     promote_turn_orchestration_runs,
     recover_incomplete_tool_response,
@@ -352,7 +355,6 @@ class BaseAgent:
     _TOOL_LOOP_UNPRODUCTIVE_THRESHOLD = 4
     #: Set once, so a provider that never reports usage says so once per
     #: process rather than on every turn of every session.
-    _missing_usage_warned: bool = False
 
     def __init__(
         self,
@@ -1267,229 +1269,8 @@ class BaseAgent:
         return [message] if isinstance(message, dict) else []
 
 
-    def _prepare_provider_context(
-        self,
-        ctx: "AgentContext",
-        tools: list[dict],
-        *,
-        output_max_tokens: int | None = None,
-    ) -> None:
-        budget = self._input_token_budget(
-            ctx,
-            tools,
-            output_max_tokens=output_max_tokens,
-        )
-        ctx.metadata["_last_input_token_budget"] = budget
-        if budget <= 0:
-            raise ContextLimitError("provider input token budget is not positive")
-        context_manager = self._context_manager_for(ctx)
-        # Compaction normally runs once, at the turn boundary (see
-        # `_compact_body_for_turn`), so that everything after it is an append.
-        # What remains here is the emergency path: a step whose own tool results
-        # have overflowed the window.  It stays because the alternative is a
-        # hard failure mid-turn, and it is rare because the boundary cut leaves
-        # half the budget free.
-        messages_before = len(ctx.messages)
-        # This is the cut an interjection can arm: it runs mid-turn, after any
-        # interjection has been appended as a real user message, so "the newest
-        # message that looks like a request" would name the interjection and free
-        # the turn's own request for eviction.  Passing the object is what makes
-        # the proxy unnecessary here.
-        protected = self._protected_turn_messages(ctx)
-        if context_manager is not None:
-            ctx.messages = context_manager.compact_messages(
-                ctx.messages, input_token_budget=budget, protected=protected
-            )
-        else:
-            # Fitting the request into the window is not a memory operation: it
-            # drops the oldest turns of *this* payload and reads or writes
-            # nothing durable.  So a turn with no manager -- the scheduler's
-            # `stateless` policy nulls it to keep runs independent -- still has
-            # to be able to compact.  Without this, such a run raised
-            # ContextLimitError the moment its own transcript outgrew the
-            # window, where the interactive path would simply have dropped
-            # turns and carried on.
-            ctx.messages = ContextManager.fit_to_budget(
-                ctx.messages,
-                input_token_budget=budget,
-                estimate_tokens=estimate_message_tokens,
-                protected=protected,
-            )
-        # Whether this call is about to pay full price for its history: the body
-        # it sends is not the one the previous call sent plus an append.  A cut
-        # made at the turn boundary belongs to the turn's *first* call, which is
-        # the one that pays for it; the flag is cleared here so the steps after
-        # it are not all reported as misses.  The in-loop cut is counted
-        # directly, because it happened on this call.
-        ctx.metadata["_payload_shape"] = describe_payload(
-            ctx.system_prompt,
-            tools,
-            ctx.messages,
-            compacted=bool(ctx.metadata.pop("_body_compacted_pending", False))
-            or len(ctx.messages) != messages_before,
-        )
-        estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
-        if estimate >= budget:
-            raise ContextLimitError(
-                f"provider input estimate {estimate} is not below budget {budget}"
-            )
-        # Record what this payload was predicted to cost so the provider's exact
-        # count can calibrate the estimator once the call returns.  The provider
-        # charges for system prompt and tool schemas too, so the comparable
-        # prediction is messages + overhead.
-        configured_cap = self._configured_output_cap(output_max_tokens)
-        overhead = self._payload_overhead(ctx, tools)
-        ctx.metadata["_predicted_input_tokens"] = estimate + max(0, overhead)
-        # What the two halves of the prediction cost, for the split-aware
-        # calibration in `_observe_provider_usage`: the head at the price this
-        # budget actually charged it, the body at the raw heuristic so the
-        # learned correction never feeds on itself.
-        ctx.metadata["_predicted_head_cost"] = max(0, overhead)
-        ctx.metadata["_predicted_body_raw"] = self._estimate_raw_body_tokens(ctx)
-        # The cap actually sent, derived here because this is the only place the
-        # real input estimate exists.  `max_tokens` is not tokenised into the
-        # prompt, so it costs nothing in cache terms to vary it per call -- and
-        # varying it is what lets the configured cap stay generous: on a short
-        # request the window has room for all of it, and only a request that
-        # nearly fills the window has to settle for less.  Deriving it any other
-        # way (shrinking the cap itself) is how long answers get truncated.
-        ctx.metadata["_output_cap"] = max(
-            1, min(configured_cap, self._output_room(ctx, tools))
-        )
 
-    def _observe_provider_usage(self, ctx: "AgentContext", response: Any) -> None:
-        """Feed the provider's exact input count back into the estimator.
 
-        Without this the character heuristic never learns: it carries the same
-        systematic bias for the life of the process, and the only signal that it
-        was wrong is a provider-side failure.
-
-        This is also the one place a provider request's real cost is known, so
-        it is where the row that makes the prompt cache measurable is written.
-        `agent.core.payload_shape` says which fields the row carries and why
-        those are the ones that explain a miss.
-        """
-        predicted = int(ctx.metadata.pop("_predicted_input_tokens", 0) or 0)
-        head_cost = int(ctx.metadata.pop("_predicted_head_cost", 0) or 0)
-        body_raw = int(ctx.metadata.pop("_predicted_body_raw", 0) or 0)
-        shape = ctx.metadata.pop("_payload_shape", None)
-        observed_usage = getattr(self._transport, "observed_usage", None)
-        usage = (
-            observed_usage(response)
-            if callable(observed_usage)
-            else extract_provider_usage(response)
-        )
-        context_manager = self._context_manager_for(ctx)
-        if context_manager is None:
-            return
-        if predicted > 0 and usage.input_tokens > 0:
-            # Like for like: `predicted` is the whole payload (messages plus the
-            # system prompt and tool schemas), so it must be compared against the
-            # provider's whole prompt count.  Feeding it the *uncached* slice
-            # instead makes the measurement shrink as caching improves, the
-            # estimate always looks too high, and the calibration clamp drags it
-            # to its floor -- an estimator that can never learn it under-counts.
-            #
-            # The split-aware path prices the two halves from their own
-            # evidence: the body factor from the difference between consecutive
-            # observations (which cancels the head out entirely), the head from
-            # the residual, locked per fingerprint.  One shared factor could not
-            # price both -- measured on this machine the schemas run ~0.5x the
-            # heuristic while ASCII tool transcripts run ~1.4x -- and letting
-            # body evidence move a byte-identical head's price was what shrank
-            # the input budget mid-turn and cut context the payload still fit.
-            head_fp = (
-                shape.get("head_fingerprint")
-                if isinstance(shape, dict)
-                else None
-            )
-            consolidation = getattr(context_manager, "consolidation", None)
-            observe_split = getattr(consolidation, "observe_payload_usage", None)
-            if callable(observe_split) and head_fp:
-                with shared._suppress_with_log("token calibration skipped"):
-                    observe_split(
-                        fingerprint=head_fp,
-                        head_estimate=head_cost,
-                        body_raw=body_raw,
-                        actual=usage.input_tokens,
-                    )
-            elif callable(
-                getattr(consolidation, "observe_actual_usage", None)
-            ):
-                with shared._suppress_with_log("token calibration skipped"):
-                    consolidation.observe_actual_usage(
-                        predicted, usage.input_tokens
-                    )
-        if usage.total_tokens <= 0:
-            # Nothing worth recording: a row of zeros reads as a request that
-            # cost nothing rather than as one whose cost was never reported, and
-            # it would drag down every aggregate it entered.  Said out loud
-            # once, because the alternative is what this path used to do --
-            # leave every streamed turn missing from `usage_events` with
-            # nothing anywhere to say why.
-            self._warn_missing_usage(ctx)
-            return
-        session_id = str(
-            ctx.metadata.get("session_id")
-            or getattr(getattr(context_manager, "staging", None), "session_id", "")
-            or ctx.agent_id
-        )
-        step = max(1, int(ctx.metadata.get("_provider_step", 1) or 1))
-        phase = "subagent" if ctx.metadata.get("_orchestration_child") else (
-            "foreground" if step == 1 else "tool_step"
-        )
-        store = getattr(context_manager, "store", None)
-        record = getattr(store, "append_usage_event", None)
-        if callable(record):
-            metadata: dict[str, Any] = {
-                "step": step,
-                "predicted_input_tokens": predicted,
-                # The ceiling this call was fitted to.  Recorded beside the
-                # payload's shape because "did the request fit, or was it cut"
-                # is the question the two answer together.
-                "input_budget": int(
-                    ctx.metadata.get("_last_input_token_budget") or 0
-                ),
-            }
-            if isinstance(shape, dict):
-                metadata.update(shape)
-            with shared._suppress_with_log("provider usage persistence skipped"):
-                record(
-                    session_id=session_id,
-                    turn_id=str(ctx.metadata.get("turn_id") or ""),
-                    phase=phase,
-                    model=self._effective_model(ctx),
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cached_input_tokens=usage.cached_input_tokens,
-                    metadata=metadata,
-                )
-        _emit_event(
-            "provider_usage",
-            phase=phase,
-            step=step,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cached_input_tokens=usage.cached_input_tokens,
-        )
-
-    def _warn_missing_usage(self, ctx: "AgentContext") -> None:
-        """Say once that a provider reported no usage for a call.
-
-        Silence here is what let the interactive path go unmeasured: the row was
-        skipped, nothing was logged, and the only symptom was an absent column
-        in a database nobody was reading.  One line per process is enough to
-        turn that into a diagnosable state, and low enough volume to leave on.
-        """
-        if BaseAgent._missing_usage_warned:
-            return
-        BaseAgent._missing_usage_warned = True
-        shared.CONSOLE.print(
-            "[yellow]Provider reported no token usage for a call "
-            f"({self._effective_model(ctx)}); it will not appear in "
-            "usage_events. If the gateway rejects stream_options, set "
-            "providers.<name>.stream_usage to false.[/yellow]"
-        )
 
     async def _stream_response(
         self,
@@ -1519,6 +1300,32 @@ class BaseAgent:
         return await recover_from_content_filter(
             self._loop_deps(), ctx, tool_uses, results
         )
+
+    def _prepare_provider_context(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        *,
+        output_max_tokens: int | None = None,
+    ) -> None:
+        """Fit the request into the window.  A facade: see :meth:`_create` for why.
+
+        The logic is in ``agent/core/turn_loop.py``.  The name stays reachable on the
+        instance because the tests drive the two-step protocol directly --
+        ``_prepare_provider_context`` then ``_observe_provider_usage`` -- and they read
+        as steps of a turn rather than as calls into the loop module.
+        """
+        return prepare_provider_context(
+            self._loop_deps(), ctx, tools, output_max_tokens=output_max_tokens
+        )
+
+    def _observe_provider_usage(self, ctx: "AgentContext", response: Any) -> None:
+        """Fold a response's token usage back into the estimator.  A facade.
+
+        See :meth:`_create` for why the name stays; the logic is in
+        ``agent/core/turn_loop.py``.
+        """
+        return observe_provider_usage(self._loop_deps(), ctx, response)
 
     async def _create(
         self,
@@ -1560,13 +1367,24 @@ class BaseAgent:
         importing ``agent.core.agent``, so it must be handed six members rather than
         an agent.
         """
+        # The two callables that fill in the request and fold its usage back now live
+        # in ``agent/core/turn_loop.py`` and take that module's dependency surface, so
+        # they are bound to one here rather than read off the agent.  A single
+        # ``deps`` for the whole model call is also what keeps the request consistent:
+        # preparing with one surface and observing with another would let a
+        # mid-turn reassignment split the two halves of one call.
+        deps = self._loop_deps()
         return ModelCall(
-            transport=self._transport,
-            effective_model=self._effective_model,
-            configured_output_cap=self._configured_output_cap,
-            prepare_provider_context=self._prepare_provider_context,
-            observe_provider_usage=self._observe_provider_usage,
-            event_bus=self._llm_event_bus,
+            transport=deps.transport,
+            effective_model=deps.effective_model,
+            configured_output_cap=deps.configured_output_cap,
+            prepare_provider_context=lambda ctx, tools, **kw: prepare_provider_context(
+                deps, ctx, tools, **kw
+            ),
+            observe_provider_usage=lambda ctx, response: observe_provider_usage(
+                deps, ctx, response
+            ),
+            event_bus=deps.llm_event_bus,
         )
 
     def _retry_policy(self) -> RetryPolicy:

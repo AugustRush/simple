@@ -131,6 +131,11 @@ LEDGER: tuple[StateEntry, ...] = (
                "BaseAgent: the loop has to ask which agent is in flight, and "
                "importing that from agent.py would be a cycle. Re-exported under "
                "the old private name so the twelve callers did not change."),
+    StateEntry("missing_usage_warned", "agent/core/turn_context.py", 52, "REBOUND", "process", "stays", None,
+               "Whether the 'provider reported no usage' line has been printed. Process "
+               "scope, not turn scope: it is a fact about this run, not about an agent. "
+               "Moved from a BaseAgent class attribute when the loop code that reads it "
+               "left BaseAgent -- a class attribute was a cycle for the module."),
     StateEntry("active_orchestration_runs", "agent/core/turn_context.py", 38, "CONTEXTVAR", "turn", "explicit", 8,
                "This turn's orchestration run records; moves with the orchestration driver. "
                "Sank into agent/core/turn_context.py with the other turn-scoped state when the "
