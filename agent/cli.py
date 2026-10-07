@@ -52,6 +52,7 @@ from agent.scheduler.unattended import UnattendedAudit, UnattendedOutputSink
 from agent.shared import CancelToken
 from agent.tools.runtime import RunSelfReport, _active_run_self_report
 from agent.tui import TuiSession
+from agent.scheduler.settings import SchedulerSettings
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
@@ -1542,13 +1543,14 @@ def gateway(
         except RuntimeError as exc:
             shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1)
-        sched_cfg = cfg.get("scheduler", {})
-        scheduler_poll = float(sched_cfg.get("poll_seconds", 30))
-        scheduler_lease = int(sched_cfg.get("lease_seconds", 300))
-        scheduler_max_concurrent = int(sched_cfg.get("max_concurrent_runs", 3))
-        scheduler_signal_depth = int(
-            sched_cfg.get("signal_max_depth", DEFAULT_SIGNAL_MAX_DEPTH)
-        )
+        # One resolution, shared with the `scheduler` command.  The two used to read
+        # the same four keys with the same four defaults independently -- see
+        # agent/scheduler/settings.py for why that is the defect.
+        scheduler_settings = SchedulerSettings.resolve(cfg)
+        scheduler_poll = scheduler_settings.poll_seconds
+        scheduler_lease = scheduler_settings.lease_seconds
+        scheduler_max_concurrent = scheduler_settings.max_concurrent_runs
+        scheduler_signal_depth = scheduler_settings.signal_max_depth
         scheduler_task: Optional[asyncio.Task] = None
         scheduler_store = None
         scheduler_components = None
@@ -1977,13 +1979,13 @@ def scheduler(
         if not agent_module._first_run_setup():
             raise typer.Exit(0)
         cfg, _ = agent_module.load_config()
-    sched_cfg = cfg.get("scheduler", {})
-    effective_poll = float(poll_seconds or sched_cfg.get("poll_seconds", 30))
-    effective_lease = int(lease_seconds or sched_cfg.get("lease_seconds", 300))
-    effective_max_concurrent = int(sched_cfg.get("max_concurrent_runs", 3))
-    effective_signal_depth = int(
-        sched_cfg.get("signal_max_depth", DEFAULT_SIGNAL_MAX_DEPTH)
+    settings = SchedulerSettings.resolve(
+        cfg, poll_seconds=poll_seconds, lease_seconds=lease_seconds
     )
+    effective_poll = settings.poll_seconds
+    effective_lease = settings.lease_seconds
+    effective_max_concurrent = settings.max_concurrent_runs
+    effective_signal_depth = settings.signal_max_depth
 
     async def _run():
         service, store, components = await _build_scheduler_service(
