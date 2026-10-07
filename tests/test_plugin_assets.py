@@ -29,9 +29,11 @@ class _Catalog:
     """
 
     def __init__(self, tool_registry=None) -> None:
-        self._slash_commands: dict = {}
-        self._slash_command_metadata: dict = {}
-        self._slash_command_owners: dict = {}
+        # One registry rather than three parallel dicts; see
+        # agent/commands/registry.py.
+        from agent.commands.registry import CommandRegistry
+
+        self._commands = CommandRegistry()
         self._bundled_skills: list = []
         self._bundled_mcp: list = []
         self._agent_defs: dict = {}
@@ -60,9 +62,9 @@ def test_a_slash_command_is_registered_and_attributed() -> None:
     catalog = _Catalog()
     assets, _ = _assets(catalog, "github")
     assets.add_slash_command("pr", lambda **kw: "ok")
-    assert "pr" in catalog._slash_commands
-    assert catalog._slash_command_owners["pr"] == "github", "attributed for reporting"
-    assert "pr" in catalog._slash_command_metadata
+    assert catalog._commands.has("pr")
+    assert catalog._commands.owner("pr") == "github", "attributed for reporting"
+    assert "pr" in catalog._commands.metadata()
 
 
 def test_removing_a_slash_command_undoes_all_three_writes() -> None:
@@ -76,9 +78,8 @@ def test_removing_a_slash_command_undoes_all_three_writes() -> None:
     assets.add_slash_command("pr", lambda **kw: "ok")
     assert len(undos) == 1
     undos[0]()
-    assert catalog._slash_commands == {}
-    assert catalog._slash_command_metadata == {}
-    assert catalog._slash_command_owners == {}
+    assert catalog._commands.names() == ()
+    assert catalog._commands.metadata() == {}
 
 
 def test_the_command_name_is_returned() -> None:
@@ -230,7 +231,7 @@ def test_each_view_is_bound_to_the_context_it_was_made_for() -> None:
     mine, _ = _assets(catalog, "mine")
     theirs, _ = _assets(catalog, "theirs")
     mine.add_slash_command("same", lambda **kw: None)
-    assert catalog._slash_command_owners["same"] == "mine"
+    assert catalog._commands.owner("same") == "mine"
     assert service.catalog is catalog
 
 
@@ -266,16 +267,17 @@ def test_command_files_return_an_undo_each(tmp_path) -> None:
     root = _catalog_paths(tmp_path)
     catalog = PluginCatalog(builtin_dir=tmp_path)
     try:
-        owners: dict = {}
-        undos = catalog._load_command_files(root, "p", owners)
+        # The owners map is gone as a parameter: the registry records the owner with
+        # the handler, so there is no second structure to keep in step.
+        undos = catalog._load_command_files(root, "p")
         assert len(undos) == 1
-        assert "p:review" in catalog._slash_commands
-        assert owners["p:review"] == "p"
+        assert catalog._commands.has("p:review")
+        assert catalog._commands.owner("p:review") == "p"
 
         undos[0]()
-        assert "p:review" not in catalog._slash_commands
-        assert "p:review" not in catalog._slash_command_metadata
-        assert "p:review" not in owners, "attribution went with the registration"
+        assert not catalog._commands.has("p:review")
+        assert "p:review" not in catalog._commands.metadata()
+        assert catalog._commands.owner("p:review") == "", "attribution went with it"
     finally:
         catalog.close()
 

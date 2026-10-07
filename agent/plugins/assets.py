@@ -87,21 +87,19 @@ class _ScopedAssets:
     # -- contributions -------------------------------------------------------
 
     def add_slash_command(self, name: str, handler: Callable[..., Any]) -> str:
-        """Contribute one slash command, removed with the plugin."""
+        """Contribute one slash command, removed with the plugin.
+
+        Delegates to the command registry's scoped view.  The three parallel dicts
+        this used to write by hand -- handler, metadata, owner -- are one record
+        there, so the "add without recording the removal" path does not exist: both
+        happen in :meth:`agent.commands.registry.CommandRegistry.add`.
+        """
         from agent.plugins.catalog import _command_metadata
 
-        catalog = self._catalog
-        catalog._slash_commands[name] = handler
-        catalog._slash_command_metadata[name] = _command_metadata(handler)
-        catalog._slash_command_owners[name] = self.owner
-
-        def forget() -> None:
-            catalog._slash_commands.pop(name, None)
-            catalog._slash_command_metadata.pop(name, None)
-            catalog._slash_command_owners.pop(name, None)
-
-        self._ctx.on_unwind(forget)
-        return name
+        registry = self._catalog._commands
+        return registry.scoped(self._ctx).add(
+            name, handler, metadata=_command_metadata(handler)
+        )
 
     def add_bundled_skill(self, path: Any) -> None:
         """Contribute a skills root, scanned by the skill catalog."""

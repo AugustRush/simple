@@ -124,8 +124,8 @@ def test_unload_removes_the_slash_command(catalog_and_plugin) -> None:
     result = catalog.unload_plugin("everything")
     assert result["ok"] is True
     assert "everything" not in catalog.get_slash_commands()
-    assert catalog._slash_command_metadata.get("everything") is None
-    assert catalog._slash_command_owners.get("everything") is None
+    assert catalog._commands.get("everything") is None
+    assert catalog._commands.owner("everything") == ""
 
 
 def test_unload_removes_the_bundled_skills(catalog_and_plugin) -> None:

@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 
 from agent import shared
 from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
+from agent.commands.registry import CommandRegistry
 from agent.core.output import _active_event_collector
 from agent.kernel.plugin import PluginHost
 from agent.plugins.profile_selection import profile_from_config
@@ -969,13 +970,11 @@ class _CatalogPlugin:
         plugin: Any,
         meta: Any,
         plugin_dir: Path,
-        slash_command_owners: dict[str, str],
     ) -> None:
         self._catalog = catalog
         self._plugin = plugin
         self._meta = meta
         self._plugin_dir = plugin_dir
-        self._owners = slash_command_owners
         self.name = name
 
     # -- identity ------------------------------------------------------------
@@ -1048,7 +1047,7 @@ class _CatalogPlugin:
                 ctx.assets.add_bundled_mcp(mcp_cfg)
 
         for undo in catalog._load_command_files(
-            plugin_dir, self.name, self._owners, meta.commands
+            plugin_dir, self.name, meta.commands
         ):
             ctx.on_unwind(undo)
         for undo in catalog._load_agent_files(plugin_dir, self.name, meta.agents):
@@ -1069,8 +1068,8 @@ class _CatalogPlugin:
             for cmd_key, handler in (
                 self._plugin.register_slash_commands() or {}
             ).items():
-                if cmd_key in catalog._slash_commands:
-                    existing = self._owners.get(cmd_key, "?")
+                if catalog._commands.has(cmd_key):
+                    existing = catalog._commands.owner(cmd_key) or "?"
                     shared.CONSOLE.print(
                         f"[yellow]Plugin '{self.name}': slash command "
                         f"'{cmd_key}' conflicts with plugin "
@@ -1126,9 +1125,11 @@ class PluginCatalog:
         )
         # name → (plugin_object, PluginMeta)
         self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
-        self._slash_commands: dict[str, Callable] = {}
-        self._slash_command_metadata: dict[str, dict[str, Any]] = {}
-        self._slash_command_owners: dict[str, str] = {}
+        #: Slash commands, as one registry rather than three parallel dicts.  See
+        #: :mod:`agent.commands.registry` for why: the handler, its ``/help`` metadata
+        #: and its owner are one record, so they cannot disagree about which keys
+        #: exist -- and the add/remove pair lives in one place.
+        self._commands = CommandRegistry()
         # Skills bundled by plugins: list of (plugin_name, skills_root_path)
         self._bundled_skills: list[tuple[str, Path]] = []
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
@@ -1348,9 +1349,7 @@ class PluginCatalog:
         """
         self._plugins.clear()
         self._pending.clear()
-        self._slash_commands.clear()
-        self._slash_command_metadata.clear()
-        self._slash_command_owners.clear()
+        self._commands.clear()
         self._bundled_skills.clear()
         self._bundled_mcp.clear()
         self._agent_defs.clear()
@@ -1379,7 +1378,6 @@ class PluginCatalog:
                         source=source,
                         name_hint=plugin_name_hint,
                         source_dir_name=entry_dir.name,
-                        slash_command_owners=self._slash_command_owners,
                     )
         return [name for name in self._plugins]
 
@@ -1398,22 +1396,17 @@ class PluginCatalog:
     def _remove_plugin_owned_state(
         self,
         plugin_name: str,
-        slash_command_owners: Optional[dict[str, str]] = None,
     ) -> None:
-        """Remove every catalog asset owned by one plugin.
+        """Remove the catalog's remaining per-plugin state.
 
-        The unload path's asset half.  Kept as a name because the same-name
-        replacement path calls it, and delegating rather than duplicating means
-        a sixth kind of contribution is added in one place.
+        The unload path's asset half.  Slash commands are **not** here any more:
+        each registration recorded its own removal on the contributing plugin's scope,
+        so disposing that scope takes them back.  Filtering by owner as well would be a
+        second mechanism for one thing, which is how the two come to disagree.
+
+        The three below are still name-tagged lists rather than scope-owned, so they
+        are still filtered here.  They are the next ones to move.
         """
-        if slash_command_owners is None:
-            slash_command_owners = self._slash_command_owners
-        for cmd_key, owner in tuple(slash_command_owners.items()):
-            if owner != plugin_name:
-                continue
-            self._slash_commands.pop(cmd_key, None)
-            self._slash_command_metadata.pop(cmd_key, None)
-            slash_command_owners.pop(cmd_key, None)
         self._bundled_skills = [
             item for item in self._bundled_skills if item[0] != plugin_name
         ]
@@ -1522,7 +1515,6 @@ class PluginCatalog:
         source: str,
         name_hint: str,
         source_dir_name: str = "",
-        slash_command_owners: dict[str, str],
     ) -> None:
         # P0-3: reject directory names that could collide with real modules.
         if not _SAFE_PLUGIN_NAME.match(name_hint):
@@ -1595,7 +1587,7 @@ class PluginCatalog:
         # A user plugin with the same plugin name replaces the built-in plugin
         # as a unit. Assets omitted by the replacement must not survive.
         if plugin_name in self._plugins:
-            self._remove_plugin_owned_state(plugin_name, slash_command_owners)
+            self._remove_plugin_owned_state(plugin_name)
 
         # Slash commands the plugin declares in Python are registered by the
         # adapter, during activation -- not here.  Registering them at discovery
@@ -1618,8 +1610,7 @@ class PluginCatalog:
                 plugin=plugin,
                 meta=meta,
                 plugin_dir=plugin_dir,
-                slash_command_owners=slash_command_owners,
-            ),
+                    ),
             # Same name means replacement, which is this catalog's historical
             # behaviour for a user plugin overriding a builtin and for a reload.
             replace=True,
@@ -1652,7 +1643,6 @@ class PluginCatalog:
         self,
         plugin_dir: Path,
         plugin_name: str,
-        slash_command_owners: dict[str, str],
         command_paths: list[str] | None = None,
     ) -> list[Callable[[], None]]:
         """Register every ``commands/*.md`` as a namespaced slash command.
@@ -1709,25 +1699,23 @@ class PluginCatalog:
                 description=str(metadata.get("description", "") or ""),
             )
 
-            if cmd_key in self._slash_commands:
-                existing_owner = slash_command_owners.get(cmd_key, "?")
+            if self._commands.has(cmd_key):
+                existing_owner = self._commands.owner(cmd_key) or "?"
                 shared.CONSOLE.print(
                     f"[yellow]Plugin '{plugin_name}': slash command "
                     f"'/{cmd_key}' conflicts with plugin "
                     f"'{existing_owner}' — overriding[/yellow]"
                 )
-            self._slash_commands[cmd_key] = handler
-            self._slash_command_metadata[cmd_key] = _command_metadata(
-                handler, explicit=metadata
+            # One write, one undo, both from the registry: the three parallel dicts
+            # this used to touch by hand are one record there.
+            undos.append(
+                self._commands.add(
+                    cmd_key,
+                    handler,
+                    metadata=_command_metadata(handler, explicit=metadata),
+                    owner=plugin_name,
+                )
             )
-            slash_command_owners[cmd_key] = plugin_name
-
-            def forget(key: str = cmd_key) -> None:
-                self._slash_commands.pop(key, None)
-                self._slash_command_metadata.pop(key, None)
-                slash_command_owners.pop(key, None)
-
-            undos.append(forget)
         return undos
 
     def _load_agent_files(
@@ -1842,12 +1830,11 @@ class PluginCatalog:
         }
         old_discovery_state = {
             "plugins": dict(self._plugins),
-            "slash_commands": dict(self._slash_commands),
-            "slash_command_metadata": {
-                name: dict(value)
-                for name, value in self._slash_command_metadata.items()
-            },
-            "slash_command_owners": dict(self._slash_command_owners),
+            # One snapshot, because the registry holds handler, metadata and owner
+            # together.  The reload rollback used to restore three dicts separately,
+            # which is three chances to restore two of them.
+            "slash_commands": self._commands.snapshot(),
+
             "bundled_skills": list(self._bundled_skills),
             "bundled_mcp": list(self._bundled_mcp),
             "plugin_source_dirs": dict(self._plugin_source_dirs),
@@ -1878,13 +1865,7 @@ class PluginCatalog:
                 command_router.register_plugin_catalog(self)
             except Exception:
                 self._plugins = old_discovery_state["plugins"]
-                self._slash_commands = old_discovery_state["slash_commands"]
-                self._slash_command_metadata = old_discovery_state[
-                    "slash_command_metadata"
-                ]
-                self._slash_command_owners = old_discovery_state[
-                    "slash_command_owners"
-                ]
+                self._commands.restore(old_discovery_state["slash_commands"])
                 self._bundled_skills = old_discovery_state["bundled_skills"]
                 self._bundled_mcp = old_discovery_state["bundled_mcp"]
                 self._plugin_source_dirs = old_discovery_state[
@@ -2002,15 +1983,11 @@ class PluginCatalog:
 
     def get_slash_commands(self) -> dict[str, Callable]:
         """Return mapping of command name → async handler(raw_cmd, components)."""
-        return dict(self._slash_commands)
+        return self._commands.handlers()
 
     def get_slash_command_metadata(self) -> dict[str, dict[str, Any]]:
         """Return detached metadata snapshots for registered slash commands."""
-
-        return {
-            name: dict(command_metadata)
-            for name, command_metadata in self._slash_command_metadata.items()
-        }
+        return self._commands.metadata()
 
     # ── Hook helpers ────────────────────────────────────────────────────────────
 

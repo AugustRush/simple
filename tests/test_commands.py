@@ -357,7 +357,7 @@ def test_plugin_adapter_normalizes_legacy_handler_results(
             return handler_result
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog._slash_commands["deploy"] = handler
+    catalog._commands.add("deploy", handler)
     router = CommandRouter()
     router.register_plugin_catalog(catalog)
 
@@ -385,7 +385,7 @@ def test_plugin_adapter_returns_stable_error_without_exception_details(
             raise RuntimeError(secret)
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog._slash_commands["explode"] = handler
+    catalog._commands.add("explode", handler)
     router = CommandRouter()
     router.register_plugin_catalog(catalog)
 
@@ -411,7 +411,7 @@ def test_plugin_adapter_passes_raw_command_and_per_invocation_overlay(tmp_path) 
         components["plugin_local"] = raw_cmd
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog._slash_commands["deploy"] = handler
+    catalog._commands.add("deploy", handler)
     router = CommandRouter()
     router.register_plugin_catalog(catalog)
     first_ctx = object()
@@ -478,7 +478,7 @@ def test_plugin_adapter_offloads_sync_handler_without_losing_async_context(
         return finish()
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog._slash_commands["slow"] = handler
+    catalog._commands.add("slow", handler)
     router = CommandRouter()
     router.register_plugin_catalog(catalog)
 
@@ -530,7 +530,7 @@ def test_plugin_adapter_bounds_sync_work_after_caller_cancellation(tmp_path) -> 
         release.wait(2)
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog._slash_commands["block"] = handler
+    catalog._commands.add("block", handler)
     router = CommandRouter()
     router.register_plugin_catalog(catalog)
 
@@ -576,7 +576,8 @@ def test_plugin_adapter_preserves_metadata_and_core_precedence(tmp_path) -> None
     handler.__command_usage__ = "/deploy <target>"  # type: ignore[attr-defined]
     handler.__command_description__ = "Deploy a target"  # type: ignore[attr-defined]
     catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog._slash_commands.update({"deploy": handler, "help": handler})
+    catalog._commands.add("deploy", handler)
+    catalog._commands.add("help", handler)
     router = CommandRouter()
     register_builtin_commands(router)
 
@@ -585,7 +586,7 @@ def test_plugin_adapter_preserves_metadata_and_core_precedence(tmp_path) -> None
 
     assert router.classify("/help").source == "core"
 
-    catalog._slash_commands.pop("help")
+    catalog._commands.remove("help")
     router.register_plugin_catalog(catalog)
     route = router.classify("/ship prod", channel_name="feishu")
 

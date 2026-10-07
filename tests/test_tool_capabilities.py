@@ -261,3 +261,127 @@ def test_a_composition_without_a_registry_stays_loadable() -> None:
         def on_unwind(self, handler): ...
 
     PluginAssets(catalog).scoped(_Ctx()).add_tool(_Tool("x"))  # must not raise
+
+
+# ── Commands: the same shape, one registry instead of three dicts ────────────
+
+
+def _command_host():
+    from agent.commands.registry import CommandRegistry
+
+    registry = CommandRegistry()
+    host = PluginHost()
+    host.services.provide("commands", registry)
+    return host, registry
+
+
+class _CommandPlugin:
+    name = "command_plugin"
+    inject = ("commands",)
+
+    def __init__(self, *names: str) -> None:
+        self._names = names
+
+    def setup(self, ctx):
+        for name in self._names:
+            ctx.commands.add(name, lambda raw, components: f"{name}:{raw}", metadata={"description": name})
+
+
+def test_a_plugin_registers_a_command_through_its_context() -> None:
+    host, registry = _command_host()
+    host.load(_CommandPlugin("deploy"))
+    assert registry.has("deploy")
+    assert registry.owner("deploy") == "command_plugin"
+
+
+def test_the_three_facts_live_in_one_record() -> None:
+    """The failure the parallel dicts made possible, asserted against.
+
+    Handler, metadata and owner used to be three dicts written in two places.  A key
+    present in one and absent from another was representable -- and the conflict
+    message read the owner map while the loader wrote the handler, so a command could
+    exist with no owner to name.
+    """
+    host, registry = _command_host()
+    host.load(_CommandPlugin("deploy"))
+
+    assert registry.get("deploy") is not None
+    assert registry.metadata()["deploy"]["description"] == "deploy"
+    assert registry.owner("deploy") == "command_plugin"
+
+    # Removing takes all three, because there is only one thing to remove.
+    registry.remove("deploy")
+    assert registry.names() == ()
+    assert registry.metadata() == {}
+    assert registry.owner("deploy") == ""
+
+
+def test_unloading_the_plugin_removes_its_commands() -> None:
+    host, registry = _command_host()
+    host.load(_CommandPlugin("deploy", "rollback"))
+    assert set(registry.names()) == {"deploy", "rollback"}
+
+    host.unload("command_plugin")
+    assert registry.names() == ()
+
+
+def test_two_plugins_contribute_commands_independently() -> None:
+    host, registry = _command_host()
+
+    class _Other:
+        name = "other"
+        inject = ("commands",)
+
+        def setup(self, ctx):
+            ctx.commands.add("other_cmd", lambda raw, components: raw)
+
+    host.load(_CommandPlugin("mine"))
+    host.load(_Other())
+    host.unload("command_plugin")
+    assert registry.names() == ("other_cmd",)
+
+
+def test_a_snapshot_restores_the_state_it_captured() -> None:
+    """What a failed reload relies on.
+
+    Deep enough that an ``add`` after the snapshot cannot mutate it: a shallow copy
+    would restore the same record dicts the failed attempt had already written into,
+    so the rollback would put back the broken state.
+    """
+    host, registry = _command_host()
+    host.load(_CommandPlugin("deploy"))
+    snapshot = registry.snapshot()
+
+    registry.add("deploy", lambda raw, components: "changed", metadata={"description": "new"}, owner="someone")
+    registry.add("extra", lambda raw, components: "x")
+
+    registry.restore(snapshot)
+    assert registry.names() == ("deploy",)
+    assert registry.owner("deploy") == "command_plugin"
+    assert registry.metadata()["deploy"]["description"] == "deploy"
+
+
+def test_the_catalog_can_be_the_loader_for_declarative_commands() -> None:
+    """The other writer: the markdown loader returns undos from the same registry."""
+    import tempfile
+    from pathlib import Path
+
+    from agent.plugins.catalog import PluginCatalog
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        commands = root / "commands"
+        commands.mkdir()
+        (commands / "review.md").write_text("---\ndescription: reviews\n---\nReview\n", encoding="utf-8")
+
+        catalog = PluginCatalog(builtin_dir=root)
+        try:
+            undos = catalog._load_command_files(root, "p")
+            assert len(undos) == 1
+            assert catalog._commands.has("p:review")
+            assert catalog._commands.owner("p:review") == "p"
+
+            undos[0]()
+            assert not catalog._commands.has("p:review")
+        finally:
+            catalog.close()
