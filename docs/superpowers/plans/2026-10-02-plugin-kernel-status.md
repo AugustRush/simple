@@ -1207,6 +1207,35 @@ plugins were **data**, a profile could express *which* plugins exist and not *wh
 comes from* -- an asymmetry in the model rather than a missing feature.  The earlier judgement
 was made before that structure existed.
 
+## Review finding 12: the layers, named
+
+Layering already happened -- defaults, then the file, then a bundle, then a profile -- but
+through **two** mechanisms, and the scheduler's run config is the clearest case:
+
+```python
+run_cfg = dict(current_cfg)                  # base
+run_cfg["workspace_root"] = str(workspace)   # a raw dict write
+run_cfg["output_dir"] = str(run_output)      # a raw dict write
+run_cfg = apply_profile_to_config(run_cfg, profile)   # a patch, validated
+```
+
+The two raw writes are layers too -- just layers `apply_patch` never saw, so they were not
+validated against declared paths, not undoable, and not attributable.  "Which layer set
+`output_dir`?" had no answer, and a typo in one became a setting nobody reads instead of an
+error.
+
+`agent/config_layers.py` is **not a new mechanism**: it is the existing one with the layers
+named and ordered, and `resolve_layers` applies what it is given, in order, through
+`apply_patch`.  `allow_new` stays **per entry**, so a run that legitimately adds
+`workspace_root` keeps the strict rule for every other patch in the same layer.
+
+**Two rounds running, I have had to reverse myself on this review item.**  First I called the
+core-plugin declaration "the same information as a profile"; then I called service replacements
+"a mechanism without a consumer".  Both times the structure that made the feature obviously
+necessary -- `CoreContext`, then `provides` -- was built *after* the judgement.  The pattern is
+worth naming: **a judgement about what a model should express is not reliable while the model is
+still being built.**
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

@@ -352,10 +352,30 @@ def build_scheduler_service(
             if config_loader is not None
             else agent_module.load_config_for_run(cfg)
         )
-        run_cfg = dict(current_cfg)
-        run_cfg["workspace_root"] = str(workspace)
-        run_cfg["output_dir"] = str(run_output)
-        run_cfg = apply_profile_to_config(run_cfg, profile)
+        # Named and ordered, through the one applier.  These were two raw dict writes and a
+        # patch -- three layers, two mechanisms -- so "which layer set output_dir" had no
+        # answer and a typo became a setting nobody reads instead of an error.  `allow_new`
+        # on the first two because a run legitimately adds paths the defaults do not declare;
+        # the profile's patches keep their own stricter rule.
+        from agent.config_layers import ConfigLayer, resolve_layers
+        from agent.config_patch import entry as patch_entry
+
+        run_cfg = resolve_layers(
+            current_cfg,
+            [
+                ConfigLayer(
+                    name="scheduler run paths",
+                    patches=(
+                        patch_entry("workspace_root", str(workspace), allow_new=True),
+                        patch_entry("output_dir", str(run_output), allow_new=True),
+                    ),
+                ),
+                ConfigLayer(
+                    name=f"profile {getattr(profile, 'key', 'unknown')}",
+                    patches=tuple(profile.config_patches),
+                ),
+            ],
+        )
         resource_home = AGENT_HOME
         if registry is not None:
             configured_resource_home = registry.get_context("resource_home")
