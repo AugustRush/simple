@@ -1587,6 +1587,56 @@ def test_build_components_registers_skill_management_tools(monkeypatch, tmp_path
     assert "write_skill_file" in tool_names
 
 
+def test_a_composition_starts_with_an_unused_provider_uncredentialed(monkeypatch, tmp_path):
+    """The user-visible regression: the gateway refused to start over a section it never used.
+
+    Six providers in ``config.json`` and one key exported is the ordinary case -- the
+    routing table exists so the rest are *offerable*, not so they are *required*.  Building a
+    client for every routed provider eagerly made each one's credential a startup
+    prerequisite, and the error blamed the wrong thing as well: ``provider: ?``, because a
+    section on disk does not carry the key it is filed under.
+
+    Asserted on the composition rather than on the router because that is where the user
+    stood: this is the call ``simple gateway`` makes.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    monkeypatch.delenv("SIMPLE_ABSENT_KEY_FOR_COMPOSITION", raising=False)
+    cfg = _minimal_cfg()
+    cfg["providers"]["sidecar"] = {
+        "api_format": "anthropic",
+        "api_key": "$SIMPLE_ABSENT_KEY_FOR_COMPOSITION",
+        "default_model": "sidecar-model",
+    }
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg, announce=True: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = asyncio.run(
+        agent_module._build_components_async(cfg, announce=False)
+    )
+
+    llm = components["llm"]
+    assert "sidecar" in llm.unavailable, (
+        "the composition came up and *reports* the provider it cannot reach"
+    )
+    assert "SIMPLE_ABSENT_KEY_FOR_COMPOSITION" in str(llm.unavailable["sidecar"])
+    assert "sidecar-model" in llm.routes, (
+        "and the model keeps its route -- dropping it would post a foreign model id to "
+        "the active provider's endpoint, the misroute the routing table exists to prevent"
+    )
+
+
 def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path):
     import asyncio
     import agent as agent_module

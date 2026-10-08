@@ -257,3 +257,44 @@ def test_an_unknown_format_in_config_fails_loudly() -> None:
     message = str(excinfo.value)
     assert "opemai" in message
     assert "typo" in message
+
+
+def test_a_missing_credential_names_the_variable_and_the_provider(monkeypatch) -> None:
+    """The message has one job: say what to export, and for which provider.
+
+    ``name`` is not in the file -- the loader attaches it -- so an error raised from a
+    section nobody named reports ``provider: ?``.  In a config with six providers that is
+    the one thing the message cannot afford to be vague about, and the routing transport
+    is exactly where an *unnamed* section arrives.
+    """
+    from agent.core.providers import missing_credential, resolve_api_key
+
+    monkeypatch.delenv("SIMPLE_ABSENT_PROVIDER_KEY", raising=False)
+    section = {"api_key": "$SIMPLE_ABSENT_PROVIDER_KEY"}
+
+    assert missing_credential(section) == "SIMPLE_ABSENT_PROVIDER_KEY"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        resolve_api_key({**section, "name": "acme"})
+    message = str(excinfo.value)
+    assert "SIMPLE_ABSENT_PROVIDER_KEY" in message
+    assert "provider: acme" in message, message
+
+
+def test_a_literal_key_is_never_missing(monkeypatch) -> None:
+    """Control: the local no-auth gateway is a real configuration.
+
+    ``api_key: ""`` means "this endpoint wants no credential", which is not the same as
+    "the credential was not provided".  Only the ``$ENV`` form can be absent, and asking
+    the question without raising is what lets a composition keep running for providers it
+    merely routes to.
+    """
+    from agent.core.providers import missing_credential, resolve_api_key
+
+    assert missing_credential({"api_key": ""}) is None
+    assert resolve_api_key({"api_key": ""}) == ""
+    assert missing_credential({"api_key": "sk-literal"}) is None
+
+    monkeypatch.setenv("SIMPLE_PRESENT_PROVIDER_KEY", "from-env")
+    assert missing_credential({"api_key": "$SIMPLE_PRESENT_PROVIDER_KEY"}) is None
+    assert resolve_api_key({"api_key": "$SIMPLE_PRESENT_PROVIDER_KEY"}) == "from-env"

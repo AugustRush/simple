@@ -237,6 +237,149 @@ def test_build_routing_transport_shares_cached_clients_across_rebuilds():
     assert made == ["k1", "k2"]
 
 
+def _key_resolving_factory(made: list[str]):
+    """A client factory that behaves like the real one about ``$ENV`` credentials.
+
+    Raises for an unset variable, exactly as ``providers.resolve_api_key`` does, and
+    reports the provider the way that message does -- from the section, not from the
+    caller.
+    """
+    import os
+
+    def factory(provider_cfg: dict, api_format: str) -> Any:
+        raw = str(provider_cfg.get("api_key") or "")
+        if raw.startswith("$"):
+            env_name = raw[1:]
+            if not os.environ.get(env_name, ""):
+                raise RuntimeError(
+                    f"API key env var {env_name!r} not set "
+                    f"(provider: {provider_cfg.get('name') or '?'}). "
+                    f"Run: export {env_name}=..."
+                )
+        made.append(str(provider_cfg.get("name") or "?"))
+        return _RecordingClient()
+
+    return factory
+
+
+def _two_provider_cfg(absent_key: bool) -> dict:
+    """An active provider that works, and a second one whose key may be missing.
+
+    The second provider's model exists **only** there, which is what makes the routing
+    table the thing under test: if it is dropped, a call for ``slow`` would be posted to
+    the active provider's endpoint -- the 400 this table exists to prevent.
+    """
+    return {
+        "active_provider": "local",
+        "providers": {
+            "local": {
+                "api_format": "openai",
+                "api_key": "k-local",
+                "models": ["fast"],
+            },
+            "other": {
+                "api_format": "anthropic",
+                "api_key": (
+                    "$SIMPLE_ABSENT_KEY_FOR_TEST" if absent_key else "k-other"
+                ),
+                "models": ["slow"],
+            },
+        },
+    }
+
+
+def test_a_provider_with_no_credential_does_not_stop_the_composition() -> None:
+    """The composition must not depend on providers it does not use.
+
+    A gateway with six configured providers and one key is the ordinary case, and the
+    routing table is the feature that makes it ordinary.  Building a client per provider
+    *eagerly* made every one of their credentials a startup prerequisite, which turned
+    "the anthropic section has no key today" into "the gateway will not start" -- while
+    the provider it actually runs on was configured and working.
+
+    What must **not** happen instead is a fallback: dropping the model from the routing
+    table would post ``slow`` to the active provider's endpoint, which is the failure
+    ``routing_table`` exists to prevent.  So the model keeps its route and the route
+    keeps the reason.
+    """
+    made: list[str] = []
+    cfg = _two_provider_cfg(absent_key=True)
+
+    routing = build_routing_transport(
+        cfg, "openai", _RecordingClient(), _key_resolving_factory(made)
+    )
+
+    assert "slow" in routing.routes, "the unusable provider still owns its model"
+    assert routing.routes["slow"] is not routing.default, "and it is not the active provider"
+    assert made == [], "the active provider's client was already built by the caller"
+
+    with pytest.raises(RuntimeError) as caught:
+        routing.routes["slow"].endpoint_for("slow")
+
+    message = str(caught.value)
+    assert "SIMPLE_ABSENT_KEY_FOR_TEST" in message, message
+    assert "other" in message, (
+        "the failure must name the provider it belongs to -- a section on disk does not "
+        f"carry its own name, so this needs injecting: {message}"
+    )
+
+
+def test_the_unusable_provider_is_reported_rather_than_hidden() -> None:
+    """Silence would be the other way to make startup succeed, and it is worse.
+
+    The reason is kept on the routing transport so the composition can say it at startup
+    instead of the user discovering it when a model silently answers from the wrong
+    endpoint -- or, before this, when the process refuses to start at all.
+    """
+    routing = build_routing_transport(
+        _two_provider_cfg(absent_key=True),
+        "openai",
+        _RecordingClient(),
+        _key_resolving_factory([]),
+    )
+
+    assert list(routing.unavailable) == ["other"], routing.unavailable
+    assert "SIMPLE_ABSENT_KEY_FOR_TEST" in str(routing.unavailable["other"])
+
+
+def test_a_usable_second_provider_is_built_normally() -> None:
+    """Control: the deferral must not become "no second provider is ever built".
+
+    Same config with the key present, and the client is constructed, cached and routed --
+    so the only thing that changed is what happens when construction fails.
+    """
+    made: list[str] = []
+    routing = build_routing_transport(
+        _two_provider_cfg(absent_key=False),
+        "openai",
+        _RecordingClient(),
+        _key_resolving_factory(made),
+    )
+
+    assert made == ["other"], "the second provider's client was built"
+    assert routing.unavailable == {}
+    assert isinstance(routing.routes["slow"], AnthropicTransport)
+
+
+def test_the_active_providers_own_credential_is_still_fatal() -> None:
+    """Control: the provider the composition runs on is not optional.
+
+    Deferring *its* failure would mean the agent comes up and fails on the first request
+    of every turn, with the reason buried behind a call.  This is the one provider whose
+    absence cannot be worked around, so it stays a startup error.
+    """
+    cfg = _two_provider_cfg(absent_key=True)
+    cfg["providers"]["local"]["api_key"] = "$SIMPLE_ABSENT_KEY_FOR_TEST"
+
+    made: list[str] = []
+    factory = _key_resolving_factory(made)
+    # The active client is built by the caller from the active section, with its name --
+    # which is the path ``ModelClientFactory.from_config`` takes.
+    with pytest.raises(RuntimeError) as caught:
+        factory({**cfg["providers"]["local"], "name": "local"}, "openai")
+    assert "provider: local" in str(caught.value), str(caught.value)
+
+
 def test_agent_transport_is_injectable_and_defaults_to_the_client():
     """The transport is a construction dependency, not a post-hoc assignment.
 

@@ -613,6 +613,17 @@ async def _build_components_async(
         client_factory=_provider_client_factory,
         client_cache=provider_client_cache,
     )
+    # Say which providers could not be built, at the one moment the user is looking at
+    # startup output.  The composition proceeds without them (a provider it merely routes
+    # to must not be a startup prerequisite -- see ``build_routing_transport``), so without
+    # this the first sign would be a call that fails, or a model that answers from the
+    # wrong endpoint.  Printed next to the "Provider:" line by putting it here.
+    if announce:
+        for _name, _reason in sorted(routing_transport.unavailable.items()):
+            console.print(
+                f"[yellow]Provider '{_name}' unavailable: {_reason}[/yellow] "
+                "[dim]— its models stay unroutable until this is fixed[/dim]"
+            )
     client_cache_key = provider_client_cache_key(
         (providers or {}).get(client_provider, {}), api_format
     )

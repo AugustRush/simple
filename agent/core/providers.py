@@ -48,8 +48,10 @@ __all__ = [
     "UnknownApiFormatError",
     "build_client",
     "build_transport",
+    "missing_credential",
     "register_provider",
     "registered_formats",
+    "resolve_api_key",
     "unregister_provider",
 ]
 
@@ -79,27 +81,48 @@ class UnknownApiFormatError(ValueError):
         self.available = available
 
 
+def missing_credential(provider_cfg: dict) -> str | None:
+    """The environment variable this provider needs and does not have, or ``None``.
+
+    The question, without the raising: *is this provider usable at all?*  Answering it
+    separately is what lets a composition keep working when a provider it is not using has
+    no key -- and say so, rather than either refusing to start or silently ignoring a
+    provider the operator did configure.
+
+    ``"$NAME"`` is the only form that can be missing.  A literal key is present by
+    definition, including the empty string a local no-auth gateway legitimately uses.
+    """
+    raw = str(provider_cfg.get("api_key", "") or "")
+    if not raw.startswith("$"):
+        return None
+    env_name = raw[1:]
+    return None if os.environ.get(env_name, "") else env_name
+
+
 def resolve_api_key(provider_cfg: dict) -> str:
     """The credential a provider config names, with ``$ENV`` indirection.
 
     Written once because it was written three times: ``"$NAME"`` reads the
-    environment and a missing value is an error rather than an empty string,
-    since an unauthenticated request is a worse failure than a refused start.
+    environment and a missing value is an error rather than an empty string.
     Anything else is the literal key, including the empty string that a
     local, no-auth gateway legitimately uses.
+
+    Note the asymmetry, because it is deliberate: **this** raises, and it is called when
+    somebody is actually building a client for one provider.  Whether a provider *must*
+    have a credential is the composition's question -- see :func:`missing_credential` --
+    and for a provider the composition does not route to, the answer is no.
     """
     raw = str(provider_cfg.get("api_key", "") or "")
     if not raw.startswith("$"):
         return raw
-    env_name = raw[1:]
-    value = os.environ.get(env_name, "")
-    if not value:
+    env_name = missing_credential(provider_cfg)
+    if env_name is not None:
         raise RuntimeError(
             f"API key env var {env_name!r} not set "
             f"(provider: {provider_cfg.get('name') or '?'}). "
             f"Run: export {env_name}=..."
         )
-    return value
+    return os.environ[raw[1:]]
 
 
 def _anthropic_client(provider_cfg: dict) -> Any:

@@ -36,17 +36,35 @@ def _provider_keys_read_by_the_loader() -> dict[str, set[str]]:
     written yet.  The variable names are the codebase's convention for a
     provider entry; files that reuse one for something else are listed in
     ``_NOT_A_PROVIDER``.
+
+    Both quote styles, because the scan was double-quote-only and that made it a
+    validation that could not see half its subject: ``provider_cfg.get('name')`` in
+    ``providers.resolve_api_key`` had been reading a key no field declares, and the rule
+    that exists to catch exactly that reported nothing.  A guard whose reach depends on a
+    quoting habit is a guard with a hole in it.
+
+    ``_INJECTED`` names the keys that are not config: written by the loader *about* a
+    section, never by the user *in* one.
     """
-    pattern = re.compile(r'(?:provider_cfg|pcfg|provider)\.get\(\s*"([a-z_]+)"\s*[,)]')
+    pattern = re.compile(r'(?:provider_cfg|pcfg|provider)\.get\(\s*["\']([a-z_]+)["\'][,)]')
     found: dict[str, set[str]] = {}
     for path in (_REPO_ROOT / "agent").rglob("*.py"):
         relative = str(path.relative_to(_REPO_ROOT))
         for match in pattern.finditer(path.read_text()):
             key = match.group(1)
-            if key in _NOT_A_PROVIDER.get(relative, set()):
+            if key in _NOT_A_PROVIDER.get(relative, set()) or key in _INJECTED:
                 continue
             found.setdefault(key, set()).add(relative)
     return found
+
+
+#: Keys the code puts *on* a provider section rather than reads *from* the file.
+#:
+#: ``name`` is the section's own key in ``providers`` -- ``ModelClientFactory`` and the
+#: routing transport add it so an error can say which provider it belongs to.  It is not
+#: a field: nothing a user writes in the file sets it, and the settings form must not
+#: offer it.
+_INJECTED = {"name"}
 
 
 #: ``pcfg`` there is a *plugin's* config, not a provider entry.

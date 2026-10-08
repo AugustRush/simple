@@ -1578,7 +1578,10 @@ class WebChannel(Channel):
 
         started = time.perf_counter()
         try:
-            client = build_client(provider_cfg, api_format)
+            # Named, because a section on disk does not carry the key it is filed under
+            # and the credential error reports ``provider: <name>`` -- without this the
+            # one message this test exists to produce says ``provider: ?``.
+            client = build_client({**provider_cfg, "name": name}, api_format)
             transport = build_transport(
                 api_format,
                 client,

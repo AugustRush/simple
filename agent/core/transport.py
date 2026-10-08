@@ -1131,6 +1131,26 @@ class RoutingTransport(ModelTransport):
             return self.default
         return self.routes.get(model, self.default)
 
+    @property
+    def unavailable(self) -> dict[str, BaseException]:
+        """Provider name → why its transport could not be built; empty normally.
+
+        A routed provider whose client cannot be built (its ``$ENV`` credential is unset,
+        its package is missing, its format is unknown) is **carried**, not raised: the
+        composition is not made to depend on providers it does not use.  It is not dropped
+        either -- dropping its models would send them to the active provider's endpoint,
+        which is the misroute this class exists to prevent.
+
+        Exposed so the composition can *say* it at startup.  A provider that fails on the
+        first call is a much later and more confusing discovery than one named next to the
+        provider line.
+        """
+        return {
+            transport.provider_name: transport.error
+            for transport in self.routes.values()
+            if isinstance(transport, _ProviderUnavailable)
+        }
+
     def _effort_override(self, model: Optional[str]) -> Optional[str]:
         """The effort this call carries, when a model was told to differ.
 
@@ -1447,6 +1467,78 @@ def _client_for_provider(
     return client
 
 
+class _ProviderUnavailable:
+    """A routed provider whose transport could not be built, kept as its reason.
+
+    Not a ``ModelTransport`` on purpose.  There is no client to speak to, and forwarding
+    to *another* provider is exactly the failure the routing table exists to prevent -- a
+    foreign model id posted to whichever endpoint happened to be active.  Writing out every
+    per-call method to raise the same error would be a second copy of the interface that
+    can rot; raising it for whatever the routing layer asks is the one behaviour there is.
+    """
+
+    def __init__(self, provider_name: str, error: BaseException) -> None:
+        self.provider_name = str(provider_name)
+        self.error = error
+        #: Read by callers that describe a group rather than call it.
+        self.api_format = ""
+
+    def __getattr__(self, item: str) -> Any:
+        # Dunders are left alone: introspection (``repr``, ``copy``, a debugger) asking
+        # whether this object can do something is not an attempt to call the provider.
+        if item.startswith("__"):
+            raise AttributeError(item)
+        raise self.error
+
+    def __repr__(self) -> str:
+        return f"<provider {self.provider_name!r} unavailable: {self.error}>"
+
+
+def _route_transport(
+    name: str,
+    provider_cfg: dict,
+    api_format: str,
+    client_for: Callable[[dict, str, str], Any],
+    *,
+    fatal: bool,
+) -> Any:
+    """One routed provider's transport, or the reason it has none.
+
+    ``fatal`` marks the active provider: it is the one this composition runs on, so a
+    client that cannot be built for it is a startup error.  Every other provider is
+    *routable*, not required -- see :func:`build_routing_transport`.
+    """
+    # Resolved here for the same reason as below: the module-level name is a compatibility
+    # re-export, and a module-scope reference would not see the real one.
+    from agent.core.providers import build_transport as _build_transport
+
+    try:
+        return _build_transport(
+            api_format,
+            client_for(provider_cfg, api_format, name),
+            provider_thinking_effort(provider_cfg),
+            provider_stream_usage(provider_cfg),
+            headers=shared.provider_headers(provider_cfg),
+            provider_name=name,
+        )
+    except Exception as exc:  # noqa: BLE001 - the reason is carried, not swallowed
+        if fatal:
+            raise
+        return _ProviderUnavailable(name, exc)
+
+
+def _named(provider_cfg: dict, provider_name: str) -> dict:
+    """*provider_cfg* with the name it is filed under.
+
+    A section on disk does not carry its own key, and the credential error reports
+    ``provider: <name>`` -- so without this the one message a user gets about a missing key
+    says ``provider: ?``, which is precisely the thing it needed to say.
+    """
+    if provider_cfg.get("name") or not provider_name:
+        return provider_cfg
+    return {**provider_cfg, "name": provider_name}
+
+
 def build_routing_transport(
     cfg: dict,
     default_format: str,
@@ -1520,8 +1612,14 @@ def build_routing_transport(
         and active_cfg is not None
     ):
         default_format = active_format
+        # The active provider's own client, rebuilt because the config it was built from
+        # is not the one we were handed.  Named, so a credential failure says whose it is,
+        # and **not** deferred: this is the provider the composition runs on.
         default_client = _client_for_provider(
-            active_cfg, default_format, client_factory, client_cache
+            _named(active_cfg, active),
+            default_format,
+            client_factory,
+            client_cache,
         )
 
     # Resolved inside the function: the module-level name is a compatibility
@@ -1539,9 +1637,12 @@ def build_routing_transport(
     routes: dict[str, ModelTransport] = {}
     transports: dict[str, ModelTransport] = {}
 
-    def _client_for(provider_cfg: dict, api_format: str) -> Any:
+    def _client_for(provider_cfg: dict, api_format: str, provider_name: str) -> Any:
         return _client_for_provider(
-            provider_cfg, api_format, client_factory, client_cache
+            _named(provider_cfg, provider_name),
+            api_format,
+            client_factory,
+            client_cache,
         )
 
     overrides: dict[str, str] = {}
@@ -1563,13 +1664,17 @@ def build_routing_transport(
         else:
             transport = transports.get(name)
             if transport is None:
-                transport = _build_transport(
+                # A client per provider, built once -- and, for a provider this
+                # composition merely *routes to*, a failure that is carried instead of
+                # raised.  Requiring every configured provider's credential at startup
+                # made an unused section with an unset `$ENV` a reason the process would
+                # not start; see `RoutingTransport.unavailable`.
+                transport = _route_transport(
+                    name,
+                    provider_cfg,
                     api_format,
-                    _client_for(provider_cfg, api_format),
-                    provider_thinking_effort(provider_cfg),
-                    provider_stream_usage(provider_cfg),
-                    headers=shared.provider_headers(provider_cfg),
-                    provider_name=name,
+                    _client_for,
+                    fatal=(name == active),
                 )
                 transports[name] = transport
         routes[model] = transport
