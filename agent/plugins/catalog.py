@@ -14,7 +14,7 @@ import sys
 from typing import Any, Callable, Optional
 
 from agent import shared
-from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
+from agent.core.events import ToolPostExecute, ToolPreExecute, bus_name
 from agent.commands.registry import CommandRegistry
 from agent.core.agent_registry import AgentRegistry, role_key
 from agent.core.output import _active_event_collector
@@ -22,7 +22,6 @@ from agent.kernel.plugin import PluginHost
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
 from agent.core.event_domains import SessionFinished
-from agent.core.events import SESSION_EVENTS
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
@@ -1172,8 +1171,15 @@ class PluginCatalog:
         # The tool-event subscription.  This is what replaces the executor
         # holding this catalog: the executor publishes ToolPreExecute /
         # ToolPostExecute to a bus, and the plugin hooks run as listeners.
-        # Defaults to the shared bus so production wiring needs no changes.
-        self._event_bus = event_bus if event_bus is not None else TOOL_EVENTS
+        #
+        # **Resolved from the composition, not from the module.**  A composition that
+        # provides its own buses (see ``default_buses``) makes the executor publish on
+        # *its* tool bus; a catalog left on the process-wide default then subscribes the
+        # ``hooks.json`` bridge to a bus nothing publishes to.  The gate is loaded,
+        # reported, and never called -- the failure this codebase warns about most -- and
+        # every existing test of the bridge called ``fire_pre_tool`` directly, so none of
+        # them could see it.  ``_bus_for`` reads the same names ``Domain.attach`` does.
+        self._event_bus = event_bus if event_bus is not None else self._bus_for("tool")
         #: Subscribed lazily, by :meth:`_ensure_event_bridge`.  Empty until a plugin
         #: declares a command hook -- see that method for why the timing matters.
         self._event_subscriptions: list[Callable[[], None]] = []
@@ -1188,6 +1194,26 @@ class PluginCatalog:
         from agent.core.event_domains import domain_of
 
         self._host.domain_lookup = domain_of
+
+    def _bus_for(self, domain: str) -> Any:
+        """The bus *domain* is published and subscribed on, in **this** composition.
+
+        The same rule ``Domain.attach`` follows, from the same source: the composition's
+        component mapping, which this catalog's registry adopted, names its buses
+        ``event_bus.<domain>``.  A catalog that resolves them per call cannot drift from
+        the plugins that subscribe through the domain table.
+
+        The fallback asks the domain table for the **process default**
+        (``bus_for(domain, None)``) rather than keeping a second table here.  A copy would
+        be a list to keep in step with ``event_domains`` -- and the way it goes wrong is
+        silent, since a stale copy is still a bus that accepts listeners.
+        """
+        provided = self._services.get(bus_name(domain), None)
+        if provided is not None:
+            return provided
+        from agent.core.event_domains import bus_for, domain as domain_named
+
+        return bus_for(domain_named(domain))
 
     def register_core_services(self, components: Any) -> None:
         """Point this catalog at the runtime's container for core services.
@@ -1774,14 +1800,19 @@ class PluginCatalog:
 
         The bridge exists to run ``hooks_config`` commands -- external commands an
         operator declares -- so a catalog whose plugins declare none has nothing for it to
-        do.  Subscribing anyway is not merely idle: the default bus is **process-wide**
-        (``TOOL_EVENTS``), so every catalog ever constructed installed two listeners on
-        one shared object.
+        do.  Subscribing anyway is not merely idle: a catalog with no composition behind it
+        falls back to the **process-wide** bus, so every such catalog ever constructed
+        installed two listeners on one shared object.
 
         That is how it was found: a test's ``PreToolUse: deny`` command hook outlived the
         test, stayed a listener, and gated an unrelated tool call in a *different* test --
         and because ``emit_blocking`` stops at the first refusal, the leftover gate won
         and the failure named the wrong test's reason string.
+
+        Which bus it subscribes to is :meth:`_bus_for` -- the composition's when it has
+        one, the process default otherwise.  Getting that wrong is the same class of
+        failure in the other direction: this docstring's own lesson, a listener nobody
+        publishes to.
 
         Called when a plugin's ``hooks_config`` becomes non-empty, which is during loading
         and therefore before any executor publishes.
@@ -2187,10 +2218,14 @@ class PluginCatalog:
         It used to notify two protocols from here -- the typed event, plus a Python
         ``on_session_end`` hook.  No plugin implements that hook any more; the event is
         what a plugin subscribes to.
+
+        Published on the composition's session bus, which is the one ``SESSION.attach``
+        resolves.  The process-wide default would be a third instance of the same miss:
+        the event constructed, emitted, and heard by nobody the composition knows about.
         """
         # Emitted unconditionally: the bus does nothing when nobody listens, and a
         # session that ended is a fact whether or not this composition has plugins.
-        await SESSION_EVENTS.emit(
+        await self._bus_for("session").emit(
             SessionFinished(
                 agent_id="",
                 messages=list(event.messages),

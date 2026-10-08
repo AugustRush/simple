@@ -393,6 +393,13 @@ def test_the_session_event_is_emitted_from_the_single_dispatch_point() -> None:
     ``fire_session_end`` is where hooks are dispatched.  Emitting the typed event at its
     callers instead would construct the same fact in two places, which is the shape that
     drifts.
+
+    And emitted on the bus the *subscriber* resolves.  This test used to require
+    ``SESSION_EVENTS.emit`` literally -- which pinned the process-wide bus, and so pinned
+    the miss: a composition provides its own session bus, ``SESSION.attach`` resolves that
+    one, and the event went where nobody was listening.  The receiver is now asserted to be
+    ``self._bus_for("session")``, which is one statement further and is the property that
+    actually has to hold.
     """
     import ast as _ast
 
@@ -408,9 +415,16 @@ def test_the_session_event_is_emitted_from_the_single_dispatch_point() -> None:
     emits = [
         node
         for node in _ast.walk(fire)
-        if isinstance(node, _ast.Call)
-        and getattr(node.func, "attr", "") == "emit"
-        and isinstance(node.func.value, _ast.Name)
-        and node.func.value.id == "SESSION_EVENTS"
+        if isinstance(node, _ast.Call) and getattr(node.func, "attr", "") == "emit"
     ]
     assert len(emits) == 1, "fire_session_end must emit exactly one session event"
+
+    receiver = emits[0].func.value
+    assert isinstance(receiver, _ast.Call), (
+        "the bus must be resolved, not taken from the module: "
+        f"got {_ast.dump(receiver)[:80]}"
+    )
+    assert getattr(receiver.func, "attr", "") == "_bus_for", (
+        "the session event must go to the composition's session bus"
+    )
+    assert [arg.value for arg in receiver.args] == ["session"]
