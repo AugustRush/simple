@@ -1493,6 +1493,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_an_attached_image_reaches_the_model_as_an_image_block` | upload → attach → the file's own base64 on the wire |
 | `test_an_image_sent_to_a_provider_without_vision_is_described_instead` | control: no vision, no block -- but the file is described, not dropped |
 | `test_the_model_command_switches_the_session_and_refuses_a_typo` | `/model`: the switch reaches the next request, a typo is refused, the choice survives |
+| `test_allowing_a_command_takes_effect_on_the_next_turn` | `/allow`: gated first, then pre-approved -- and it persists |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1737,6 +1738,23 @@ content, so a path that "attached" something but sent its name would fail.
 The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
+
+## One command test that guards a *fix* rather than a feature
+
+`/allow <command>` spans four things: the command writes the config file *and* applies the
+list to the session's registry context, the tool call merges that context onto the registry
+its implementation reads, the classifier consults the list before its risky-command branches,
+and the prompt does not appear.
+
+Measured: with the per-call context merge reverted -- the defect fixed two rounds ago --
+**this test fails**.  So `/allow` is the user-visible shape of that fix, where before it had
+only a synthetic test of `ToolRegistry.call`.  That is the difference the functional layer is
+for: "the merge is installed correctly" is a statement about machinery, and "the list I
+allowed takes effect" is a statement about the product.
+
+The test measures the transition rather than the end state: the command is *gated first* (a
+prompt arrives, refused), and only then allowed.  A command that never prompted would make the
+second half pass for the wrong reason.
 
 ## `/model` said it switched, and the next turn used the default
 

@@ -503,6 +503,19 @@ async def _drain_after_completion(socket, events: list[dict], grace: float = 0.5
         events.append(event)
 
 
+def _shown_text(events: list[dict]) -> str:
+    """Everything a person would read on the page, including status lines.
+
+    A command that answers with a ``status`` and an empty completion is invisible to a
+    reader that only looks at chunk/text -- which would let "the reply names it" pass on a
+    build that said nothing.
+    """
+    return " ".join(
+        str(event.get("chunk") or event.get("text") or event.get("error") or "")
+        for event in events
+    )
+
+
 def _answer(events: list[dict]) -> str:
     completion = next(e for e in events if e["type"] == "turn_complete")
     return str(completion.get("text", ""))
@@ -2671,33 +2684,16 @@ def test_the_model_command_switches_the_session_and_refuses_a_typo(home):
 
         switched, after_switch, typo, after_typo = asyncio.run(run())
 
-        def _shown(events: list[dict]) -> str:
-            """Everything a person would read on the page, including status lines.
-
-            A refused command reports itself as a ``status`` with ``level="error"`` and an
-            empty completion, so reading only chunk/text would see nothing at all -- which is
-            how "the reply names the typo" would pass on a build that said nothing.
-            """
-            return " ".join(
-                str(
-                    event.get("chunk")
-                    or event.get("text")
-                    or event.get("error")
-                    or ""
-                )
-                for event in events
-            )
-
-        assert "beta-model" in _shown(switched), switched
+        assert "beta-model" in _shown_text(switched), switched
         assert _answer(after_switch) == "answer for beta-model", (
             "the switch must reach the next turn's request -- that is the whole command: "
             f"{after_switch}"
         )
-        assert "gamma-model" in _shown(typo), (
+        assert "gamma-model" in _shown_text(typo), (
             f"the refusal must name what was asked for: {typo}"
         )
-        assert "alpha-model" in _shown(typo) and "beta-model" in _shown(typo), (
-            f"and what is available, so the typo is fixable from the reply: {_shown(typo)}"
+        assert "alpha-model" in _shown_text(typo) and "beta-model" in _shown_text(typo), (
+            f"and what is available, so the typo is fixable from the reply: {_shown_text(typo)}"
         )
         assert _answer(after_typo) == "answer for beta-model", (
             "and a refused switch must not move the session off the last good choice: "
@@ -2707,5 +2703,106 @@ def test_the_model_command_switches_the_session_and_refuses_a_typo(home):
             "beta-model",
             "beta-model",
         ], [request.get("model") for request in provider.requests]
+    finally:
+        provider.close()
+
+
+# ── 26. Allowing a command for good ─────────────────────────────────────────
+
+
+def test_allowing_a_command_takes_effect_on_the_next_turn(home):
+    """``/allow`` writes the pre-approved list; the *next* shell call must read it.
+
+    The switch spans four things: the command writes the config file and applies the list to
+    the session's registry context, the tool call merges that context onto the registry its
+    implementation reads, the classifier consults the list before the risky-command branches,
+    and the prompt never appears.
+
+    Measured with the command that *is* gated first (a prompt, refused), because a command
+    that never prompts would make the second half pass for the wrong reason -- this is the
+    product's own "it was confirmed, now it is not" transition, and the interesting direction
+    is the one that could silently keep prompting.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "tool": (
+                "shell",
+                {
+                    "command": "echo hi | sh",
+                    "intent": "check the pre-approved list takes effect",
+                },
+            )
+        },
+        {"text": "first turn done"},
+        {
+            "tool": (
+                "shell",
+                {
+                    "command": "echo hi | sh",
+                    "intent": "the same command, now pre-approved",
+                },
+            )
+        },
+        {"text": "second turn done"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run():
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-allow/stream"
+                ) as socket:
+                    first, first_prompts = await _ask_with_approval(
+                        socket, "run it", "m1", "deny"
+                    )
+                    allowed = await _ask(socket, "/allow echo hi | sh", "m2")
+                    second, second_prompts = await _ask_with_approval(
+                        socket, "run it again", "m3", "deny"
+                    )
+                return first, first_prompts, allowed, second, second_prompts
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        first, first_prompts, allowed, second, second_prompts = asyncio.run(run())
+
+        assert first_prompts, (
+            "the command must be gated before it is allowed, or the second half proves "
+            f"nothing: {[e['type'] for e in first]}"
+        )
+        # The reply is markdown, so the pipe comes back escaped ("echo hi \| sh"); the
+        # command itself is what has to be in there, unescaped.
+        assert "echo hi | sh" in _shown_text(allowed).replace("\\", ""), allowed
+        assert second_prompts == [], (
+            "a pre-approved command must not ask again: "
+            f"{[e['type'] for e in second]}"
+        )
+
+        tool_result = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_result, [m.get("role") for m in provider.requests[-1]["messages"]]
+        content = str(tool_result[-1].get("content", ""))
+        assert "requires_confirmation" not in content, (
+            f"and it must have been allowed rather than re-gated: {content[:300]}"
+        )
+
+        stored = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        assert "echo hi | sh" in (stored.get("shell_allowed_commands") or []), (
+            "the command promises persistence, so the file must carry it: "
+            f"{stored.get('shell_allowed_commands')}"
+        )
     finally:
         provider.close()
