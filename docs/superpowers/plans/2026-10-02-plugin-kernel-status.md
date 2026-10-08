@@ -1147,6 +1147,40 @@ assertions follow the seam, because what matters is that the key is read *on the
 planner* -- a test that keeps passing by looking where the value no longer travels is worse
 than one that fails.
 
+## What is left of "the agent is the centre", measured
+
+The previous section said the centrality is that `LoopDeps` is built *from* the agent rather
+than *from* the composition.  Measured, so the next attempt starts from numbers rather than
+from the phrase:
+
+```
+LoopDeps.of(agent)  ->  28 attributes
+```
+
+Of those, about **fifteen are private methods and callables**, not values:
+
+    agent._bounded_text            agent._protected_turn_messages
+    agent._input_token_budget      agent._output_room
+    agent._token_budget            agent._format_agent_error
+    agent._create                  agent._retry_policy()
+    agent._context_manager_for     agent._recover_from_content_filter
+    ...
+
+So the loop does not merely read configuration from the agent -- it calls the agent's own
+budget arithmetic, clipping, retry policy and error formatting.  **That is the centre**: not
+that the agent holds state, but that the turn loop's *behaviour* is delivered through the
+agent's private helpers.
+
+Extracting it means moving budgeting, truncation, retry policy and error formatting out of a
+2,537-line class and into the loop or into services -- a change with a wide blast radius, and
+one that should not be started at the end of a long run.  **Recorded rather than begun.**
+
+What is *not* left, contrary to the review's phrasing: `AgentCore` reads through
+`require_service`/`resolve` and its names are ledger entries (now checked in both directions);
+`TurnRunner` has a plugin path, with `bind` as the documented fallback; and the settings half
+is done -- `AgentSettings` holds the derivation, so what the agent carries is closer to
+"state plus collaborators" than "state plus a config bag".
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
