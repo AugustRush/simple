@@ -197,8 +197,17 @@ class _ScriptedProvider:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                if reply.get("tool"):
+                if reply.get("no_tools") and reply.get("finish") == "tool_calls":
+                    # A gateway that announces a tool call and sends none.  Nothing in the
+                    # protocol forbids it, and the loop must not wedge on it.
+                    self.wfile.write(_chunk({}, finish="tool_calls"))
+                elif reply.get("tool"):
                     name, arguments = reply["tool"]
+                    # A real provider *streams* the arguments: the name arrives first and
+                    # the JSON body arrives in fragments, which the client has to
+                    # concatenate.  Sending it whole would leave that assembly untested --
+                    # and a client that replaced instead of appended would look identical
+                    # on a fake that never split anything.
                     self.wfile.write(
                         _chunk(
                             {
@@ -214,20 +223,19 @@ class _ScriptedProvider:
                             }
                         )
                     )
-                    self.wfile.write(
-                        _chunk(
-                            {
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "function": {
-                                            "arguments": json.dumps(arguments)
-                                        },
-                                    }
-                                ]
-                            }
+                    for fragment in _fragments(json.dumps(arguments)):
+                        self.wfile.write(
+                            _chunk(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "function": {"arguments": fragment},
+                                        }
+                                    ]
+                                }
+                            )
                         )
-                    )
                     self.wfile.write(_chunk({}, finish="tool_calls"))
                 else:
                     self.wfile.write(_chunk({"role": "assistant", "content": ""}))
@@ -236,8 +244,13 @@ class _ScriptedProvider:
                     # A provider that ran out of room says "length", and the product has a
                     # continuation path for it; a provider that finished says "stop".
                     self.wfile.write(_chunk({}, finish=str(reply.get("finish", "stop"))))
-                self.wfile.write(_usage_chunk())
-                self.wfile.write(b"data: [DONE]\n\n")
+                # Two things a real gateway does that a tidy fake would not: it may report
+                # no usage at all (``stream_options`` is not universally supported), and it
+                # may close the stream without the ``[DONE]`` terminator.
+                if not reply.get("no_usage"):
+                    self.wfile.write(_usage_chunk())
+                if not reply.get("no_done"):
+                    self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
 
             def log_message(self, *args):
@@ -253,6 +266,18 @@ class _ScriptedProvider:
     def close(self) -> None:
         self._server.shutdown()
         self._server.server_close()
+
+
+def _fragments(payload: str, parts: int = 3) -> list[str]:
+    """Split a tool call's JSON body the way a provider streams it.
+
+    In pieces that do not line up with the JSON's structure, because a real one makes no
+    such promise: ``{"pa`` / ``th": "a.tx`` / ``t"}`` is what the wire actually carries.
+    """
+    if len(payload) < parts:
+        return [payload]
+    size = max(1, len(payload) // parts)
+    return [payload[index : index + size] for index in range(0, len(payload), size)]
 
 
 def _pieces(text: str) -> list[str]:
@@ -2278,6 +2303,93 @@ def test_an_answer_that_stays_truncated_says_so(home):
         assert "truncated" in shown.lower(), (
             "a response that never finished must be reported as such: "
             f"{shown[:300]!r} (events: {[e['type'] for e in events]})"
+        )
+    finally:
+        provider.close()
+
+
+# ── 22. A wire that is not as tidy as the protocol ──────────────────────────
+
+
+async def _ask_once(home, cfg, session: str, text: str = "say hello") -> list[dict]:
+    """One turn on a session of its own, returning every event it produced."""
+    import agent as agent_module
+
+    components = await agent_module._build_components_async(cfg, announce=False)
+    server, serving, port = await _start_web_channel(components, cfg)
+    try:
+        import websockets
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}/api/sessions/{session}/stream"
+        ) as socket:
+            return await _ask(socket, text, "m1")
+    finally:
+        server.should_exit = True
+        await serving
+        await agent_module._close_components(components)
+
+
+def test_a_stream_that_never_terminates_still_delivers_its_answer(home):
+    """``data: [DONE]`` is a convention, not a guarantee.
+
+    A gateway that closes the stream after the last chunk is behaving acceptably, and the
+    answer must still arrive.  A fake that always sent the terminator could not tell the
+    difference between a client that handles a closed stream and one that waits for a line
+    that never comes -- the second looks exactly like "the page did nothing".
+    """
+    import asyncio
+
+    provider = scripted({"text": "answer without a terminator", "no_done": True})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+        events = asyncio.run(_ask_once(home, cfg, "web-no-done"))
+        assert _answer(events) == "answer without a terminator", events
+        assert not [e for e in events if e["type"] == "error"], events
+    finally:
+        provider.close()
+
+
+def test_a_stream_with_no_usage_report_still_delivers_its_answer(home):
+    """``stream_options`` is not universally supported, and usage must not be required.
+
+    The transport asks for a usage report because a stream that reports nothing cannot be
+    recorded; a gateway that ignores the request must cost the *accounting*, not the answer.
+    """
+    import asyncio
+
+    provider = scripted({"text": "answer without usage", "no_usage": True})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+        events = asyncio.run(_ask_once(home, cfg, "web-no-usage"))
+        assert _answer(events) == "answer without usage", events
+        assert not [e for e in events if e["type"] == "error"], events
+    finally:
+        provider.close()
+
+
+def test_a_tool_call_announced_and_never_sent_does_not_wedge_the_turn(home):
+    """``finish_reason: tool_calls`` with no tool calls: the loop has to end somehow.
+
+    Nothing in the protocol forbids it, and the failure mode is the worst kind -- a turn
+    that waits for a step that will never arrive.  Asserted as "the turn finishes and says
+    something", which is the property; what it says is the product's business.
+    """
+    import asyncio
+
+    provider = scripted({"text": "", "finish": "tool_calls", "no_tools": True})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+        events = asyncio.run(_ask_once(home, cfg, "web-no-tools"))
+        kinds = [event["type"] for event in events]
+        assert "turn_complete" in kinds, kinds
+        shown = " ".join(
+            str(event.get("error") or event.get("text") or event.get("chunk") or "")
+            for event in events
+        ).strip()
+        assert shown, (
+            "a turn that produced nothing must say so rather than complete silently: "
+            f"{kinds}"
         )
     finally:
         provider.close()

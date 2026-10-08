@@ -1486,6 +1486,9 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_transient_rate_limit_is_retried_and_the_turn_answers` | control: a 429 is still replayed, and the turn answers |
 | `test_a_truncated_answer_is_continued_not_left_half_written` | `finish_reason: length`: the continuation carries the prompt and the tools |
 | `test_an_answer_that_stays_truncated_says_so` | control: giving up is reported, not presented as a whole answer |
+| `test_a_stream_that_never_terminates_still_delivers_its_answer` | no `[DONE]`: the answer still arrives |
+| `test_a_stream_with_no_usage_report_still_delivers_its_answer` | no usage chunk: the accounting is lost, not the answer |
+| `test_a_tool_call_announced_and_never_sent_does_not_wedge_the_turn` | `tool_calls` finish with none sent: the turn ends and says so |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1621,6 +1624,29 @@ The fix keeps the view and makes it faithful where a tool implementation needs i
 and ``ScopedTools._context_override`` (the variable tools read, under the name they read it
 by).  Not a general passthrough: what a contributed tool may read through a view should be a
 short list somebody maintains.
+
+## Making the fake as untidy as the wire
+
+The refusal mode was the first half of "the fake needs the real thing's *behaviour*".  Three
+more came from the same question, and one change to an *existing* behaviour of the harness:
+
+* **Tool-call arguments arrive in fragments.**  A real provider streams the JSON body in
+  pieces that do not line up with its structure (``{"pa`` / ``th": "a.tx`` / ``t"}``); the
+  fake sent it whole.  A client that replaced instead of appended would look identical on a
+  fake that never split anything.  The fake now splits, and the 27 paths that call a tool
+  became a regression net for the assembly -- all still pass.
+* **A stream may end without ``data: [DONE]``.**  A gateway that closes after the last chunk
+  is behaving acceptably; a client that waits for a line that never comes looks exactly like
+  "the page did nothing".
+* **``stream_options`` may be ignored** -- no usage chunk at all.  That must cost the
+  *accounting*, not the answer.
+* **``finish_reason: tool_calls`` with no tool calls.**  Nothing forbids it, and the failure
+  mode is a turn waiting for a step that never arrives.  Driven: the turn ends and the user
+  is told, in words, that no response could be generated.
+
+All four were already handled.  They are pinned now because each one is a shape the harness
+could not previously produce, and a fake that cannot produce a failure mode cannot be used to
+argue that the failure mode is handled.
 
 ## The provider that refused said something the vocabulary did not have
 
