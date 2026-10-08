@@ -1,0 +1,740 @@
+"""Functional turns: the product, driven the way a person drives it.
+
+Why this file exists
+--------------------
+Two rounds in a row shipped a defect that every unit test in this suite passed
+through:
+
+* the agent was constructed with ``ctx.get("registry")`` -- a *plugin-scoped
+  view* -- and its turn loop writes the registry's shared context before the
+  first model call, so every turn raised ``'ScopedTools' object has no attribute
+  'set_context'``.  The web UI showed a message and then nothing at all, and the
+  CLI was dead the same way;
+* ``build_routing_transport`` built a client for every provider that owns a model,
+  so an unset ``$ENV`` in a section nobody routed to stopped the process starting.
+
+Neither was subtle; both were invisible, because the tests that looked like they
+covered the ground replaced the very thing that was broken.  ``test_agent_plugin``
+handed the plugin a mapping whose registry was a plain ``object()`` -- no
+``scoped`` method, so the double could not tell a view from a service.  The CLI
+integration tests replace ``agent.send_message``, so the turn loop they "drive"
+never runs.
+
+What is real here, and what is not
+----------------------------------
+Real: the composition root (``_build_components_async``), the plugin catalog and
+its plugins, the agent, ``LoopDeps``, the turn loop, tool dispatch, the command
+coordinator, the channel and its WebSocket, the CLI command and its options, and
+an OpenAI-compatible endpoint over a real socket -- so the SDK client, the
+OpenAI transport and the SSE parse are the production ones.
+
+Not real: the model's *answers*.  They are scripted, one per request, because a
+test that needs a specific reply from a specific model is a test about that
+model.
+
+The rule this file is built on: **a double must not be simpler than the thing it
+stands in for, in the way that matters.**  Every double here has the shape of
+the real object on the axis the test is about.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+import pytest
+
+from agent import shared
+
+# ── A local, scripted, OpenAI-compatible provider ────────────────────────────
+
+
+def _chunk(delta: dict, finish: str | None = None) -> bytes:
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-func",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "scripted-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+        )
+        + "\n\n"
+    ).encode()
+
+
+def _usage_chunk() -> bytes:
+    """The final usage-only chunk a stream ends with when usage is requested.
+
+    Sent because the real providers send it and the transport reads it: a fake
+    that omits it would leave the usage path unexercised, which is exactly the
+    kind of gap this file exists to close.
+    """
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-func",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "scripted-model",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "total_tokens": 13,
+                },
+            }
+        )
+        + "\n\n"
+    ).encode()
+
+
+class _ScriptedProvider:
+    """An OpenAI-shaped endpoint that answers from a script, over a real socket.
+
+    Each POST consumes the next scripted reply, so a test can say what the model
+    does *this* call: answer, or ask for a tool and answer on the next one.
+    """
+
+    def __init__(self, replies: list[dict]) -> None:
+        self._replies = list(replies)
+        self.requests: list[dict] = []
+        provider = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = json.loads(raw)
+                provider.requests.append(body)
+                reply = (
+                    provider._replies.pop(0)
+                    if provider._replies
+                    else {"text": "no scripted reply left"}
+                )
+                if body.get("stream"):
+                    self._stream(reply)
+                else:
+                    self._json(reply, body)
+
+            def _json(self, reply: dict, body: dict) -> None:
+                message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": reply.get("text", ""),
+                }
+                finish = "stop"
+                if reply.get("tool"):
+                    name, arguments = reply["tool"]
+                    message["content"] = None
+                    message["tool_calls"] = [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments),
+                            },
+                        }
+                    ]
+                    finish = "tool_calls"
+                payload = json.dumps(
+                    {
+                        "id": "chatcmpl-func",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": body.get("model", "scripted-model"),
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": message,
+                                "finish_reason": finish,
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 11,
+                            "completion_tokens": 2,
+                            "total_tokens": 13,
+                        },
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def _stream(self, reply: dict) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                if reply.get("tool"):
+                    name, arguments = reply["tool"]
+                    self.wfile.write(
+                        _chunk(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call-1",
+                                        "type": "function",
+                                        "function": {"name": name, "arguments": ""},
+                                    }
+                                ],
+                            }
+                        )
+                    )
+                    self.wfile.write(
+                        _chunk(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {
+                                            "arguments": json.dumps(arguments)
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                    self.wfile.write(_chunk({}, finish="tool_calls"))
+                else:
+                    self.wfile.write(_chunk({"role": "assistant", "content": ""}))
+                    for piece in _pieces(str(reply.get("text", ""))):
+                        self.wfile.write(_chunk({"content": piece}))
+                    self.wfile.write(_chunk({}, finish="stop"))
+                self.wfile.write(_usage_chunk())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}/v1"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _pieces(text: str) -> list[str]:
+    """Several deltas rather than one, so streaming is streaming.
+
+    A single-chunk reply would pass through a path that never has to accumulate,
+    and accumulating is where a streamed answer goes wrong.
+    """
+    if len(text) < 2:
+        return [text]
+    middle = len(text) // 2
+    return [text[:middle], text[middle:]]
+
+
+def scripted(*replies: dict) -> _ScriptedProvider:
+    return _ScriptedProvider(list(replies))
+
+
+# ── An isolated home and a config that points at the scripted provider ────────
+
+
+@pytest.fixture
+def home(tmp_path):
+    """A throwaway agent home, switched with the product's own switch.
+
+    ``shared._set_agent_home`` is what ``--name`` and ``SIMPLE_AGENT_HOME`` use,
+    so the paths the composition reads are rebound exactly as a real run rebinds
+    them -- and restored afterwards, because they are module globals.
+    """
+    previous = shared.AGENT_HOME
+    home_dir = tmp_path / "agent-home"
+    home_dir.mkdir(parents=True, exist_ok=True)
+    shared._set_agent_home(home_dir)
+    try:
+        yield home_dir
+    finally:
+        shared._set_agent_home(previous)
+
+
+def write_config(home_dir, provider: _ScriptedProvider, **extra: Any) -> dict:
+    """A one-provider config pointing at *provider*, written where the CLI reads it."""
+    cfg = {
+        "active_provider": "scripted",
+        "providers": {
+            "scripted": {
+                "api_format": "openai",
+                "api_key": "scripted-key",
+                "base_url": provider.base_url,
+                "default_model": "scripted-model",
+                "models": ["scripted-model"],
+            }
+        },
+        "channels": {"web": {"enabled": False}, "feishu": {"enabled": False}},
+        "plugins": {},
+        "memory": {},
+        "orchestration": {},
+        "context": {},
+        "mcp_servers": [],
+    }
+    cfg.update(extra)
+    (home_dir / "config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return cfg
+
+
+# ── 1. The CLI, which is the entry point a person actually types ─────────────
+
+
+def test_cli_chat_answers(home):
+    """``simple chat "..."`` prints the model's answer.
+
+    This is the test that would have caught the scoped-registry defect: the CLI
+    builds the real composition, so the real agent and the real turn loop run,
+    and ``prepare_turn`` writes the registry's shared context before anything
+    else happens.
+    """
+    provider = scripted({"text": "pong"})
+    write_config(home, provider)
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "reply with one word"])
+
+        assert result.exit_code == 0, result.output
+        assert "pong" in result.output, result.output
+        assert provider.requests, "the composition must have called the provider"
+    finally:
+        provider.close()
+
+
+def test_cli_chat_sends_the_configured_model(home):
+    """The model in the config is the model on the wire.
+
+    A separate assertion because "it answered" and "it answered from the model
+    you configured" are different facts, and only the second one is the product.
+    """
+    provider = scripted({"text": "ok"})
+    write_config(home, provider)
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "hi"])
+
+        assert result.exit_code == 0, result.output
+        assert provider.requests[0]["model"] == "scripted-model"
+    finally:
+        provider.close()
+
+
+# ── 2. A tool call, all the way round ────────────────────────────────────────
+
+
+def test_a_tool_call_goes_out_and_its_result_comes_back(home):
+    """Two model calls: one asking for a tool, one answering with its result.
+
+    The second request is asserted to contain the tool's *output*, which is what
+    distinguishes a tool round trip from a model that merely mentioned one.
+    """
+    provider = scripted(
+        {"tool": ("read_file", {"path": "missing-file-for-the-test.txt"})},
+        {"text": "the tool said so"},
+    )
+    write_config(home, provider)
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "read that file"])
+
+        assert result.exit_code == 0, result.output
+        assert "the tool said so" in result.output, result.output
+        assert len(provider.requests) >= 2, (
+            "the tool call has to come back to the model, or this is not a round trip"
+        )
+        # The tool result travels back as a `tool` role message naming the tool.
+        second = provider.requests[1]["messages"]
+        assert any(
+            message.get("role") == "tool" for message in second
+        ), [message.get("role") for message in second]
+    finally:
+        provider.close()
+
+
+# ── 3. The web channel, over a real WebSocket ────────────────────────────────
+
+WEB_CHANNELS = {
+    "web": {"enabled": True, "host": "127.0.0.1", "port": 0},
+    "feishu": {"enabled": False},
+}
+
+
+async def _start_web_channel(components, cfg):
+    """The gateway's own wiring, without uvicorn's blocking serve loop.
+
+    The channel, the runner's handler factory, ``bind_runtime`` and the ASGI app
+    are the production ones -- this only runs them in the test's event loop so the
+    test can hold the server handle and stop it.
+    """
+    import asyncio
+    import uvicorn
+
+    from agent.channels.base import ChannelRunner
+    from agent.channels.web import WebChannel, WebConfig
+
+    channel = WebChannel(WebConfig(host="127.0.0.1", port=0))
+    sessions: dict[str, Any] = {}
+    runner = ChannelRunner([channel], components, cfg)
+    channel.bind_runtime(sessions, components)
+    channel._handler = runner._make_message_handler(sessions)
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            channel._build_app(), host="127.0.0.1", port=0, log_level="warning"
+        )
+    )
+    serving = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    return server, serving, port
+
+
+async def _ask(socket, text: str, message_id: str) -> list[dict]:
+    """One message, and every event until its turn is complete."""
+    import asyncio
+    import json as _json
+
+    await socket.send(
+        _json.dumps({"type": "message", "text": text, "message_id": message_id})
+    )
+    events: list[dict] = []
+    while True:
+        event = _json.loads(await asyncio.wait_for(socket.recv(), timeout=30))
+        events.append(event)
+        if event.get("type") == "turn_complete":
+            return events
+
+
+def _answer(events: list[dict]) -> str:
+    completion = next(e for e in events if e["type"] == "turn_complete")
+    return str(completion.get("text", ""))
+
+
+def test_the_web_socket_streams_a_reply(home):
+    """A browser's own path: send a message, receive the answer as it is written.
+
+    The composition, the channel, the command coordinator, the per-session runtime
+    and the WebSocket are the production ones; the server is really listening and
+    the client really connects.  What was reported as "the web chat does nothing
+    at all" is the failure this asserts against: a broken turn produced a
+    ``turn_complete`` with an empty text and no error event, so the page had
+    nothing to show and nothing to report.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "pong from the web"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-functional/stream"
+                ) as socket:
+                    return await _ask(socket, "hi", "m1")
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        kinds = [event["type"] for event in events]
+        assert "turn_complete" in kinds, kinds
+        completion = next(e for e in events if e["type"] == "turn_complete")
+        assert "pong from the web" in completion.get("text", ""), events
+        assert any(event["type"] == "stream_chunk" for event in events), (
+            "the web path streams: a completion with no chunk before it means the "
+            "streamed answer never reached the socket"
+        )
+        assert not [e for e in events if e["type"] == "error"], events
+        assert provider.requests, "the provider was called"
+    finally:
+        provider.close()
+
+
+# ── 4. A user plugin, loaded by the real catalog ─────────────────────────────
+
+_PLUGIN = '''
+import json
+import pathlib
+
+HERE = pathlib.Path(__file__).parent
+MARKER = "%(marker)s"
+
+
+def _note(kind, **fields):
+    with (HERE / "calls.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": kind, "marker": MARKER, **fields}) + "\\n")
+
+
+class _Tool:
+    name = "plugin_echo"
+    description = "Echo a word back."
+    parameters = {"type": "object", "properties": {"word": {"type": "string"}}}
+    capabilities = None
+
+    def fn(self, word="", **kwargs):
+        _note("tool", word=word)
+        return "the plugin says " + str(word)
+
+
+def register():
+    class Recorder:
+        name = "recorder"
+        # The service is called ``registry`` in this codebase; the plan's ``ctx.tools``
+        # is the same shape under a different name.
+        inject = ("registry",)
+
+        def setup(self, ctx):
+            from agent.core.event_domains import TurnCompleted
+
+            ctx.registry.register(_Tool())
+            ctx.on(TurnCompleted, lambda event: _note("turn", response=event.response))
+            # Written **last**, so the marker appearing at all is evidence that setup
+            # ran to completion -- a note written first would still be there after the
+            # rest of setup raised, which is how this test first passed for the wrong
+            # reason.
+            _note("setup")
+
+    return Recorder()
+'''
+
+
+def write_plugin(home_dir, marker: str = "v1") -> Any:
+    """A user plugin in the home the composition discovers plugins from."""
+    plugin_dir = home_dir / "plugins" / "recorder"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    init = plugin_dir / "__init__.py"
+    init.write_text(_PLUGIN % {"marker": marker}, encoding="utf-8")
+    return init
+
+
+def plugin_notes(plugin_dir) -> list[dict]:
+    path = plugin_dir / "calls.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_a_user_plugin_contributes_a_tool_and_hears_the_turn(home):
+    """Four subsystems in one turn, through the product rather than around it.
+
+    Plugin discovery, ``ctx.tools.register`` (which goes through the scoped view,
+    so the registration is an effect on the plugin's scope), the agent *calling*
+    the tool it contributed, and ``ctx.on(TurnCompleted, ...)`` -- the single-type
+    subscription that is routed to the turn bus by the composition.
+
+    Each of those has unit tests.  What none of them covers is that the four are
+    wired to each other in a running composition, which is the only place the
+    wiring exists.
+    """
+    provider = scripted(
+        {"tool": ("plugin_echo", {"word": "marco"})},
+        {"text": "polo"},
+    )
+    write_config(home, provider)
+    write_plugin(home, "v1")
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "use the echo tool"])
+
+        assert result.exit_code == 0, result.output
+        notes = plugin_notes(home / "plugins" / "recorder")
+        kinds = [note["kind"] for note in notes]
+        assert "setup" in kinds, notes
+        assert "tool" in kinds, (
+            "the agent must be able to call the tool the plugin contributed: "
+            f"{notes}"
+        )
+        assert "turn" in kinds, (
+            "ctx.on(TurnCompleted, ...) must be delivered in a real composition: "
+            f"{notes}"
+        )
+        assert [n for n in notes if n["kind"] == "turn"][0]["response"] == "polo"
+
+        # And it was *offered* to the model, which is what makes it callable.
+        offered = [
+            tool["function"]["name"]
+            for tool in provider.requests[0].get("tools", [])
+        ]
+        assert "plugin_echo" in offered, offered
+    finally:
+        provider.close()
+
+
+def test_reloading_a_plugin_runs_its_new_code(home):
+    """A plugin edit takes effect, including one Python cannot see by itself.
+
+    ``MARKER`` changes from ``v1`` to ``v2``: same file size, and the mtime is
+    restored to the byte, which is exactly the pair CPython validates a ``.pyc``
+    against.  Without dropping the cached bytecode the loader imports the *old*
+    module, so the second run reports ``v1`` -- a hot-reload path that silently
+    keeps old code.
+
+    Driven as two real CLI runs rather than a synthetic reload call, because that
+    is how a person reloads a plugin: they edit the file and run it again.  The
+    two runs share this process, so the import cache is shared too.
+    """
+    provider = scripted({"text": "first"}, {"text": "second"})
+    write_config(home, provider)
+    init = write_plugin(home, "v1")
+    stat = init.stat()
+    plugin_dir = home / "plugins" / "recorder"
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        runner = CliRunner()
+        first = runner.invoke(app, ["chat", "one"])
+        assert first.exit_code == 0, first.output
+
+        # Same length, same mtime: the edit CPython's .pyc check cannot see.
+        init.write_text(_PLUGIN % {"marker": "v2"}, encoding="utf-8")
+        import os
+
+        os.utime(init, (stat.st_atime, stat.st_mtime))
+        assert init.stat().st_size == stat.st_size, "the size must be unchanged"
+        assert init.stat().st_mtime == stat.st_mtime, "and so must the mtime"
+
+        second = runner.invoke(app, ["chat", "two"])
+        assert second.exit_code == 0, second.output
+
+        markers = [
+            note["marker"]
+            for note in plugin_notes(plugin_dir)
+            if note["kind"] == "setup"
+        ]
+        assert markers == ["v1", "v2"], (
+            "the second run must have executed the edited plugin, not its cached "
+            f"bytecode: {markers}"
+        )
+    finally:
+        provider.close()
+
+
+# ── 5. Switching provider mid-session, the way the settings page does ────────
+
+
+def test_switching_provider_rebuilds_the_session_runtime(home):
+    """A provider switch takes effect on the next turn of the same session.
+
+    This is the path the settings page drives: ``POST
+    /api/providers/{name}/activate`` writes the config, and the *existing* session
+    has to notice -- it holds a runtime built from the old config, with a client
+    for the old endpoint.  A session that kept it would answer from the provider
+    the user just moved away from, which is the kind of wrong that looks like a
+    working system.
+
+    Both providers are real endpoints over real sockets, so "which provider
+    answered" is answered by which server received the request.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    first = scripted({"text": "from the first provider"})
+    second = scripted({"text": "from the second provider"})
+    cfg = write_config(
+        home,
+        first,
+        channels=WEB_CHANNELS,
+        model="scripted-model",
+        providers={
+            "scripted": {
+                "api_format": "openai",
+                "api_key": "key-one",
+                "base_url": first.base_url,
+                "default_model": "scripted-model",
+                "models": ["scripted-model"],
+            },
+            "other": {
+                "api_format": "openai",
+                "api_key": "key-two",
+                "base_url": second.base_url,
+                "default_model": "other-model",
+                "models": ["other-model"],
+            },
+        },
+    )
+    try:
+
+        async def run() -> tuple[list[dict], list[dict], dict]:
+            import httpx
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-switch/stream"
+                ) as socket:
+                    before = await _ask(socket, "who are you", "m1")
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(
+                            f"http://127.0.0.1:{port}/api/providers/other/activate"
+                        )
+                    switched = response.json()
+                    after = await _ask(socket, "and now", "m2")
+                return before, after, switched
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        before, after, switched = asyncio.run(run())
+
+        assert switched.get("active_provider") == "other", switched
+        assert _answer(before) == "from the first provider", before
+        # Which server answered is the evidence; the text is only its shadow.
+        assert len(first.requests) == 1, (
+            f"the first provider must be called exactly once, before the switch: "
+            f"{[r.get('model') for r in first.requests]}"
+        )
+        assert second.requests, (
+            "the session must rebuild against the config the switch wrote; the "
+            f"second provider was never called.  Second turn: {after}"
+        )
+        assert second.requests[0]["model"] == "other-model", second.requests[0]["model"]
+        assert _answer(after) == "from the second provider", after
+    finally:
+        first.close()
+        second.close()

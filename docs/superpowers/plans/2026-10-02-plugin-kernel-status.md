@@ -1446,6 +1446,60 @@ them is a *contributor* (`ctx.commands.add`, `ctx.agents.add`, `ctx.channels.add
 they were always getting the service.  `agent_plugin` was the only configuration-side
 consumer, and it was the only one wrong.
 
+## The functional layer, and what it found in its first hour
+
+Three defects in a row were invisible to a green suite of 3,600 tests, for one reason: the
+tests that looked like they covered the ground replaced the thing that was broken.
+`test_agent_plugin` handed over a registry double with no ``scoped`` method, so it could not
+tell a view from a service; the CLI integration tests replace ``agent.send_message``, so the
+turn loop they "drive" never ran.  Both times the suite said the wiring was fine.
+
+`tests/test_functional_turns.py` drives the product instead: the real composition root, the
+real catalog and plugins, the real agent, ``LoopDeps``, the turn loop, tool dispatch, the
+command coordinator, the channel, the CLI command -- over a real socket to a local
+OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
+
+| Test | What it drives |
+|---|---|
+| `test_cli_chat_answers` / `..._sends_the_configured_model` | `simple chat`, end to end |
+| `test_a_tool_call_goes_out_and_its_result_comes_back` | two model calls, tool result in the second request |
+| `test_the_web_socket_streams_a_reply` | uvicorn + WebSocket + coordinator + per-session runtime |
+| `test_a_user_plugin_contributes_a_tool_and_hears_the_turn` | discovery, scoped registration, tool call, `ctx.on(TurnCompleted, ...)` |
+| `test_reloading_a_plugin_runs_its_new_code` | an edit with the same size *and* mtime -- the `.pyc` trap |
+| `test_switching_provider_rebuilds_the_session_runtime` | the settings page's `activate`, then the next turn |
+
+**What the last one found, immediately.**  Switching provider rebuilt the session runtime
+correctly -- the log showed the new active provider and the new endpoint -- and the next
+message still went to the **old** provider.  The session's ``AgentCore`` resolved
+``agent_loop`` from its container, and the container inherits the composition's service by
+copying the mapping, so every session turn ran through a loop **bound to the composition's
+container** and resolved the *composition's* ``agent``.
+
+That is a regression from making the loop a plugin (`24e8de1`).  The code before it had this
+rule:
+
+    turn_runner = resolve(self._components, "turn_runner")
+    if turn_runner is None or isinstance(turn_runner, TurnRunner):
+        return TurnRunner(self._components)     # bound to THIS container
+    return turn_runner                          # a composition's own loop, verbatim
+
+The ``isinstance`` check was doing real work: a stock loop carries the container it was bound
+to, so it has to be re-bound to the container asking.  The plugin version dropped it and used
+any service it found.  The consequences were wider than the provider switch: a web session
+has **its own** agent, registry fork (workspace root, file policy, output dir, project memory
+scope) and model settings, and none of them were reached by its turns -- a session's
+isolation was decorative.
+
+Fixed by restoring the distinction: a loop that is not a stock ``TurnRunner`` is used
+verbatim (the substitution point), a stock one is re-bound per container.  Two unit guards in
+`tests/test_runtime_contracts.py` pin both halves, and the functional test pins the
+user-visible one.
+
+**The lesson, stated so it can be applied**: a green suite is a statement about the tests, not
+about the product.  Where a test replaces a collaborator, ask what the real collaborator has
+that the double lacks -- a method, a binding, a container -- because that difference is
+exactly where the bug will be.
+
 ## Not built, and why
 
 Re-measured against a DSH-style plan (Cordis kernel / typed events / profiles / per-agent
