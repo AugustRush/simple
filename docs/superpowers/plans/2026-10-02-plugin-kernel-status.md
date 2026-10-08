@@ -1484,6 +1484,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_two_sessions_answer_their_own_requests_concurrently` | two sessions at once: each answers its own model, no crossing |
 | `test_an_unfunded_account_is_reported_as_such_and_not_retried` | a 402 from a spent account: asked once, and the user gets advice |
 | `test_a_transient_rate_limit_is_retried_and_the_turn_answers` | control: a 429 is still replayed, and the turn answers |
+| `test_a_truncated_answer_is_continued_not_left_half_written` | `finish_reason: length`: the continuation carries the prompt and the tools |
+| `test_an_answer_that_stays_truncated_says_so` | control: giving up is reported, not presented as a whole answer |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1650,6 +1652,12 @@ which meant reading past the ``turn_complete``, since the reason arrives *after*
 predicate with the provider's strings, the formatter's message, and a control that a 429 is
 still retried and answered.  A second control says the list is about money and not about the
 word: ``insufficient permissions`` must stay a permanent, non-account failure.
+
+The same refusal mode made two truncation paths drivable, and both were already right:
+`finish_reason: length` sends a continuation carrying the product's own prompt *and* the
+turn's tools (a continuation without tools cannot produce a tool call), the two halves are
+merged, and an answer that never finishes is reported as truncated rather than presented as
+a whole one.
 
 **Why the happy-path harness could not have found this.**  A fake that always succeeds tests
 the composition for the outcome it was written to produce; the defect was in a branch no

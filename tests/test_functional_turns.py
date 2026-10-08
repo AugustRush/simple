@@ -149,7 +149,7 @@ class _ScriptedProvider:
                     "role": "assistant",
                     "content": self._text_for(reply, body),
                 }
-                finish = "stop"
+                finish = str(reply.get("finish", "stop"))
                 if reply.get("tool"):
                     name, arguments = reply["tool"]
                     message["content"] = None
@@ -233,7 +233,9 @@ class _ScriptedProvider:
                     self.wfile.write(_chunk({"role": "assistant", "content": ""}))
                     for piece in _pieces(self._text_for(reply, body)):
                         self.wfile.write(_chunk({"content": piece}))
-                    self.wfile.write(_chunk({}, finish="stop"))
+                    # A provider that ran out of room says "length", and the product has a
+                    # continuation path for it; a provider that finished says "stop".
+                    self.wfile.write(_chunk({}, finish=str(reply.get("finish", "stop"))))
                 self.wfile.write(_usage_chunk())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -2159,5 +2161,123 @@ def test_a_transient_rate_limit_is_retried_and_the_turn_answers(home):
 
         assert _answer(events) == "answered after the retry", events
         assert len(provider.requests) == 2, len(provider.requests)
+    finally:
+        provider.close()
+
+
+# ── 21. An answer the provider ran out of room for ──────────────────────────
+
+
+def test_a_truncated_answer_is_continued_not_left_half_written(home):
+    """``finish_reason: length`` is an everyday event with a path written for it.
+
+    The provider stops mid-sentence, so the turn asks it to continue and merges the two
+    halves.  The continuation carries the turn's own tools and the continuation prompt; a
+    build that dropped either would still produce text, which is why the *request* is
+    asserted and not only the merged answer.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {"text": "the answer so far", "finish": "length"},
+        {"text": " and the rest of it"},
+    )
+    cfg = write_config(
+        home,
+        provider,
+        channels=WEB_CHANNELS,
+        max_truncation_continuations=2,
+    )
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-truncated/stream"
+                ) as socket:
+                    return await _ask(socket, "tell me something long", "m1")
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        answer = _answer(events)
+        assert "the answer so far" in answer and "the rest of it" in answer, (
+            f"both halves must reach the user: {answer!r}"
+        )
+        assert len(provider.requests) == 2, (
+            f"one continuation, so two calls: {len(provider.requests)}"
+        )
+        continuation = json.dumps(
+            provider.requests[1]["messages"], ensure_ascii=False
+        )
+        assert "Continue exactly from where you left off" in continuation, (
+            "the continuation must use the product's own prompt: "
+            f"{continuation[-400:]}"
+        )
+        offered = provider.requests[1].get("tools") or []
+        assert offered, "and it must carry the turn's tools, or the answer cannot use one"
+    finally:
+        provider.close()
+
+
+def test_an_answer_that_stays_truncated_says_so(home):
+    """Control for the other outcome: when continuing does not help, the user is told.
+
+    Every continuation comes back truncated, so the loop gives up -- and the failure has to
+    be *visible*.  Silence here would be a half-written answer presented as a whole one.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {"text": "still cut off", "finish": "length"},
+        {"text": "still cut off", "finish": "length"},
+        {"text": "still cut off", "finish": "length"},
+    )
+    cfg = write_config(
+        home,
+        provider,
+        channels=WEB_CHANNELS,
+        max_truncation_continuations=1,
+    )
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-still-truncated/stream"
+                ) as socket:
+                    events = await _ask(socket, "tell me something long", "m1")
+                    await _drain_after_completion(socket, events)
+                    return events
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        shown = " ".join(
+            str(event.get("error") or event.get("text") or event.get("chunk") or "")
+            for event in events
+        )
+        assert "truncated" in shown.lower(), (
+            "a response that never finished must be reported as such: "
+            f"{shown[:300]!r} (events: {[e['type'] for e in events]})"
+        )
     finally:
         provider.close()
