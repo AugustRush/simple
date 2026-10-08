@@ -1478,6 +1478,9 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_the_ralph_task_loop_runs_through_the_command_router` | `/ralph … --max 2`: the seven-dependency plugin, its store, a turn per iteration |
 | `test_a_sessions_end_reaches_the_plugins_watching_for_it` | the runner's teardown: `SessionFinished` and the turn before it, both heard |
 | `test_a_second_message_sent_mid_turn_still_gets_its_own_answer` | the queue: a message during a running turn, both answered in order |
+| `test_switching_a_sessions_workspace_moves_where_its_tools_write` | `/workspace <dir>`: persisted to the manifest **and** repointed live |
+| `test_a_skill_is_offered_and_its_instructions_reach_the_model` | a skill bundle: advertised in the prompt, loaded as a tool result |
+| `test_clearing_a_session_forgets_its_turns_and_nothing_else` (+ control) | `/clear`: the conversation leaves the next request, and does so only when cleared |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1533,6 +1536,14 @@ three model calls.  The evidence that the *derived* registry was used is in what
 request offered: no ``spawn_agent``, and a shorter tool list.  A sub-agent that inherited the
 parent's registry would be able to spawn, which is the recursion the exclusion exists to
 prevent.
+
+**Choosing a folder, loading a skill, clearing a conversation.**  Three per-session services
+driven through the commands a person uses: ``/workspace <dir>`` must persist the choice *and*
+repoint the live runtime (the next turn's file lands in the new folder, and the manifest says
+so); a skill bundle must be advertised in the prompt *and* come back as a tool result when
+loaded; ``/clear`` must take the conversation out of the next request -- with a control test
+that the conversation *is* carried when it is not cleared, because otherwise "it is absent"
+would pass on a build that never carried it.
 
 **A message during a running turn.**  The coordinator queues it against the running turn and
 gives it its own sink; the assertion is the outcome -- both answered, in order, exactly two

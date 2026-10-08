@@ -1648,3 +1648,254 @@ def test_a_second_message_sent_mid_turn_still_gets_its_own_answer(home):
         assert not [e for e in events if e["type"] == "error"], events
     finally:
         provider.close()
+
+
+# ── 16. Choosing a folder for one conversation ──────────────────────────────
+
+
+def test_switching_a_sessions_workspace_moves_where_its_tools_write(home, tmp_path):
+    """``/workspace <dir>`` is how a person pins a conversation to a folder.
+
+    The command has to do two things that only a running session can show: persist the
+    choice where a restart reads it (``.session.json``), and repoint the *live* runtime --
+    this session's registry fork, its file policy and its file service -- so the next turn
+    works in the new directory.  A command that only did the first would look right until
+    the next message.
+
+    Asserted by where the next turn's file lands, and by what the manifest says: the two
+    halves are separate statements and only one of them survives a restart.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    # The command itself does not call the model, so the first scripted reply is the
+    # first *turn*'s -- which is the one that writes the probe.
+    provider = scripted(
+        {
+            "tool": (
+                "write_file",
+                {
+                    "root": "workspace",
+                    "path": "in-the-chosen-folder.txt",
+                    "mode": "create",
+                    "content": "here",
+                },
+            )
+        },
+        {"text": "written in the folder"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    # A folder the session may write in, and one it may not: the policy follows the choice.
+    chosen = tmp_path / "chosen-folder"
+    chosen.mkdir()
+    try:
+
+        async def run() -> dict:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-workspace/stream"
+                ) as socket:
+                    before = await _ask(socket, f"/workspace {chosen}", "m1")
+                    after = await _ask(socket, "write the probe there", "m2")
+                return {"before": before, "after": after}
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        reply = " ".join(
+            str(event.get("chunk") or event.get("text") or "")
+            for event in events["before"]
+        )
+        assert not [e for e in events["before"] if e["type"] == "error"], events["before"]
+        assert "工作" in reply or "workspace" in reply.lower() or "文件夹" in reply, (
+            f"the command must report something about the folder: {reply[:300]}"
+        )
+        assert _answer(events["after"]) == "written in the folder", events["after"]
+
+        written = list(chosen.rglob("in-the-chosen-folder.txt"))
+        assert len(written) == 1, (
+            "the next turn must work in the folder that was chosen: "
+            f"{[str(p) for p in written]}"
+        )
+
+        manifest = home / "web" / "sessions" / "web-workspace" / ".session.json"
+        assert manifest.is_file(), manifest
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        assert payload.get("workspace_root") == str(chosen), payload
+    finally:
+        provider.close()
+
+
+# ── 17. A skill the agent loads on demand ───────────────────────────────────
+
+
+def _write_skill(home_dir, skill_id: str, marker: str) -> None:
+    """A skill bundle on disk: the shape the catalog discovers."""
+    skill_dir = home_dir / "skills" / skill_id
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {skill_id}\n"
+        f"description: A skill that answers with {marker}.\n"
+        "user-invocable: true\n"
+        "---\n\n"
+        f"# {skill_id}\n\nThe passphrase is {marker}.\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_skill_is_offered_and_its_instructions_reach_the_model(home):
+    """A skill bundle is discovered, advertised, and loaded into the conversation.
+
+    Two separate facts, and the second is the one that matters: the catalog's listing has to
+    reach the system prompt (otherwise the model never knows the skill exists *this session*),
+    and ``activate_skill``'s body has to come back as a tool result (otherwise loading it does
+    nothing).  The catalog is a per-session service and the prompt is assembled per turn, so
+    this is a composition path rather than a file-parsing one.
+    """
+    provider = scripted(
+        {"tool": ("activate_skill", {"skill_name": "passphrase-skill"})},
+        {"text": "I have the passphrase"},
+    )
+    write_config(home, provider)
+    _write_skill(home, "passphrase-skill", "swordfish")
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "load the passphrase skill"])
+
+        assert result.exit_code == 0, result.output
+        assert "I have the passphrase" in result.output, result.output
+
+        first = provider.requests[0]
+        system_prompt = "\n".join(
+            str(message.get("content") or "")
+            for message in first["messages"]
+            if message.get("role") == "system"
+        )
+        assert "passphrase-skill" in system_prompt, (
+            "the skill catalog must be advertised to the model in the prompt: "
+            f"{system_prompt[-400:]}"
+        )
+
+        tool_result = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_result, [m.get("role") for m in provider.requests[-1]["messages"]]
+        assert "swordfish" in str(tool_result[-1].get("content", "")), (
+            "activating the skill must bring its instructions back: "
+            f"{str(tool_result[-1])[:300]}"
+        )
+    finally:
+        provider.close()
+
+
+# ── 18. Clearing a conversation, and only that conversation ─────────────────
+
+
+def test_clearing_a_session_forgets_its_turns_and_nothing_else(home):
+    """``/clear`` empties this session's context -- not the process's, not the memory.
+
+    The context a session clears is the one its ``RuntimeSessionState`` holds, which is
+    built per session by the channel runner; the durable memory and the palace live
+    elsewhere and must survive.  Asserted on the *next request*, because that is what the
+    model is actually handed: the earlier exchange must be gone from it.
+
+    A command that cleared the wrong object would still reply "已清除", which is why the
+    reply is not the evidence here.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "first reply"}, {"text": "second reply"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> tuple[list[dict], list[dict]]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-clear/stream"
+                ) as socket:
+                    first = await _ask(socket, "remember the word pineapple", "m1")
+                    cleared = await _ask(socket, "/clear", "m2")
+                    second = await _ask(socket, "what did I ask you to remember", "m3")
+                return first, cleared, second
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        first, cleared, second = asyncio.run(run())
+
+        assert _answer(first) == "first reply", first
+        assert not [e for e in cleared if e["type"] == "error"], cleared
+        assert _answer(second) == "second reply", second
+
+        # The turn before the command is in the request; the one after it is not.
+        after_clear = json.dumps(provider.requests[-1]["messages"], ensure_ascii=False)
+        assert "pineapple" not in after_clear, (
+            "the cleared conversation must be gone from what the model is handed: "
+            f"{after_clear[:400]}"
+        )
+    finally:
+        provider.close()
+
+
+def test_without_clearing_the_earlier_turn_is_still_in_the_request(home):
+    """Control for the test above: the conversation *is* carried, until it is cleared.
+
+    Without this, "pineapple is absent after /clear" would also pass on a build that never
+    carried the conversation at all -- a validation that cannot fail, which is the thing
+    this file exists to avoid.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "first reply"}, {"text": "second reply"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-noclear/stream"
+                ) as socket:
+                    await _ask(socket, "remember the word pineapple", "m1")
+                    return await _ask(socket, "and now", "m2")
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        assert _answer(events) == "second reply", events
+        carried = json.dumps(provider.requests[-1]["messages"], ensure_ascii=False)
+        assert "pineapple" in carried, (
+            "a conversation that was not cleared must still be in the request: "
+            f"{carried[:400]}"
+        )
+    finally:
+        provider.close()
