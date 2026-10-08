@@ -90,8 +90,10 @@ def _status_error(status: int, body: dict):
 
     classes = {
         400: openai.BadRequestError,
+        402: openai.APIStatusError,
         403: openai.PermissionDeniedError,
         429: openai.RateLimitError,
+        500: openai.InternalServerError,
     }
     request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
     response = httpx.Response(status, request=request, json=body)
@@ -313,3 +315,39 @@ def test_a_model_id_sent_to_the_wrong_endpoint_names_the_config_as_the_fix():
     assert "配置" in message
     assert "config.json" in message
     assert "deepseek-v4-pro" in message, "the endpoint's own list is the evidence"
+
+
+def test_the_reported_unfunded_account_reaches_the_user_as_advice():
+    """The case that was reported: a 402 whose body never said "quota".
+
+    The formatter's account branch turns a refusal into "change provider or top up", and it
+    fires on the same vocabulary as the retry veto.  This provider's wording -- "Insufficient
+    account funds" -- was not in it, so the user got the raw body and the message said nothing
+    about what to do.
+
+    Both halves are asserted, because the scheduler reads the *formatted* text afterwards:
+    the advice has to be there, and the raw body has to stay quoted so the veto still sees it.
+    """
+    from agent.shared import is_account_exhausted_text
+
+    agent = _agent()
+    message = agent._format_agent_error(
+        _status_error(
+            402,
+            {
+                "error": {
+                    "message": "Upstream request failed: Insufficient account funds",
+                    "type": "server_error",
+                }
+            },
+        )
+    )
+
+    assert "账户" in message, message
+    assert "重试不会恢复" in message, message
+    assert "Insufficient account funds" in message, (
+        "the provider's own words stay quoted, so the user can see what it said"
+    )
+    assert is_account_exhausted_text(message) is True, (
+        "and the scheduler's veto must still see it in the stored text"
+    )

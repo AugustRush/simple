@@ -1482,6 +1482,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_skill_is_offered_and_its_instructions_reach_the_model` | a skill bundle: advertised in the prompt, loaded as a tool result |
 | `test_clearing_a_session_forgets_its_turns_and_nothing_else` (+ control) | `/clear`: the conversation leaves the next request, and does so only when cleared |
 | `test_two_sessions_answer_their_own_requests_concurrently` | two sessions at once: each answers its own model, no crossing |
+| `test_an_unfunded_account_is_reported_as_such_and_not_retried` | a 402 from a spent account: asked once, and the user gets advice |
+| `test_a_transient_rate_limit_is_retried_and_the_turn_answers` | control: a 429 is still replayed, and the turn answers |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1617,6 +1619,42 @@ The fix keeps the view and makes it faithful where a tool implementation needs i
 and ``ScopedTools._context_override`` (the variable tools read, under the name they read it
 by).  Not a general passthrough: what a contributed tool may read through a view should be a
 short list somebody maintains.
+
+## The provider that refused said something the vocabulary did not have
+
+The fake provider in this layer could only ever *answer*.  Real ones refuse, and the
+refusals are where the error handling lives -- so the harness grew a mode that answers with
+an HTTP status and a body, and the SDK's own error classes then reach the product the way
+they do in flight.
+
+The first refusal tried was the one this user's provider actually returns:
+
+```
+402 {'error': {'message': 'Upstream request failed: Insufficient account funds'}}
+```
+
+**It was not in `ACCOUNT_EXHAUSTED_MARKERS`**, and that one list decides three things:
+
+* the LLM retry loop -- it must not replay a closed account (measured: it did not, but only
+  because no retryable token happened to match; the *right* reason is the account);
+* the scheduler's `_automatic_retry_at` -- measured by reading the predicate: it would have
+  scheduled an exponential-backoff retry for a task that cannot succeed until the account is
+  funded, which the surrounding comment says is exactly what the veto exists to prevent;
+* the agent's formatter -- so the user got the raw body instead of "switch provider or top
+  up", which is the message written for this case.
+
+The marker list gained the missing vocabulary (``insufficient funds``, ``insufficient account
+funds``, ``payment required``, ``out of credits``), and the layer now has a refusal to drive.
+Four guards: the functional one (asked **once**, and the advice is what reaches the client --
+which meant reading past the ``turn_complete``, since the reason arrives *after* it), the
+predicate with the provider's strings, the formatter's message, and a control that a 429 is
+still retried and answered.  A second control says the list is about money and not about the
+word: ``insufficient permissions`` must stay a permanent, non-account failure.
+
+**Why the happy-path harness could not have found this.**  A fake that always succeeds tests
+the composition for the outcome it was written to produce; the defect was in a branch no
+scripted answer reaches.  The lesson generalises: *the fake needs the failure modes of the
+real thing, not just its shape.*
 
 ## The composition's buses reached one construction site out of three
 

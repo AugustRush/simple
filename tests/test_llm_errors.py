@@ -232,3 +232,37 @@ def _fake_response(status_code: int):
     import httpx
 
     return httpx.Response(status_code=status_code, request=httpx.Request("POST", "https://x"))
+
+
+def test_the_funds_vocabulary_a_provider_actually_uses_is_recognised() -> None:
+    """The phrasing that prompted this, plus the neighbours it generalises to.
+
+    ``opencode.ai`` answers a spent account with ``402 {'error': {'message':
+    'Upstream request failed: Insufficient account funds'}}`` -- an *account* problem, not a
+    slow request.  It was not in the list, and the list is read by three decisions: the LLM
+    retry loop (never replay it), the scheduler (never schedule a retry), and the agent's
+    formatter (say "switch provider or top up" instead of quoting the body).  All three were
+    getting the wrong answer for this provider.
+    """
+    for text in (
+        "Upstream request failed: Insufficient account funds",
+        "402 Payment Required",
+        "you are out of credits",
+        "Insufficient funds",
+    ):
+        assert is_account_exhausted(Exception(text)) is True, text
+        assert is_llm_retryable(Exception(text)) is False, text
+
+
+def test_the_word_insufficient_alone_is_not_an_account_problem() -> None:
+    """Control: the markers are about money, not about the word.
+
+    A list grown by matching "insufficient" would also swallow permissions errors, and a
+    swallowed one is a permanent failure that no retry can fix -- the same mistake in the
+    other direction.
+    """
+    assert is_account_exhausted(Exception("insufficient permissions")) is False
+    assert is_account_exhausted(Exception("insufficient context window")) is False
+    assert is_llm_retryable(Exception("insufficient permissions")) is False, (
+        "and it is not retryable either -- it is simply not an account problem"
+    )

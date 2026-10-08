@@ -117,6 +117,23 @@ class _ScriptedProvider:
                     if provider._replies
                     else {"text": "no scripted reply left"}
                 )
+                if reply.get("status"):
+                    # A provider that refuses: the wire format a real one uses, so the
+                    # SDK's own error class is what the product's error handling sees.
+                    payload = json.dumps(
+                        reply.get(
+                            "body",
+                            {"error": {"message": "refused", "type": "invalid_request_error"}},
+                        )
+                    ).encode()
+                    self.send_response(int(reply["status"]))
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    if reply.get("retry_after") is not None:
+                        self.send_header("Retry-After", str(reply["retry_after"]))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 if body.get("stream"):
                     self._stream(reply, body)
                 else:
@@ -436,6 +453,27 @@ async def _ask(socket, text: str, message_id: str) -> list[dict]:
         events.append(event)
         if event.get("type") == "turn_complete":
             return events
+
+
+async def _drain_after_completion(socket, events: list[dict], grace: float = 0.5) -> None:
+    """Collect what follows a completion, without waiting long for it.
+
+    The product reports a failed turn as a completion *and then* the reason, so a reader
+    that stops at the completion sees an empty answer and no error -- which is what "the
+    page did nothing" looks like from the client side.  A short grace rather than the full
+    timeout keeps the other tests fast.
+    """
+    import asyncio
+    import json as _json
+
+    while True:
+        try:
+            event = _json.loads(
+                await asyncio.wait_for(socket.recv(), timeout=grace)
+            )
+        except asyncio.TimeoutError:
+            return
+        events.append(event)
 
 
 def _answer(events: list[dict]) -> str:
@@ -1993,5 +2031,133 @@ def test_two_sessions_answer_their_own_requests_concurrently(home):
 
         asked = [request.get("model") for request in provider.requests]
         assert sorted(asked) == ["alpha-model", "beta-model"], asked
+    finally:
+        provider.close()
+
+
+# ── 20. A provider that refuses ─────────────────────────────────────────────
+
+
+def test_an_unfunded_account_is_reported_as_such_and_not_retried(home):
+    """The user's own provider's refusal, driven end to end.
+
+    ``opencode.ai`` answers a spent account with
+
+        402 {'error': {'message': 'Upstream request failed: Insufficient account funds'}}
+
+    which is a *permanent* condition: retrying lands in the same closed account.  The
+    product knows this distinction -- the retry loop refuses to replay it, the scheduler
+    refuses to schedule a retry, and the agent has a message that tells the user to switch
+    provider or top up instead of quoting the body -- but all three read one vocabulary
+    list, and this phrasing was not in it.
+
+    So this asserts the three things that vocabulary decides, from the outside: the request
+    is made **once**, and what the user is told is the actionable sentence rather than the
+    provider's body.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "status": 402,
+            "body": {
+                "error": {
+                    "message": "Upstream request failed: Insufficient account funds",
+                    "type": "server_error",
+                }
+            },
+        }
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-unfunded/stream"
+                ) as socket:
+                    events = await _ask(socket, "say hello", "m1")
+                    await _drain_after_completion(socket, events)
+                    return events
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        assert len(provider.requests) == 1, (
+            "an account that cannot serve must not be asked twice: "
+            f"{len(provider.requests)} request(s)"
+        )
+        shown = " ".join(
+            str(event.get("error") or event.get("text") or event.get("chunk") or "")
+            for event in events
+        )
+        assert "账户不可用" in shown or "配额" in shown, (
+            "the user must be told the account is the problem, not handed the raw body: "
+            f"{shown[:300]!r} (events: {[e['type'] for e in events]})"
+        )
+        assert "Insufficient account funds" in shown, (
+            "the provider's own words are still quoted, so the user can see what it "
+            f"actually said: {shown[:300]!r}"
+        )
+    finally:
+        provider.close()
+
+
+def test_a_transient_rate_limit_is_retried_and_the_turn_answers(home):
+    """Control: the same machinery must still replay what *is* worth replaying.
+
+    A 429 is the case the retry exists for, and the two decisions share one predicate --
+    so a vocabulary that grew too eager would be visible here as a single request and a
+    failure instead of an answer.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "status": 429,
+            "retry_after": 0,
+            "body": {"error": {"message": "Rate limit reached", "type": "rate_limit_error"}},
+        },
+        {"text": "answered after the retry"},
+    )
+    cfg = write_config(
+        home,
+        provider,
+        channels=WEB_CHANNELS,
+        llm_max_retries=2,
+        llm_retry_base_delay=0.1,
+    )
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-retry/stream"
+                ) as socket:
+                    return await _ask(socket, "say hello", "m1")
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        assert _answer(events) == "answered after the retry", events
+        assert len(provider.requests) == 2, len(provider.requests)
     finally:
         provider.close()

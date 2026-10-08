@@ -235,9 +235,13 @@ ACCOUNT_EXHAUSTED_MARKERS: tuple[str, ...] = (
     "usage quota",
     "arrearage",
     "insufficient balance",
+    "insufficient funds",
+    "insufficient account funds",
     "credit balance is too low",
     "exceeded your current quota",
     "insufficient quota",
+    "payment required",
+    "out of credits",
 )
 
 
