@@ -1323,6 +1323,78 @@ and lost the `isinstance` guard on the first line of the handler; it had been su
 to the whole `TURN` domain and dropping two of the three types, because asking for one was
 not possible.  `SESSION.attach` stays: sessions are a domain it takes as a whole.
 
+## The provider refactor made every configured provider a startup prerequisite
+
+Reported as "the gateway no longer starts":
+
+```
+Provider: opencodego | format: openai | model: deepseek-v4.1-flash
+Error: API key env var 'ANTHROPIC_API_KEY' not set (provider: ?).
+```
+
+The active provider was configured and working.  The failure came one statement later, in
+`build_routing_transport`, which built a client for **every provider that owns a model**
+so that per-call model overrides could be routed.  Six providers in `config.json` and one
+exported key is the ordinary case -- the routing table exists so the others are
+*offerable*, not so they are *required*.
+
+The regression was the provider-registry commit: it made
+`bootstrap._provider_client_factory` delegate to `providers.build_client`, which resolves
+`$ENV` and **raises**.  The function it replaced resolved `$ENV` to `""` and built the
+client anyway, so an unused provider's missing key cost a failing request *later* rather
+than a refused start.  Naming the failure a "single construction path" hid that this path
+is called eagerly for providers nobody selected.  `provider: ?` was the second half of the
+same commit: a section on disk does not carry the key it is filed under, so the one message
+about a missing credential could not say whose it was.
+
+The fix keeps the model routable and carries the failure:
+
+- `providers.missing_credential` answers "is this provider usable" **without raising**, so
+  the composition can ask before it builds;
+- `build_routing_transport` builds each routed provider's transport through
+  `_route_transport`, which returns a `_ProviderUnavailable` holding the reason instead of
+  raising -- *except* for the active provider, whose client the composition runs on;
+- the model keeps its route, because dropping it would post a foreign model id to the
+  active endpoint -- the misroute the routing table exists to prevent;
+- `RoutingTransport.unavailable` exposes the reasons, and bootstrap prints them next to the
+  `Provider:` line;
+- the provider's own name is attached to the section before the client is built, in the
+  routing loop and in the web connection test.
+
+Tests: four in `tests/test_model_routing.py` (deferral, report, a usable sibling still
+built, active still fatal), two in `tests/test_provider_registry.py` for the message and
+for the literal-key control, and one at the composition level
+(`test_a_composition_starts_with_an_unused_provider_uncredentialed`) because that is where
+the user stood.
+
+**A blind spot found while fixing `provider: ?`.**  The guard that keeps
+`PROVIDER_FIELDS` and the loader in agreement scanned only `provider_cfg.get("key")` with
+**double** quotes, and `resolve_api_key` had always read `provider_cfg.get('name')` with
+single ones -- a validation that could not see half its subject.  The scan now takes both
+quoting styles, which makes it see that read, and `_INJECTED = {"name"}` names the keys the
+loader *writes about* a section rather than reads *in* one.
+
+## An error path that could not describe its error
+
+Also in the gateway log, and not from this refactor (blame: 2026-08-11):
+
+```
+Sleep extraction error: Error code: 402 - Insufficient account funds
+Background consolidation error: 'ConsolidationResult' object has no attribute 'error'
+```
+
+The extraction call failed, the engine caught it and returned `success=False`, and the
+caller's failure branch read `consolidated.error` -- a field `ConsolidationResult` never
+had.  So the emit that exists to say *why* consolidation failed reported an `AttributeError`
+about the reporting code, and the real reason (the provider's 402) was replaced by it.  An
+error path that cannot describe its error is worse than none: it looks like one.
+
+`ConsolidationResult` has an `error` field now, the engine fills it from the exception, and
+`_coerce_consolidation_result` describes the one failure it can see (a consolidator that
+answered with something that is not a result).  The test drives the real path --
+`process_one_job` against a client that raises -- and asserts the *event*, because that is
+where the log line comes from.
+
 ## Not built, and why
 
 Re-measured against a DSH-style plan (Cordis kernel / typed events / profiles / per-agent
