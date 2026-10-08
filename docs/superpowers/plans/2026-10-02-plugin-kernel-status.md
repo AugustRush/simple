@@ -1476,6 +1476,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_declined_approval_leaves_the_command_unrun` | the same path refusing |
 | `test_a_tool_from_an_mcp_server_can_be_called_by_the_agent` | an external server's tool: offered to the model, called, closed by teardown |
 | `test_the_ralph_task_loop_runs_through_the_command_router` | `/ralph … --max 2`: the seven-dependency plugin, its store, a turn per iteration |
+| `test_a_sessions_end_reaches_the_plugins_watching_for_it` | the runner's teardown: `SessionFinished` and the turn before it, both heard |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1591,6 +1592,36 @@ The fix keeps the view and makes it faithful where a tool implementation needs i
 and ``ScopedTools._context_override`` (the variable tools read, under the name they read it
 by).  Not a general passthrough: what a contributed tool may read through a view should be a
 short list somebody maintains.
+
+## The composition's buses reached one construction site out of three
+
+The session-boundary test found it on its first run, and the assertion that failed was the
+*smaller* one: a plugin watching a session heard ``SessionFinished`` (that fix held) and never
+heard the turn that preceded it.
+
+``BaseAgent`` takes the buses at construction.  ``AgentPlugin`` passes them -- that was the fix
+two rounds ago -- and two other sites build agents without them:
+
+* ``_build_web_session_components`` (a Web session's agent);
+* ``build_sub_agent`` (a sub-agent, built from its parent).
+
+Omitted, ``BaseAgent`` falls back to the module-level buses.  So a session's turns announced
+themselves on the **process** bus while every subscriber the composition routed listened on the
+composition's: an event emitted and never heard, which is the failure this project warns about
+most -- and the same defect the last round fixed, at the site nobody had driven.
+
+Fixed at all three: the session builder passes ``event_bus`` / ``llm_event_bus`` /
+``tool_event_bus`` from the mapping it inherits, and ``SubAgentSpec`` carries the parent's
+buses so a sub-agent's turns are its parent's composition's turns.  Two unit guards pin the
+sub-agent half (including that an absent bus stays absent, so the documented fallback for
+hand-built agents is unchanged), and the session half is pinned by the functional test that
+found it.
+
+**Count, across four rounds: five defects, four of them the same shape** -- something that
+belongs to a *composition* was left pointing at a process-wide default.  Two were buses, two
+were a plugin-scoped view standing in for a service.  That is the shape to sweep for, and a
+functional test finds it faster than reading does: it is invisible in any single object and
+obvious in a running product.
 
 ## Measured, reported, not changed: `chat` never offers MCP tools
 

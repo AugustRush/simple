@@ -68,6 +68,10 @@ class SubAgentSpec:
     registry: Any
     settings: AgentSettings
     context_manager: Any = None
+    #: The parent's event buses, inherited verbatim -- see :func:`build_sub_agent`.
+    event_bus: Any = None
+    llm_event_bus: Any = None
+    tool_event_bus: Any = None
 
 
 def settings_from(agent: Any) -> AgentSettings:
@@ -108,6 +112,12 @@ def build_sub_agent(
     constructor.
     """
     config = spec.settings
+    # The buses are the parent's, not the process default.  A sub-agent runs *inside* the
+    # parent's turn, so its turn events belong to the same composition the parent belongs
+    # to: dropped here, they went to the module-level buses, where the composition's
+    # subscribers could not hear them and another runtime's could.  Inherited rather than
+    # rebuilt for the same reason the transport is -- anything else would be a second
+    # answer to "which composition is this".
     sub_agent = agent_type(
         spec.client,
         spec.registry,
@@ -118,6 +128,9 @@ def build_sub_agent(
         context_window=config.context_window,
         output_reserve=config.output_reserve,
         transport=spec.transport,
+        event_bus=spec.event_bus,
+        llm_event_bus=spec.llm_event_bus,
+        tool_event_bus=spec.tool_event_bus,
     )
     sub_agent.context_manager = spec.context_manager
     sub_agent.max_parallel_agents = config.max_parallel_agents

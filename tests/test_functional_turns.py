@@ -1429,3 +1429,141 @@ def test_the_ralph_task_loop_runs_through_the_command_router(home):
         )
     finally:
         provider.close()
+
+
+# ── 14. The end of a session, which only the runner's teardown reaches ──────
+
+_SESSION_PLUGIN = '''
+import json
+import pathlib
+
+HERE = pathlib.Path(__file__).parent
+
+
+def _note(kind, **fields):
+    with (HERE / "calls.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": kind, **fields}) + "\\n")
+
+
+def register():
+    class SessionRecorder:
+        name = "session_recorder"
+
+        def setup(self, ctx):
+            from agent.core.event_domains import SessionFinished, TurnCompleted
+
+            # One type each, subscribed through the context -- the routed form.  A session
+            # ending is published on the composition's session bus by whoever dispatches
+            # it, so this also pins that the two agree about where it lives.
+            ctx.on(TurnCompleted, lambda event: _note("turn", response=event.response))
+            ctx.on(
+                SessionFinished,
+                lambda event: _note(
+                    "session_end",
+                    turns=event.turn_count,
+                    messages=len(event.messages),
+                    session_id=event.session_id,
+                ),
+            )
+
+    return SessionRecorder()
+'''
+
+
+class _HandlerOnlyChannel:
+    """A channel that only holds the handler, so the runner's own teardown runs.
+
+    ``ChannelRunner._run_channel`` is where a stopped channel's sessions are closed and
+    their ends announced -- in a ``finally``, after ``channel.start`` returns.  Reaching it
+    needs a real ``runner.run()`` and a channel that simply waits, which is what this is:
+    a transport, not a server.
+    """
+
+    def __init__(self) -> None:
+        self.handler = None
+        self._stopped = None
+
+    async def start(self, handler) -> None:
+        import asyncio
+
+        self.handler = handler
+        self._stopped = asyncio.Event()
+        await self._stopped.wait()
+
+    async def stop(self) -> None:
+        self._stopped.set()
+
+    def create_sink(self, msg):
+        from agent.channels.web import WebOutputSink
+
+        return WebOutputSink(collect=True)
+
+
+def test_a_sessions_end_reaches_the_plugins_watching_for_it(home):
+    """The session boundary: announced once, to subscribers, with what the session was.
+
+    ``fire_session_end`` is the single dispatch point, and it was publishing on the process
+    bus while the plugin subscribed through the domain -- an event constructed, emitted and
+    heard by nobody.  Nothing drove the path end to end, because it is only reached by the
+    runner's teardown, which is to say by a channel *stopping*.
+
+    Asserted on the plugin's own record: the turn it saw, and the session end carrying the
+    transcript and the turn count.
+    """
+    import asyncio
+
+    import agent as agent_module
+    from agent.channels.base import ChannelRunner, IncomingMessage
+    from agent.channels.web import WebOutputSink
+
+    provider = scripted({"text": "noted"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    plugin_dir = home / "plugins" / "session_recorder"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "__init__.py").write_text(_SESSION_PLUGIN, encoding="utf-8")
+    try:
+
+        async def run() -> list[dict]:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            channel = _HandlerOnlyChannel()
+            runner = ChannelRunner([channel], components, cfg)
+            serving = asyncio.create_task(runner.run())
+            try:
+                for _ in range(200):
+                    if channel.handler is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert channel.handler is not None, "the runner never started the channel"
+
+                await channel.handler(
+                    IncomingMessage(
+                        text="remember this",
+                        session_id="session-end-one",
+                        channel_name="web",
+                        metadata={"message_id": "m1"},
+                    ),
+                    WebOutputSink(collect=True),
+                )
+                await channel.stop()
+                await serving
+            finally:
+                await agent_module._close_components(components)
+            return plugin_notes(plugin_dir)
+
+        notes = asyncio.run(run())
+
+        kinds = [note["kind"] for note in notes]
+        assert "turn" in kinds, notes
+        endings = [note for note in notes if note["kind"] == "session_end"]
+        assert len(endings) == 1, (
+            "a session's end is announced exactly once, at the boundary: "
+            f"{kinds}"
+        )
+        ending = endings[0]
+        assert ending["turns"] >= 1, ending
+        assert ending["messages"] >= 2, (
+            f"the transcript the plugin is handed must contain the turn: {ending}"
+        )
+        assert ending["session_id"] == "session-end-one", ending
+    finally:
+        provider.close()

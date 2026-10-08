@@ -309,6 +309,15 @@ async def _build_web_session_components(
         transport=session_transport,
         # One name, for the same reason as the process-wide construction below.
         services={"llm": session_transport},
+        # The composition's buses, exactly as ``AgentPlugin`` passes them for the
+        # process-wide agent.  Omitted, a session's turn announced its completion on the
+        # **process** bus while every subscriber whose ``ctx.on`` the composition routed
+        # was listening on the composition's -- an event emitted and never heard, which is
+        # the failure this codebase warns about most.  Measured: a plugin watching
+        # ``SessionFinished`` heard the session end and never heard its turn.
+        event_bus=session_components.get("event_bus.turn"),
+        llm_event_bus=session_components.get("event_bus.llm"),
+        tool_event_bus=session_components.get("event_bus.tool"),
     )
     for name in (
         "max_parallel_agents",

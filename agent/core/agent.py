@@ -2174,6 +2174,10 @@ class BaseAgent:
                 registry=sub_registry,
                 settings=settings_from(self),
                 context_manager=self._context_manager_for(),
+                # The parent's buses: a sub-agent's turns are this composition's turns.
+                event_bus=self._event_bus,
+                llm_event_bus=self._llm_event_bus,
+                tool_event_bus=self._tool_event_bus,
             ),
             agent_type=BaseAgent,
         )

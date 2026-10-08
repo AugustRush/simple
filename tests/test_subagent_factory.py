@@ -209,3 +209,43 @@ def test_the_agent_still_builds_a_sub_agent() -> None:
     assert isinstance(sub, agent_module.BaseAgent)
     assert sub._transport is agent._transport, "the routing table must be inherited"
     assert sub.max_tool_call_iterations == agent.max_tool_call_iterations
+
+
+def test_the_sub_agent_inherits_the_parents_buses() -> None:
+    """A sub-agent's turns belong to the parent's composition.
+
+    A sub-agent runs *inside* the parent's turn, so its turn and model events are the same
+    composition's events.  Omitted at construction, ``BaseAgent`` falls back to the
+    module-level buses: the composition's subscribers never hear them, and a listener left
+    on one of those buses by some *other* runtime in the same process hears them instead.
+
+    The same defect was found twice before by driving the product rather than the parts --
+    once for the process-wide agent and once for a web session's -- so this asserts the
+    third construction site directly.
+    """
+    agent = build_sub_agent(
+        _spec(
+            event_bus="the-turn-bus",
+            llm_event_bus="the-llm-bus",
+            tool_event_bus="the-tool-bus",
+        ),
+        agent_type=_FakeAgent,
+    )
+
+    assert agent.kwargs["event_bus"] == "the-turn-bus"
+    assert agent.kwargs["llm_event_bus"] == "the-llm-bus"
+    assert agent.kwargs["tool_event_bus"] == "the-tool-bus"
+
+
+def test_a_spec_without_buses_passes_none_so_the_default_still_applies() -> None:
+    """Control: a hand-built spec keeps the fallback it had.
+
+    ``BaseAgent`` treats ``None`` as "the process bus", which is what a test or an embedder
+    constructing one by hand relies on.  The builder must pass the absence through rather
+    than inventing a bus for it.
+    """
+    agent = build_sub_agent(_spec(), agent_type=_FakeAgent)
+
+    assert agent.kwargs["event_bus"] is None
+    assert agent.kwargs["llm_event_bus"] is None
+    assert agent.kwargs["tool_event_bus"] is None
