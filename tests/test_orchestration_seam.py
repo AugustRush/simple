@@ -201,7 +201,15 @@ def test_the_config_key_reaches_the_planner() -> None:
     loop_src = (root / "agent/core/turn_loop.py").read_text(encoding="utf-8")
     agent_src = (root / "agent/core/agent.py").read_text(encoding="utf-8")
 
-    assert "policy_skill_id" in plugin_src, "the plugin must read the config key"
+    # The derivation moved into `AgentSettings` (the review's "separate Service from
+    # Settings"), and the plugin now delegates to it.  The assertion follows the seam: what
+    # matters is that the config key is read *somewhere on the way to the planner*, not that
+    # the read happens in one particular file.
+    settings_src = (root / "agent/core/agent_settings.py").read_text(encoding="utf-8")
+    assert "policy_skill_id" in settings_src, "the config key must be read"
+    assert "AgentSettings.from_config(cfg)" in plugin_src, (
+        "the plugin must build the settings the key is read into"
+    )
     assert "orchestration_policy_skill_id" in agent_src, "the agent must hold it"
     tree = ast.parse(loop_src)
     cls = next(

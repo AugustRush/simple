@@ -1119,6 +1119,34 @@ rather than started at the end of a long run.
 everything" -- it is that the loop's dependency struct is built *from* the agent instead of
 *from* the composition.  That is a much smaller thing to fix, and it is where to start.
 
+## Review finding 10: settings are not services
+
+`AgentPlugin` wrote twelve attributes onto the agent it had just built, ten of them derived
+from config with **three different clamp idioms** spread over forty lines.  `agent/core/agent_settings.py`
+now holds that derivation as one frozen value, and `apply_to` copies it onto the agent so the
+dozen places that read `agent.max_parallel_agents` keep working unchanged.
+
+The review's phrasing is the reason this is worth doing: the container was carrying **both**
+services and settings, and they are not the same kind of thing -- a service is something a
+composition chooses and can replace, a setting is a number the operator wrote in a file.
+Nothing in `AgentSettings` is provided by a plugin, resolved by name, or replaceable at run
+time.
+
+**The risk in a move like this is silent, and one instance of it happened.**  Moving a
+derivation is behaviour-preserving only if every clamp, default and *config path* moves with
+it.  `result_content_max_chars` is read under `orchestration`, and the first version of
+`from_config` looked for it at the top level -- which would have quietly stopped honouring a
+configured value, with no error and no failing test.  It was caught by comparing against the
+old code line by line, and `test_the_orchestration_section_is_where_the_orchestration_keys_live`
+now asserts both directions: the value under the section is honoured, and a top-level spelling
+of the same name is **not**.
+
+**And the seam moved under two source-scanning tests, which were updated rather than
+deleted.**  `policy_skill_id` is now read in `AgentSettings`, not in the plugin.  The
+assertions follow the seam, because what matters is that the key is read *on the way to the
+planner* -- a test that keeps passing by looking where the value no longer travels is worse
+than one that fails.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

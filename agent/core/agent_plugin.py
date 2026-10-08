@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.core.agent_settings import AgentSettings
 from agent.config import (
     active_context_window,
     active_output_reserve,
@@ -92,75 +93,11 @@ class AgentPlugin:
             llm_event_bus=ctx.get("event_bus.llm", None),
             tool_event_bus=ctx.get("event_bus.tool", None),
         )
-        # A composition may name a plugin's policy bundle in full; the default is the
-        # built-in one, so this changes nothing unless it is configured.
-        agent.orchestration_policy_skill_id = str(
-            (cfg.get("orchestration", {}) or {}).get(
-                "policy_skill_id", "multi-agent-orchestration"
-            )
-        )
-        agent.max_parallel_agents = max(
-            1,
-            int(cfg.get("orchestration", {}).get("max_parallel_agents", shared.DEFAULT_MAX_PARALLEL_AGENTS)),
-        )
-        agent.sub_agent_timeout_seconds = max(
-            1,
-            int(
-                cfg.get("orchestration", {}).get("sub_agent_timeout_seconds", shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
-            ),
-        )
-        agent.sub_agent_retries = max(
-            0,
-            int(cfg.get("orchestration", {}).get("sub_agent_retries", shared.DEFAULT_SUB_AGENT_RETRIES)),
-        )
-        # Bounds total sub-agents per turn, not concurrency.  0 means "derive from
-        # max_parallel_agents".
-        agent.max_agents_per_turn = max(
-            0,
-            int(cfg.get("orchestration", {}).get("max_agents_per_turn", 0)),
-        )
-        # `max_steps` is the preferred spelling; `max_tool_call_iterations` stays
-        # accepted because it is a published config key and dropping it would
-        # break existing configs.  Both name the same bound: the number of steps
-        # (model request + its tools) allowed in one turn.
-        agent.max_tool_call_iterations = bounded_int(
-            cfg.get(
-                "max_steps",
-                cfg.get("max_tool_call_iterations", shared.MAX_TOOL_CALL_ITERATIONS),
-            ),
-            default=shared.MAX_TOOL_CALL_ITERATIONS,
-            min_value=1,
-            max_value=shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
-        )
-        agent.max_truncation_continuations = bounded_int(
-            cfg.get(
-                "max_truncation_continuations",
-                shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
-            ),
-            default=shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
-            min_value=0,
-            max_value=shared.MAX_CONFIGURABLE_TRUNCATION_CONTINUATIONS,
-        )
-        agent.llm_max_retries = max(
-            0,
-            int(cfg.get("llm_max_retries", shared.DEFAULT_LLM_MAX_RETRIES)),
-        )
-        agent.llm_retry_base_delay = max(
-            0.1,
-            float(cfg.get("llm_retry_base_delay", shared.DEFAULT_LLM_RETRY_BASE_DELAY)),
-        )
-        agent.result_content_max_chars = min(
-            shared.MAX_RESULT_CONTENT_CHARS,
-            max(
-                shared.MIN_RESULT_CONTENT_CHARS,
-                int(
-                    cfg.get("orchestration", {}).get(
-                        "result_content_max_chars",
-                        shared.DEFAULT_RESULT_CONTENT_MAX_CHARS,
-                    )
-                ),
-            ),
-        )
+        # One typed value rather than twelve assignments.  The derivation -- including the
+        # three different clamp idioms that were spread over forty lines -- lives in
+        # `AgentSettings.from_config`, and `apply_to` copies it onto the agent so every
+        # existing reader of `agent.max_parallel_agents` and its siblings keeps working.
+        AgentSettings.from_config(cfg).apply_to(agent)
         # Wired here rather than by the composition afterwards.  Both services exist by
         # the time this plugin mounts -- `plugin_catalog` is provided before any mount, and
         # `context_manager` by `SessionPlugin` -- so the agent is finished when it is
