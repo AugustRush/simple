@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from agent import shared
+
 __all__ = ["AgentSettings"]
 
 
@@ -38,23 +40,30 @@ class AgentSettings:
 
     Frozen because these are read all over the runtime and a value that can change
     underneath a turn makes the failure depend on where in the turn it was read.
+
+    **The defaults are the ``shared`` constants, not placeholder numbers.**  The first
+    version of this dataclass used bare ``1``/``0`` as its field defaults, on the reasoning
+    that ``from_config`` would always override them -- and every test that constructs a
+    ``BaseAgent`` directly, without going through the plugin, silently got a one-iteration
+    tool loop instead of the configured ceiling.  A default that no real caller is expected to
+    use is still a default somebody uses.
     """
 
     #: Which skill bundle decides how a turn is orchestrated; named in full so a
     #: composition can point at a plugin's bundle (see the planner for why).
     orchestration_policy_skill_id: str = "multi-agent-orchestration"
     #: Caps concurrency, not the total.
-    max_parallel_agents: int = 1
-    sub_agent_timeout_seconds: int = 1
-    sub_agent_retries: int = 0
+    max_parallel_agents: int = shared.DEFAULT_MAX_PARALLEL_AGENTS
+    sub_agent_timeout_seconds: int = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
+    sub_agent_retries: int = shared.DEFAULT_SUB_AGENT_RETRIES
     #: Bounds total sub-agents per turn.  ``0`` means "derive from max_parallel_agents".
-    max_agents_per_turn: int = 0
+    max_agents_per_turn: int = 0  # 0 = derive from max_parallel_agents
     #: Steps (model request plus its tools) allowed in one turn.
-    max_tool_call_iterations: int = 1
-    max_truncation_continuations: int = 0
-    llm_max_retries: int = 0
-    llm_retry_base_delay: float = 0.1
-    result_content_max_chars: int = 0
+    max_tool_call_iterations: int = shared.MAX_TOOL_CALL_ITERATIONS
+    max_truncation_continuations: int = shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS
+    llm_max_retries: int = shared.DEFAULT_LLM_MAX_RETRIES
+    llm_retry_base_delay: float = shared.DEFAULT_LLM_RETRY_BASE_DELAY
+    result_content_max_chars: int = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
 
     @classmethod
     def from_config(cls, cfg: Mapping[str, Any] | None) -> "AgentSettings":

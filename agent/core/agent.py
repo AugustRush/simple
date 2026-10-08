@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
+from agent.core.agent_settings import AgentSettings
 from agent.core.spawn_planning import (
     PlannerDeps,
     SpawnPlanner,
@@ -369,6 +370,7 @@ class BaseAgent:
         event_bus: Any = None,
         llm_event_bus: Any = None,
         tool_event_bus: Any = None,
+        settings: Any = None,
     ):
         #: The names this class resolves rather than receives.  One name today --
         #: ``llm`` -- and deliberately **not** the whole composition: the caller passes
@@ -445,8 +447,16 @@ class BaseAgent:
         #: Which skill bundle decides how a turn is orchestrated.  The built-in one
         #: unless a composition names another -- see the planner for why a plugin's
         #: bundle has to be named in full.
-        self.orchestration_policy_skill_id = orchestration_policy_skill_id
-        self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
+        # Received, not poured in afterwards.  `AgentPlugin` used to assign twelve
+        # attributes onto the object it had just built, which made "what does this agent
+        # need" unanswerable from its signature -- the same complaint as a plugin handed the
+        # whole component mapping.  The derivation lives in `AgentSettings.from_config`;
+        # this takes the result.
+        self.settings = settings if settings is not None else AgentSettings()
+        self.orchestration_policy_skill_id = (
+            orchestration_policy_skill_id or self.settings.orchestration_policy_skill_id
+        )
+        self.max_parallel_agents = self.settings.max_parallel_agents
 
         # Spawn-batch planning (agent/core/spawn_planning.py).  Assigned
         # before anything can call it; helpers are handed over as bound
@@ -463,18 +473,16 @@ class BaseAgent:
                 result_content_limit=self._result_content_limit,
             )
         )
-        self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
-        self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
+        self.sub_agent_timeout_seconds = self.settings.sub_agent_timeout_seconds
+        self.sub_agent_retries = self.settings.sub_agent_retries
         # 0 = derive from max_parallel_agents (see _max_agents_per_turn).
-        self.max_agents_per_turn = 0
-        self.max_tool_call_iterations = shared.MAX_TOOL_CALL_ITERATIONS
-        self.max_truncation_continuations = (
-            shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS
-        )
+        self.max_agents_per_turn = self.settings.max_agents_per_turn
+        self.max_tool_call_iterations = self.settings.max_tool_call_iterations
+        self.max_truncation_continuations = self.settings.max_truncation_continuations
         self.max_rendezvous_rounds = 2  # Mirrors OrchestrationDecision default.
-        self.result_content_max_chars = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
-        self.llm_max_retries = shared.DEFAULT_LLM_MAX_RETRIES
-        self.llm_retry_base_delay = shared.DEFAULT_LLM_RETRY_BASE_DELAY
+        self.result_content_max_chars = self.settings.result_content_max_chars
+        self.llm_max_retries = self.settings.llm_max_retries
+        self.llm_retry_base_delay = self.settings.llm_retry_base_delay
         self.workspace_root: Optional[Path] = None
         self._base_system_prompt: str = ""
         self.content_filter: ContentFilter = ContentFilter.load(default_model_path())

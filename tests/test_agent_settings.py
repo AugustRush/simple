@@ -25,8 +25,33 @@ from agent.core.agent_settings import AgentSettings
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+def test_a_bare_construction_matches_the_constants_the_old_code_used() -> None:
+    """The dataclass's *own* defaults, not only `from_config`'s.
+
+    This is the case that was missing.  The first version of `AgentSettings` used bare
+    ``1``/``0`` as field defaults, on the reasoning that `from_config` would always override
+    them -- and every test that constructs a `BaseAgent` directly, without going through the
+    plugin, silently got a one-iteration tool loop instead of the configured ceiling.  A
+    default that no real caller is expected to use is still a default somebody uses.
+    """
+    from agent import shared
+
+    bare = AgentSettings()
+
+    assert bare.max_tool_call_iterations == shared.MAX_TOOL_CALL_ITERATIONS
+    assert (
+        bare.max_truncation_continuations
+        == shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS
+    )
+    assert bare.llm_max_retries == shared.DEFAULT_LLM_MAX_RETRIES
+    assert bare.max_parallel_agents == shared.DEFAULT_MAX_PARALLEL_AGENTS
+    assert bare.sub_agent_timeout_seconds == shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
+    assert bare.sub_agent_retries == shared.DEFAULT_SUB_AGENT_RETRIES
+    assert bare.llm_retry_base_delay == shared.DEFAULT_LLM_RETRY_BASE_DELAY
+
+
 def test_defaults_match_the_constants_the_old_code_used() -> None:
-    """With no config at all, the result is what the inline code produced."""
+    """With no config at all, `from_config` produces what the inline code produced."""
     from agent import shared
 
     settings = AgentSettings.from_config({})

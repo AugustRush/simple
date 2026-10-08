@@ -92,12 +92,11 @@ class AgentPlugin:
             event_bus=ctx.get("event_bus.turn", None),
             llm_event_bus=ctx.get("event_bus.llm", None),
             tool_event_bus=ctx.get("event_bus.tool", None),
+            # Passed in, not poured in afterwards: the derivation lives in
+            # `AgentSettings.from_config`, and what the agent ends up with is visible in the
+            # call that built it.
+            settings=AgentSettings.from_config(cfg),
         )
-        # One typed value rather than twelve assignments.  The derivation -- including the
-        # three different clamp idioms that were spread over forty lines -- lives in
-        # `AgentSettings.from_config`, and `apply_to` copies it onto the agent so every
-        # existing reader of `agent.max_parallel_agents` and its siblings keeps working.
-        AgentSettings.from_config(cfg).apply_to(agent)
         # Wired here rather than by the composition afterwards.  Both services exist by
         # the time this plugin mounts -- `plugin_catalog` is provided before any mount, and
         # `context_manager` by `SessionPlugin` -- so the agent is finished when it is
