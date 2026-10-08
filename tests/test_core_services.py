@@ -1482,6 +1482,10 @@ _COMPONENT_KEYS: dict[str, str] = {
     "file_access_policy": "the file policy",
     # construction and paths
     "cfg": "the config this composition was built against",
+    # Written by the composition root at the end of a build: what did not load, and what
+    # is waiting.  Both were computed before and neither was shown anywhere.
+    "plugin_failures": "plugins whose setup raised, by name",
+    "plugin_pending": "plugins waiting for a dependency the composition does not supply",
     "output_dir": "where output is written",
     "workspace_root": "the workspace",
     "config_revision": "bumped to force a session rebuild",

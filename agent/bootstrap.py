@@ -879,6 +879,35 @@ async def _build_components_async(
             ),
             name="mcp-connect",
         )
+
+    # The composition says what did not load -- at the end, not in the middle.
+    #
+    # Placed here rather than beside the mounts because a plugin can be *transiently*
+    # pending: `system_prompt` is written into the mapping below the mounts, so a
+    # report taken just after them announced 'ralph is waiting for: system_prompt'
+    # for a plugin that was loaded by the time the composition returned.  A warning
+    # that is usually wrong is one people learn to skip.
+    #
+    # Both halves were computed and neither was shown: `pending_report()` had no caller at
+    # all, and a plugin refused by a raising `setup` was in neither list -- its only trace
+    # was a log line, which is not something an operator reads or a caller can assert on.
+    # Printed here rather than inside the catalog because the catalog does not own the
+    # console, and recorded in the mapping so the gateway and the CLI can surface it where
+    # the user actually is.
+    plugin_failures = plugin_catalog.failed_report()
+    plugin_pending = plugin_catalog.pending_report()
+    components["plugin_failures"] = plugin_failures
+    components["plugin_pending"] = plugin_pending
+    for plugin_name, error in sorted(plugin_failures.items()):
+        shared.CONSOLE.print(
+            f"[red]Plugin '{plugin_name}' failed to load: {error}[/red]"
+        )
+    for plugin_name, missing in sorted(plugin_pending.items()):
+        shared.CONSOLE.print(
+            f"[yellow]Plugin '{plugin_name}' is waiting for: "
+            f"{', '.join(missing)}[/yellow]"
+        )
+
     return components
 
 

@@ -131,6 +131,16 @@ class PluginHost:
         #: by an explicit call -- while unloading a name that never existed still
         #: raises, which is the case that indicates a typo.
         self._unloaded: set[str] = set()
+        #: Installs whose ``setup`` is running right now, keyed by name.  Everything else
+        #: in this class treats "loaded" as "setup has returned", which is wrong *during*
+        #: a setup: a plugin that loads a child from its own setup could not be found as
+        #: that child's parent, so the link was silently dropped.
+        self._activating: dict[str, Install] = {}
+        #: Installs that were refused because their ``setup`` raised, keyed by name.
+        #: Kept rather than dropped: a plugin that fails to load registers nothing, so
+        #: "it is not in ``loaded()``" and "it was never there" looked identical, and a
+        #: composition that lost a plugin to an exception could not say so.
+        self._failed: dict[str, Install] = {}
 
     # -- introspection -------------------------------------------------------
 
@@ -165,6 +175,20 @@ class PluginHost:
     def pending(self) -> tuple[str, ...]:
         """Names waiting for a dependency the composition does not supply."""
         return tuple(self._pending)
+
+    def failed(self) -> dict[str, str]:
+        """Plugins whose ``setup`` raised, by name, with the error.
+
+        The third state after loaded and pending, and the one that used to be invisible:
+        a refused plugin registers nothing, so it appeared in neither of the other two
+        and the only trace was a log line.  A composition can now report it, and a
+        caller can assert on it.
+        """
+        return {name: install.error or "" for name, install in self._failed.items()}
+
+    def failures(self) -> tuple[Install, ...]:
+        """The refused installs themselves, for a diagnostic that wants more than a name."""
+        return tuple(self._failed.values())
 
     def waiting_for(self) -> dict[str, tuple[str, ...]]:
         """What each pending plugin is missing.
@@ -227,8 +251,19 @@ class PluginHost:
             inject=tuple(str(d) for d in (getattr(plugin, "inject", ()) or ())),
             parent=parent,
         )
-        if parent is not None and parent in self._installs:
-            self._installs[parent].children.append(name)
+        if parent is not None:
+            # ``_installs`` **or** the parent currently running its own setup.  A plugin
+            # that loads a child from ``setup`` used to get no link at all, because the
+            # loading plugin is not in ``_installs`` until its own ``setup`` returns --
+            # measured: a parent's ``children`` was `[]` after `ctx.plugin(Child())`.
+            #
+            # The link is not what disposes the child: scopes nest, so the child's
+            # registrations are unwound by the parent's scope either way.  It is what
+            # makes the child *findable* -- for a diagnostic that says which plugin
+            # installed what, and for `replace`, whose capture walks this list.
+            owner = self._installs.get(parent) or self._activating.get(parent)
+            if owner is not None:
+                owner.children.append(name)
 
         if self._activate(install) and install.provided:
             # Only a plugin that just *provided* something can have unblocked a
@@ -248,8 +283,24 @@ class PluginHost:
         ``unload`` includes them: a parent's scope owns the records that installed
         them, so they go down too -- and a replacement that restored only the direct
         dependents would leave a subtree missing.
+
+        **Both tables, not only the active one.**  ``unload`` takes down a child whether
+        it is active or still pending -- its loop tests ``_installs`` *and* ``_pending``
+        -- so a capture that read only ``_installs`` dropped every pending child: it was
+        unloaded with its parent and never restored, vanishing from the composition
+        entirely.  Measured: a pending child present before a ``replace=True`` was gone
+        from both ``loaded()`` and ``pending()`` afterwards.
+
+        Active *dependents* are still the only dependents collected, which is correct
+        rather than an omission: ``unload`` does not take pending dependents down (they
+        never held the service), so there is nothing to restore.  A pending plugin whose
+        provider is replaced simply stays pending, and ``waiting_for`` continues to say
+        what it wants.
         """
         taken: set[str] = set()
+
+        def install_for(target: str) -> Install:
+            return self._installs.get(target) or self._pending.get(target)
 
         def collect(target: str) -> None:
             for dependent in self._dependents_of(target):
@@ -257,7 +308,7 @@ class PluginHost:
                     continue
                 taken.add(dependent)
                 collect(dependent)
-            install = self._installs.get(target)
+            install = install_for(target)
             for child in list(install.children) if install else []:
                 if child in taken:
                     continue
@@ -267,8 +318,11 @@ class PluginHost:
         collect(name)
         # Activation order, so a provider is re-loaded before the plugin that
         # injects it -- `load` would otherwise leave the dependent pending until a
-        # later flush, which is correct but reads as flapping in a log.
-        return [self._installs[n] for n in self._installs if n in taken]
+        # later flush, which is correct but reads as flapping in a log.  Pending
+        # ones keep their relative order too; they go back to waiting either way.
+        order = [n for n in self._installs if n in taken]
+        order += [n for n in self._pending if n in taken]
+        return [install_for(n) for n in order]
 
     def _activate(self, install: Install) -> bool:
         """Run ``setup`` if every injected service exists.  Returns activation."""
@@ -280,6 +334,9 @@ class PluginHost:
 
         ctx = self.context_for(install)
         install.ctx = ctx
+        # Visible to any child this plugin loads while its own setup runs.  Removed in
+        # a `finally` so a setup that raises does not leave the name claimed.
+        self._activating[install.name] = install
         setup = getattr(install.plugin, "setup", None)
         if callable(setup):
             try:
@@ -287,6 +344,8 @@ class PluginHost:
             except Exception as exc:
                 self._fail(install, exc)
                 return False
+            finally:
+                self._activating.pop(install.name, None)
             if inspect.iscoroutine(returned):
                 # An ``async def setup`` returns a coroutine that nothing awaits, so
                 # the plugin loads, registers nothing, and reports no error -- the
@@ -307,8 +366,12 @@ class PluginHost:
                 return False
 
         install.pending = False
+        self._activating.pop(install.name, None)
         self._installs[install.name] = install
         self._pending.pop(install.name, None)
+        # A name that now works is not a failure any more, and a report that kept saying
+        # so would be one somebody learns to ignore.
+        self._failed.pop(install.name, None)
         return True
 
     def _fail(self, install: Install, exc: BaseException) -> None:
@@ -323,6 +386,11 @@ class PluginHost:
         install.scope.dispose()
         install.error = str(exc)
         self._pending.pop(install.name, None)
+        self._activating.pop(install.name, None)
+        # Recorded, not only logged.  A log line is not part of the API: a composition
+        # root that wanted to report "these plugins did not load" had to parse output it
+        # does not own, and a caller had no way to ask at all.
+        self._failed[install.name] = install
         logger.warning("plugin %r setup failed: %s", install.name, exc)
 
     def context_for(self, install: Install) -> Any:
@@ -364,7 +432,11 @@ class PluginHost:
         dependency therefore unloads whatever declared itself dependent on it --
         which is what the declaration means, not a side effect of it.
         """
-        install = self._installs.get(name) or self._pending.get(name)
+        install = (
+            self._installs.get(name)
+            or self._pending.get(name)
+            or self._failed.get(name)
+        )
         if install is None:
             if name in self._unloaded:
                 # Already gone, most likely because its parent took it down.
@@ -378,6 +450,7 @@ class PluginHost:
 
         install.unloaded = True
         install.pending = False
+        self._failed.pop(name, None)
 
         # The children go with the parent, as a consequence of the parent's scope
         # owning the records that installed them.
@@ -417,6 +490,10 @@ class PluginHost:
         for name in list(self._pending):
             if name in self._pending:
                 self.unload(name)
+        # And clear the record of what failed: `unload_all` means the composition is
+        # empty, and a failure list that outlived it would describe a tree that is gone.
+        for name in list(self._failed):
+            self.unload(name)
 
     def _provides(self, name: str) -> set[str]:
         """Service names the install called ``name`` currently provides."""

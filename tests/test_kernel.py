@@ -1222,3 +1222,143 @@ def test_replacement_keeps_the_activation_order_of_the_restored_plugins() -> Non
 
     order = list(host.loaded())
     assert order.index("provider") < order.index("middle") < order.index("deep")
+
+
+# ── the third state: refused ─────────────────────────────────────────────────
+
+
+class _Boom:
+    name = "boom"
+
+    def setup(self, ctx) -> None:
+        raise RuntimeError("setup exploded")
+
+
+class _AsyncBoom:
+    name = "async_boom"
+
+    async def setup(self, ctx) -> None:  # pragma: no cover - refused, never awaited
+        ...
+
+
+class _Child:
+    name = "child"
+    inject = ("never_provided",)
+
+    def setup(self, ctx) -> None:
+        ctx.provide("child_up", True)
+
+
+class _ChildLoader:
+    name = "loader"
+
+    def setup(self, ctx) -> None:
+        ctx.provide("loaded_marker", True)
+        ctx.plugin(_Child())
+
+
+class _OtherLoader:
+    name = "loader"
+
+    def setup(self, ctx) -> None:
+        ctx.provide("loaded_marker", "replaced")
+
+
+def test_a_setup_that_raises_is_reported_not_only_logged() -> None:
+    """``loaded`` and ``pending`` were the only two states, and a refusal was neither.
+
+    A plugin whose ``setup`` raised registered nothing, so it appeared in no list at all
+    and the only trace was a log line -- which is not an API.  A composition root that
+    wanted to say "these did not load" had to parse output it does not own.
+    """
+    host, _ = _host()
+    host.load(_Boom())
+
+    assert host.loaded() == ()
+    assert host.pending() == ()
+    assert host.failed() == {"boom": "setup exploded"}
+    assert [install.name for install in host.failures()] == ["boom"]
+
+
+def test_an_async_setup_is_reported_the_same_way() -> None:
+    """Both refusals go through one path, so neither can be the quiet one.
+
+    The async form is refused on purpose -- the kernel calls ``setup`` synchronously and
+    awaiting would make ``load`` async -- and the point of refusing it is that its
+    *absence of effect* is otherwise invisible.
+    """
+    host, _ = _host()
+    host.load(_AsyncBoom())
+
+    assert list(host.failed()) == ["async_boom"]
+    assert "async setup" in host.failed()["async_boom"]
+
+
+def test_a_later_success_clears_the_record_of_an_earlier_failure() -> None:
+    """A report that kept naming a fixed plugin is one people learn to ignore."""
+    host, _ = _host()
+    host.load(_Boom())
+    assert "boom" in host.failed()
+
+    class _Fixed:
+        name = "boom"
+
+        def setup(self, ctx) -> None:
+            ctx.provide("boom_ok", True)
+
+    host.load(_Fixed(), replace=True)
+    assert host.failed() == {}
+    assert "boom_ok" in host.services._services
+
+
+def test_unload_all_clears_the_failure_record_too() -> None:
+    """``unload_all`` means the tree is empty; a failure list would describe a gone tree."""
+    host, _ = _host()
+    host.load(_Boom())
+    host.unload_all()
+    assert host.failed() == {}
+
+
+def test_a_plugin_that_loads_a_child_from_setup_is_recorded_as_its_parent() -> None:
+    """The link was dropped, and the consequence was a child that could not be restored.
+
+    ``self._installs[name] = install`` happens **after** ``setup`` returns, so during its
+    own setup a plugin is not in ``_installs`` -- and the child it loaded got no link.
+    Disposal still worked (scopes nest), which is why nothing looked wrong; what broke
+    was everything that *walks* the tree, ``replace``'s capture included.
+    """
+    host, _ = _host()
+    host.load(_ChildLoader())
+
+    assert host._installs["loader"].children == ["child"]
+    assert host.pending() == ("child",)
+
+
+def test_replacing_a_parent_keeps_a_pending_child() -> None:
+    """Measured before the fix: the pending child vanished from both lists.
+
+    ``unload`` takes a child down whether it is active or pending -- its loop tests
+    ``_installs`` *and* ``_pending`` -- so a capture that read only ``_installs`` dropped
+    every pending child, and it was never restored.
+    """
+    host, _ = _host()
+    host.load(_ChildLoader())
+    assert host.pending() == ("child",)
+
+    host.load(_OtherLoader(), replace=True)
+
+    assert host.loaded() == ("loader",)
+    assert host.pending() == ("child",), "the pending child must survive its parent's swap"
+    assert host.waiting_for() == {"child": ("never_provided",)}
+
+
+def test_a_child_loaded_during_setup_is_still_disposed_with_its_parent() -> None:
+    """Control: the scope nesting that made the missing link invisible still works."""
+    host, _ = _host()
+    host.load(_ChildLoader())
+    assert "loaded_marker" in host.services._services
+
+    host.unload("loader")
+
+    assert "loaded_marker" not in host.services._services
+    assert host.pending() == ()

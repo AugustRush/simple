@@ -397,6 +397,15 @@ user-invocable: true
         def discover_and_load(self):
             return []
 
+        def failed_report(self):
+            # Part of the surface the composition root reads.  A stand-in that lacks it
+            # is not a stand-in -- the same rule that made `mount` have to *run* a plugin
+            # rather than merely accept one.
+            return {}
+
+        def pending_report(self):
+            return {}
+
         def compose_all_prompts(self, base):
             return base
 

@@ -820,6 +820,45 @@ why the opposite-looking change (passing the class in by name) is actively wrong
 would break the optional-dependency behaviour.  Recorded because declining a literal
 instruction is a decision, not an omission.
 
+## Review findings, verified: the refused state and the parent link
+
+An external review raised twelve points.  Two of them are P0 and both were **reproduced
+before being fixed**; a third was found while verifying them.
+
+**1. A plugin whose `setup` raises was invisible.**  `loaded()` and `pending()` were the only
+two states, and a refusal is neither -- `_fail` set `install.error`, logged a warning and
+dropped the install.  Measured: `load()` returned an install with the error, and **no API
+reported it at all**.  Now `failed()` and `failures()` exist, `unload` reaches a failed
+install, a later success clears the record, and the composition root reports what did not
+load.
+
+**2. `pending_report()` had no caller in production.**  So even the state that *was*
+diagnosable was never diagnosed.  It is now printed by the composition root alongside
+failures, and both are recorded in the mapping (`plugin_failures`, `plugin_pending`) for the
+gateway and the CLI.
+
+**3. Found while verifying the review's first P0, and worse than what it described.**  The
+review said `_capture_dependents` misses *pending dependents*.  The real defect was one level
+down: **a child loaded from a plugin's own `setup` never got a parent link at all**, because
+`self._installs[name] = install` happens *after* `setup` returns.  Measured: a parent's
+`children` was `[]` after `ctx.plugin(Child())`.
+
+Disposal still worked -- scopes nest, so the child's registrations were unwound by the
+parent's scope either way -- which is exactly why nothing looked wrong.  What broke was
+everything that *walks* the tree: `replace`'s capture.  A **pending** child present before a
+`replace=True` vanished from both `loaded()` and `pending()`.
+
+Both halves are fixed: `_activating` tracks installs whose setup is running (so the link is
+recorded), and the capture reads `_installs` **and** `_pending`.  A pending child is now
+restored and still reported as waiting for what it wanted.
+
+**A placement mistake worth recording.**  The report was first placed immediately after the
+mounts, where it announced `Plugin 'ralph' is waiting for: system_prompt` -- for a plugin that
+was loaded by the time the composition returned, because `system_prompt` is written into the
+mapping below the mounts.  A warning that is usually wrong is one people learn to skip, so the
+report now runs at the **end** of the composition, where the state has settled.  That this was
+visible at all is the new report doing its job.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

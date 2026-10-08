@@ -3449,3 +3449,68 @@ def test_a_missing_provider_is_not_a_failure() -> None:
     host.load(EvolutionPlugin())
     assert host.pending() == ()
     assert host.services.get("evolution", "MISSING") is None
+
+
+def test_a_plugin_whose_setup_raises_is_reported_by_the_catalog(tmp_path):
+    """The third state, surfaced where a composition can see it.
+
+    `pending_report()` had **no caller** anywhere, and a plugin refused by a raising
+    `setup` was in neither `loaded` nor `pending` -- so a composition that lost a plugin to
+    an exception looked exactly like one that had never been given it.  Both are now
+    reported, and the failure is recorded in the mapping the composition returns.
+    """
+    import json
+
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "bad-plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"name": "bad-plugin"}), encoding="utf-8"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "def register():\n"
+        "    class P:\n"
+        "        name = 'bad-plugin'\n"
+        "        def setup(self, ctx):\n"
+        "            raise RuntimeError('deliberate')\n"
+        "    return P()\n",
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    assert catalog.failed_report() == {"bad-plugin": "deliberate"}
+    assert "bad-plugin" not in catalog._plugins, "a refused plugin is not loaded"
+
+
+def test_a_plugin_waiting_for_a_dependency_is_reported_by_the_catalog(tmp_path):
+    """The report that existed and nobody called.
+
+    A plugin that never activates registers nothing, and "nothing happened" is the hardest
+    kind of silence to debug -- which is why the report was written.  It is now read.
+    """
+    import json
+
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "waiter"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(json.dumps({"name": "waiter"}), encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "def register():\n"
+        "    class P:\n"
+        "        name = 'waiter'\n"
+        "        inject = ('nothing_provides_this',)\n"
+        "        def setup(self, ctx):\n"
+        "            raise AssertionError('must not run')\n"
+        "    return P()\n",
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    assert catalog.pending_report() == {"waiter": ["nothing_provides_this"]}
+    assert catalog.failed_report() == {}, "waiting is not failing"

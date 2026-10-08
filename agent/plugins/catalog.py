@@ -1565,6 +1565,15 @@ class PluginCatalog:
             for name, pending in sorted(self._pending.items())
         }
 
+    def failed_report(self) -> dict[str, str]:
+        """Plugins that were refused, by name, with the error.
+
+        The counterpart to :meth:`pending_report`, and the half that was missing: a plugin
+        whose ``setup`` raised is in neither ``loaded`` nor ``pending``, so a composition
+        that lost one to an exception looked exactly like one that had never been given it.
+        """
+        return self._host.failed()
+
     # ── Declarative commands / agents (Claude Code convention) ──────────
 
     def _load_command_files(
