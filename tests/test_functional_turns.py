@@ -1358,13 +1358,24 @@ class _ScriptedMCP:
 
     instances: list["_ScriptedMCP"] = []
 
+    #: How long the server takes to answer ``connect_from_config``.  A real one spawns a
+    #: process, so "not ready yet" is a normal state and not an error -- which is the state a
+    #: one-shot command has to decide what to do about.
+    delay: float = 0.0
+
     def __init__(self, registry) -> None:
         self.registry = registry
         self.calls: list[dict] = []
         self.closed = False
+        self.registered = False
         type(self).instances.append(self)
 
     async def connect_from_config(self, config, extra_env=None):
+        import asyncio
+
+        if type(self).delay:
+            await asyncio.sleep(type(self).delay)
+
         def echo(word: str = "") -> dict:
             self.calls.append({"word": word})
             return {"echoed": word}
@@ -1380,16 +1391,24 @@ class _ScriptedMCP:
             echo,
             source="mcp:scripted",
         )
+        self.registered = True
 
     async def close(self) -> None:
         self.closed = True
 
     def status_summary(self) -> dict:
+        """The truth about this client, not a canned success.
+
+        This used to report one connected server and one registered tool unconditionally, so a
+        connect that raised was followed by the composition announcing "MCP active".  A double
+        that reports success it never had is what makes a real failure invisible.
+        """
+        connected = 1 if self.registered else 0
         return {
             "configured_servers": 1,
-            "connected_servers": 1,
-            "failed_servers": 0,
-            "registered_tools": 1,
+            "connected_servers": connected,
+            "failed_servers": 0 if connected else 1,
+            "registered_tools": 1 if connected else 0,
         }
 
 
@@ -3294,5 +3313,103 @@ def test_saying_approve_redeems_the_one_pending_command(home):
             f"and the retry must run: {str(executed[-1])[:300]}"
         )
         assert retried, retried
+    finally:
+        provider.close()
+
+
+# ── 32. The one-shot command and the tools it was configured with ───────────
+
+
+def _quiet_console(monkeypatch):
+    """Capture what the CLI prints, without a terminal."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    from agent import shared
+
+    stream = StringIO()
+    console = Console(file=stream, width=100, no_color=True)
+    monkeypatch.setattr(shared, "CONSOLE", console)
+    return lambda: stream.getvalue()
+
+
+def test_the_one_shot_chat_waits_for_its_mcp_tools(home, monkeypatch):
+    """``simple chat`` runs exactly one turn, so the connection has to land before it starts.
+
+    Measured before this test: the composition starts the MCP connect in the background, the
+    command runs its single turn, and then its own teardown cancels the connection.  The model
+    was offered every tool *except* the ones the user configured, and answered "I don't have
+    that" about a server sitting in the config -- a wrong answer, not a fast one.
+
+    Driven through the real CLI command rather than a helper, which is also the only test in
+    this layer that enters at the command a person types.
+    """
+    import agent as agent_module
+    import agent.cli as cli
+
+    _ScriptedMCP.instances.clear()
+    monkeypatch.setattr(agent_module, "MCPClient", _ScriptedMCP)
+    _quiet_console(monkeypatch)
+    provider = scripted(
+        {"tool": ("mcp_echo", {"word": "from-mcp"})},
+        {"text": "the server said so"},
+    )
+    write_config(home, provider, mcp_servers=[{"name": "scripted", "command": "unused"}])
+    try:
+        cli.chat("use the external tool")
+
+        offered = [
+            tool["function"]["name"] for tool in provider.requests[0].get("tools", [])
+        ]
+        assert "mcp_echo" in offered, (
+            "the server's tool has to be offered to the model in the one turn this "
+            f"command gets: {offered}"
+        )
+        assert _ScriptedMCP.instances, "the composition must have built a client"
+        assert _ScriptedMCP.instances[-1].calls == [{"word": "from-mcp"}], (
+            "and the call has to reach the server: "
+            f"{_ScriptedMCP.instances[-1].calls}"
+        )
+    finally:
+        provider.close()
+
+
+def test_the_one_shot_chat_says_when_the_servers_are_not_ready(home, monkeypatch):
+    """A wait that ran out is reported, and the turn still happens.
+
+    The other half of the same decision: waiting must be bounded, and the user must be told
+    which of the two happened.  A silent extra wait is indistinguishable from a slow program,
+    and a silent skip is indistinguishable from a server that is broken -- both leave the
+    person guessing about a tool they configured.
+    """
+    import agent as agent_module
+    import agent.cli as cli
+
+    _ScriptedMCP.instances.clear()
+    monkeypatch.setattr(agent_module, "MCPClient", _ScriptedMCP)
+    monkeypatch.setattr(_ScriptedMCP, "delay", 5.0)
+    shown = _quiet_console(monkeypatch)
+    provider = scripted({"text": "answered anyway"})
+    write_config(
+        home,
+        provider,
+        mcp_servers=[{"name": "scripted", "command": "unused"}],
+        mcp_connect_timeout_seconds=0.2,
+    )
+    try:
+        cli.chat("hello")
+
+        offered = [
+            tool["function"]["name"] for tool in provider.requests[0].get("tools", [])
+        ]
+        assert "mcp_echo" not in offered, offered
+        output = shown()
+        assert "still connecting" in output, (
+            f"the run has to say that it gave up waiting: {output!r}"
+        )
+        assert "answered anyway" in output or "answered anyway" in json.dumps(
+            provider.requests[0]
+        ), "and the turn still has to happen"
     finally:
         provider.close()

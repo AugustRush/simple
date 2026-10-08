@@ -95,6 +95,12 @@ DEFAULT_CONFIG: dict = {
     "max_truncation_continuations": shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
+    # How long a *one-shot* command (``simple chat``) waits for the MCP servers to
+    # connect before running its single turn.  A long-running process gets them for free:
+    # the connection lands while it serves.  A one-shot command that does not wait
+    # cancels the connection before the model sees a single tool, so a server the user
+    # configured reports itself as "no such tool" -- a wrong answer, not a fast one.
+    "mcp_connect_timeout_seconds": 15.0,
     # ── Evolution / self-improvement ──────────────────────────────────────
     "evolution": {
         "enabled": True,  # set to false to disable session scoring and rule learning
@@ -443,7 +449,8 @@ class ModelClientFactory:
 _KNOWN_SECTIONS = frozenset({
     "active_provider", "providers", "model", "max_tokens", "output_reserve",
     "memory", "orchestration", "evolution", "scheduler", "audio",
-    "mcp_servers", "context", "plugins", "skills", "channels", "user_tools",
+    "mcp_servers", "mcp_connect_timeout_seconds",
+    "context", "plugins", "skills", "channels", "user_tools",
     "system_prompt_file", "output_dir", "tavily_api_key",
     "assistant_identity", "shell_blocked_commands",
     "shell_allowed_commands",

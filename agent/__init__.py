@@ -295,7 +295,7 @@ from .config import (
     load_config_for_run,
     save_config,
 )
-from .bootstrap import _build_components, _build_components_async
+from .bootstrap import _build_components, _build_components_async, await_mcp_ready
 from .scheduler import (
     ClaimedTask,
     DailyTrigger,

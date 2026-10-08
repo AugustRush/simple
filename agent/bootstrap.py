@@ -435,6 +435,48 @@ async def _connect_mcp_in_background(
             )
 
 
+async def await_mcp_ready(components: dict, *, timeout: float | None = None) -> bool:
+    """Wait for the background MCP connect, for a command that runs **one** turn.
+
+    A long-running process does not need this: the connection lands while it serves, and the
+    tools are there for every turn after the first.  A one-shot command -- ``simple chat`` is
+    the only one -- builds its components, runs a single turn and tears them down, so a
+    connection still in flight at turn time is cancelled by its own teardown: the model is
+    offered every tool *except* the ones the user configured, and answers "I don't have that"
+    about a server that is sitting right there in the config.
+
+    Returns True when the connect finished (or there was nothing to wait for), False when the
+    deadline passed.  Says which happened, because a silent extra wait is indistinguishable
+    from a slow program and a silent skip is indistinguishable from a broken server.
+    """
+    task = components.get("mcp_task")
+    if task is None:
+        return True
+    if task.done():
+        return True
+    if timeout is None:
+        from agent.config import DEFAULT_CONFIG
+
+        timeout = float(DEFAULT_CONFIG["mcp_connect_timeout_seconds"])
+    if timeout <= 0:
+        shared.CONSOLE.print(
+            "[dim]MCP servers are connecting in the background; this run does not wait "
+            "for them (mcp_connect_timeout_seconds=0).[/dim]"
+        )
+        return False
+    shared.CONSOLE.print(
+        f"[dim]Waiting for MCP servers (up to {timeout:g}s)…[/dim]"
+    )
+    done, _pending = await asyncio.wait({task}, timeout=timeout)
+    if done:
+        return True
+    shared.CONSOLE.print(
+        "[yellow]MCP servers are still connecting; this one-shot run continues without "
+        "their tools.[/yellow]"
+    )
+    return False
+
+
 async def _build_components_async(
     cfg: dict,
     *,

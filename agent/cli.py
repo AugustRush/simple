@@ -1134,6 +1134,16 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
 
     async def _run():
         components = await _build_quiet_cli_components(cfg)
+        # This command runs exactly one turn and then tears the composition down, so an MCP
+        # connection that is still in flight when the turn starts is cancelled before the
+        # model can be offered its tools -- see `await_mcp_ready`.  Wait for it first, and
+        # build the context afterwards: connecting refreshes the system prompt, and waiting
+        # must not be the only part of the composition the turn misses.
+        timeout = cfg.get("mcp_connect_timeout_seconds")
+        await agent_module.await_mcp_ready(
+            components,
+            timeout=float(timeout) if timeout is not None else None,
+        )
         ctx = AgentContext(system_prompt=components["system_prompt"])
         state = RuntimeSessionState(ctx=ctx)
         sink = CliOutputSink(shared.CONSOLE)
