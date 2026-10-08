@@ -568,27 +568,33 @@ class ChannelRunner:
             # factory's base manager has its own random staging id; using it
             # here sends tool events to an unrelated session and makes traces
             # disappear after a browser refresh.
+            # One lookup, and no fallback to a *different session's* log.  This used to be
+            # a chain -- the live state's context manager, else the session's components,
+            # else the base components -- whose last step is wrong by construction: the
+            # factory's base manager has a random staging id, so events recorded through it
+            # are filed under an unrelated session and tool traces vanish after a refresh.
+            # The comment documenting that was the reason this looked safe.
+            #
+            # A session's log is now a name in that session's own components, so "which log"
+            # is answered by the lookup rather than by the order of the chain.
             state = sessions.get(event.session_id)
             ctx_mgr = getattr(state, "context_manager", None)
-            if ctx_mgr is None:
-                runtime = session_components.get(event.session_id, components)
-                ctx_mgr = (
-                    resolve(runtime, "context_manager")
-                    if isinstance(runtime, dict)
-                    else None
+            session_log = getattr(ctx_mgr, "session_log", None)
+            if session_log is None:
+                # No session bound yet: the fact is still logged above, and dropping the
+                # durable write is a visible gap rather than a mis-filed one.
+                logger.debug(
+                    "no session log for %r; runtime event %s not persisted",
+                    event.session_id,
+                    event.name,
                 )
-            record_event = getattr(ctx_mgr, "record_runtime_event", None)
-            if callable(record_event):
-                metadata = dict(event.metadata or {})
-                turn_id = str(
-                    metadata.get("turn_id")
-                    or metadata.get("message_id")
-                    or ""
-                )
-                try:
-                    record_event(event.name, dict(event.fields), turn_id=turn_id)
-                except Exception:
-                    logger.exception("failed to persist runtime event: %s", event.name)
+                return
+            metadata = dict(event.metadata or {})
+            turn_id = str(metadata.get("turn_id") or metadata.get("message_id") or "")
+            try:
+                session_log.append(event.name, dict(event.fields), turn_id=turn_id)
+            except Exception:
+                logger.exception("failed to persist runtime event: %s", event.name)
 
         coordinator_factory = components.get("command_coordinator_factory")
         coordinator = (

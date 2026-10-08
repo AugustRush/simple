@@ -1198,6 +1198,21 @@ def test_channel_runner_persists_runtime_events_to_session_context_manager():
         def record_runtime_event(self, event_type, payload=None, *, turn_id=""):
             recorded.append((event_type, payload or {}, turn_id))
 
+        @property
+        def session_log(self):
+            # The channel reaches the durable log through the session's own context manager
+            # -- one hop, no resolve chain -- so a stand-in for that manager has to expose
+            # it.  Delegating to `record_runtime_event` keeps this test asserting what it
+            # always did: the event reached *this session's* recorder.
+            class _Log:
+                def append(self, event_type, payload=None, *, turn_id=""):
+                    return self_context.record_runtime_event(
+                        event_type, payload, turn_id=turn_id
+                    )
+
+            self_context = self
+            return _Log()
+
     class BaseContext:
         def spawn_session(self, session_id, *, project_scope=""):
             assert session_id == "web-session"

@@ -999,6 +999,44 @@ The rule was already in this session's notes: probe with `cp`, never `git checko
 with uncommitted work.  The guard itself was fine; the verification of it was the mistake, and
 it cost a full-suite run to notice.
 
+## Review finding 6: one path writes durable history
+
+Durable session history was appended from **three** layers -- `AgentCore` for
+`turn_finished`, a channel for the runtime events it drained, and `ContextManager` holding
+both halves -- and the sequence "append the fact, then derive the projection" was written out
+at each.
+
+**The cost was not line count.**  It was that a caller had to know *which context manager
+belonged to which session*, and the chain for finding out had a step that is wrong by
+construction.  The channel did this:
+
+```python
+ctx_mgr = getattr(state, "context_manager", None)
+if ctx_mgr is None:
+    runtime = session_components.get(event.session_id, components)
+    ctx_mgr = resolve(runtime, "context_manager") if isinstance(runtime, dict) else None
+```
+
+with a comment explaining that the fallback "sends tool events to an unrelated session and
+makes traces disappear after a browser refresh".  **A chain whose last step has a known wrong
+answer is a chain nobody can check**; the comment was the reason it looked safe.
+
+`agent/memory/session_log.py` owns the sequence; `ContextManager.record_runtime_event`
+delegates to it, so there is one implementation rather than two; and the channel resolves the
+log through the session's own state -- **one hop, no chain**, so "which session" is answered by
+the lookup instead of by an ordering.
+
+**What it does not own, said plainly**: the projection itself stays with the context manager
+that holds the clipping helpers and the working-state shape, and is handed in as a callback.
+This unifies *where a fact is written*, which is what was scattered, rather than moving the
+projection to a new home for its own sake.
+
+**A dead condition I wrote and removed.**  The first version of the `session_log` property
+rebuilt the log when `log.session_id != staging.session_id` -- which is always false, because
+both sides read the same callable.  A condition that can never be true suggests a protection
+that is not there, so it is gone; reading the id through a callable is what makes rebuilding
+unnecessary, and the docstring now says that instead.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

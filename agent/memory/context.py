@@ -17,6 +17,7 @@ from agent.lexical import lexical_terms
 if TYPE_CHECKING:
     from agent.core.transport import ModelEndpoint
 
+from .session_log import SessionLog
 from ._helpers import (
     _FACT_QUERY_PREDICATE_ALIASES,
     _FACT_QUERY_SUBJECT_ALIASES,
@@ -1828,6 +1829,31 @@ class ContextManager:
                     return merged
         return merged
 
+    @property
+    def session_log(self) -> Any:
+        """This session's durable log.
+
+        Built once and cached, and it does **not** need rebuilding when the session is
+        rebound: it reads the id through a callable rather than capturing it, so it always
+        files under the session in force.  Capturing the id is what produced events
+        attributed to an unrelated session -- the bug the channel used to work around by
+        hand.
+
+        (The first version of this property compared the log's id against the staging id to
+        decide whether to rebuild.  That comparison is always false, because both sides read
+        the same callable -- a condition that can never be true, guarding nothing, which is
+        worse than no condition at all.)
+        """
+        log = getattr(self, "_session_log", None)
+        if log is None:
+            log = SessionLog(
+                self.store,
+                lambda: self.staging.session_id,
+                project=self._project_working_state_from_event,
+            )
+            self._session_log = log
+        return log
+
     def _project_working_state_from_event(
         self,
         *,
@@ -1965,24 +1991,14 @@ class ContextManager:
     ) -> AgentRuntimeEvent:
         """Record a runtime fact and update the model-readable projection.
 
-        This is the single path for recoverable runtime context: append the
-        factual event first, then derive ``session_working_state`` from it.
+        Delegates to :attr:`session_log`.  It used to do the work itself, which meant two
+        places could write durable history -- and the other one, a channel, had to find the
+        right context manager by a lookup chain with a known-wrong fallback.
+
+        Kept as a method because callers hold a context manager, not a log; the *path* is
+        what was duplicated, and there is now one.
         """
-        payload = payload if isinstance(payload, dict) else {}
-        created_at = _now()
-        event = self.store.append_agent_event(
-            session_id=self.staging.session_id,
-            event_type=event_type,
-            payload=payload,
-            turn_id=turn_id,
-            created_at=created_at,
-        )
-        self._project_working_state_from_event(
-            event_type=event.event_type,
-            payload=event.payload,
-            created_at=event.created_at,
-        )
-        return event
+        return self.session_log.append(event_type, payload, turn_id=turn_id)
 
     def retrieve_context(
         self,
