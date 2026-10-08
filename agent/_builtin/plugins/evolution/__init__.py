@@ -25,7 +25,7 @@ per-invocation overlay provides ``command_context`` and the current session
 
 from __future__ import annotations
 
-from agent.runtime.services import require_service, resolve
+from agent.kernel.service import require_service, resolve
 
 from agent.runtime.system_prompt import publish_system_prompt
 

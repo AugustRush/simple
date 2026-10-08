@@ -3,7 +3,7 @@
 Why this exists
 ---------------
 The container already holds these: ``RuntimeComponents.services`` is a
-:class:`~agent.runtime.services.ServiceRegistry` that **adopts** the component
+:class:`~agent.kernel.service.ServiceRegistry` that **adopts** the component
 mapping, so ``services.get("agent_core")`` has always returned the real object.
 What was missing is that nothing *said* which names are services.  They travelled
 as string keys through a plain ``dict``, read at sixty-odd call sites, so:

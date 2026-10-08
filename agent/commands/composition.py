@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from agent.runtime.services import resolve
+from agent.kernel.service import resolve
 
 __all__ = ["ensure_command_router"]
 

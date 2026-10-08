@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 from agent import shared
-from agent.runtime.services import resolve
+from agent.kernel.service import resolve
 from agent.channels.base import Channel, IncomingMessage
 from agent.commands.composition import ensure_command_router
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime

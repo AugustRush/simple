@@ -124,7 +124,7 @@ def test_a_plugin_providing_nothing_resolves_to_absent(plugins: Path) -> None:
 
 def test_resolving_a_missing_service_without_a_default_raises(plugins: Path) -> None:
     """A silent None is how a missing dependency becomes a puzzle three frames away."""
-    from agent.runtime.services import MissingServiceError
+    from agent.kernel.service import MissingServiceError
 
     catalog, _ = _load(plugins)
     try:
@@ -190,7 +190,7 @@ def test_without_inject_a_consumer_loaded_first_sees_nothing(tmp_path: Path) -> 
 
 def test_providing_twice_without_replace_is_refused(plugins: Path) -> None:
     """Two plugins claiming one name is a configuration error, not a race."""
-    from agent.runtime.services import ServiceRegistry
+    from agent.kernel.service import ServiceRegistry
 
     registry = ServiceRegistry()
     registry.provide("mine", object())

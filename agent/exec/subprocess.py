@@ -303,7 +303,7 @@ def _signal_group(process, sig: int) -> None:
 _DEFAULT_PROVIDER = LocalSubprocessProvider()
 
 #: Registry-context key under which a
-#: :class:`~agent.runtime.services.ServiceRegistry` may be attached.  When
+#: :class:`~agent.kernel.service.ServiceRegistry` may be attached.  When
 #: present it is consulted second, after the direct ``subprocess_provider``
 #: key, so a caller can scope its replacement and get the previous provider
 #: back on unload.

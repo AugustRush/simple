@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from agent.exec.subprocess import LocalSubprocessProvider, provider_from
-from agent.runtime.services import (
+from agent.kernel.service import (
     MissingServiceError,
     ServiceRegistry,
     ServiceScope,

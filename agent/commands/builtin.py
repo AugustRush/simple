@@ -168,7 +168,7 @@ def _session_agent(context: CommandContext) -> Any:
     components = getattr(core, "_components", None)
     if components is None:
         return None
-    from agent.runtime.services import resolve
+    from agent.kernel.service import resolve
 
     return resolve(components, "agent")
 

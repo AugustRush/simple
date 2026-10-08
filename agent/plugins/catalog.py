@@ -1142,7 +1142,7 @@ class PluginCatalog:
         # ``agent.runtime.contracts``, which imports the skill catalog, which
         # imports the tool registry, which imports this module.  A lazy import
         # breaks that cycle at the one point where it is not needed yet.
-        from agent.runtime.services import ServiceRegistry
+        from agent.kernel.service import ServiceRegistry
 
         #: The kernel for this catalog: services, events, the plugin tree, and
         #: the lifecycle.  The registry **adopts the runtime's component mapping**
@@ -1234,7 +1234,7 @@ class PluginCatalog:
         returns ``None`` -- the two had to be distinguished, which is what the
         sentinel is for.
         """
-        from agent.runtime.services import MissingServiceError
+        from agent.kernel.service import MissingServiceError
 
         if default is _NO_DEFAULT:
             return self._services.get(name)  # raises MissingServiceError

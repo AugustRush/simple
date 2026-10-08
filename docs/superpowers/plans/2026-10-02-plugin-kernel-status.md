@@ -977,6 +977,28 @@ orders, plus a control that the tool set actually registered rather than merely 
 list that can be reordered freely is a list that can become data -- and it is why the
 remaining work is now smaller than the review estimated.
 
+## Review finding P2-8: the re-export is gone
+
+`agent/runtime/services.py` was a re-export of six names from `agent.kernel.service`, and its
+own docstring said it would be "deleted once nothing imports it".  **Eighteen modules imported
+it** -- so "nothing" was a long way off, and the review's suggestion (pin the list and stop the
+growth) would have frozen that layer in place.
+
+The names never changed, so this was mechanical: eighteen files now import
+`agent.kernel.service` directly and the re-export is deleted.  A structural guard parses every
+module for an import of the old path -- **parses, not searches**, because the first version of
+the guard matched its own source: the assertion text names the module it checks for, and a
+scan that cannot tell a mention from an import reports itself.
+
+**And one process failure, the exact one this session had already written down.**  To verify the
+guard bit, the probe reverted `agent/cli.py` to the old import and then ran
+`git checkout -- agent/cli.py` to undo it -- which restored it to **HEAD**, where the migration
+does not exist, and so to an import of a module that is now deleted.  Sixty-two tests failed.
+
+The rule was already in this session's notes: probe with `cp`, never `git checkout` on a file
+with uncommitted work.  The guard itself was fine; the verification of it was the mistake, and
+it cost a full-suite run to notice.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

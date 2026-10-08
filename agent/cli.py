@@ -32,7 +32,7 @@ from agent import shared
 from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.commands.composition import ensure_command_router
-from agent.runtime.services import require_service, resolve
+from agent.kernel.service import require_service, resolve
 from agent.bundles import loader_for_name
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock

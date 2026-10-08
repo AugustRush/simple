@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 import agent as agent_module
-from agent.runtime.services import resolve
+from agent.kernel.service import resolve
 from agent import shared
 
 if TYPE_CHECKING:

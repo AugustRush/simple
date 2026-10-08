@@ -47,7 +47,7 @@ from agent.ralph import (
     open_task_store,
 )
 from agent.tools.files import FileService, resolve_file_access_config
-from agent.runtime.services import require_service
+from agent.kernel.service import require_service
 from agent.pathing import project_memory_scope
 
 BaseAgent = agent_module.BaseAgent

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, MutableMapping
 
-from agent.runtime.services import resolve
+from agent.kernel.service import resolve
 
 __all__ = ["publish_system_prompt", "refresh_system_prompt"]
 

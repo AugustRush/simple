@@ -26,7 +26,7 @@ from agent.runtime.core_services import (
     entry_for,
 )
 from agent.runtime.contracts import RuntimeComponents
-from agent.runtime.services import MissingServiceError
+from agent.kernel.service import MissingServiceError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_ROOT = REPO_ROOT / "agent"
@@ -557,7 +557,7 @@ def test_a_core_service_entry_is_not_blank() -> None:
 
 #: Files that may read a core service straight from a component mapping, with the
 #: reason.  Everything else resolves through a container -- see
-#: :func:`agent.runtime.services.resolve` and the per-package accessors listed in
+#: :func:`agent.kernel.service.resolve` and the per-package accessors listed in
 #: ``_scan``.
 _RAW_MAPPING_ALLOWED: dict[str, str] = {
     "agent/bootstrap.py": (
@@ -651,7 +651,7 @@ def test_no_undeclared_file_reads_a_service_from_the_raw_mapping() -> None:
         + "\n  ".join(
             f"{rel}: {', '.join(hits)}" for rel, hits in sorted(offenders.items())
         )
-        + "\n\nUse resolve()/require_service() (agent/runtime/services.py), or add "
+        + "\n\nUse resolve()/require_service() (agent/kernel/service.py), or add "
         "the file to the guard with a reason."
     )
 
@@ -1667,3 +1667,42 @@ def test_the_agent_is_given_only_the_names_it_looks_up() -> None:
             f"the agent resolves {sorted(names)} by name; declare what it needs here "
             "rather than handing it the mapping"
         )
+
+
+def test_the_service_primitive_has_exactly_one_import_path() -> None:
+    """The re-export was kept "only while the callers are migrated"; the migration is done.
+
+    `agent/runtime/services.py` existed to make the move verifiable as behaviour-preserving
+    -- a suite that stayed green across it distinguishes "I broke the registry" from "I
+    moved it" -- and it said in its own docstring that it would be deleted once nothing
+    imported it.  Eighteen modules imported it, so "nothing" was a long way off; all of them
+    now import the kernel directly.
+
+    Asserted structurally, because the failure mode is a *new* file reaching for the old
+    path out of habit, and an import that resolves is not an error anybody notices.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    assert not (root / "agent/runtime/services.py").exists(), (
+        "the re-export is gone; nothing should recreate it"
+    )
+
+    # Parsed, not searched for a substring: the first version of this matched its own
+    # source, because the assertion text names the module it is checking for.  A scan that
+    # cannot tell a mention from an import is the kind of guard that reports itself.
+    offenders = []
+    for path in list((root / "agent").rglob("*.py")) + list((root / "tests").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8", errors="ignore"))):
+            modules: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                modules.append(node.module)
+            elif isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            if any(
+                module == "agent.runtime.services"
+                or module.startswith("agent.runtime.services.")
+                for module in modules
+            ):
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not offenders, f"these still import the removed re-export: {offenders}"

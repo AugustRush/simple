@@ -25,7 +25,7 @@ from agent.runtime import (
     AgentCore,
     RuntimeComponents,
 )
-from agent.runtime.services import require_service, resolve
+from agent.kernel.service import require_service, resolve
 from agent.runtime.contracts import (
     RuntimeEvent,
     RuntimeSessionState,

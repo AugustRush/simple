@@ -18,7 +18,7 @@ from typing import (
     overload,
 )
 
-from agent.runtime.services import (
+from agent.kernel.service import (
     MissingServiceError,
     ServiceRegistry,
     require_service,
@@ -108,7 +108,7 @@ class TurnResult:
 class RuntimeComponents:
     """Typed access wrapper for bootstrapped runtime dependencies.
 
-    ``require`` resolves through a :class:`~agent.runtime.services.ServiceRegistry`
+    ``require`` resolves through a :class:`~agent.kernel.service.ServiceRegistry`
     rather than reading a plain mapping, so this is the runtime's *container* and
     not only a typed view of a dict.  The registry adopts ``values`` in place, so
     the many call sites that read or assign the mapping directly and the ones that

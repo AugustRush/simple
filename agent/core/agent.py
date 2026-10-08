@@ -130,7 +130,7 @@ from agent.core.turn_loop import (
     stream_response,
     tool_result_messages,
 )
-from agent.runtime.services import resolve
+from agent.kernel.service import resolve
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry, ToolView

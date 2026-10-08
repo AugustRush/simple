@@ -26,7 +26,7 @@ import pytest
 
 from agent.commands.models import CommandContext
 from agent.runtime.contracts import RuntimeComponents
-from agent.runtime.services import ServiceRegistry
+from agent.kernel.service import ServiceRegistry
 
 
 def _context(**components):
@@ -58,7 +58,7 @@ def test_a_service_the_mapping_lacks_is_missing_not_none() -> None:
     ``.get`` on the mapping returned ``None``, which for a service is
     indistinguishable from a composition that legitimately has none.
     """
-    from agent.runtime.services import MissingServiceError
+    from agent.kernel.service import MissingServiceError
 
     ctx = _context(skill_catalog="SKILLS")
     with pytest.raises(MissingServiceError):
