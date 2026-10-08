@@ -2878,3 +2878,139 @@ def test_auto_approving_a_session_stops_the_questions(home):
         assert "requires_confirmation" not in content, content[:300]
     finally:
         provider.close()
+
+
+# ── 28. Approving from the conversation, for a sink that cannot ask ─────────
+
+
+def test_a_gateway_style_approval_is_redeemed_by_a_chat_command(home):
+    """The documented path for a sink with no dialog: a token, then ``/confirm``.
+
+    A transport that cannot show a prompt (Feishu, a scheduled run, a collecting sink) is
+    supposed to leave a *pending record* and report a token, and the human redeems it with
+    ``/confirm <token>``.  Shell's pending tokens are keyed by ``(session_id, channel,
+    user_id)`` minted at tool time, and the command derives the same key at command time --
+    one key, two derivations, which is the shape that produced the last defect found here.
+
+    Driven through a channel that holds the handler and collects sink events instead of
+    showing them, because that is what makes the sink non-interactive: the prompt path is
+    never available, so the fallback is the only way this turn can be approved.
+    """
+    import asyncio
+
+    import agent as agent_module
+    from agent.channels.base import ChannelRunner, IncomingMessage
+    from agent.channels.web import WebOutputSink
+
+    command = "dd if=/dev/zero of=/tmp/simple-confirm.bin bs=1 count=0"
+    provider = scripted(
+        {"tool": ("shell", {"command": command, "intent": "ask, with no dialog available"})},
+        {"text": "waiting for approval"},
+        {"tool": ("shell", {"command": command, "intent": "the approved retry"})},
+        {"text": "done after approval"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[list[dict]]:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            channel = _HandlerOnlyChannel()
+            runner = ChannelRunner([channel], components, cfg)
+            serving = asyncio.create_task(runner.run())
+            try:
+                for _ in range(200):
+                    if channel.handler is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert channel.handler is not None
+
+                async def turn(text: str, message_id: str) -> list[dict]:
+                    sink = WebOutputSink(collect=True)
+                    await channel.handler(
+                        IncomingMessage(
+                            text=text,
+                            session_id="session-confirm",
+                            channel_name="web",
+                            metadata={"message_id": message_id},
+                        ),
+                        sink,
+                    )
+                    return sink.events
+
+                first = await turn("run the command", "m1")
+                # The token the sink could not ask about travels back to the model in the
+                # tool's result; read it from the wire rather than from an internal store.
+                tool_results = [
+                    message
+                    for message in provider.requests[-1]["messages"]
+                    if message.get("role") == "tool"
+                ]
+                payload = json.loads(str(tool_results[-1]["content"]))
+                assert payload.get("requires_confirmation") is True, payload
+                token = str(payload.get("confirmation_token") or "")
+                assert token, payload
+
+                confirmed = await turn(f"/confirm {token}", "m2")
+                retried = await turn("try it again", "m3")
+                return [first, confirmed, retried]
+            finally:
+                await channel.stop()
+                await serving
+                await agent_module._close_components(components)
+
+        first, confirmed, retried = asyncio.run(run())
+
+        assert "requires_confirmation" in json.dumps(first), _shown_text(first)
+        shown = _shown_text(confirmed)
+        assert "Confirmation accepted" in shown, (
+            f"the token must redeem for this session: {shown!r} {confirmed}"
+        )
+        executed = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert executed, "the retry must have run the tool"
+        assert '"ok": true' in str(executed[-1].get("content", "")), (
+            "and the approved command must actually run this time: "
+            f"{str(executed[-1])[:300]}"
+        )
+    finally:
+        provider.close()
+
+
+def test_an_unattended_run_refuses_rather_than_leaving_a_token(home):
+    """Control for the third answer: a *policy* refusal is not "nobody could ask".
+
+    ``UnattendedOutputSink`` answers "may I?" with a recorded refusal on purpose -- its own
+    docstring says so, and the audit trail is the point: an unattended run must not leave a
+    token that somebody could redeem later for a command nobody watched.  So it returns
+    ``False``, not ``None``, and the shell path retires the token.
+
+    Pinned because the two are one line apart and look interchangeable: a sink that refuses
+    by policy and a sink that *cannot* ask both decline, and only one of them should be able
+    to have its command approved afterwards.
+    """
+    import asyncio
+
+    from agent.scheduler.unattended import UnattendedOutputSink
+
+    sink = UnattendedOutputSink()
+
+    approved = asyncio.run(
+        sink.on_tool_confirmation(
+            "shell",
+            command="dd if=/dev/zero of=/tmp/x bs=1 count=0",
+            risk_level="high",
+            reason="unattended",
+            confirmation_token="token-unattended",
+            scope=None,
+        )
+    )
+
+    assert approved is False, (
+        "an unattended run refuses by policy; None would leave its token redeemable"
+    )
+    assert sink.audit.decisions, (
+        "and the refusal has to be recorded, or nobody learns it was asked"
+    )

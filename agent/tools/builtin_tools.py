@@ -3043,9 +3043,17 @@ class BuiltinTools:
                 confirmation_token=safety.confirmation_token,
                 scope=authorization_scope,
             )
+            if approved is None:
+                # Nobody could be asked: the sink has no dialog (a gateway, a pipe, a
+                # scheduled run's sink, a browser that is not connected).  **This is not a
+                # refusal**, and retiring the token here is what made `/confirm <token>`
+                # answer "invalid, expired, or belongs to another user" for the one kind of
+                # sink that command exists for.  The pending record stays, and the caller
+                # keeps the structured confirmation-required result the human redeems later.
+                return False
             if not approved:
-                # Refusal is terminal: retire the token so no later approval
-                # reply can redeem the command the human just declined.
+                # Asked and declined: terminal, so retire the token -- no later approval
+                # reply may redeem the command the human just refused.
                 shell_pending_reject(
                     safety.confirmation_token,
                     scope=authorization_scope,

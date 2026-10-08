@@ -1495,6 +1495,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_the_model_command_switches_the_session_and_refuses_a_typo` | `/model`: the switch reaches the next request, a typo is refused, the choice survives |
 | `test_allowing_a_command_takes_effect_on_the_next_turn` | `/allow`: gated first, then pre-approved -- and it persists |
 | `test_auto_approving_a_session_stops_the_questions` | `/auto-approve session on`: two derivations of one session key agree |
+| `test_a_gateway_style_approval_is_redeemed_by_a_chat_command` | a sink that cannot ask: the token survives, `/confirm` redeems it, the retry runs |
+| `test_an_unattended_run_refuses_rather_than_leaving_a_token` | control: a *policy* refusal is not "nobody could ask" |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1739,6 +1741,52 @@ content, so a path that "attached" something but sent its name would fail.
 The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
+
+## `/confirm` could never work, because "nobody could ask" read as "no"
+
+The eighth defect, and the third of its shape: **two components disagreeing about an
+interface, each statement reasonable alone.**
+
+`on_tool_confirmation` returned ``bool``.  Its own docstring said the default ``False`` means
+"there is no interactive human at this sink; callers must then fall back to the structured
+confirmation-required result instead of assuming consent" -- and the shell caller read that
+``False`` as a human refusal and **retired the token**:
+
+    if not approved:
+        # Refusal is terminal: retire the token so no later approval reply can redeem it
+        shell_pending_reject(safety.confirmation_token, scope=authorization_scope)
+
+But the structured result the caller falls back on **is** that token (``requires_confirmation:
+true`` plus ``confirmation_token``), and the documented path for a sink with no dialog is
+``/confirm <token>`` in a later message.  Measured, end to end, through a collecting sink:
+
+```
+turn 1: the tool returns {"requires_confirmation": true, "confirmation_token": "<uuid>"}
+        ...and retires it in the same breath (mint scope == command scope, both correct)
+turn 2: /confirm <uuid>  ->  "Confirmation token is invalid, expired, or belongs to another
+                              user."
+```
+
+The scopes matched; the store was empty.  The reply was even accurate -- the token *was*
+invalid, because nothing had been asked and the answer had been recorded as a refusal.
+
+Fixed by giving the API the third answer it was describing: ``Optional[bool]``, where ``None``
+is **nobody could be asked** -- the base sink, a CLI sink with no terminal, a browser that is
+not connected.  The pending record survives, and the structured result stays redeemable.  A
+sink that *was* asked and declined still returns ``False`` (the web socket, which asks in the
+browser) and a **policy** refusal still returns ``False`` (``UnattendedOutputSink``, whose
+docstring says "answers 'may I?' with a recorded refusal" and whose audit trail is the point)
+-- the last one is pinned by its own control test, because the two are one line apart and look
+interchangeable.
+
+Interface change, and it is meant to be one: `CliOutputSink.on_tool_confirmation` now returns
+``None`` instead of ``False`` when it has no terminal, and the test that asserted ``is False``
+was asserting the defect.  Its name and docstring changed with it.
+
+**A test that would not have caught this, and says so itself.**  `tests/test_web_channel.py`
+has a handler that "Mirrors agent.tools.builtin_tools._try_interactive_confirmation: a refusal
+retires the token, an approval redeems it" -- it re-implements the caller instead of calling
+it, so it kept passing while the real caller was wrong for the sinks that need the fallback.
 
 ## The other half of that shape: two derivations of one key
 

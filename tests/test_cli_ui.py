@@ -185,7 +185,15 @@ def test_shell_confirmation_gate_declines_after_turn_cancelled(
     assert spawned == {}
 
 
-def test_cli_output_sink_declines_without_terminal():
+def test_cli_output_sink_cannot_ask_without_terminal():
+    """No terminal means *nobody could be asked*: ``None``, not a refusal.
+
+    The difference is load-bearing.  A refusal retires the shell confirmation token, and the
+    structured confirmation-required result the caller falls back on **is** that token --
+    saying "declined" here destroyed it, so the human reading the conversation could not
+    approve with ``/confirm <token>``, which is the documented path for a sink with no
+    dialog.  It also read as a decision the human never made.
+    """
     from agent.core.output import CliOutputSink
 
     console = Console(file=StringIO())
@@ -202,7 +210,8 @@ def test_cli_output_sink_declines_without_terminal():
         )
     )
 
-    assert approved is False
+    assert approved is None
+    assert approved is not True, "and it must never fabricate consent"
 
 
 def test_cli_history_path_is_under_agent_home(monkeypatch, tmp_path):

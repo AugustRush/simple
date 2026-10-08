@@ -419,15 +419,26 @@ class OutputSink(ABC):
         reason: str,
         confirmation_token: str,
         scope: Any,
-    ) -> bool:
+    ) -> Optional[bool]:
         """Ask the human whether a medium-risk tool action may proceed.
 
-        Returns True only after the human approved in their own medium.
-        The default returns False because there is no interactive human at
-        this sink; callers must then fall back to the structured
-        confirmation-required result instead of assuming consent.
+        Three answers, and the third is the one that has to exist:
+
+        * ``True`` -- the human approved, in their own medium;
+        * ``False`` -- the human was asked and declined, **or** a policy decided this sink
+          never approves (an unattended run, say).  Either way the answer is final and the
+          pending record may be retired;
+        * ``None`` -- **nobody could be asked.**  The pending record must be left alone, and
+          the caller keeps the structured confirmation-required result, because the whole
+          point of that result is the token in it: a human reading the conversation can
+          approve later with ``/confirm <token>``.
+
+        Returning ``False`` for the third case is what this signature exists to prevent.  It
+        reads as a refusal to every caller, so the token was retired before the human who
+        was about to type ``/confirm`` ever saw it -- and the reply they got said the token
+        was invalid, expired, or somebody else's.
         """
-        return False
+        return None
 
     @property
     def interactive_confirmation(self) -> bool:
@@ -810,17 +821,18 @@ class CliOutputSink(OutputSink):
         reason: str,
         confirmation_token: str,
         scope: Any,
-    ) -> bool:
+    ) -> Optional[bool]:
         """Ask the human at the terminal whether a medium-risk action may run.
 
-        Only an interactive terminal qualifies; every other sink declines,
-        leaving the structured confirmation-required result for the caller.
+        Only an interactive terminal qualifies; anything else returns ``None`` -- "nobody
+        could be asked" -- so the pending record survives and the structured
+        confirmation-required result stays redeemable with ``/confirm <token>``.
         The human's answer here is the only path into the allowlist — the
         model can never fabricate it (the token is validated separately by
         shell.py).
         """
         if not self._supports_consent_prompt():
-            return False
+            return None
         self._approval_active = True
         try:
             self._stop_activity()

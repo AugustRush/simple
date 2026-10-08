@@ -943,8 +943,13 @@ class WebOutputSink(OutputSink):
         reason: str,
         confirmation_token: str,
         scope: Any,
-    ) -> bool:
-        """Ask a connected web client for approval; deny when unavailable.
+    ) -> Optional[bool]:
+        """Ask a connected web client for approval; ``None`` when there is no client.
+
+        ``None`` rather than ``False`` on the no-socket path: a browser that is not connected
+        is a human who could not be asked, and the pending record has to survive so the
+        answer can arrive later -- as a ``/confirm <token>`` in the conversation, or on the
+        next socket.  A client that *was* asked and declined still gets ``False``.
 
         The prompt is advisory to the browser only: whatever the human picks
         still has to be redeemed against the pending record by the caller, so a
@@ -952,7 +957,7 @@ class WebOutputSink(OutputSink):
         server never minted.
         """
         if self._collect or self._websocket is None:
-            return False
+            return None
         allow_session = self._session_scope_supported(
             name, confirmation_token, scope
         )
