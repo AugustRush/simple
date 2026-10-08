@@ -948,3 +948,136 @@ def test_a_scheduled_run_executes_a_turn_and_records_the_answer(home):
         assert provider.requests, "the run must have reached the provider"
     finally:
         provider.close()
+
+
+# ── 9. A sub-agent, which is a derived container of its own ─────────────────
+
+
+def test_a_spawned_sub_agent_runs_with_its_own_restricted_tool_set(home):
+    """The parent's call spawns a real sub-agent, whose request offers fewer tools.
+
+    A sub-agent is built from a *derived* registry (``capability_profile``,
+    ``write_scope``, and the orchestration capability excluded so it cannot spawn
+    further).  Three model calls happen -- the parent asking for a spawn, the sub-agent
+    answering, the parent answering -- and the evidence that the derived registry was the
+    one used is in what the *middle* request offered: ``spawn_agent`` must not be there.
+
+    Asserted on the wire rather than on the objects, because that is where a sub-agent that
+    inherited the parent's registry would show up: a sub-agent that can spawn is a
+    recursion the exclusion exists to prevent.
+    """
+    provider = scripted(
+        {
+            "tool": (
+                "spawn_agent",
+                {"role": "researcher", "task": "answer the sub-question"},
+            )
+        },
+        {"text": "the sub answer"},
+        {"text": "the parent answer"},
+    )
+    write_config(home, provider)
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "delegate this"])
+
+        assert result.exit_code == 0, result.output
+        assert "the parent answer" in result.output, result.output
+        assert len(provider.requests) >= 3, (
+            "expected a spawn, a sub-agent call and a parent call: "
+            f"{[r.get('model') for r in provider.requests]}"
+        )
+
+        offered = [
+            sorted(
+                tool["function"]["name"] for tool in request.get("tools", [])
+            )
+            for request in provider.requests
+        ]
+        # The first request is the parent's (it has the spawner); the second is the
+        # sub-agent's; the third is the parent's again.
+        assert "spawn_agent" in offered[0], offered[0][:12]
+        assert "spawn_agent" not in offered[1], (
+            "a sub-agent must not be offered the spawner -- that is what makes the "
+            f"derived registry observable: {offered[1][:12]}"
+        )
+        assert len(offered[1]) < len(offered[0]), (
+            "and its tool set must be the restricted one, not the parent's"
+        )
+    finally:
+        provider.close()
+
+
+# ── 10. Loading and unloading a plugin in a *running* composition ────────────
+
+
+async def _turn_in_process(components: dict, text: str) -> str:
+    """One turn in this process, the way the CLI command runs one.
+
+    For tests that need the composition to stay alive between turns -- a plugin that is
+    unloaded between them, a config that changes -- which a fresh ``chat`` invocation
+    cannot express.
+    """
+    import agent as agent_module
+    from agent.core.agent import AgentContext
+    from agent.core.output import CliOutputSink
+    from agent.runtime import RuntimeSessionState, TurnInput
+    from agent.runtime.contracts import agent_core_for_components
+
+    sink = CliOutputSink(shared.CONSOLE)
+    sink.begin_turn()
+    state = RuntimeSessionState(ctx=AgentContext(system_prompt=components["system_prompt"]))
+    await agent_core_for_components(components).handle_turn(
+        TurnInput.from_text(text, channel_name="cli"), state, sink=sink
+    )
+    return sink.text if hasattr(sink, "text") else ""
+
+
+def test_unloading_a_plugin_takes_its_tool_with_it(home):
+    """Registrations are effects: a plugin that goes away leaves nothing behind.
+
+    Loaded and unloaded in a **running** composition, with a turn either side.  The
+    first turn's request offers the plugin's tool; after ``unload`` the second turn's
+    does not, and the composition still answers -- which is the whole promise of "the
+    plugin is the unit of removal", and something a fresh process per turn cannot show.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "with the plugin"}, {"text": "without the plugin"})
+    cfg = write_config(home, provider)
+    write_plugin(home, "v1")
+    plugin_dir = home / "plugins" / "recorder"
+    try:
+
+        async def run() -> tuple[list[dict], bool]:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            try:
+                catalog = components["plugin_catalog"]
+                assert "recorder" in catalog.get_loaded_names_for_directory(
+                    home / "plugins" / "recorder"
+                ) or "recorder" in catalog._plugins, "the user plugin must be loaded"
+                await _turn_in_process(components, "use the echo tool")
+                catalog.unload_plugin("recorder")
+                await _turn_in_process(components, "and now")
+                return provider.requests, catalog.failed_report()
+            finally:
+                await agent_module._close_components(components)
+
+        requests, failures = asyncio.run(run())
+
+        assert not failures, failures
+        first = [t["function"]["name"] for t in requests[0].get("tools", [])]
+        second = [t["function"]["name"] for t in requests[1].get("tools", [])]
+        assert "plugin_echo" in first, first
+        assert "plugin_echo" not in second, (
+            "the unloaded plugin's tool must be gone from the registry: "
+            f"{second[:12]}"
+        )
+        assert len(second) == len(first) - 1, (len(first), len(second))
+    finally:
+        provider.close()

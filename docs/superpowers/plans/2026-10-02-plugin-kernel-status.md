@@ -1470,6 +1470,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_session_turn_writes_into_the_sessions_own_output_dir` | the per-session runtime, asserted by where the file lands |
 | `test_a_turns_transcript_is_recorded_and_served_to_a_reconnecting_client` | the durable record a refreshed page reads |
 | `test_a_scheduled_run_executes_a_turn_and_records_the_answer` | the unattended path: runtime factory, a real turn, the recorded run |
+| `test_a_spawned_sub_agent_runs_with_its_own_restricted_tool_set` | a derived container: the sub-agent's request offers fewer tools, and no spawner |
+| `test_unloading_a_plugin_takes_its_tool_with_it` | load and unload inside a **running** composition, a turn either side |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1519,6 +1521,18 @@ vanishing on refresh), which is why it is worth a test rather than an assumption
 runtime factory from the config on disk, so a genuinely different entry point -- reaches the
 provider, and records its outcome.  A run has nobody watching it, so the store is the only
 place its result exists: the test asserts on ``TaskRun.summary``, not on a console.
+
+**A sub-agent.**  The parent asks to spawn one, the sub-agent answers, the parent answers --
+three model calls.  The evidence that the *derived* registry was used is in what the middle
+request offered: no ``spawn_agent``, and a shorter tool list.  A sub-agent that inherited the
+parent's registry would be able to spawn, which is the recursion the exclusion exists to
+prevent.
+
+**Unloading a plugin in a running composition.**  A turn, then ``unload_plugin``, then
+another turn: the plugin's tool is gone from what the model is offered, the count drops by
+exactly one, and the composition still answers.  A fresh process per turn -- which is what
+the CLI tests do -- cannot show this, and "the plugin is the unit of removal" is the promise
+it checks.
 
 Both are the shape the plan calls for: the plugin supplies the capability, and the
 assertion is made where the user would look.
