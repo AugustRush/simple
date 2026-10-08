@@ -1474,6 +1474,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_unloading_a_plugin_takes_its_tool_with_it` | load and unload inside a **running** composition, a turn either side |
 | `test_a_risky_tool_call_waits_for_the_browser_and_runs_when_approved` | the approval prompt, the reply over the same socket, the call executed |
 | `test_a_declined_approval_leaves_the_command_unrun` | the same path refusing |
+| `test_a_tool_from_an_mcp_server_can_be_called_by_the_agent` | an external server's tool: offered to the model, called, closed by teardown |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1583,6 +1584,30 @@ The fix keeps the view and makes it faithful where a tool implementation needs i
 and ``ScopedTools._context_override`` (the variable tools read, under the name they read it
 by).  Not a general passthrough: what a contributed tool may read through a view should be a
 short list somebody maintains.
+
+## Measured, reported, not changed: `chat` never offers MCP tools
+
+Found while writing the MCP path in the functional layer, and left alone on purpose,
+because the fix trades a behaviour the user chose.
+
+``simple chat "..."`` builds the composition, which starts the MCP connection as a
+**background task** (``bootstrap`` prints "MCP connecting in background"), then runs its one
+turn and closes the composition.  Measured with a scripted MCP client:
+
+    clients built:            1
+    connect_from_config ran:  yes -- the registry has mcp_echo
+    offered to the model:     no  -- mcp_echo is not in the request's tool list
+    client closed:            yes (the composition's teardown)
+
+So the registration races the turn's tool snapshot: the server is contacted, its tools land
+in the registry, and the request that was built before that goes out without them.  The
+interactive CLI and the gateway are unaffected in practice -- they keep the composition
+alive, so later turns have the tools.
+
+Two ways to fix it, and they are different products: make ``chat`` await the connection
+before its turn (a one-shot pays the connect latency and gets the tools), or skip the
+connection for a one-shot (no wasted subprocess, and the "connecting in background" line
+would be a lie to remove).  Not chosen here.
 
 ## Not built, and why
 

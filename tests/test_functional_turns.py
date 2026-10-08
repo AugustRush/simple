@@ -1256,3 +1256,109 @@ def test_a_declined_approval_leaves_the_command_unrun(home):
         assert "declin" in content.lower() or "confirm" in content.lower(), content[:300]
     finally:
         provider.close()
+
+
+# ── 12. A tool that comes from an external server ───────────────────────────
+
+
+class _ScriptedMCP:
+    """Stands in for an MCP server over stdio: same client interface, scripted tools.
+
+    The *client* is the boundary here -- everything on this side of it (the composition
+    adopting the client, the tools it registers, the agent calling one, the result
+    travelling back) is the production path, and that is what the test is about.
+    """
+
+    instances: list["_ScriptedMCP"] = []
+
+    def __init__(self, registry) -> None:
+        self.registry = registry
+        self.calls: list[dict] = []
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def connect_from_config(self, config, extra_env=None):
+        def echo(word: str = "") -> dict:
+            self.calls.append({"word": word})
+            return {"echoed": word}
+
+        self.registry.register(
+            "mcp_echo",
+            "Echo a word back, from a server that is not part of this process.",
+            {
+                "type": "object",
+                "properties": {"word": {"type": "string"}},
+                "required": [],
+            },
+            echo,
+            source="mcp:scripted",
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def status_summary(self) -> dict:
+        return {
+            "configured_servers": 1,
+            "connected_servers": 1,
+            "failed_servers": 0,
+            "registered_tools": 1,
+        }
+
+
+def test_a_tool_from_an_mcp_server_can_be_called_by_the_agent(home, monkeypatch):
+    """An external server's tool, offered to the model and executed for real.
+
+    The composition adopts the MCP client, the tools it registers join the same registry as
+    everything else, and a turn can call one.  Asserted on both ends: the tool is in what
+    the model was *offered*, and the server's own record shows it was asked.
+
+    The connection is awaited first, which is what the interactive paths effectively do --
+    the composition starts it in the background and goes on (see the note below the test).
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    _ScriptedMCP.instances.clear()
+    # Read off the package, which is where ``bootstrap`` resolves it from -- the
+    # documented substitution point for the client class.
+    monkeypatch.setattr(agent_module, "MCPClient", _ScriptedMCP)
+
+    provider = scripted(
+        {"tool": ("mcp_echo", {"word": "from-mcp"})},
+        {"text": "the server said so"},
+    )
+    cfg = write_config(
+        home,
+        provider,
+        mcp_servers=[{"name": "scripted", "command": "unused"}],
+    )
+    try:
+
+        async def run() -> None:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            try:
+                await components["mcp_task"]
+                await _turn_in_process(components, "use the external tool")
+                # Still connected while the composition runs: closing it is the
+                # composition's teardown, not something a turn does.
+                assert not _ScriptedMCP.instances[-1].closed
+            finally:
+                await agent_module._close_components(components)
+
+        asyncio.run(run())
+
+        offered = [
+            tool["function"]["name"] for tool in provider.requests[0].get("tools", [])
+        ]
+        assert "mcp_echo" in offered, offered
+
+        assert _ScriptedMCP.instances, "the composition must have built a client"
+        client = _ScriptedMCP.instances[-1]
+        assert client.calls == [{"word": "from-mcp"}], (
+            f"the server must have received the call with its arguments: {client.calls}"
+        )
+        assert client.closed, "and the composition's teardown closed it"
+    finally:
+        provider.close()
