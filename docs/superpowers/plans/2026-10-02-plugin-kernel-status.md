@@ -1969,29 +1969,30 @@ asked for *and* what is available, and must leave the session where it was -- be
 half-applied switch sends the next turn to an endpoint that answers with a 400 about its own
 model names rather than about the typo.
 
-## Candidate, not changed: the content-filter vocabulary
+## Resolved: the content-filter vocabulary now reads the provider's code
 
-Found while sweeping the classification lists after the account-vocabulary fix, and left
-alone -- the reasoning matters more than the change.
+First recorded here as a **candidate, not changed**, because widening a phrase list from my own
+recollection of provider APIs is guessing in the direction where a false positive is expensive
+(the recovery rolls the last round out of the conversation and re-asks).  Then it was measured,
+which settled it:
 
-`is_content_filter_block`'s docstring says "True when the provider rejected the request on
-content policy", and the implementation matches two phrasings: ``content exists risk`` and
-``content filter``.  What depends on it is the **only mechanism in the product that repairs a
-refusal** rather than reporting it: the round is rolled back, tool results are replaced with
-safe summaries, and the call is retried once.  A miss means the user is handed the provider's
-policy message for a request that could have succeeded.
+* `is_content_filter_block` matched two phrasings (``content exists risk``, ``content filter``);
+* the real rejection an OpenAI-compatible endpoint raises says *"Your request was rejected as a
+  result of our safety system."* with code ``content_policy_violation`` -- and ``str(exc)``
+  contains **neither** phrase, so the recovery, **the only mechanism in the product that
+  repairs a refusal rather than reporting it**, never ran for the case it exists for;
+* the client does carry the code: `exc.code` is lifted out of the ``{"error": {...}}`` envelope
+  (measured against `openai.BadRequestError` built the way the SDK builds one), and `exc.type`
+  is the generic ``invalid_request_error``.
 
-Two things are measurable and were measured: the rollback-and-re-ask path works end to end
-(driven in the functional layer with the phrasing it matches), and **nothing in this
-repository names a phrasing the predicate misses** -- no comment, no doc, no test.  Adding
-`content_policy_violation` or Anthropic's "output blocked by content filtering policy" would
-be from my own recollection of provider APIs, not from evidence in the tree.
+So the predicate now reads the provider's **codes** first -- ``content_policy_violation``,
+``content_filter`` -- and the prose second.  The asymmetry that argued against guessing phrases
+is exactly what makes codes safe: a code is the provider stating its reason, so a wrong entry
+in that set costs a *miss* (the same as today) and never a false positive.  ``invalid_request_error``
+is deliberately **not** in the set, and there are control tests for generic 400s, for a body
+that mentions filtering without being about policy, and for an unknown code.
 
-The asymmetry is what decides it: a **miss** costs a turn that could have been repaired,
-while a **false positive** costs a rolled-back conversation and a re-sent request -- the
-recovery runs on an error that was not about content at all.  A list broadened on recollection
-is the wrong direction to guess in.  Recorded here so the next reader knows it is a question,
-not an oversight.
+The prose list stays, unchanged, as the fallback for providers that only send text.
 
 ## Measured, reported, not changed: `chat` never offers MCP tools
 

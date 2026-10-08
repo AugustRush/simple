@@ -266,3 +266,81 @@ def test_the_word_insufficient_alone_is_not_an_account_problem() -> None:
     assert is_llm_retryable(Exception("insufficient permissions")) is False, (
         "and it is not retryable either -- it is simply not an account problem"
     )
+
+
+def _openai_status_error(body: dict):
+    """A real SDK error object, built the way the SDK builds one.
+
+    Constructed rather than hand-rolled: the predicate's job is to read what the *client*
+    carries, so a ``SimpleNamespace(code=...)`` would test the test instead of the integration.
+    """
+    import httpx
+    import openai
+
+    return openai.BadRequestError(
+        f"Error code: 400 - {body}",
+        response=httpx.Response(
+            400, request=httpx.Request("POST", "http://127.0.0.1/v1/chat/completions")
+        ),
+        body=body,
+    )
+
+
+def test_a_policy_rejection_is_recognised_by_the_providers_own_code() -> None:
+    """The measured case the phrase list missed.
+
+    The message an OpenAI-compatible endpoint sends for a safety rejection --
+    "Your request was rejected as a result of our safety system." -- contains neither
+    "content exists risk" nor "content filter", so ``str(exc)`` alone never matched it and the
+    recovery path never ran for the rejection it was written for.  The provider's own code does
+    match, and it is the one signal that survives a rewording.
+    """
+    from agent.core.llm_errors import is_content_filter_block
+
+    body = {
+        "message": "Your request was rejected as a result of our safety system.",
+        "type": "invalid_request_error",
+        "code": "content_policy_violation",
+    }
+    error = _openai_status_error(body)
+
+    assert "content filter" not in str(error).lower(), (
+        "the point of the test is that the prose carries no match"
+    )
+    assert getattr(error, "code", None) == "content_policy_violation"
+    assert is_content_filter_block(error) is True
+
+
+def test_an_unparsed_envelope_is_read_one_level_deep() -> None:
+    """An SDK that hands the envelope through: ``{"error": {"code": ...}}``."""
+    from agent.core.llm_errors import _provider_reason_codes
+
+    class _Unparsed(Exception):
+        body = {"error": {"type": "invalid_request_error", "code": "content_filter"}}
+
+    assert "content_filter" in _provider_reason_codes(_Unparsed("boom"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The generic 400 type must never be a policy signal, however often it appears.
+        {"message": "max_tokens is too large", "type": "invalid_request_error"},
+        # Prose that mentions filtering without being about content policy.
+        {"message": "response filtering is not supported by this model",
+         "code": "unsupported_parameter"},
+        # A code the predicate does not know, on a body it can read.
+        {"message": "model not found", "type": "invalid_request_error",
+         "code": "model_not_found"},
+    ],
+)
+def test_a_provider_error_that_is_not_a_policy_block_stays_unmatched(body: dict) -> None:
+    """Control: reading codes must not become "any 400 is a policy block".
+
+    A false positive here is expensive in the other direction: the recovery rolls the last
+    round out of the conversation and re-asks, so it would repair a request that was never
+    rejected on policy grounds.
+    """
+    from agent.core.llm_errors import is_content_filter_block
+
+    assert is_content_filter_block(_openai_status_error(body)) is False

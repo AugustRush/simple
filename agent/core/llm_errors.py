@@ -28,7 +28,7 @@ asks anything else, and that ordering is the whole point of the function.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from agent import shared
 
@@ -111,10 +111,66 @@ def is_llm_retryable(exc: BaseException) -> bool:
     return any(token in error_msg for token in _RETRYABLE_TOKENS)
 
 
+#: Machine-readable reason codes for a policy rejection.  A *code* is the provider stating its
+#: reason, so matching one cannot be the false positive a phrase can be -- the failure mode of a
+#: wrong entry here is "no match", exactly like today.
+#:
+#: This exists because the prose list below **misses the real thing**.  Measured against the
+#: error an OpenAI-compatible endpoint actually raises for a safety rejection::
+#:
+#:     message: "Your request was rejected as a result of our safety system."
+#:     code   : "content_policy_violation"
+#:     type   : "invalid_request_error"
+#:
+#: ``str(exc)`` contains neither phrase, so the recovery -- the only mechanism in the product
+#: that *repairs* a refusal instead of reporting it -- never ran for the case it exists for.
+#: ``invalid_request_error`` is deliberately not treated as a signal: it is the generic 400 type.
+_POLICY_REASON_CODES = frozenset({"content_policy_violation", "content_filter"})
+
+#: Fallback for providers that only say it in prose.
+_POLICY_REASON_PHRASES = ("content exists risk", "content filter")
+
+
+def _provider_reason_codes(exc: BaseException) -> list[str]:
+    """The provider's own reason codes, wherever this SDK left them.
+
+    ``exc.code``/``exc.type`` cover the OpenAI-compatible clients, which lift the inner code out
+    of the envelope (measured).  The body is walked too, for an SDK that hands the envelope
+    through unparsed -- one nesting level, because ``{"error": {...}}`` is the documented shape.
+    Absent values contribute nothing: nothing here guesses.
+    """
+    found: list[str] = []
+
+    def collect(mapping: Mapping[str, Any]) -> None:
+        for key in ("code", "type"):
+            value = mapping.get(key)
+            if isinstance(value, str) and value.strip():
+                found.append(value.strip().casefold())
+
+    for source in (exc, getattr(exc, "body", None)):
+        if isinstance(source, Mapping):
+            collect(source)
+            nested = source.get("error")
+            if isinstance(nested, Mapping):
+                collect(nested)
+        else:
+            for key in ("code", "type"):
+                value = getattr(source, key, None)
+                if isinstance(value, str) and value.strip():
+                    found.append(value.strip().casefold())
+    return found
+
+
 def is_content_filter_block(exc: BaseException) -> bool:
-    """True when the provider rejected the request on content policy."""
+    """True when the provider rejected the request on content policy.
+
+    The provider's own code is checked first, then the prose: a code survives a provider
+    rewording its message, which is the case that made this necessary.
+    """
+    if _POLICY_REASON_CODES.intersection(_provider_reason_codes(exc)):
+        return True
     error_msg = str(exc).lower()
-    return "content exists risk" in error_msg or "content filter" in error_msg
+    return any(phrase in error_msg for phrase in _POLICY_REASON_PHRASES)
 
 
 def merge_continuation_text(prefix: str, continuation: str) -> str:
