@@ -2393,3 +2393,48 @@ def test_a_tool_call_announced_and_never_sent_does_not_wedge_the_turn(home):
         )
     finally:
         provider.close()
+
+
+# ── 23. The one path that repairs a conversation instead of reporting it ────
+
+
+def test_a_content_filter_rejection_is_recovered_without_the_user_seeing_it(home):
+    """A provider's policy rejection rolls the turn back and re-asks, once.
+
+    This is the only mechanism in the product that *repairs* a refusal rather than
+    reporting it: the offending round is rolled back, the tool results are replaced with
+    safe summaries, and the call is retried.  A slip here shows up as the user being handed
+    the provider's policy message for a request that could have succeeded.
+
+    Driven with the phrasing the predicate matches, because that is the path as written;
+    the phrasings it does *not* match are recorded in the status document as a candidate
+    rather than guessed at here.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "status": 400,
+            "body": {
+                "error": {
+                    "message": "Content Exists Risk",
+                    "type": "invalid_request_error",
+                    "code": "content_filter",
+                }
+            },
+        },
+        {"text": "recovered answer"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+        events = asyncio.run(_ask_once(home, cfg, "web-filtered"))
+        assert _answer(events) == "recovered answer", events
+        assert not [e for e in events if e["type"] == "error"], events
+        assert len(provider.requests) >= 2, (
+            "the recovery is a re-ask, so the provider sees the request again: "
+            f"{len(provider.requests)}"
+        )
+    finally:
+        provider.close()

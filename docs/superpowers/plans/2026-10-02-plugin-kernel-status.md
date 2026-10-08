@@ -1489,6 +1489,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_stream_that_never_terminates_still_delivers_its_answer` | no `[DONE]`: the answer still arrives |
 | `test_a_stream_with_no_usage_report_still_delivers_its_answer` | no usage chunk: the accounting is lost, not the answer |
 | `test_a_tool_call_announced_and_never_sent_does_not_wedge_the_turn` | `tool_calls` finish with none sent: the turn ends and says so |
+| `test_a_content_filter_rejection_is_recovered_without_the_user_seeing_it` | the rollback-and-re-ask path, driven end to end |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1719,6 +1720,30 @@ belongs to a *composition* was left pointing at a process-wide default.  Two wer
 were a plugin-scoped view standing in for a service.  That is the shape to sweep for, and a
 functional test finds it faster than reading does: it is invisible in any single object and
 obvious in a running product.
+
+## Candidate, not changed: the content-filter vocabulary
+
+Found while sweeping the classification lists after the account-vocabulary fix, and left
+alone -- the reasoning matters more than the change.
+
+`is_content_filter_block`'s docstring says "True when the provider rejected the request on
+content policy", and the implementation matches two phrasings: ``content exists risk`` and
+``content filter``.  What depends on it is the **only mechanism in the product that repairs a
+refusal** rather than reporting it: the round is rolled back, tool results are replaced with
+safe summaries, and the call is retried once.  A miss means the user is handed the provider's
+policy message for a request that could have succeeded.
+
+Two things are measurable and were measured: the rollback-and-re-ask path works end to end
+(driven in the functional layer with the phrasing it matches), and **nothing in this
+repository names a phrasing the predicate misses** -- no comment, no doc, no test.  Adding
+`content_policy_violation` or Anthropic's "output blocked by content filtering policy" would
+be from my own recollection of provider APIs, not from evidence in the tree.
+
+The asymmetry is what decides it: a **miss** costs a turn that could have been repaired,
+while a **false positive** costs a rolled-back conversation and a re-sent request -- the
+recovery runs on an error that was not about content at all.  A list broadened on recollection
+is the wrong direction to guess in.  Recorded here so the next reader knows it is a question,
+not an oversight.
 
 ## Measured, reported, not changed: `chat` never offers MCP tools
 
