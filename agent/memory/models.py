@@ -233,3 +233,9 @@ class ConsolidationResult:
     success: bool
     compressed_messages: list[dict]
     stored_entries: int = 0
+    #: Why it failed, when it did.  The reader of this result reports the failure, and a
+    #: failure it cannot describe is one it can only re-raise as itself -- which is how
+    #: ``context`` came to read an attribute that did not exist and turn every real
+    #: consolidation failure into ``AttributeError: 'ConsolidationResult' object has no
+    #: attribute 'error'``.
+    error: str = ""

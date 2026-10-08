@@ -166,11 +166,23 @@ class ContextManager:
 
     @staticmethod
     def _coerce_consolidation_result(result: Any) -> ConsolidationResult:
+        """A consolidator's return value as a result, with a reason when there is one.
+
+        The last branch is a consolidator that answered with something that is not a
+        result at all (a bare ``None``, a flag).  Falsy is a failure, and it is one this
+        code *can* describe -- so it does, instead of leaving the reporter to say only
+        "extraction returned failure" about a return value it never saw.
+        """
         if isinstance(result, ConsolidationResult):
             return result
         if isinstance(result, list):
             return ConsolidationResult(success=True, compressed_messages=result)
-        return ConsolidationResult(success=bool(result), compressed_messages=[])
+        success = bool(result)
+        return ConsolidationResult(
+            success=success,
+            compressed_messages=[],
+            error="" if success else f"consolidator returned {type(result).__name__}",
+        )
 
     def spawn_session(
         self,

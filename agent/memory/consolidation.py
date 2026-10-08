@@ -503,6 +503,10 @@ class ConsolidationEngine:
                     + conversation_chunks[-tail_count:]
                 )
 
+        #: Why this run failed, when it did.  Filled by the handler below and carried out
+        #: in the result, because the caller reports the failure and cannot describe one
+        #: it was not told about -- see ``ConsolidationResult.error``.
+        failure_reason = ""
         try:
             raw_responses: list[str] = []
             for idx, chunk_text in enumerate(conversation_chunks, start=1):
@@ -578,6 +582,7 @@ class ConsolidationEngine:
         except Exception as e:
             shared.CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
             success = False
+            failure_reason = f"{type(e).__name__}: {e}"
 
         compressed = messages[-keep_last:] if len(messages) > keep_last else messages
         if messages:
@@ -591,6 +596,7 @@ class ConsolidationEngine:
             success=success,
             compressed_messages=compressed,
             stored_entries=len(entries) if success else 0,
+            error=failure_reason,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────

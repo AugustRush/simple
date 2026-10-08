@@ -1147,6 +1147,68 @@ def test_compact_messages_raises_when_newest_request_cannot_fit(tmp_path):
         )
 
 
+class _FailingExtractionClient:
+    """A provider client whose extraction call fails, the way a quota does."""
+
+    class chat:
+        class completions:
+            @staticmethod
+            async def create(**kwargs):
+                raise RuntimeError("402 Payment Required: insufficient account funds")
+
+
+def test_a_failed_extraction_reports_its_reason_instead_of_its_own_crash(tmp_path):
+    """The failure branch of the sleep cycle used to raise instead of reporting.
+
+    Found in a gateway log, not in a test: the extraction call returned 402, the engine
+    caught it and returned ``success=False``, and the caller's
+
+        error=consolidated.error
+
+    read a field ``ConsolidationResult`` never had.  So the emit that exists to say *why*
+    consolidation failed reported ``'ConsolidationResult' object has no attribute 'error'``
+    -- an error path that cannot describe its error, which is worse than no error path,
+    because it looks like one.  The event is where the log line comes from, so it is what
+    this asserts.
+    """
+    import asyncio
+
+    from agent import ModelEndpoint
+    from agent.core.output import EventCollector, _active_event_collector
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    # Armed the way the gateway arms it: a turn arrived, so a job is queued and the
+    # job below is the one the background worker would pick up.
+    ctx_mgr.mark_activity()
+    ctx_mgr.staging.append("user", "a turn that needs consolidating")
+
+    collector = EventCollector()
+    token = _active_event_collector.set(collector)
+    try:
+        processed = asyncio.run(
+            ctx_mgr.process_one_job(
+                ModelEndpoint(client=_FailingExtractionClient(), api_format="openai"),
+                "fake-model",
+            )
+        )
+    finally:
+        _active_event_collector.reset(token)
+
+    assert processed is False, "the job failed, and says so rather than raising"
+
+    failures = [
+        event.fields
+        for event in collector.drain()
+        if event.name == "consolidation_failed"
+    ]
+    assert len(failures) == 1, failures
+    fields = failures[0]
+    assert fields["reason"] == "extraction_returned_failure", (
+        f"the reason is the extraction, not the reporting path: {fields}"
+    )
+    assert "402" in str(fields.get("error", "")), fields
+
+
 def test_compact_messages_drops_complete_openai_tool_turn(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     messages = [
