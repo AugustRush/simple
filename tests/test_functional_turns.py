@@ -2806,3 +2806,75 @@ def test_allowing_a_command_takes_effect_on_the_next_turn(home):
         )
     finally:
         provider.close()
+
+
+# ── 27. Auto-approving a session ────────────────────────────────────────────
+
+
+def test_auto_approving_a_session_stops_the_questions(home):
+    """``/auto-approve session on`` is keyed by session, and the tool has to find that key.
+
+    The command stores a permission level under ``(session_id, channel, user_id)``; the shell
+    classifier looks it up under a scope derived *later*, from the active agent's metadata.
+    Two derivations of one key -- and if they disagree the user's "always allow this session"
+    silently does nothing, which is the shape of the last defect found here.
+
+    The command chosen is gated at the default level and *allowed* at the elevated one, and it
+    writes zero bytes, so approving it runs nothing worth running.  The first turn is the
+    control: the same command must ask before the setting exists.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    command = "dd if=/dev/zero of=/tmp/simple-autoapprove.bin bs=1 count=0"
+    provider = scripted(
+        {"tool": ("shell", {"command": command, "intent": "prove the gate is closed first"})},
+        {"text": "first turn done"},
+        {"tool": ("shell", {"command": command, "intent": "prove the gate opened"})},
+        {"text": "second turn done"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run():
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-autoapprove/stream"
+                ) as socket:
+                    before = await _ask_with_approval(socket, "run it", "m1", "deny")
+                    enabled = await _ask(socket, "/auto-approve session on", "m2")
+                    after = await _ask_with_approval(socket, "run it again", "m3", "deny")
+                return before, enabled, after
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        (_first_events, first_prompts), enabled, (second_events, second_prompts) = (
+            asyncio.run(run())
+        )
+
+        assert first_prompts, (
+            "control: this command must be gated before the setting exists, or the "
+            f"second half proves nothing: {_shown_text(_first_events)}"
+        )
+        assert "自动放行" in _shown_text(enabled), enabled
+        assert second_prompts == [], (
+            "a session that auto-approves must not be asked again: "
+            f"{_shown_text(second_events)}"
+        )
+        tool_result = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_result, [m.get("role") for m in provider.requests[-1]["messages"]]
+        content = str(tool_result[-1].get("content", ""))
+        assert "requires_confirmation" not in content, content[:300]
+    finally:
+        provider.close()

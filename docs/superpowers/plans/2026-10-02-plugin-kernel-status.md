@@ -1494,6 +1494,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_an_image_sent_to_a_provider_without_vision_is_described_instead` | control: no vision, no block -- but the file is described, not dropped |
 | `test_the_model_command_switches_the_session_and_refuses_a_typo` | `/model`: the switch reaches the next request, a typo is refused, the choice survives |
 | `test_allowing_a_command_takes_effect_on_the_next_turn` | `/allow`: gated first, then pre-approved -- and it persists |
+| `test_auto_approving_a_session_stops_the_questions` | `/auto-approve session on`: two derivations of one session key agree |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1738,6 +1739,17 @@ content, so a path that "attached" something but sent its name would fail.
 The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
+
+## The other half of that shape: two derivations of one key
+
+`/auto-approve session on` stores a permission level under ``(session_id, channel,
+user_id)``, and the classifier looks it up under a scope derived **later**, from the active
+agent's metadata.  Two derivations of one key -- if they disagree, "always allow this session"
+silently does nothing, which is exactly the shape of the `/model` defect.
+
+Measured: they agree, and the test is built as the transition (gated before the setting, not
+asked after it) with a command that is gated at the default level, allowed at the elevated one,
+and writes zero bytes -- so approving it runs nothing worth running.
 
 ## One command test that guards a *fix* rather than a feature
 
