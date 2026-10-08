@@ -1540,3 +1540,58 @@ def test_an_interjection_reaches_the_record_and_the_memory_pipeline(tmp_path):
     assert [item["role"] for item in display] == ["user", "user", "assistant"]
     assert display[1]["interjection"] is True
     assert "interjection" not in display[0]
+
+
+def test_a_stock_loop_service_is_rebound_to_the_container_that_asks():
+    """A derived container must not inherit the composition's *binding*.
+
+    ``agent_loop`` is provided once, over the composition's container.  A web session
+    builds a container of its own -- its own agent, registry, workspace and output paths --
+    by copying the composition's mapping, so it *contains* that service.  Resolving it and
+    using it verbatim makes the session's turns resolve the **composition's** ``agent``,
+    which is how a provider switch stopped reaching an existing browser session: the page
+    said "switched", the session runtime was rebuilt correctly, and the next message still
+    went to the old endpoint.
+
+    The rule is the one the code had before the loop became a plugin: a stock
+    ``TurnRunner`` is re-bound to the container that asks it, and only a loop that is not
+    a stock one is used as it is.
+    """
+    from agent.kernel.service import require_service
+
+    composition_agent = object()
+    session_agent = object()
+    composition: dict = {"agent": composition_agent}
+    composition["agent_loop"] = TurnRunner.bind(composition)
+
+    session = dict(composition)
+    session["agent"] = session_agent
+
+    runner = AgentCore(session)._turn_runner()
+
+    assert runner is not composition["agent_loop"], (
+        "the session must not run its turns through the composition's binding"
+    )
+    assert require_service(runner._components, "agent") is session_agent
+
+
+def test_a_loop_that_is_not_a_stock_runner_is_used_as_it_is():
+    """Control: the substitution point stays a substitution point.
+
+    A composition that provides its *own* loop -- anything that is not a stock
+    ``TurnRunner`` -- is not second-guessed.  Re-binding it would replace the thing a
+    composition deliberately chose, and every test in this file that supplies a loop
+    double would silently stop testing what it says it tests.
+    """
+
+    class _CustomLoop:
+        async def run(self, turn_input, ctx, stream_callback=None):
+            return TurnResult(text="custom")
+
+        async def complete_turn(self, turn_input, state, result):
+            return []
+
+    provided = _CustomLoop()
+    runner = AgentCore({"agent_loop": provided, "agent": object()})._turn_runner()
+
+    assert runner is provided

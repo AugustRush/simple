@@ -560,21 +560,29 @@ class AgentCore:
 
 
     def _turn_runner(self) -> Any:
-        """The mounted agent loop, or the stock one bound to this composition.
+        """The composition's own loop, or a stock one bound to **this** container.
 
-        The service wins when a composition mounted a loop: that is what makes the
-        loop replaceable by providing ``agent_loop``.  A composition that mounted
-        none still runs turns, through the stock loop bound to the same container --
-        the same shape as ``post_turn_maintenance`` falling back to the default, and
-        the reason a hand-assembled runtime does not have to know that the loop is
-        now a plugin.
+        A composition's own loop wins when the composition supplied one: providing
+        ``agent_loop`` is what makes the loop replaceable, and a loop a composition chose
+        is not second-guessed.
 
-        What it must not do is invent a *different* container: the fallback is bound
-        to these components, so the loop it produces sees exactly the services the
-        composition supplied.
+        A **stock** ``TurnRunner`` does not win, and that distinction is not cosmetic.  A
+        loop carries the container it was bound to, and ``agent_loop`` is provided once,
+        over the composition's container.  A *derived* container -- a web session, which
+        has its own agent, registry, workspace and output paths -- copies the composition's
+        mapping, so it contains that service and would run its turns through the
+        composition's ``agent``.  Measured: switching provider in the settings page rebuilt
+        the session runtime correctly (new client, new endpoint) and the next message still
+        went to the old provider, because the turn ran through the composition's loop.
+
+        So: rebind when it is stock, use it verbatim when it is not.  This is the rule the
+        pre-plugin code had (it tested ``isinstance(turn_runner, TurnRunner)`` too), and it
+        survives the loop becoming a plugin -- "the loop is replaceable" and "one loop
+        instance serves every container" are different statements, and only the first is
+        wanted.
         """
         loop = resolve(self._components, "agent_loop")
-        if loop is not None:
+        if loop is not None and not isinstance(loop, TurnRunner):
             return loop
         return TurnRunner.bind(self._components)
 
