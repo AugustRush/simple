@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -168,6 +169,9 @@ class _ScriptedProvider:
                 self.wfile.write(payload)
 
             def _stream(self, reply: dict) -> None:
+                # A reply may be told to take its time, which is how a test gets a turn
+                # that is still running when the next message arrives.
+                time.sleep(float(reply.get("delay", 0)))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -1565,5 +1569,82 @@ def test_a_sessions_end_reaches_the_plugins_watching_for_it(home):
             f"the transcript the plugin is handed must contain the turn: {ending}"
         )
         assert ending["session_id"] == "session-end-one", ending
+    finally:
+        provider.close()
+
+
+# ── 15. A second message while the first turn is still running ──────────────
+
+
+def test_a_second_message_sent_mid_turn_still_gets_its_own_answer(home):
+    """Typing again before the first answer arrives must not lose either one.
+
+    The coordinator owns per-session serialisation: the second message is queued against the
+    running turn, gets its own sink and its own completion, and is answered in order.  The
+    failure this guards against is the quiet one -- a message accepted into a queue and never
+    run, which from the browser looks exactly like "nothing happened".
+
+    The first reply is told to take its time, so the second message really does arrive during
+    it.  The *assertion* does not depend on that timing: whatever the interleaving, both
+    messages must be answered, in order.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {"text": "first answer", "delay": 0.4},
+        {"text": "second answer"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[dict]:
+            import json as _json
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-queue/stream"
+                ) as socket:
+                    await socket.send(
+                        _json.dumps(
+                            {"type": "message", "text": "first", "message_id": "m1"}
+                        )
+                    )
+                    await socket.send(
+                        _json.dumps(
+                            {"type": "message", "text": "second", "message_id": "m2"}
+                        )
+                    )
+                    events: list[dict] = []
+                    completions = 0
+                    while completions < 2:
+                        event = _json.loads(
+                            await asyncio.wait_for(socket.recv(), timeout=30)
+                        )
+                        events.append(event)
+                        if event.get("type") == "turn_complete":
+                            completions += 1
+                    return events
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        answers = [
+            str(event.get("text", ""))
+            for event in events
+            if event.get("type") == "turn_complete"
+        ]
+        assert answers == ["first answer", "second answer"], (
+            f"both messages must be answered, in order: {answers}"
+        )
+        assert len(provider.requests) == 2, len(provider.requests)
+        assert not [e for e in events if e["type"] == "error"], events
     finally:
         provider.close()

@@ -1477,6 +1477,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_tool_from_an_mcp_server_can_be_called_by_the_agent` | an external server's tool: offered to the model, called, closed by teardown |
 | `test_the_ralph_task_loop_runs_through_the_command_router` | `/ralph … --max 2`: the seven-dependency plugin, its store, a turn per iteration |
 | `test_a_sessions_end_reaches_the_plugins_watching_for_it` | the runner's teardown: `SessionFinished` and the turn before it, both heard |
+| `test_a_second_message_sent_mid_turn_still_gets_its_own_answer` | the queue: a message during a running turn, both answered in order |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1532,6 +1533,12 @@ three model calls.  The evidence that the *derived* registry was used is in what
 request offered: no ``spawn_agent``, and a shorter tool list.  A sub-agent that inherited the
 parent's registry would be able to spawn, which is the recursion the exclusion exists to
 prevent.
+
+**A message during a running turn.**  The coordinator queues it against the running turn and
+gives it its own sink; the assertion is the outcome -- both answered, in order, exactly two
+provider requests -- rather than the interleaving, so it does not go flaky on a slow machine.
+The quiet failure it guards against is a message accepted into a queue and never run, which
+from the browser is indistinguishable from "nothing happened".
 
 **The task loop.**  `/ralph make the test pass --max 2` over a session's socket: the plugin
 with the longest dependency list activates, the loop drives a turn per iteration, and the task
