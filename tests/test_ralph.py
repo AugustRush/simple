@@ -446,25 +446,45 @@ def test_verifier_caller_cancellation_propagates_after_cleanup(tmp_path):
         workspace_root=workspace,
         output_dir=tmp_path / "output",
         timeout_seconds=5,
-        termination_grace_seconds=0.05,
+        # The claim is "the group is asked to stop before it is killed".  How long the machine
+        # takes to schedule the child's SIGTERM handler and write its file is not part of it,
+        # so the budget is generous: 50 ms was a race against process scheduling, and losing it
+        # looks exactly like the product escalating without asking.
+        termination_grace_seconds=0.5,
     )
 
     async def scenario():
         pending = asyncio.create_task(verifier.verify("./sleeper"))
-        for _ in range(200):
+        # Separate budget for *starting* a process, which is machine speed, from the cleanup
+        # claim below, which is not.  A slow start used to count against the same two seconds.
+        for _ in range(600):
             if (workspace / "ready").exists():
                 break
             await asyncio.sleep(0.01)
-        assert (workspace / "ready").exists()
+        assert (workspace / "ready").exists(), (
+            "the helper process never started (6s); if it ever does, this test says "
+            "nothing"
+        )
+        started = time.monotonic()
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending
+        return time.monotonic() - started
 
-    started = time.monotonic()
-    asyncio.run(scenario())
+    cleanup_seconds = asyncio.run(scenario())
 
-    assert (workspace / "term-seen").read_text() == "yes"
-    assert time.monotonic() - started < 2
+    term_seen = workspace / "term-seen"
+    assert term_seen.exists(), (
+        "the group must be asked to stop before it is killed: the helper writes "
+        "'term-seen' from its SIGTERM handler, and nothing appeared within the "
+        f"{verifier.termination_grace_seconds:g}s grace"
+    )
+    assert term_seen.read_text() == "yes", (
+        f"the handler's file was written but not completed: {term_seen.read_text()!r}"
+    )
+    assert cleanup_seconds < 2, (
+        f"cancelling must not hang: cleanup took {cleanup_seconds:.2f}s"
+    )
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX process groups")
@@ -507,11 +527,13 @@ def test_verifier_escalates_for_live_process_group_after_leader_exits(
     repeated_cancellations: list[bool] = []
 
     async def wait_for_file(path):
-        for _ in range(200):
+        for _ in range(600):
             if path.exists():
                 return
             await asyncio.sleep(0.01)
-        raise AssertionError(f"process did not create {path.name}")
+        raise AssertionError(
+            f"process did not create {path.name} within 6s (a startup budget, not a claim)"
+        )
 
     async def scenario():
         pending = asyncio.create_task(
@@ -526,11 +548,13 @@ def test_verifier_escalates_for_live_process_group_after_leader_exits(
             token.cancel("graceful")
         elif trigger == "caller":
             pending.cancel()
-
-            def cancel_again():
-                repeated_cancellations.append(pending.cancel())
-
-            asyncio.get_running_loop().call_later(0.03, cancel_again)
+            # A second cancel *here*, not 30 ms later on a timer.  What gets recorded is
+            # asyncio's answer -- "was the task still running?" -- and the timer version raced
+            # the cleanup: the grace is 150 ms, so a congested loop delivering the callback
+            # after the task had finished turned True into False with nothing about the
+            # product changed.  Nothing is awaited between the two calls, so the task provably
+            # cannot be finished: True is now True for a reason.
+            repeated_cancellations.append(pending.cancel())
             with pytest.raises(asyncio.CancelledError):
                 await pending
             return None

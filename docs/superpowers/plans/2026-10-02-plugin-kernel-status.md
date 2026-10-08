@@ -1745,6 +1745,46 @@ The control is the half that is easy to lose: with ``supports_vision: false`` th
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
 
+## The intermittent Ralph failures: not reproduced, and made unable to lie
+
+Recorded earlier as "two different failures under full-suite load":
+
+```
+test_verifier_escalates_for_live_process_group_after_leader_exits[caller]
+test_verifier_caller_cancellation_propagates_after_cleanup
+```
+
+**I could not reproduce either one.**  What was tried: 60 isolated runs of the ``[caller]``
+case; 24 runs under CPU load (load average 7-15 on 12 cores); 6 runs of the whole file; three
+full-suite runs, two of them *concurrent with each other* under load.  All green.  So this
+section is a repair of the timing assumptions, not a diagnosis, and it says so.
+
+What the two tests assert includes two things that are **not claims about the product**:
+
+* ``test_verifier_caller_cancellation_propagates_after_cleanup`` gave the child a
+  ``termination_grace_seconds=0.05`` budget to be scheduled, run a Python SIGTERM handler and
+  write a file -- and its "cleanup must not hang" bound was measured from *before* the helper
+  process started, so a slow `python3` start counted against it.  Measured margin in isolation:
+  the handler writes at ~30 ms against a 50 ms grace.  Losing that race reports itself as "the
+  verifier killed without asking", which is a product claim the failure never proved.
+* ``[caller]`` asserted ``repeated_cancellations == [True]`` from a ``call_later(0.03)``
+  callback: ``Task.cancel()`` returns True only while the task is unfinished, and the cleanup
+  lasts the 150 ms grace.  Measured margin: **120 ms**.  A congested event loop delivering the
+  callback late flips it to False with nothing about the product changed.
+
+Both are repaired by keeping the claim and dropping the machine-speed dependency: the grace is
+0.5 s (the claim is "asked before killed", not "answered within 50 ms"); the cleanup bound is
+measured from the cancel; process startup gets its own 6 s budget and its own message; and the
+second cancel happens in the same synchronous block as the first, where the task provably
+cannot be finished.  Failure messages now carry the observed facts -- the grace, the file's
+contents, the elapsed time, the surviving pid -- so the next occurrence says *which* thing
+happened instead of which assertion tripped.
+
+Both repairs were verified by breaking the product underneath them: forcing SIGKILL first makes
+the first fail with "the group must be asked to stop before it is killed ... nothing appeared
+within the 0.5s grace", and pretending the process group is gone makes the second fail with
+"process <pid> is still alive after 2s".
+
 ## The fix had a second consumer, and the test shows it
 
 The chat-channel approval -- a short reply ("批准", "yes") redeeming the single pending record
