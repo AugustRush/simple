@@ -928,6 +928,34 @@ and inside their own file, both pass on a re-run of the full suite, and both exe
 process-group signals and cancellation.  Not diagnosed, and not dismissed: a baseline
 compared by diff has to say when it saw something once.
 
+## Review finding 4: the buses belong to a composition
+
+The four domain buses were module-level singletons.  Their docstrings gave a real
+justification -- "the executor is built in several places (the turn loop, the scheduler,
+tests) and a per-instance bus would mean a plugin's gate applied to whichever construction
+path happened to pass one" -- which is an argument for **one bus per composition** and was
+implemented as one per *process*.  The cost was measured in this suite: a leaked
+`PreToolUse: deny` gate from one test won another test's `emit_blocking`.
+
+`default_buses()` produces a fresh set; `bootstrap` provides them under
+`event_bus.<domain>`; `Domain.attach` **resolves through the context**; and `BaseAgent` takes
+`event_bus` / `llm_event_bus` / `tool_event_bus` at construction, defaulting to the process
+buses so an embedder that provides nothing keeps the behaviour it had.
+
+**Both halves had to move together, and that is not a detail.**  Resolving only the
+subscribing half -- `Domain.attach` reading a composition bus while `BaseAgent` kept
+publishing to `TURN_EVENTS` -- would have produced the failure this codebase warns about
+most: a listener that is never called, indistinguishable from a plugin that works.  The test
+asserts independence in both directions for that reason.
+
+**Two of my own mistakes in that test, both worth recording.**  It first emitted a bare
+`object()`, which reaches nobody because the bus dispatches by exact event class; and then it
+shared one listener between the two compositions, which made the negative assertion test the
+opposite of what it meant -- composition B's bus *should* reach composition B's listener.
+Along the way `EventBus.emit` turned out to be a **coroutine**, so calling it without awaiting
+returned an object that did nothing, and the first version "passed" the negative half for
+entirely the wrong reason.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

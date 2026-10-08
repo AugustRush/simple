@@ -124,3 +124,30 @@ LLM_EVENTS = EventBus()
 #: which pipeline a listener is joining -- and the same class, because a domain is
 #: vocabulary rather than transport.
 SESSION_EVENTS = EventBus()
+
+
+#: The four domain buses, by domain name.  What a composition provides so that every
+#: construction path -- the turn loop, the scheduler, a channel session -- resolves the
+#: *same* bus.
+_DOMAINS = ("tool", "turn", "llm", "session")
+
+
+def default_buses() -> dict[str, EventBus]:
+    """A fresh set of buses, for a composition that wants its own.
+
+    The module-level buses above are the **process default**, which is what a program with
+    one composition should use.  This exists for the program with two: a test suite, a
+    gateway serving several runtimes, a scheduler that builds its own turn loop.
+
+    The globals were justified by "the executor is built in several places, so a
+    per-instance bus would mean a plugin's gate applied to whichever construction path
+    happened to pass one" -- which is a good argument for **one bus per composition** and
+    not for one per process.  A composition that provides these gets that property
+    *and* isolation; one that provides nothing keeps the behaviour it had.
+    """
+    return {name: EventBus() for name in _DOMAINS}
+
+
+def bus_name(domain: str) -> str:
+    """The service name a domain's bus is provided under."""
+    return f"event_bus.{domain}"

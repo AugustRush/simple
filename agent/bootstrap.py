@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 import agent as agent_module
 from agent import shared
+from agent.core.events import bus_name, default_buses
 from agent.config import (
     ModelClientFactory,
     _compose_system_prompt,
@@ -625,6 +626,12 @@ async def _build_components_async(
     # a constructor argument so that a composition replaces the model plugin by
     # providing this name -- the plan's ``llm`` seam, and the edge the agent loop
     # declares.
+    # The composition's own event buses.  Providing them is what makes the bus part of the
+    # composition rather than of the import graph: `Domain.attach` and the agent both
+    # resolve these names, so a second runtime in the same process -- a test, a gateway
+    # session -- gets its own listener set instead of sharing one with the first.
+    _composition_buses = default_buses()
+
     _partial_components: dict = {
         "client": client,
         "client_cache_key": client_cache_key,
@@ -693,6 +700,8 @@ async def _build_components_async(
     # this root building itself, and the sixth is a scheduled run, which is not the root
     # and should not have to import it.  ``agent/runtime/factory.py`` explains the rest.
     _partial_components["runtime_factory"] = RuntimeFactory()
+    for _bus_domain, _bus in _composition_buses.items():
+        _partial_components[bus_name(_bus_domain)] = _bus
 
     # ── Plugin Catalog ────────────────────────────────────────────────────────
     # Constructed after the partial components because the kernel adopts them.

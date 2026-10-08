@@ -84,6 +84,13 @@ class AgentPlugin:
             transport=ctx.get("llm"),
             # One name, not the whole mapping: this is what the agent resolves by name.
             services={"llm": ctx.get("llm")},
+            # The composition's buses, when it provided any.  Passed at construction
+            # rather than assigned afterwards: the agent reads them in `__init__`, so an
+            # attribute set later would be a second field nothing looks at -- which is what
+            # the first version of this did.
+            event_bus=ctx.get("event_bus.turn", None),
+            llm_event_bus=ctx.get("event_bus.llm", None),
+            tool_event_bus=ctx.get("event_bus.tool", None),
         )
         # A composition may name a plugin's policy bundle in full; the default is the
         # built-in one, so this changes nothing unless it is configured.

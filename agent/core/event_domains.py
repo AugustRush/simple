@@ -255,7 +255,7 @@ class Domain:
         :func:`bus_for` already keeps it, and the caller gets one call that both
         subscribes and makes the subscription reversible.
         """
-        undo = self.subscribe(bus_for(self), listener)
+        undo = self.subscribe(bus_for(self, ctx), listener)
         ctx.on_unwind(undo)
         return undo
 
@@ -300,7 +300,7 @@ SESSION = Domain(
 DOMAINS: dict[str, Domain] = {d.name: d for d in (TOOL, TURN, LLM, SESSION)}
 
 
-def bus_for(domain: Domain) -> EventBus:
+def bus_for(domain: Domain, ctx: Any = None) -> EventBus:
     """The bus *domain* publishes to.
 
     Kept here, next to the domain table, so a new domain has one place to say
@@ -309,6 +309,15 @@ def bus_for(domain: Domain) -> EventBus:
     its buses at import time and this module is imported from there.
     """
     from agent.core import events as buses
+
+    # The composition's bus wins when it provided one.  Resolved through the context
+    # rather than read from the module, because a bus is part of a composition: two
+    # runtimes in one process -- a test, a gateway with several sessions -- must not share
+    # one, and a plugin must be able to *own* what it subscribes to.
+    if ctx is not None:
+        named = ctx.get(buses.bus_name(domain.name), None)
+        if named is not None:
+            return named
 
     _BY_NAME = {
         "tool": buses.TOOL_EVENTS,

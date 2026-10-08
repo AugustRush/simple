@@ -365,6 +365,9 @@ class BaseAgent:
         transport: Optional["ModelTransport"] = None,
         services: Any = None,
         orchestration_policy_skill_id: str = "multi-agent-orchestration",
+        event_bus: Any = None,
+        llm_event_bus: Any = None,
+        tool_event_bus: Any = None,
     ):
         #: The names this class resolves rather than receives.  One name today --
         #: ``llm`` -- and deliberately **not** the whole composition: the caller passes
@@ -389,8 +392,21 @@ class BaseAgent:
         #: Where this agent's turn and model-call events go.  The module-level
         #: buses, so a listener mounted by a plugin reaches every agent, including
         #: the scheduler's own.  Settable for a test that wants a private one.
-        self._event_bus = TURN_EVENTS
-        self._llm_event_bus = LLM_EVENTS
+        # The composition's buses when it provides them, the process defaults otherwise.
+        #
+        # Defaulted rather than required because a bus is only *observable*: an agent built
+        # directly -- by a test, by an embedder -- has nobody to publish to, and demanding
+        # one would be ceremony.  A composition that provides them gets isolation: two
+        # runtimes in one process stop sharing a listener set, which is a bug this suite
+        # has already had once (a leaked gate from one test winning another test's
+        # ``emit_blocking``).
+        self._event_bus = event_bus if event_bus is not None else TURN_EVENTS
+        self._llm_event_bus = (
+            llm_event_bus if llm_event_bus is not None else LLM_EVENTS
+        )
+        self._tool_event_bus = (
+            tool_event_bus if tool_event_bus is not None else TOOL_EVENTS
+        )
         self._tool_watchdog = ToolLoopWatchdog(
             repeat_threshold=self._TOOL_LOOP_REPEAT_THRESHOLD,
             unproductive_threshold=self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD,
@@ -1568,7 +1584,7 @@ class BaseAgent:
             # execution layer naming the plugin machinery.
             regular_executor = RegularToolExecutor(
                 self.registry,
-                event_bus=TOOL_EVENTS,
+                event_bus=self._tool_event_bus,
             )
             regular_results = await _execute_regular_tool_calls(
                 regular_calls, regular_executor
