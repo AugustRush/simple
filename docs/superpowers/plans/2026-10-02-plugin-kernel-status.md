@@ -1070,6 +1070,55 @@ diff: `HEAD` 126 statements, mine 105, with 22 missing and 1 added.  The fix was
 patching the damaged file -- rebuild from `HEAD` and apply only the intended change, which the
 same comparison then confirmed as exactly 6 removed and 1 added.
 
+## Review finding 9: the ledger was missing 22 of its readers
+
+The ledger (`agent/runtime/core_services.py`) says it exists to enumerate **every read
+point**, so that "was anything reading this" is answered from a table before a deletion.  It
+checked one direction: every file it names really does read the service.
+
+Nothing checked the other direction, so **a reader nobody listed was invisible**.  Measured
+with the ledger's **own** scanner: **22 reader/file pairs across 7 services**, every one of
+them a plugin this refactor added -- `agent/tools/plugin.py` reading `memory` and `registry`,
+`agent/core/agent_plugin.py` reading `llm` and `plugin_catalog`, and so on.
+
+That is not incomplete bookkeeping.  This session's notes already said what a false negative
+does: *"a check with false negatives is worse than no check when it gates a deletion: it does
+not merely miss a problem, it authorises one."*  The guard that was supposed to prevent exactly
+that had the flaw it was written against.
+
+`test_every_reader_of_a_service_is_declared` now checks the other direction, and the 22
+readers are declared with the reason each one reads that service.
+
+**And two of my own measurement mistakes on the way there.**  A regex of mine reported five
+services as having *no ledger entry* -- they all have entries; the regex only matched blocks
+ending where I guessed.  Then a `head -8` on a grep truncated the very results it was run to
+establish, and I briefly reported that `PluginProfile` had **no consumer** when
+`agent/plugins/profile_selection.py` imports it.  A truncated search for absence is not a
+search.
+
+## Review finding 8: "the agent is still the centre" -- partly outdated
+
+Measured, and the review's premise holds less than it sounds:
+
+- `AgentCore` holds the component container, but reads through `require_service`/`resolve`,
+  and **those names are ledger entries** -- so it is not reaching arbitrarily.  It reads ten
+  names, now all declared.
+- `TurnRunner` **has** a plugin path (`setup(ctx)` provides `agent_loop`); `bind(components)`
+  is the documented fallback for a hand-assembled runtime.
+- `LoopDeps` is already "everything the turn loop needs from the agent, and nothing else" --
+  but it is **derived from the agent** (`LoopDeps.of(agent)`), which is where the centrality
+  actually lives.
+
+What is genuinely left, and not done: `AgentPlugin` writes **12** config attributes onto one
+`BaseAgent`, and `BaseAgent` carries ~35 instance attributes.  Turning those into a typed
+settings value resolved once is the review's "separate Service from Settings", and it is a
+change to a 2,500-line class with call sites across the runtime.  Recorded as the next piece
+rather than started at the end of a long run.
+
+**What was measured and is worth keeping**: the centrality is not "the agent reaches
+everything" -- it is that the loop's dependency struct is built *from* the agent instead of
+*from* the composition.  That is a much smaller thing to fix, and it is where to start.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

@@ -75,6 +75,9 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/plugins/catalog.py",
             "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
+            "agent/core/agent_plugin.py",  # the agent's tool registry
+            "agent/scheduler/plugin.py",  # a scheduled run's tools come from it
+            "agent/tools/plugin.py",  # the built-in tools register on it
         ),
         summary="The tool registry: definitions, capabilities, and the context keys below.",
     ),
@@ -95,6 +98,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/plugins/catalog.py",
             "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
+            "agent/ralph/plugin.py",  # a task may be driven by a skill
         ),
         summary="Loaded skills, and the dirty flag that decides when the prompt is stale.",
     ),
@@ -115,6 +119,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/config.py",
             "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
+            "agent/core/agent_plugin.py",  # the agent reaches the composition through it
         ),
         summary="Loaded plugins and everything they contributed.",
     ),
@@ -132,6 +137,9 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/cli.py",
             "agent/commands/builtin.py",
             "agent/runtime/contracts.py",
+            "agent/_builtin/plugins/evolution/__init__.py",  # the engine scores a turn against the agent's provider
+            "agent/ralph/plugin.py",  # the task loop drives an agent per task
+            "agent/scheduler/build.py",  # a scheduled run is a turn, so it needs one
         ),
         summary="The agent a turn runs on: the object that answers a user message.",
     ),
@@ -147,6 +155,10 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/cli.py",
             "agent/commands/builtin.py",
             "agent/config.py",
+            "agent/core/agent_plugin.py",  # the agent assembles context through it
+            "agent/ralph/plugin.py",  # a task turn records through it
+            "agent/scheduler/build.py",  # a scheduled run records through it
+            "agent/tools/plugin.py",  # the built-in tools read and write session context
         ),
         summary="The memory system: staging, retrieval, consolidation, per session.",
     ),
@@ -185,6 +197,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         ),
         consumers=(
             "agent/core/agent.py",
+            "agent/core/agent_plugin.py",  # the agent's transport
         ),
         summary=(
             "The model adapter: the one place provider dispatch happens.  An ABC "
@@ -204,6 +217,10 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/channels/base.py",
             "agent/cli.py",
             "agent/commands/builtin.py",
+            "agent/_builtin/plugins/evolution/__init__.py",  # experience is scored against stored memory
+            "agent/memory/plugin.py",  # the palace is built over the store this reads
+            "agent/scheduler/plugin.py",  # a scheduled run consolidates into it
+            "agent/tools/plugin.py",  # the memory tools
         ),
         summary="The long-term store behind the context manager.",
     ),

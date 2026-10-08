@@ -371,6 +371,37 @@ def test_every_declared_consumer_really_reads_the_service() -> None:
     assert not wrong, "the ledger and the source disagree:\n  " + "\n  ".join(wrong)
 
 
+def test_every_reader_of_a_service_is_declared() -> None:
+    """The direction that was missing, and the one that matters.
+
+    The guard above checks declared -> actual: every file the ledger names really does read
+    the service.  Nothing checked actual -> declared, so **a reader nobody listed was
+    invisible**.  Measured when this was added: 22 reader/file pairs across 7 services, every
+    one of them a plugin added by this refactor.
+
+    That matters because the ledger's stated purpose is to enumerate *every read point* before
+    anything is deleted.  A ledger that misses readers is not incomplete bookkeeping -- it is a
+    false negative, and this session's notes say plainly what those do: "a check with false
+    negatives is worse than no check when it gates a deletion: it does not merely miss a
+    problem, it *authorises* one."
+    """
+    _, readers = _scan()
+    ledger = {entry.name: entry for entry in CORE_SERVICES}
+
+    undeclared = []
+    for name, files in sorted(readers.items()):
+        entry = ledger.get(name)
+        if entry is None:
+            undeclared.append(f"{name}: no ledger entry, read by {sorted(files)}")
+            continue
+        for path in sorted(files - set(entry.consumers)):
+            undeclared.append(f"{name}: {path} reads it but is not a declared consumer")
+
+    assert not undeclared, (
+        "the ledger under-reports its readers:\n  " + "\n  ".join(undeclared)
+    )
+
+
 def test_the_scan_finds_reads_and_writes_at_all() -> None:
     """Control: a scanner that finds nothing passes every assertion above."""
     writers, readers = _scan()
