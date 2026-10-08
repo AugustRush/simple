@@ -118,14 +118,19 @@ class _ScriptedProvider:
                     else {"text": "no scripted reply left"}
                 )
                 if body.get("stream"):
-                    self._stream(reply)
+                    self._stream(reply, body)
                 else:
                     self._json(reply, body)
+
+            def _text_for(self, reply: dict, body: dict) -> str:
+                if reply.get("echo_model"):
+                    return f"answer for {body.get('model', '?')}"
+                return str(reply.get("text", ""))
 
             def _json(self, reply: dict, body: dict) -> None:
                 message: dict[str, Any] = {
                     "role": "assistant",
-                    "content": reply.get("text", ""),
+                    "content": self._text_for(reply, body),
                 }
                 finish = "stop"
                 if reply.get("tool"):
@@ -168,7 +173,7 @@ class _ScriptedProvider:
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def _stream(self, reply: dict) -> None:
+            def _stream(self, reply: dict, body: dict) -> None:
                 # A reply may be told to take its time, which is how a test gets a turn
                 # that is still running when the next message arrives.
                 time.sleep(float(reply.get("delay", 0)))
@@ -209,7 +214,7 @@ class _ScriptedProvider:
                     self.wfile.write(_chunk({}, finish="tool_calls"))
                 else:
                     self.wfile.write(_chunk({"role": "assistant", "content": ""}))
-                    for piece in _pieces(str(reply.get("text", ""))):
+                    for piece in _pieces(self._text_for(reply, body)):
                         self.wfile.write(_chunk({"content": piece}))
                     self.wfile.write(_chunk({}, finish="stop"))
                 self.wfile.write(_usage_chunk())
@@ -1897,5 +1902,96 @@ def test_without_clearing_the_earlier_turn_is_still_in_the_request(home):
             "a conversation that was not cleared must still be in the request: "
             f"{carried[:400]}"
         )
+    finally:
+        provider.close()
+
+
+# ── 19. Two sessions talking at once ────────────────────────────────────────
+
+
+def test_two_sessions_answer_their_own_requests_concurrently(home):
+    """Two conversations in one gateway, running at the same time.
+
+    Each session carries its own runtime -- its own agent, registry, context and model
+    override -- and the turns run concurrently in one event loop, which is what a browser
+    with two tabs does.  The failure this guards against is not exotic: anything the
+    per-session path shares by accident (a sink, a context variable, a bus, a client) makes
+    one conversation's answer appear in the other, or sends an answer to the wrong model.
+
+    Distinguished by the model each session asked for -- the endpoint echoes it -- because
+    both answers come from one process and one scripted queue.  The gather is inside the
+    coroutine, so both connections are opened on the loop that serves them.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"echo_model": True}, {"echo_model": True})
+    cfg = write_config(
+        home,
+        provider,
+        channels=WEB_CHANNELS,
+        providers={
+            "scripted": {
+                "api_format": "openai",
+                "api_key": "scripted-key",
+                "base_url": provider.base_url,
+                "default_model": "alpha-model",
+                "models": ["alpha-model", "beta-model"],
+            }
+        },
+    )
+    try:
+
+        async def everything() -> list[list[dict]]:
+            import json as _json
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+
+                async def one(session: str, model: str, message_id: str) -> list[dict]:
+                    async with websockets.connect(
+                        f"ws://127.0.0.1:{port}/api/sessions/{session}/stream"
+                    ) as socket:
+                        await socket.send(
+                            _json.dumps(
+                                {
+                                    "type": "message",
+                                    "text": f"which model are you, {session}?",
+                                    "message_id": message_id,
+                                    "model": model,
+                                }
+                            )
+                        )
+                        events: list[dict] = []
+                        while True:
+                            event = _json.loads(
+                                await asyncio.wait_for(socket.recv(), timeout=30)
+                            )
+                            events.append(event)
+                            if event.get("type") == "turn_complete":
+                                return events
+
+                return list(
+                    await asyncio.gather(
+                        one("web-alpha", "alpha-model", "m1"),
+                        one("web-beta", "beta-model", "m2"),
+                    )
+                )
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        alpha, beta = asyncio.run(everything())
+
+        assert _answer(alpha) == "answer for alpha-model", alpha
+        assert _answer(beta) == "answer for beta-model", beta
+        assert not [e for e in alpha + beta if e["type"] == "error"], alpha + beta
+
+        asked = [request.get("model") for request in provider.requests]
+        assert sorted(asked) == ["alpha-model", "beta-model"], asked
     finally:
         provider.close()

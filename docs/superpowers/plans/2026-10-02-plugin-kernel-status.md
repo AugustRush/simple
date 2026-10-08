@@ -1481,6 +1481,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_switching_a_sessions_workspace_moves_where_its_tools_write` | `/workspace <dir>`: persisted to the manifest **and** repointed live |
 | `test_a_skill_is_offered_and_its_instructions_reach_the_model` | a skill bundle: advertised in the prompt, loaded as a tool result |
 | `test_clearing_a_session_forgets_its_turns_and_nothing_else` (+ control) | `/clear`: the conversation leaves the next request, and does so only when cleared |
+| `test_two_sessions_answer_their_own_requests_concurrently` | two sessions at once: each answers its own model, no crossing |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1536,6 +1537,12 @@ three model calls.  The evidence that the *derived* registry was used is in what
 request offered: no ``spawn_agent``, and a shorter tool list.  A sub-agent that inherited the
 parent's registry would be able to spawn, which is the recursion the exclusion exists to
 prevent.
+
+**Two sessions at once.**  Two conversations on one gateway, turns running concurrently in
+one loop -- what a browser with two tabs does.  Each session's answer names the model that
+session asked for (the endpoint echoes it), so a sink, a context variable, a bus or a client
+shared by accident would show up as a crossed answer rather than as a subtle difference
+nobody asserts.
 
 **Choosing a folder, loading a skill, clearing a conversation.**  Three per-session services
 driven through the commands a person uses: ``/workspace <dir>`` must persist the choice *and*
