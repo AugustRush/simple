@@ -3195,3 +3195,104 @@ def test_toggling_a_skill_off_changes_the_next_prompt_and_the_tool(home):
         )
     finally:
         provider.close()
+
+
+# ── 31. Approving by saying so, for a transport with no dialog ──────────────
+
+
+def test_saying_approve_redeems_the_one_pending_command(home):
+    """The chat-channel approval: a short reply approves the single pending record.
+
+    Written for transports that cannot prompt at the moment of the side effect.  It has its
+    own guards worth driving -- it must not run beside an interactive menu, it refuses when
+    zero or several records are pending (a bare "yes" cannot choose between them), and on
+    success it **rewrites the message** to tell the agent which command was approved.
+
+    It also depends on the pending record surviving the turn that created it, which is the
+    defect fixed just before this test: the shell path used to retire the token as it reported
+    it, so there was nothing left for this mechanism to redeem.
+    """
+    import asyncio
+
+    import agent as agent_module
+    from agent.channels.base import ChannelRunner, IncomingMessage
+    from agent.channels.web import WebOutputSink
+
+    command = "dd if=/dev/zero of=/tmp/simple-phrase.bin bs=1 count=0"
+    provider = scripted(
+        {"tool": ("shell", {"command": command, "intent": "ask, with no dialog available"})},
+        {"text": "waiting"},
+        {"text": "ok, retrying"},
+        {"tool": ("shell", {"command": command, "intent": "the approved retry"})},
+        {"text": "done"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[list[dict]]:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            channel = _HandlerOnlyChannel()
+            runner = ChannelRunner([channel], components, cfg)
+            serving = asyncio.create_task(runner.run())
+            try:
+                for _ in range(200):
+                    if channel.handler is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert channel.handler is not None
+
+                async def turn(text: str, message_id: str) -> list[dict]:
+                    sink = WebOutputSink(collect=True)
+                    await channel.handler(
+                        IncomingMessage(
+                            text=text,
+                            session_id="session-phrase",
+                            channel_name="web",
+                            metadata={"message_id": message_id},
+                        ),
+                        sink,
+                    )
+                    return sink.events
+
+                asked = await turn("run the command", "m1")
+                approved = await turn("批准", "m2")
+                retried = await turn("try again", "m3")
+                return [asked, approved, retried]
+            finally:
+                await channel.stop()
+                await serving
+                await agent_module._close_components(components)
+
+        asked, approved, retried = asyncio.run(run())
+
+        tool_result = [
+            message
+            for message in provider.requests[1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert "requires_confirmation" in str(tool_result[-1].get("content", "")), (
+            "the command has to be pending before the approval can mean anything"
+        )
+
+        shown = _shown_text(approved)
+        assert command in shown or "dd" in shown, (
+            f"the approval must say which command it approved: {shown!r}"
+        )
+        # The rewrite is the mechanism: the agent is told, in the message, to retry.
+        rewritten = json.dumps(provider.requests[2]["messages"], ensure_ascii=False)
+        assert "已批准" in rewritten, (
+            "the approval has to reach the agent as a message it can act on: "
+            f"{rewritten[-400:]}"
+        )
+
+        executed = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert '"ok": true' in str(executed[-1].get("content", "")), (
+            f"and the retry must run: {str(executed[-1])[:300]}"
+        )
+        assert retried, retried
+    finally:
+        provider.close()

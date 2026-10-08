@@ -1499,6 +1499,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_an_unattended_run_refuses_rather_than_leaving_a_token` | control: a *policy* refusal is not "nobody could ask" |
 | `test_toggling_a_plugin_off_takes_its_tool_out_of_a_live_session` | the plugins page: off, gone from an open session; on, back |
 | `test_toggling_a_skill_off_changes_the_next_prompt_and_the_tool` | the skills page: prompt recomposed without a rebuild, and the tool refuses by name |
+| `test_saying_approve_redeems_the_one_pending_command` | a gateway's "批准" approves the single pending record, and the agent is told |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1743,6 +1744,18 @@ content, so a path that "attached" something but sent its name would fail.
 The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
+
+## The fix had a second consumer, and the test shows it
+
+The chat-channel approval -- a short reply ("批准", "yes") redeeming the single pending record
+for the scope -- is written for transports that cannot prompt at the moment of the side
+effect.  Its own guards are worth driving: it does not run beside an interactive menu (a bare
+"yes" may answer some other question), it refuses when zero or several records are pending,
+and on success it **rewrites the message** so the agent knows which command was approved.
+
+Measured: reverting the tri-state fix turns this test red as well as the ``/confirm`` one.  So
+that one-line interface repair restored **two** user-facing mechanisms, and both are now
+guarded -- which is the argument for finding the *shape* rather than fixing the instance.
 
 ## The two switches on the pages, driven
 
