@@ -30,11 +30,14 @@ here.
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 
 from agent.kernel.plugin import PluginHost
 from agent.ralph.plugin import RalphPlugin
-from agent.tools.runtime import ToolRegistry
+from agent.tools.runtime import ToolRegistry, ToolView
 
 
 class _Tool:
@@ -678,3 +681,120 @@ def test_the_view_forwards_the_authorizer_it_was_given() -> None:
 
     tool = registry._tools["write_file"]
     assert tool.authorizer is authorizer
+
+
+# ── The caller's context reaches a contributed tool ──────────────────────────
+
+
+class _ContextReader:
+    """Reads the registry context the way the built-in tools do.
+
+    ``BuiltinTools`` reads ``workspace_root``, ``output_dir``, ``file_access_policy``,
+    ``write_scope`` and the shell policies this way, so a tool that answers with one of
+    them is a faithful stand-in for the largest implementation in the project.
+    """
+
+    def __init__(self, registry, key: str = "write_scope") -> None:
+        self.registry = registry
+        self.name = "context_reader"
+        self.description = "Reports one registry context value."
+        self.parameters = {"type": "object", "properties": {}}
+        self.capabilities = None
+        self._key = key
+
+    def fn(self):
+        return self.registry.get_context(self._key, "unset")
+
+
+class _ReaderPlugin:
+    """Contributes the reader, holding the registry *view* -- as ``ToolsPlugin`` does."""
+
+    name = "reader_plugin"
+    inject = ("registry",)
+
+    def __init__(self, key: str = "write_scope", holdings=None) -> None:
+        self._key = key
+        self._holdings = holdings
+
+    def setup(self, ctx):
+        registry = ctx.registry if self._holdings is None else self._holdings(ctx)
+        ctx.registry.register(_ContextReader(registry, self._key))
+
+
+def test_a_derived_context_reaches_a_tool_contributed_through_a_view() -> None:
+    """A narrower scope has to reach the tool, or it is not a scope.
+
+    ``ToolRegistry.call`` merges the *caller's* context with the owner registry's and
+    installs the result as a per-call override, because the tool reads its context from
+    the registry it holds -- which, for a contributed tool, is a plugin's view, not the
+    registry that was asked.  When the override is installed on the wrong object the merge
+    does not happen and the tool reads the *composition's* context instead.
+
+    What that costs is not cosmetic: a sub-agent spawned with a narrowed ``write_scope``
+    and a Web session with its own workspace both read the composition's values, so a
+    restriction that was asked for is silently not applied.
+    """
+    host, registry = _host()
+    host.load(_ReaderPlugin("write_scope"))
+
+    narrowed = registry.derive(ToolView(), {"write_scope": ["only/here"]})
+    seen = asyncio.run(narrowed.call("context_reader", {}))
+    assert seen == json.dumps(["only/here"]), (
+        f"the tool read {seen!r}: the caller's context never reached it"
+    )
+
+
+def test_the_composition_context_is_still_read_when_the_caller_has_none() -> None:
+    """Control: merging must not replace the owner's context with nothing.
+
+    A tool called on the registry that owns it has no caller context to merge, and must
+    keep reading what the composition set.
+    """
+    host, registry = _host()
+    host.load(_ReaderPlugin("write_scope"))
+    registry.set_context("write_scope", ["composition"])
+
+    seen = asyncio.run(registry.call("context_reader", {}))
+    assert seen == json.dumps(["composition"]), seen
+
+
+def test_the_write_scope_gate_reads_the_caller_registry_by_hand() -> None:
+    """Control, and the reason the context-merge defect was not a security hole.
+
+    ``_file_mutation_authorizer`` asks the registry it is handed for
+    ``capability_profile`` and ``write_scope`` -- and ``ToolRegistry.call`` hands it the
+    **calling** registry, not the tool's owner.  So the gate reads the caller's scope even
+    when the per-call context merge is not installed on the owner, which is what kept a
+    sub-agent's narrowed scope enforced while every *other* context read was silently
+    falling back to the composition's.
+
+    Worth pinning because the two paths look alike: both read ``write_scope``, and only one
+    of them can be broken by a view standing in for the registry.
+    """
+    from agent.tools.builtin_tools import BuiltinTools
+
+    host, registry = _host()
+    tools = BuiltinTools(memory=None, registry=host.services.get("registry"))
+    narrowed = registry.derive(
+        ToolView(),
+        {"capability_profile": "implementation", "write_scope": ["allowed/only"]},
+    )
+
+    denial = tools._file_mutation_authorizer(
+        {"root": "workspace", "path": "outside.txt"}, narrowed
+    )
+
+    assert denial is not None, "a write outside the caller's write_scope is refused"
+    assert "write scope" in json.dumps(denial), denial
+
+    # Control: the same tool, called by a registry whose scope does contain the path.
+    permitted = registry.derive(
+        ToolView(),
+        {"capability_profile": "implementation", "write_scope": ["outside.txt"]},
+    )
+    assert (
+        tools._file_mutation_authorizer(
+            {"root": "workspace", "path": "outside.txt"}, permitted
+        )
+        is None
+    ), "the gate must not refuse a path the caller's scope allows"

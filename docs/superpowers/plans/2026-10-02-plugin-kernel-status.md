@@ -1467,6 +1467,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_user_plugin_contributes_a_tool_and_hears_the_turn` | discovery, scoped registration, tool call, `ctx.on(TurnCompleted, ...)` |
 | `test_reloading_a_plugin_runs_its_new_code` | an edit with the same size *and* mtime -- the `.pyc` trap |
 | `test_switching_provider_rebuilds_the_session_runtime` | the settings page's `activate`, then the next turn |
+| `test_a_session_turn_writes_into_the_sessions_own_output_dir` | the per-session runtime, asserted by where the file lands |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1499,6 +1500,44 @@ user-visible one.
 about the product.  Where a test replaces a collaborator, ask what the real collaborator has
 that the double lacks -- a method, a binding, a container -- because that difference is
 exactly where the bug will be.
+
+## The per-call context merge was never installed
+
+The second thing the functional layer found, from the session-isolation test: a web
+session's tools wrote into the **composition's** ``output_dir`` instead of the session's.
+
+``ToolRegistry.call`` has a merge for exactly this: when the tool's owner registry is not
+the registry being called through, it builds ``owner_context | caller_context`` and installs
+it as a per-call ContextVar override **on the owner registry**, because that is the object
+the tool implementation reads its context from:
+
+    owner_registry = getattr(owner, "registry", None)
+    if isinstance(owner_registry, ToolRegistry) and owner_registry is not self:
+        override_token = owner_registry._context_override.set(merged)
+
+After the built-in tool set became a plugin, the tool object holds ``ctx.get("registry")`` --
+a ``ScopedTools`` **view**, which is what makes its 44 registrations removable.  A view is
+not a ``ToolRegistry``, so the condition was false, no merge was installed, and every context
+read a tool made returned the **composition's** value.  The tools read a lot through that
+path: ``workspace_root``, ``output_dir``, ``file_access_policy``, ``write_scope``, the four
+``shell_*`` policies, ``skill_catalog``, ``mcp_client``.
+
+So a web session's own workspace, output dir and file policy were decorative -- and had been
+since the tools-plugin round, with the whole suite green.  The same reads are what a
+sub-agent's ``capability_profile``/``write_scope`` live in, which is why this was treated as
+possibly a security hole; **measured, it was not**, and the reason is worth keeping:
+
+``_file_mutation_authorizer`` is handed the **calling** registry by ``ToolRegistry.call``
+rather than reading its own, so the write-scope gate always saw the caller's scope no matter
+what was installed on the owner.  That asymmetry -- two paths that both read ``write_scope``,
+one of which cannot be broken this way -- is now pinned by a control test, because a reader
+who notices the first will reasonably suspect the second.
+
+The fix keeps the view and makes it faithful where a tool implementation needs it:
+``ScopedTools.registry`` (the registry behind the view, so ``call`` can recognise its owner)
+and ``ScopedTools._context_override`` (the variable tools read, under the name they read it
+by).  Not a general passthrough: what a contributed tool may read through a view should be a
+short list somebody maintains.
 
 ## Not built, and why
 

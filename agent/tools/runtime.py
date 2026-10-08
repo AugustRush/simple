@@ -550,6 +550,16 @@ class ToolRegistry:
             fn = self._tools[tool_name].fn
             owner = getattr(fn, "__self__", None)
             owner_registry = getattr(owner, "registry", None)
+            # A contributed tool holds a plugin-scoped *view* of the registry -- that is
+            # what makes its registrations reversible -- and the view names the registry
+            # behind it.  Unwrapped, because the merge below has to be installed on the
+            # object the tool implementation reads its context from
+            # (``ScopedTools._context_override``); a view that is not recognised as the
+            # owner installs nothing, and the tool silently reads the *composition's*
+            # context -- a sub-agent's narrowed write scope and a session's own workspace
+            # are both delivered this way.
+            if owner_registry is not None and owner_registry is not self:
+                owner_registry = getattr(owner_registry, "registry", owner_registry)
             if isinstance(owner_registry, ToolRegistry) and owner_registry is not self:
                 merged_context = dict(owner_registry._context)
                 merged_context.update(self._context)

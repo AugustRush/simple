@@ -55,6 +55,40 @@ class ScopedTools:
         """The plugin these tools belong to; also the registry's ``source``."""
         return f"plugin:{self._ctx.name}"
 
+    @property
+    def registry(self) -> Any:
+        """The registry behind this view.
+
+        For the machinery that has to act on the registry **itself** rather than contribute
+        to it: a tool call merges the caller's context with the owner's and installs the
+        result on the owner registry (``ToolRegistry.call``), because that is the object
+        the tool implementation reads its context from.  Recognising a view as the owner --
+        rather than as an unrelated object -- is what makes that happen at all.
+        """
+        return self._registry
+
+    @property
+    def _context_override(self) -> Any:
+        """The registry's per-call context variable, under the name tools read it by.
+
+        ``BuiltinTools._file_service`` asks its registry for ``_context_override`` and
+        consults it *before* the service injected at construction, because that variable is
+        where the calling registry's merged context is installed -- a Web session's own
+        file service, a sub-agent's narrowed write scope.
+
+        A contributed tool holds this view, so without the property the variable is not
+        found: the merge becomes invisible and every tool reads the **composition's**
+        context instead.  That is not a cosmetic difference -- a sub-agent's ``write_scope``
+        and a session's ``workspace_root`` / ``output_dir`` / ``file_access_policy`` all
+        arrive this way, and a restriction that is silently not applied looks exactly like
+        one that is.
+
+        A property rather than a general passthrough: what a contributed tool may read
+        through a view should be a short list somebody maintains, not whatever happens to
+        be on the other object.
+        """
+        return self._registry._context_override
+
     # -- contributing --------------------------------------------------------
 
     def register(

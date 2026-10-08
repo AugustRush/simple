@@ -738,3 +738,80 @@ def test_switching_provider_rebuilds_the_session_runtime(home):
     finally:
         first.close()
         second.close()
+
+
+# ── 6. A session's own runtime, not the composition's ───────────────────────
+
+
+def test_a_session_turn_writes_into_the_sessions_own_output_dir(home):
+    """A per-session runtime is only real if the turn uses it.
+
+    A web session builds its own container -- its own agent, its own registry fork
+    and its own ``output_dir`` under ``web/sessions/<id>/`` -- so that sessions do
+    not write over each other.  That was decorative while the turn ran through the
+    composition's loop, which resolved the composition's ``agent``: the tools saw
+    the composition's ``output_dir``.
+
+    Asserted by where the file lands, which is the fact the isolation is made of.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "tool": (
+                "write_file",
+                {
+                    "root": "output_dir",
+                    "path": "isolation-probe.txt",
+                    "mode": "create",
+                    "content": "written by a session",
+                },
+            )
+        },
+        {"text": "written"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> list[dict]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-isolation/stream"
+                ) as socket:
+                    return await _ask(socket, "write the probe file", "m1")
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+        assert _answer(events) == "written", events
+
+        written = list(home.rglob("isolation-probe.txt"))
+        assert len(written) == 1, written
+        where = written[0].relative_to(home).as_posix()
+        assert where.startswith("web/sessions/web-isolation/output/"), (
+            "the session's own output_dir must be what the tool writes into, not the "
+            f"composition's: {where}"
+        )
+        # The composition's own output dir must be untouched: the isolation is not
+        # "a copy also landed in the right place", it is "the wrong place was not used".
+        assert not (home / "output" / "isolation-probe.txt").exists()
+
+        # And the tool reported success, so the write that landed was the one the model
+        # asked for -- not a fallback that happened to succeed elsewhere.
+        tool_result = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_result, [m.get("role") for m in provider.requests[-1]["messages"]]
+        assert '"ok": true' in str(tool_result[-1].get("content", "")), tool_result[-1]
+    finally:
+        provider.close()
