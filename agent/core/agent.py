@@ -45,6 +45,7 @@ from agent.core.output_contract import (
     validate_output_contract,
     with_output_contract,
 )
+from agent.core.turn_helpers import protected_turn_messages
 from agent.core.bounded_text import (
     append_named_block,
     bounded_json,
@@ -1284,8 +1285,9 @@ class BaseAgent:
         has no object to hand over and ``ContextManager._protected_indexes``
         falls back to the newest message that looks like a request.
         """
-        message = ctx.metadata.get(_TURN_REQUEST_KEY)
-        return [message] if isinstance(message, dict) else []
+        # Moved to `agent.core.turn_helpers` so the turn loop can reach it without an
+        # agent.  Kept here because callers hold an agent.
+        return protected_turn_messages(ctx)
 
 
 

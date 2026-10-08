@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from agent import shared
+from agent.core.bounded_text import bounded_text
+from agent.core.turn_helpers import protected_turn_messages
 from agent.config import _now
 from agent.core.event_domains import (
     LLMResponseParsed,
@@ -203,8 +205,82 @@ class LoopDeps:
     recover_from_content_filter: Callable[..., Any]
 
     @classmethod
+    @classmethod
+    def from_services(
+        cls,
+        *,
+        settings: Any,
+        transport: Any,
+        registry: Any,
+        context_assembler: Any,
+        context_manager_for: Callable[..., Any],
+        effective_model: Callable[..., str],
+        format_agent_error: Callable[..., Any],
+        create: Callable[..., Any],
+        retry_policy: Any,
+        recover_from_content_filter: Callable[..., Any],
+        token_budget: Any,
+        content_filter: Any = None,
+        event_bus: Any = None,
+        llm_event_bus: Any = None,
+    ) -> "LoopDeps":
+        """Build the loop's dependencies from **services and settings**, not from an agent.
+
+        The struct used to be obtainable only through ``of(agent)``, so a turn could not run
+        without an agent object -- which is what "the agent is the centre" means concretely,
+        and the review's phrasing is the target: the loop should take ``llm``, ``registry``
+        and the rest as services, with an agent being one thing that happens to hold them.
+
+        The budget arithmetic is the interesting case.  Its four entries used to be bound
+        methods of ``BaseAgent`` that each did nothing but delegate to
+        ``agent.core.token_budget.TokenBudget`` -- the implementation was **already** out of
+        the agent, and only the *route* went through it.  Here they come from the budget
+        directly.
+        """
+        budget = token_budget
+        return cls(
+            transport=transport,
+            effective_model=effective_model,
+            configured_output_cap=budget.configured_output_cap,
+            supports_vision=bool(getattr(settings, "supports_vision", False)),
+            registry=registry,
+            orchestration_policy_skill_id=str(
+                getattr(settings, "orchestration_policy_skill_id", "multi-agent-orchestration")
+            ),
+            max_tool_call_iterations=int(
+                getattr(settings, "max_tool_call_iterations", 0)
+            ),
+            context_assembler=context_assembler,
+            context_manager_for=context_manager_for,
+            bounded_text=bounded_text,
+            protected_turn_messages=protected_turn_messages,
+            input_token_budget=budget.input_token_budget,
+            output_room=budget.output_room,
+            token_budget=budget.token_budget,
+            max_tokens=int(getattr(settings, "max_tokens", 0)),
+            max_truncation_continuations=int(
+                getattr(settings, "max_truncation_continuations", 0)
+            ),
+            llm_max_retries=int(getattr(settings, "llm_max_retries", 0)),
+            llm_retry_base_delay=float(
+                getattr(settings, "llm_retry_base_delay", 0.0)
+            ),
+            event_bus=event_bus,
+            llm_event_bus=llm_event_bus,
+            content_filter=content_filter,
+            format_agent_error=format_agent_error,
+            create=create,
+            retry_policy=retry_policy,
+            recover_from_content_filter=recover_from_content_filter,
+        )
+
+    @classmethod
     def of(cls, agent: Any) -> "LoopDeps":
-        """Read the surface off *agent*.
+        """Read the surface off *agent* -- one adapter, not the only route.
+
+        Kept because every existing caller has an agent and this is how its surface is
+        read.  ``from_services`` is the other route, and its existence is what makes "the
+        loop needs services, not an agent" a fact rather than a claim.
 
         Written out by hand rather than collected with ``getattr`` over a name list:
         a reflective version would accept a typo by failing later, and the one thing
