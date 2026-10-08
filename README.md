@@ -109,6 +109,49 @@ change would move.
 with `--save-baseline` after an intentional change, and read the tag
 breakdown first.
 
+## Current State & Roadmap
+
+**The architecture is a plugin kernel.** `agent/kernel/` is the whole core — Context, Plugin,
+Service, Event, Scope, Lifecycle — and everything the agent is made of (Agent, Model, Tool,
+Session, Memory, Scheduler, Channels, Ralph, Orchestration) is a plugin or a service mounted on
+top of it. The **composition is data**: a profile names the plugins, bundles and config layers a
+deployment has, so "this deployment has no memory" is a sentence in configuration rather than a
+branch in the wiring. A plugin's registrations are effects on a `ServiceScope` it receives from
+`install()` and gets back on unload, the four event domains (`tool`, `turn`, `llm`, `session`)
+are buses the *composition* provides, and `tests/test_kernel_boundary.py` enforces the boundary
+structurally: the core may not import a domain.
+
+**There is a functional layer, not only units.** `tests/test_functional_turns.py` drives the
+real composition root and the real entry points — the CLI `chat` command, the web WebSocket,
+scheduled runs, plugin hot-swap, sub-agents, approvals, MCP, Ralph — through a whole turn,
+against a local OpenAI-compatible fake provider. No network; 43 paths in ~27s. It is built on
+one rule: **a double must not be simpler than the thing it stands in for, in the way that
+matters** — so the fake carries the real thing's failure modes (rate limits, an unpaid account,
+a content rejection, a stream that ends without `[DONE]`, tool-call arguments split across
+deltas) and not merely its shape.
+
+**What this work found: twelve defects**, each with a measured failure and a guard that was
+verified by putting the violation back. Most share a shape — *something belonging to a
+composition left pointing at a process-wide default; a check that read "present" as "intended";
+an interface with three answers squeezed into two; a vocabulary missing the spelling the real
+world produces.* One of the twelve was a regression the refactor itself introduced, caught by
+the same discipline. The full record, with the measurements and the shape of each finding, is
+[`docs/superpowers/plans/2026-10-02-plugin-kernel-status.md`](docs/superpowers/plans/2026-10-02-plugin-kernel-status.md).
+This work is on the `refactor/service-kernel` branch.
+
+### Roadmap
+
+| Item | State |
+|---|---|
+| Plugin kernel: core, composition-as-data, scopes, domain buses | **done** — [`agent/kernel/`](agent/kernel), guarded by `tests/test_kernel_boundary.py` |
+| Functional layer over the real entry points | **done** — 43 paths, [`tests/test_functional_turns.py`](tests/test_functional_turns.py) |
+| `simple chat` and MCP | **done** — the one-shot command waits for the background connect (bounded by `mcp_connect_timeout_seconds`) and says so when the wait runs out; before, its own teardown cancelled the connection and the model was offered every tool *except* the configured ones |
+| Content-filter recovery | **done** — reads the provider's own `code` (`content_policy_violation`) first and its prose second; the phrase list alone missed the real rejection, and that predicate gates the only mechanism that *repairs* a refusal instead of reporting it |
+| `LoopDeps.of(agent)` surface | **partly** — the six pure pass-throughs (`_output_room` and friends, each `return self._token_budget.X(...)`) are gone, and both routes (`of` / `from_services`) are now driven with a real `TokenBudget`; the route that had never been driven was **broken**. `of` still reads 22 attributes off the agent, 13 of them underscored — each either real logic or a documented test seam (the model-call seam, the recovery seam) |
+| `agent/channels/web.py` (4.2k lines), `feishu.py` (2.6k), `agent/tools/builtin_tools.py` (5.5k) | **not started** — behind the plugin boundary, but their internals are untouched. The next large piece; start with a survey, not a rewrite |
+| Browser-side JavaScript | **not covered** — the functional layer drives the HTTP/WebSocket protocol, not the page. Needs a headless browser, which is a different kind of investment |
+| Feishu channel | **not covered** — an external service; it shares the `Channel` abstraction with web, so most of the wiring is exercised, but the channel itself is undriven |
+| Intermittent `tests/test_ralph.py` failures | **not reproduced** in ~130 attempts (including two concurrent full suites under load) and repaired where it could not be diagnosed: the two wall-clock assumptions that made a slow machine indistinguishable from a broken product are gone, and the failure messages now carry the observed facts |
 
 ## Examples
 
@@ -1786,6 +1829,9 @@ server diagnostics cannot overwrite the interactive CLI input line.
 # Full suite
 uv run pytest -q
 
+# The functional layer: real composition and entry points, a local fake provider
+uv run pytest tests/test_functional_turns.py -q
+
 # Specific area
 uv run pytest tests/test_builtin_tools.py -q
 uv run pytest tests/test_scheduler.py -q
@@ -1801,14 +1847,24 @@ macOS detection ever breaks, those tests fail instead of quietly skipping while
 nothing is enforced. `tests/test_filesystem_sandbox.py` keeps what is genuinely
 seatbelt-specific: the generated `.sb` text and its cache key.
 
-Latest verification: `uv run pytest -q` → `2286 collected`, **2268 passed**,
-1 skipped, 17 failed.
+Latest verification: `uv run pytest -q` → **3728 passed**, 3 failed, 1 skipped
+(`tests/test_functional_turns.py` on its own: 43 passed).
 
-The 17 are environment-bound, all of the same shape: they ask the OS to spawn a
-nested sandbox (or to read the agent home from inside one), which a host that
-forbids nesting `sandbox-exec` cannot do. The same 17 fail on every run here and
-none of them is about the change under test, which is what makes them usable as
-a baseline — diff the `FAILED` set against it rather than reading the pass count.
+The 3 are the pinned baseline, and all of them are the same thing:
+`tests/test_cli_ui.py::test_console_width_check_is_throttled`,
+`::test_console_width_follows_terminal_resize` and
+`::test_console_width_survives_a_failing_terminal_probe` — console-width
+behaviour under captured, non-terminal stdout. They fail on every run here, they
+are about the test's terminal rather than about the code, and none of them is
+about the change under test: **diff the `FAILED` set against the baseline rather
+than reading the pass count**, which is how every change described above was
+verified.
+
+A host that forbids nesting `sandbox-exec` adds failures of one shape — tests
+that ask the OS to spawn a nested sandbox, or to read the agent home from inside
+one. This machine does not have that restriction, so its baseline is three
+failures rather than three plus those; on a host that does, they are environment
+bound in exactly the same way and belong in the same baseline diff.
 
 If your shell cannot create directories under the system temp directory,
 pytest's `tmp_path` fixture errors out across the whole suite before a single
