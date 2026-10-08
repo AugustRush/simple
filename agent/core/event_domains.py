@@ -1,21 +1,26 @@
-"""Event domains: named sets of event types a listener can subscribe to together.
+"""Event domains: named sets of event types, and the bus each set publishes on.
 
-Why this is a layer over the existing bus and not a second bus
---------------------------------------------------------------
-``EventBus`` already dispatches by exact event class, so two domains sharing one
-bus cannot see each other's events: a listener registered for ``LLMResponse`` is
-never called for ``ToolPostExecute``.  A bus per domain would therefore add a way
-to *lose* a listener -- register on the wrong instance and nothing arrives, which
-is the failure the tool bus's module-level comment already warns about ("a
-per-instance bus would mean a plugin's gate applied to whichever construction path
-happened to pass one").
+Why this is a layer over the existing bus, and when a domain has its own
+-----------------------------------------------------------------------
+``EventBus`` already dispatches by exact event class, so two domains sharing one bus
+cannot see each other's events: a listener registered for ``LLMResponseParsed`` is never
+called for ``ToolPostExecute``.  A separate bus is therefore *not* what keeps the domains
+apart -- the type is -- and that matters, because a bus per domain adds a way to **lose** a
+listener: register on the wrong instance and nothing arrives, which is the failure the tool
+bus's module-level comment already warns about ("a per-instance bus would mean a plugin's
+gate applied to whichever construction path happened to pass one").
 
-So a domain is vocabulary, not transport: it names the event types that belong to
-one part of the turn, and it can subscribe a listener to all of them at once,
-returning one unsubscribe callable.  That last part matters because a plugin
-subscribes several handlers and unloads as a unit -- the tool catalog already
-builds a tuple of unsubscribes and calls them together, and this makes the same
-shape available per domain.
+An earlier version of this module argued from that to "so a domain is vocabulary, not
+transport" -- and then kept one bus per domain anyway.  The argument was right and the
+conclusion did not follow: the remedy for "placed on the wrong bus" is to *place* it, not
+to give up the partition.  So this table owns the answer to "which bus":
+
+    Domain.attach(ctx, handler)   # every type in the domain, one handler, one undo
+    ctx.on(EventType, handler)    # one type — routed here through bus_for_type
+
+Both ask the same question of the same table, so neither can be the silent one.  What is
+still the composition's job is to wire the lookup and publish on the same bus; see
+``Context.on`` and ``tests/test_event_bus_ownership.py``.
 
 Two systems, two jobs
 ---------------------
@@ -25,8 +30,8 @@ typed event is a different job: an in-process extension point a plugin subscribe
 to.  Both are kept.  These types are the extension half, and nothing here changes
 what the log records.
 
-The refusal semantic is why ``tool`` is declared here too
----------------------------------------------------------
+The gate semantic is why ``tool`` is declared here too
+-----------------------------------------------------
 ``ToolPreExecute`` is the one event a listener can *block*, and
 ``EventBus.emit_blocking`` is the only delivery that stops early.  A domain that
 silently inherited that -- an LLM listener whose truthy return stopped every
@@ -52,6 +57,7 @@ __all__ = [
     "domain",
     "domain_names",
     "bus_for",
+    "bus_for_type",
     "TurnStarted",
     "TurnFinished",
     "TurnCompleted",
@@ -243,17 +249,17 @@ class Domain:
         return unsubscribe
 
     def attach(self, ctx: Any, listener: Callable[[Any], Any]) -> Callable[[], None]:
-        """Subscribe *listener* to this domain and bind the undo to *ctx*.
+        """Subscribe *listener* to **every** event type in this domain, bound to *ctx*.
 
-        The form a plugin uses, because the bus is **not** the context's: this
-        codebase keeps one bus per domain, and ``ctx.bus`` is a single bus for
-        events the composition itself defines.  Registering a turn handler on the
-        context's bus would produce a listener that is never called -- the failure
-        mode with no symptom, indistinguishable from a plugin that works.
+        The set form.  A plugin that wants one type writes ``ctx.on(T, handler)`` -- that
+        call is routed to the same bus through :func:`bus_for_type` -- and this is for a
+        handler that wants the domain, which is not the same thing: the turn loop's phases
+        are several types, and a listener that reacts to each of them with one function
+        would otherwise have to name them all.
 
-        The domain table therefore owns the answer to "which bus", which is where
-        :func:`bus_for` already keeps it, and the caller gets one call that both
-        subscribes and makes the subscription reversible.
+        The domain table owns the answer to "which bus", which is where :func:`bus_for`
+        keeps it, and the caller gets one call that both subscribes (to all of them) and
+        makes the subscription reversible.
         """
         undo = self.subscribe(bus_for(self, ctx), listener)
         ctx.on_unwind(undo)
@@ -356,17 +362,35 @@ def domain_names() -> tuple[str, ...]:
 def domain_of(event_type: type) -> "Domain | None":
     """The domain *event_type* belongs to, or ``None``.
 
-    Exists so a subscriber that reaches for the wrong channel can be told.  A domain's
-    events are published on **that domain's bus**, not on the composition's:
-    ``Context.on`` registers on ``ctx.bus``, which is the bus for events a composition
-    defines itself, so ``ctx.on(TurnCompleted, handler)`` installs a listener that is
-    never called -- and a listener that is never called is indistinguishable from a
-    plugin that works, until the day somebody notices the feature does nothing.
+    The question ``Context.on`` needs answered: a domain's events are published on **that
+    domain's bus**, so a subscription to one has to be placed there rather than on
+    ``ctx.bus`` -- the bus for events a composition defines itself.  A listener on the
+    wrong one is never called, which is indistinguishable from a plugin that works, until
+    the day somebody notices the feature does nothing.
 
-    ``Domain.attach(ctx, handler)`` is the form that goes to the right bus; this is what
-    lets :meth:`Context.on` say so instead of accepting it.
+    :func:`bus_for_type` is the form the kernel is wired with; this is the half that needs
+    only the table.
     """
     for declared in DOMAINS.values():
         if event_type in declared.event_types:
             return declared
     return None
+
+
+def bus_for_type(event_type: type, ctx: Any = None) -> "EventBus | None":
+    """The bus *event_type* is published on, or ``None`` when no domain owns it.
+
+    The single call a composition wires into the kernel as ``event_bus_lookup``, so the
+    obvious plugin code lands in the right place:
+
+        ctx.on(ToolPreExecute, self.gate)     # this call resolves the tool bus
+        TOOL.attach(ctx, self.watch)          # and this one does the same, for a set
+
+    ``None`` -- rather than the context's bus -- for a type no domain owns: that is the
+    kernel's own default to choose, and the kernel has one.  Returning it here would move
+    the decision out of the kernel while pretending to answer it.
+    """
+    declared = domain_of(event_type)
+    if declared is None:
+        return None
+    return bus_for(declared, ctx)

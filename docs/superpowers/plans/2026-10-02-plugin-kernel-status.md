@@ -471,16 +471,31 @@ the same object, so `ctx.on(TurnCompleted, handler)` **works there** -- and woul
 working the moment a composition had its own bus.  A listener that is never called is
 indistinguishable from a plugin that works.
 
-`Context.on` now refuses a domain's event type and names `Domain.attach`, which goes to
+`Context.on` first refused a domain's event type and named `Domain.attach`, which goes to
 the domain's bus in every configuration.  The kernel does not import the domain table to
 find out -- a domain is vocabulary kept outside the kernel by design -- so the composition
-wires `host.domain_lookup = event_domains.domain_of`, and a bare host accepts anything.
+wired `host.domain_lookup = event_domains.domain_of`, and a bare host accepted anything.
 
-The refusal is narrower than it first looks and was almost written wrong twice:
-`_domain_lookup` had to be added to `Context.__slots__` (without it every plugin failed
-at construction, which reads as "the guard broke a hundred tests" rather than as a missing
-slot), and the rule is *not* "domain events are never delivered on the context's bus" --
-they are, whenever the two happen to coincide.
+The refusal was narrower than it looked and was almost written wrong twice: `_domain_lookup`
+had to be added to `Context.__slots__` (without it every plugin failed at construction,
+which reads as "the guard broke a hundred tests" rather than as a missing slot), and the
+rule was *not* "domain events are never delivered on the context's bus" -- they are,
+whenever the two happen to coincide.
+
+**Superseded.**  The refusal was right about the danger and wrong about the remedy: the
+composition *is* the thing that knows where a type is published, so `Context.on` now
+**asks** rather than refuses, and the obvious call is the correct one:
+
+```python
+ctx.on(ToolPreExecute, self.gate)     # one type -- routed to the tool bus
+TOOL.attach(ctx, self.watch)          # the whole domain, one handler
+```
+
+`host.event_bus_lookup = event_domains.bus_for_type` replaces `domain_lookup`; the
+`ValueError` and its message are gone, because a guard that has to teach you the right bus
+is a worse answer than placing the subscription on it.  The failure mode is closed by
+construction instead of by a message.  See "The third half" below for why the message was
+not enough anyway.
 
 ## The engine moved into `EvolutionPlugin`
 
@@ -1250,3 +1265,76 @@ still being built.**
 3. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the
    tool-execution entry points and the streaming entry point. Those are the next
    things to leave it -- each is a plugin by the plan's table, and none is blocked.
+
+## The third half: two listeners were still on the process bus
+
+"Both halves had to move together" was the finding that produced composition-owned buses,
+and it was one half short.  The two that moved were the *subscribing* half
+(`Domain.attach` resolving a composition bus) and the *publishing* half (`BaseAgent`
+taking the buses it is given).  The missed one is a listener that is neither: the plugin
+catalog subscribes its `hooks.json` bridge at construction, from
+
+```python
+self._event_bus = event_bus if event_bus is not None else TOOL_EVENTS
+```
+
+and `bootstrap` constructs the catalog **without** `event_bus` while handing it the
+component mapping that already contains `event_bus.tool`.  So in production the executor
+published on the composition's tool bus and the bridge listened on the process one, and a
+`PreToolUse: deny` command hook was loaded, reported, and never called.  The same
+statement existed a second time in `fire_session_end`, which emitted `SessionFinished` on
+`SESSION_EVENTS` while `EvolutionPlugin` subscribed through `SESSION.attach` -- the
+session's transcript scored by nobody.
+
+**No test could see either one.**  Every existing test of the tool bridge calls
+`catalog.fire_pre_tool(...)` directly, never through a bus; and the two callers of
+`fire_session_end` are a CLI loop and a channel.  That is the shape of blind spot worth
+recording: the bridge had tests, the bridge was correct, and *the wire to it* had none.
+
+The fix is `PluginCatalog._bus_for(domain)`: resolve `event_bus.<domain>` from the
+composition's registry (the same names `Domain.attach` uses), falling back to the process
+default **asked of the domain table** -- `bus_for(domain, None)` -- rather than to a second
+copy of the table in the catalog, because a stale copy is still a bus that accepts
+listeners.
+
+Three tests, and they bite in both directions: the bridge is delivered a refusal through
+the composition bus; a catalog with no composition still bridges on `TOOL_EVENTS`; and
+the session's end reaches a plugin subscribed through `SESSION` into a real `PluginCatalog`.
+
+## Typed subscription: ask, do not refuse
+
+`Context.on` used to refuse a domain's event type and point at `Domain.attach`.  That
+guard had a cost that only showed up here: **it taught a rule the kernel could have
+applied itself.**  The composition knows where a type is published, so the kernel now
+asks -- `host.event_bus_lookup = event_domains.bus_for_type` -- and
+
+```python
+ctx.on(ToolPreExecute, self.gate)      # routed: tool bus
+ctx.on(MyOwnEvent, handler)            # no domain owns it: the host's bus
+```
+
+Both forms of subscription go through the same table, and `Context.on` lost a slot
+(`_domain_lookup`), a `ValueError` and eleven lines of message.  The tests for it changed
+shape rather than count: *delivery* instead of *a raised message*, because a message is
+not a listener -- the old test would have passed with the subscription going nowhere.
+
+`EvolutionPlugin` switched to the single-type form (`ctx.on(TurnCompleted, self.on_turn)`)
+and lost the `isinstance` guard on the first line of the handler; it had been subscribing
+to the whole `TURN` domain and dropping two of the three types, because asking for one was
+not possible.  `SESSION.attach` stays: sessions are a domain it takes as a whole.
+
+## Not built, and why
+
+Re-measured against a DSH-style plan (Cordis kernel / typed events / profiles / per-agent
+scope), the deltas that remain are choices rather than gaps:
+
+- **Per-agent registration of *services*** does not exist, and should not: a service is a
+  composition-level thing, while per-agent variation is *selection* -- `ToolRegistry.derive`
+  with a `ToolView` per capability profile, and a composed sub-system prompt.  Making
+  `llm` per-agent would break the two-agents-one-composition case the suite pins.
+- **Typed durable events** -- the durable side is `SessionLog` (one append path) plus the
+  `EventCollector` log, and the live side is these buses.  They are separate mechanisms on
+  purpose and the split is asserted; giving the durable side its own event *classes* would
+  add a second vocabulary for something that is already one call.
+- **`Runtime`** exists only as `agent/runtime/`: DTOs, locks, a heartbeat and a factory.
+  There is no privileged runtime object to delete.

@@ -133,6 +133,47 @@ def test_a_plugin_subscribes_to_both_domains(tmp_path: Path) -> None:
         catalog.close()
 
 
+ONE_TYPE = '''
+    from agent.core.event_domains import TurnCompleted
+
+    def register():
+        class OneType:
+            name = "one-type"
+
+            def __init__(self):
+                self.seen = []
+
+            def setup(self, ctx):
+                # One event class, the obvious call.  It has to be placed on the bus
+                # that owns the type -- which the composition, not the plugin, knows.
+                ctx.on(TurnCompleted, self.seen.append)
+
+        return OneType()
+'''
+
+
+def test_a_single_type_subscribed_through_the_context_is_delivered(tmp_path: Path) -> None:
+    """The call shape a plugin author reaches for first, against the real catalog.
+
+    Not a unit test of ``Context.on``: ``_load`` builds a real ``PluginCatalog``, which is
+    the module that wires ``event_bus_lookup``.  So this fails if the wiring is missing or
+    points somewhere else -- the whole difference between "the API accepts it" and "the
+    listener is called".
+    """
+    from agent import PluginCatalog
+
+    root = tmp_path / "plugins"
+    _write_plugin(root / "one-type", ONE_TYPE)
+    catalog = PluginCatalog(builtin_dir=root)
+    try:
+        loaded = catalog.discover_and_load()
+        assert loaded == ["one-type"]
+        asyncio.run(TURN_EVENTS.emit(TurnCompleted("a", "hi", "yo")))
+        assert len(_plugin(catalog, "one-type").seen) == 1
+    finally:
+        catalog.close()
+
+
 # ── Unloading removes the subscription ───────────────────────────────────────
 
 
@@ -210,9 +251,10 @@ def test_a_reload_does_not_double_subscribe(tmp_path: Path) -> None:
 # The catalog used to answer ``resolve_event_bus("turn")``, which meant the mapping
 # from a domain to its bus lived in the plugin manager.  It lives in the domain table
 # now (``agent/core/event_domains.py``), next to the types it maps, and
-# ``Domain.attach`` is the one call a plugin makes.  The mapping's own tests moved
-# there with it -- a wrong answer here produces a listener that is never called,
-# which is indistinguishable from a plugin that works.
+# ``Domain.attach`` / ``ctx.on`` both ask it -- the set form and the single-type form,
+# one answer.  The mapping's own tests moved there with it -- a wrong answer here
+# produces a listener that is never called, which is indistinguishable from a plugin
+# that works.
 
 
 def test_attach_subscribes_on_the_domains_own_bus(tmp_path: Path) -> None:

@@ -15,8 +15,9 @@ unloaded or replaced.*
     is how an absent dependency becomes an ``AttributeError`` three frames away
     from the thing that was actually missing.
 ``on(event_type, handler)``
-    Subscribe.  Returns an unsubscribe callable *and* records it on the scope, so
-    unloading cannot leave a listener behind.
+    Subscribe to one event **class**, on whichever bus publishes it (the composition
+    says which -- see :meth:`Context.on`).  Returns an unsubscribe callable *and*
+    records it on the scope, so unloading cannot leave a listener behind.
 ``emit(event)``
     Notify listeners of an event's type.
 ``scope()``
@@ -63,7 +64,7 @@ class Context:
     registration goes, and its name is what a diagnostic reports.
     """
 
-    __slots__ = ("_host", "_install", "_extra", "_views", "_domain_lookup")
+    __slots__ = ("_host", "_install", "_extra", "_views", "_bus_lookup")
 
     def __init__(self, *, host: Any, install: Any) -> None:
         self._host = host
@@ -76,12 +77,14 @@ class Context:
         self._extra = frozenset(Context.__slots__) | frozenset(
             n for n in dir(Context) if not n.startswith("__")
         )
-        #: Asked by :meth:`on` whether an event type belongs to a domain -- and therefore
-        #: to a different bus.  Supplied by whoever wired the host rather than imported
-        #: here: a domain is a set of event types kept **outside** the kernel by design,
-        #: and the kernel reaching for the table would be the coupling it exists to
-        #: prevent.  ``None`` means "no table wired", and then ``on`` accepts anything.
-        self._domain_lookup = getattr(host, "domain_lookup", None)
+        #: ``(event_type, ctx) -> bus | None``, asked by :meth:`on` so a subscription
+        #: lands on the bus that publishes the type.  Supplied by whoever wired the host
+        #: rather than imported here: a domain is a set of event types kept **outside**
+        #: the kernel by design, and the kernel reaching for that table would be the
+        #: coupling it exists to prevent.  ``None`` means "no table wired", and then every
+        #: type goes to the host's own bus -- the behaviour an embedder that provides
+        #: nothing already had.
+        self._bus_lookup = getattr(host, "event_bus_lookup", None)
 
     # -- identity ------------------------------------------------------------
 
@@ -171,28 +174,35 @@ class Context:
     # -- events --------------------------------------------------------------
 
     def on(self, event_type: type, handler: Callable[[Any], Any]) -> Callable[[], None]:
-        """Subscribe *handler* to *event_type*; undone when this plugin unloads.
+        """Subscribe *handler* to *event_type*, on **whichever bus publishes it**.
 
-        For events the composition defines.  A **domain's** events are published on that
-        domain's own bus, so this refuses them rather than installing a listener that is
-        never called -- see :func:`agent.core.event_domains.domain_of`.  The refusal is
-        the whole point: `ctx.on(TurnCompleted, handler)` reads correctly, registers
-        successfully, and does nothing, which is indistinguishable from working code.
+        The type is the channel, and the composition says where a type is published.  For
+        an event a plugin or a composition defines itself that is ``ctx.bus``; for a
+        **domain's** events -- the set this codebase keeps in
+        ``agent/core/event_domains.py``, one bus per domain -- it is that domain's bus,
+        resolved by the lookup whoever wired the host supplied.  So the obvious call is
+        the correct one:
 
-        The kernel does not import the domain table to ask; the lookup is passed in by
-        whoever wired the host, because a domain is vocabulary that lives *outside* the
-        kernel by design.
+            ctx.on(ToolPreExecute, self.gate)          # one type
+            TOOL.attach(ctx, self.watch)               # every event of a domain
+
+        **Asking rather than refusing is the point.**  The kernel cannot work out on its
+        own where ``TurnCompleted`` is published -- a domain is vocabulary kept *outside*
+        the kernel by design -- so this used to raise and name ``Domain.attach``.  That
+        refusal was right about the danger ("registered, and never called, which is
+        indistinguishable from working code") and wrong about the remedy: the composition
+        *does* know, and a subscription it can place is strictly better than one it
+        rejects.  The danger is removed by construction instead of by a guard a plugin
+        author has to be told about.
+
+        What is still the composition's job: wiring the lookup, and publishing on the same
+        bus.  A missing lookup means the kernel keeps its own default, which is the
+        behaviour an embedder that provides nothing already had.
         """
-        declared = self._domain_lookup(event_type) if self._domain_lookup else None
-        if declared is not None:
-            raise ValueError(
-                f"{event_type.__name__} belongs to the {declared.name!r} domain, whose "
-                f"events are published on that domain's bus, not on the context's. "
-                f"Registering here would subscribe you to a bus nothing publishes to. "
-                f"Use Domain.attach(ctx, handler) instead -- "
-                f"from agent.core.event_domains import {declared.name.upper()}"
-            )
-        unsubscribe = self._host.events.on(event_type, handler)
+        bus = self._bus_lookup(event_type, self) if self._bus_lookup else None
+        unsubscribe = (bus if bus is not None else self._host.events).on(
+            event_type, handler
+        )
         self._install.scope.on_unwind(unsubscribe)
         return unsubscribe
 

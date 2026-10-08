@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent.core.event_domains import SESSION, TURN, TurnCompleted
+from agent.core.event_domains import SESSION, TurnCompleted
 
 _RULE_EXTRACTION_THRESHOLD = 3  # corrections before we try to extract a rule
 
@@ -118,10 +118,13 @@ class EvolutionPlugin:
         plugin to activate at all, and present-with-``None`` is a decision the composition
         made -- active, with no engine, which is a state correction detection can work in.
 
-        Subscriptions go through ``TURN``/``SESSION`` rather than ``ctx.on`` because a
-        domain's bus is not the context's -- see :meth:`Domain.attach`.  A typed handler
-        registered on the context's bus would never be called, which is the failure with
-        no symptom.
+        Two subscriptions, and each is the shape its need has.  Turn learning reads the
+        prompt against the answer, which is exactly ``TurnCompleted`` -- so it asks for that
+        **type**, and the context routes it to the turn bus (see ``Context.on``).  It used
+        to subscribe to the whole ``TURN`` domain and drop everything that was not a
+        ``TurnCompleted``, because a single type could not be asked for; the filter went
+        with the reason for it.  ``SESSION`` stays the set form: sessions are a domain this
+        plugin takes as a whole, where a turn is one fact it looks at.
         """
         cfg = ctx.get("cfg", None) or {}
         section = cfg.get("evolution", {}) or {}
@@ -142,7 +145,7 @@ class EvolutionPlugin:
             ctx.provide("evolution", self._engine)
         # Subscribed whether or not there is an engine, because only rule *extraction*
         # needs one and that checks `_engine` itself.
-        TURN.attach(ctx, self.on_turn)
+        ctx.on(TurnCompleted, self.on_turn)
         SESSION.attach(ctx, self.on_session)
         self._ensure_rule_store()
 
@@ -172,13 +175,11 @@ class EvolutionPlugin:
     async def on_turn(self, event: Any) -> None:
         """Detect corrections; record rule applications; trigger extraction.
 
-        Subscribed to the whole ``TURN`` domain and filtered here, because a domain's
-        subscription is all-or-nothing by design: ``Domain.subscribe`` registers for every
-        type it declares, and reaching for ``TURN_EVENTS.subscribe(TurnCompleted, ...)``
-        instead would move the bus choice out of the domain table that owns it.
+        One event type, so the subscription names it -- see ``setup``.  The
+        ``isinstance`` guard that used to open this method is gone: it existed because the
+        subscription was to the whole ``TURN`` domain, and a guard on the first line of
+        every handler is what that costs.
         """
-        if not isinstance(event, TurnCompleted):
-            return
         signal = self._detector.detect(event.user_input, self._prev_response)
 
         # Record every turn as an application for all active rules so

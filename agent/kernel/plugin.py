@@ -120,11 +120,12 @@ class PluginHost:
     ) -> None:
         self.services = services if services is not None else ServiceRegistry()
         self.events = events if events is not None else EventBus()
-        #: ``event_type -> Domain | None``, or ``None`` when no domain table is wired.
-        #: Set by the composition, which owns the domains; the kernel asks it through
-        #: ``Context.on`` so a subscription to another bus's event is refused rather
-        #: than silently never called.  See ``agent.core.event_domains.domain_of``.
-        self.domain_lookup: Optional[Callable[[type], Any]] = None
+        #: ``(event_type, ctx) -> bus | None``, or ``None`` when no domain table is wired.
+        #: Set by the composition, which owns the domains: the kernel cannot know that
+        #: ``TurnCompleted`` is published on a bus of its own, and a listener placed on the
+        #: wrong bus is never called.  **Answered rather than refused** -- see
+        #: ``Context.on`` and ``agent.core.event_domains.bus_for_type``.
+        self.event_bus_lookup: Optional[Callable[[type, Any], Any]] = None
         self._installs: dict[str, Install] = {}
         #: Plugins waiting for a dependency, keyed by name.
         self._pending: dict[str, Install] = {}

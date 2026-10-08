@@ -77,11 +77,15 @@ class AgentPlugin:
     activated when it appears.  A plugin whose ``inject`` is unmet stays **pending**
     and registers nothing.
 
-    Events are per *domain*, and ``Domain.attach(ctx, handler)`` is the subscription
-    form: ``TURN``, ``LLM``, ``TOOL`` and ``SESSION`` each name a set of event types
-    (``agent/core/event_domains.py``).  Use it rather than ``ctx.on`` for those --
-    a domain's bus is not the context's, and a handler on the wrong one is never
-    called, which is the failure with no symptom.
+    Events are per *domain*: ``TURN``, ``LLM``, ``TOOL`` and ``SESSION`` each name a set of
+    event types (``agent/core/event_domains.py``) published on that domain's bus.  Both
+    forms of subscription ask the table where the type lives, so both work:
+
+        ctx.on(TurnCompleted, handler)       # one type
+        TURN.attach(ctx, handler)            # every event of a domain, one handler
+
+    ``ctx.on`` for a single type is usually the right one -- it says what the plugin
+    actually reacts to, and the bus is resolved for it.
 
     What is still a method on the plugin
     ------------------------------------
@@ -1190,10 +1194,12 @@ class PluginCatalog:
         # is simply never called, which is the failure mode with no symptom.
         self._host.events = self._event_bus
         # The composition owns the domains, so it is the composition that tells the kernel
-        # which event types live on another bus -- see `Context.on`.
-        from agent.core.event_domains import domain_of
+        # where an event type is published -- see `Context.on`.  This is what makes
+        # ``ctx.on(ToolPreExecute, ...)`` land on the tool bus without the plugin having to
+        # know that there is more than one.
+        from agent.core.event_domains import bus_for_type
 
-        self._host.domain_lookup = domain_of
+        self._host.event_bus_lookup = bus_for_type
 
     def _bus_for(self, domain: str) -> Any:
         """The bus *domain* is published and subscribed on, in **this** composition.

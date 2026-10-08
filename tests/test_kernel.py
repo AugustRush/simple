@@ -979,10 +979,10 @@ def test_a_sync_setup_that_returns_something_harmless_is_fine() -> None:
 
 def _host_with_domains():
     """A host wired the way a composition wires one: it knows the domain table."""
-    from agent.core.event_domains import domain_of
+    from agent.core.event_domains import bus_for_type
 
     host = PluginHost()
-    host.domain_lookup = domain_of
+    host.event_bus_lookup = bus_for_type
     return host
 
 
@@ -996,33 +996,76 @@ class _Subscriber:
         self.ctx = ctx
 
 
-def test_subscribing_to_a_domain_event_through_the_context_is_refused() -> None:
-    """``ctx.on(TurnCompleted, ...)`` reads correctly and does nothing.
+def test_a_domain_event_subscribed_through_the_context_reaches_its_bus() -> None:
+    """``ctx.on(TurnCompleted, handler)`` is the obvious call, so it must work.
 
-    A domain's events are published on **that domain's bus**.  The context's bus is for
-    events a composition defines itself, and in the shipped composition the two happen to
-    be the same object -- so this call *would* work there, and would stop working the
-    moment a composition had its own bus.  A listener that is never called is
-    indistinguishable from a plugin that works, which is why the refusal is worth more
-    than the permissiveness.
+    A domain's events are published on **that domain's bus**, not on ``ctx.bus``, so the
+    subscription has to be *placed* -- and the composition is the one that knows where.
+    This used to raise and name ``Domain.attach``: right about the danger, wrong about the
+    remedy.  A listener registered and never called is indistinguishable from a plugin that
+    works, and the fix for that is to put it where it is called, not to refuse it.
 
-    ``Domain.attach(ctx, handler)`` goes to the domain's bus in every configuration, and
-    that is what the message points at.
+    Asserted by **delivery**, which is the property that matters.  The refusal version of
+    this test asserted a message, and a message is not a listener: it would have passed
+    with the subscription going anywhere at all, including nowhere.
     """
+    from agent.core.events import TURN_EVENTS
+
     host = _host_with_domains()
     plugin = _Subscriber()
     host.load(plugin)
     assert host.pending() == (), "the plugin activated"
 
-    with pytest.raises(ValueError) as caught:
-        plugin.ctx.on(TurnCompleted, lambda event: None)
+    plugin.ctx.on(TurnStarted, plugin.seen.append)
+    asyncio.run(TURN_EVENTS.emit(TurnStarted("a", True, False)))
 
-    message = str(caught.value)
-    assert "turn" in message and "Domain.attach" in message, message
+    assert len(plugin.seen) == 1, "the context's subscription must reach the turn bus"
+
+
+def test_the_one_type_form_and_the_domain_form_agree() -> None:
+    """Control: both calls subscribe to the same bus, so neither is a second mechanism.
+
+    ``ctx.on(T, h)`` is for one type, ``Domain.attach(ctx, h)`` for a set; if they
+    disagreed about *where*, one of them would be the silent one.
+    """
+    from agent.core.event_domains import TURN
+    from agent.core.events import TURN_EVENTS
+
+    host = _host_with_domains()
+    plugin = _Subscriber()
+    host.load(plugin)
+
+    plugin.ctx.on(TurnStarted, plugin.seen.append)
+    plugin.ctx.on_unwind(TURN.attach(plugin.ctx, plugin.seen.append))
+
+    asyncio.run(TURN_EVENTS.emit(TurnStarted("a", True, False)))
+    assert len(plugin.seen) == 2, "both forms heard the same event once each"
+
+
+def test_unloading_removes_a_domain_subscription_made_through_the_context() -> None:
+    """Reversibility does not depend on which form was used.
+
+    The unsubscribe the domain's bus handed back has to be the one the scope records; a
+    subscription that outlives its plugin is called for ever, and raises into the isolation
+    handler every time.
+    """
+    from agent.core.events import TURN_EVENTS
+
+    host = _host_with_domains()
+    plugin = _Subscriber()
+    host.load(plugin)
+
+    plugin.ctx.on(TurnStarted, plugin.seen.append)
+    before = len(TURN_EVENTS.listeners(TurnStarted))
+    host.unload("subscriber")
+
+    assert len(TURN_EVENTS.listeners(TurnStarted)) == before - 1
+    asyncio.run(TURN_EVENTS.emit(TurnStarted("a", True, False)))
+    assert plugin.seen == [], "a listener left behind would be called after its plugin is gone"
 
 
 def test_the_domain_form_is_accepted_and_reachable() -> None:
-    """Control: the refusal must point at something that works."""
+    """Control: the set form goes to the domain's bus too."""
     from agent.core.event_domains import TURN
     from agent.core.events import TURN_EVENTS
 
@@ -1036,11 +1079,14 @@ def test_the_domain_form_is_accepted_and_reachable() -> None:
 
 
 def test_an_event_of_the_composition_is_accepted() -> None:
-    """Control: the rule is about the domain table, not about every event.
+    """Control: the lookup answers for types it knows and declines the rest.
 
     A plugin defining its own event and subscribing with ``ctx.on`` is the case the
-    context's bus exists for, and refusing it would make the context useless.
+    context's bus exists for, and ``bus_for_type`` must return ``None`` for it rather than
+    the context's bus -- the kernel's own default is the kernel's to choose.
     """
+    from agent.core.event_domains import bus_for_type
+
     host = _host_with_domains()
     plugin = _Subscriber()
     host.load(plugin)
@@ -1048,22 +1094,31 @@ def test_an_event_of_the_composition_is_accepted() -> None:
     class _Mine:
         pass
 
+    assert bus_for_type(_Mine) is None, "no domain owns a plugin's own event"
     unsub = plugin.ctx.on(_Mine, plugin.seen.append)
     assert callable(unsub)
     asyncio.run(plugin.ctx.emit(_Mine()))
     assert len(plugin.seen) == 1
 
 
-def test_without_a_wired_table_the_context_accepts_anything() -> None:
-    """The kernel does not know the domains, so it cannot refuse on its own.
+def test_without_a_wired_table_every_type_goes_to_the_kernel_bus() -> None:
+    """The kernel does not know the domains, so it cannot ask anyone where they live.
 
-    A host with no ``domain_lookup`` is a bare kernel -- used in the kernel's own tests
-    and by anything embedding it -- and it must keep working without the domain table.
+    A host with no ``event_bus_lookup`` is a bare kernel -- used in the kernel's own tests
+    and by anything embedding it -- and it must keep working without the domain table:
+    every type lands on the host's own bus.
+
+    Asserted by delivery on that bus rather than by "it returned something", because the
+    latter is true of a subscription placed anywhere, including a bus nothing publishes to.
     """
     host = PluginHost()
     plugin = _Subscriber()
     host.load(plugin)
-    assert plugin.ctx.on(TurnCompleted, lambda event: None) is not None
+
+    plugin.ctx.on(TurnCompleted, plugin.seen.append)
+    asyncio.run(host.events.emit(TurnCompleted("a", "hi", "yo")))
+
+    assert len(plugin.seen) == 1, "with no lookup, the host's own bus is where it lands"
 
 
 # ── replacement is an act, not a collision ────────────────────────────────────
