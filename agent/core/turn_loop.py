@@ -163,16 +163,18 @@ class LoopDeps:
 
     max_tool_call_iterations: int
 
-    # Context assembly and its budgets.  ``token_budget`` is a factory rather than a
-    # value: the budget depends on the turn, so the loop asks for one when it needs
-    # one instead of being handed a number that was right at some earlier point.
+    # Context assembly and its budgets.  ``token_budget`` is the budget *object* the
+    # agent holds, not a factory: the loop reads per-turn arithmetic off it (for example
+    # ``retrieval_token_budget(ctx, tools, current_user_content=...)``), and each of those
+    # takes the turn's context, so the object is what varies per turn -- not a number that
+    # was right at some earlier point.
     context_assembler: Any
     context_manager_for: Callable[..., Any]
     bounded_text: Callable[..., Any]
     protected_turn_messages: Any
     input_token_budget: Callable[..., int]
     output_room: Callable[..., int]
-    token_budget: Callable[..., Any]
+    token_budget: Any
 
     # Output limits and continuation.
     max_tokens: int
@@ -204,7 +206,6 @@ class LoopDeps:
     #: agent directly, so declaring it would be a field nothing in the loop reads.
     recover_from_content_filter: Callable[..., Any]
 
-    @classmethod
     @classmethod
     def from_services(
         cls,
@@ -256,7 +257,7 @@ class LoopDeps:
             protected_turn_messages=protected_turn_messages,
             input_token_budget=budget.input_token_budget,
             output_room=budget.output_room,
-            token_budget=budget.token_budget,
+            token_budget=budget,
             max_tokens=int(getattr(settings, "max_tokens", 0)),
             max_truncation_continuations=int(
                 getattr(settings, "max_truncation_continuations", 0)
@@ -286,10 +287,15 @@ class LoopDeps:
         a reflective version would accept a typo by failing later, and the one thing
         this struct is for is that the set is visible and closed.
         """
+        # The budget arithmetic comes from the budget, exactly as it does in
+        # ``from_services``.  Reading ``agent._configured_output_cap`` and three
+        # siblings routed four identical callables through the agent, which is the
+        # indirection this struct exists to make visible.
+        budget = agent._token_budget
         return cls(
             transport=agent._transport,
             effective_model=agent._effective_model,
-            configured_output_cap=agent._configured_output_cap,
+            configured_output_cap=budget.configured_output_cap,
             supports_vision=agent.supports_vision,
             registry=agent.registry,
             max_tool_call_iterations=agent.max_tool_call_iterations,
@@ -300,9 +306,9 @@ class LoopDeps:
             context_manager_for=agent._context_manager_for,
             bounded_text=agent._bounded_text,
             protected_turn_messages=agent._protected_turn_messages,
-            input_token_budget=agent._input_token_budget,
-            output_room=agent._output_room,
-            token_budget=agent._token_budget,
+            input_token_budget=budget.input_token_budget,
+            output_room=budget.output_room,
+            token_budget=budget,
             max_tokens=agent.max_tokens,
             max_truncation_continuations=agent.max_truncation_continuations,
             llm_max_retries=agent.llm_max_retries,

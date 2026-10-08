@@ -5177,7 +5177,7 @@ def test_create_enforces_input_budget_before_transport(tmp_path):
     asyncio.run(agent._create(ctx, [{"name": "tool", "description": "y" * 40}]))
 
     assert len(calls) == 1
-    budget = agent._input_token_budget(ctx, [{"name": "tool", "description": "y" * 40}])
+    budget = agent._token_budget.input_token_budget(ctx, [{"name": "tool", "description": "y" * 40}])
     assert manager.consolidation.estimate_tokens(calls[0]["messages"]) < budget
     assert calls[0]["messages"][-1]["content"] == "latest"
 
@@ -5240,7 +5240,7 @@ def test_the_output_cap_follows_the_request_instead_of_capping_the_conversation(
     asyncio.run(agent._create(long_ctx, tools))
 
     sent = transport.calls[-1]["max_tokens"]
-    charged = agent._payload_overhead(long_ctx, tools) + agent._estimate_input_tokens(
+    charged = agent._token_budget.payload_overhead(long_ctx, tools) + agent._token_budget.estimate_input_tokens(
         long_ctx.messages, ctx=long_ctx
     )
     assert sent < configured_cap, "the cap was not clamped to the remaining room"
@@ -5275,7 +5275,7 @@ def test_a_compacted_body_still_leaves_room_for_the_full_configured_cap():
         output_reserve=reserve,
     )
     probe = agent_module.AgentContext(system_prompt="s", messages=[])
-    budget = agent._input_token_budget(probe, tools)
+    budget = agent._token_budget.input_token_budget(probe, tools)
     # The low-water mark is where a compaction leaves the body, so it is the
     # largest the conversation can be when a turn starts.  Read from the
     # constant rather than written as "half", so raising the mark is what makes
@@ -5286,7 +5286,7 @@ def test_a_compacted_body_still_leaves_room_for_the_full_configured_cap():
         messages=[{"role": "user", "content": "x" * (body_tokens * 4)}],
     )
 
-    room = agent._output_room(body, tools)
+    room = agent._token_budget.output_room(body, tools)
     assert room >= configured_cap, (
         f"a body at the low-water mark leaves only {room} tokens of output room, "
         f"so the configured cap of {configured_cap} would be clamped"
@@ -5359,8 +5359,8 @@ def test_create_fits_the_budget_without_a_context_manager(tmp_path):
     asyncio.run(agent._create(ctx, tools))
 
     assert len(calls) == 1
-    budget = agent._input_token_budget(ctx, tools)
-    assert agent._estimate_input_tokens(calls[0]["messages"], ctx=ctx) < budget
+    budget = agent._token_budget.input_token_budget(ctx, tools)
+    assert agent._token_budget.estimate_input_tokens(calls[0]["messages"], ctx=ctx) < budget
     # The oversized opening turn is what had to go; the live request stays.
     assert len(calls[0]["messages"]) < 3
     assert calls[0]["messages"][-1]["content"] == "latest"

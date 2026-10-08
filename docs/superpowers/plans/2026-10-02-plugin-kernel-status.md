@@ -1745,6 +1745,54 @@ The control is the half that is easy to lose: with ``supports_vision: false`` th
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
 
+## `LoopDeps` again: the alternate route was broken, and a double was hiding it
+
+The review item was "the loop still reads ~15 private methods off the agent".  Doing it turned
+up something better first.
+
+**The finding.**  ``LoopDeps.token_budget`` is the budget *object* -- the loop reads
+``deps.token_budget.retrieval_token_budget(ctx, tools, ...)`` from it.  The field was annotated
+``Callable`` and documented as "a factory rather than a value", and ``from_services`` -- the
+route whose whole purpose is to show the loop can be built without an agent -- read
+``budget.token_budget``.  The real ``TokenBudget`` **has no such member**:
+
+```
+AttributeError: 'TokenBudget' object has no attribute 'token_budget'
+```
+
+So the alternate route was broken, and its test passed because its double,
+``tests/test_loop_deps_from_services.py::_Budget``, **invented that method**:
+
+```python
+class _Budget:
+    """Stands in for `TokenBudget`, which is where the arithmetic actually lives."""
+    def token_budget(self, ctx, tools):     # the real class has no such member
+        return 45
+```
+
+and then asserted ``deps.token_budget(None, []) == 45`` -- a call the loop never makes.  A
+double that is simpler than the real thing in the way that matters, hiding a broken route,
+in the test for the struct whose entire job is to make routes visible.  The same double also
+**lacked** ``retrieval_token_budget``, the one member the loop actually calls, so no test ever
+asked either route for something usable.
+
+**Fixed**: ``from_services`` passes the budget; ``of(agent)`` passes the property's value
+(``agent._token_budget`` *is* a property -- my first attempt called it and a test caught that
+immediately); the field's annotation and docstring now say object-and-why; the double carries
+``retrieval_token_budget`` and no longer invents a member; and a new test drives the **real**
+``TokenBudget`` through **both** routes and ends in the loop's own call.  Both halves verified
+by reintroducing the violation: the old line fails with
+``AttributeError: '_Budget' object has no attribute 'token_budget'``, and calling the property
+fails with ``TypeError: 'TokenBudget' object is not callable``.
+
+**And then the actual item.**  Six pass-throughs on ``BaseAgent`` --
+``_configured_output_cap``, ``_payload_overhead``, ``_output_room``, ``_input_token_budget``,
+``_estimate_input_tokens``, ``_estimate_raw_body_tokens`` -- each existed only to route
+``loop -> agent -> budget``.  Deleted; ``LoopDeps.of`` reads the budget once and takes the four
+callables from it, exactly as ``from_services`` does.  ``tests/test_token_budget.py`` had a test
+whose only job was "the agent's wrappers agree with the budget"; it now asserts the stronger and
+now-true claim that the loop's callables **are** the budget's.
+
 ## The intermittent Ralph failures: not reproduced, and made unable to lie
 
 Recorded earlier as "two different failures under full-suite load":

@@ -35,7 +35,16 @@ class _Settings:
 
 
 class _Budget:
-    """Stands in for `TokenBudget`, which is where the arithmetic actually lives."""
+    """Stands in for `TokenBudget`, which is where the arithmetic actually lives.
+
+    Faithful in the two ways that matter, and both were wrong here before:
+
+    * it does **not** invent a ``token_budget(ctx, tools)`` member.  The real class has no
+      such method, and this double having one hid a real ``AttributeError``: the field is the
+      budget *object* -- the loop reads ``token_budget.retrieval_token_budget(...)`` from it.
+    * it **does** carry ``retrieval_token_budget``, the one member the loop actually calls,
+      so a route that produced something unusable fails here instead of in a turn.
+    """
 
     def configured_output_cap(self, output_max_tokens=None):
         return 42
@@ -46,8 +55,16 @@ class _Budget:
     def output_room(self, ctx, tools):
         return 44
 
-    def token_budget(self, ctx, tools):
+    def retrieval_token_budget(self, ctx, tools, *, current_user_content=None):
         return 45
+
+
+class _RealCtx:
+    """The minimum a real `TokenBudget` asks of a context."""
+
+    messages: list = []
+    metadata: dict = {}
+    system_prompt = ""
 
 
 def _deps(**overrides):
@@ -81,19 +98,22 @@ def test_the_dependencies_can_be_built_without_an_agent() -> None:
 
 
 def test_the_budget_entries_come_from_the_budget_itself() -> None:
-    """Not from bound methods that delegate to it.
+    """The budget's own callables, and the budget itself.
 
-    This is the whole difference between the two routes: `of(agent)` takes
-    `agent._configured_output_cap`, which calls `TokenBudget.configured_output_cap`;
-    `from_services` takes the budget's own method.  Asserted by result so the identity of the
-    route is visible in the value.
+    Three of the four entries are callables taken off the object; the fourth is the object,
+    because the loop reads per-turn arithmetic from it.  Asserted by result *and* identity:
+    the value shows the route works, and the identity shows there is one implementation rather
+    than two that agree today.
     """
-    deps = _deps()
+    budget = _Budget()
+    deps = _deps(token_budget=budget)
 
     assert deps.configured_output_cap(None) == 42
     assert deps.input_token_budget(None, []) == 43
     assert deps.output_room(None, []) == 44
-    assert deps.token_budget(None, []) == 45
+    assert deps.token_budget.retrieval_token_budget(None, []) == 45
+    assert deps.token_budget is budget
+    assert deps.configured_output_cap == budget.configured_output_cap
 
 
 def test_the_pure_helpers_are_module_functions() -> None:
@@ -156,3 +176,34 @@ def test_the_struct_is_still_closed() -> None:
     assert len(fields) == len(
         [f for f in dataclasses.fields(LoopDeps) if f.init]
     ), "every field is set through the constructor"
+
+
+def test_both_routes_carry_the_real_budget_through() -> None:
+    """No doubles: the real `TokenBudget` has to survive both routes.
+
+    `_Budget` above is a stand-in, and a stand-in is exactly where this went wrong: it grew a
+    ``token_budget(ctx, tools)`` method the real class does not have, so ``from_services``
+    passed its test while raising ``AttributeError`` against a real budget, and nothing ever
+    asked a route for the one member the loop calls
+    (``deps.token_budget.retrieval_token_budget(...)``).
+
+    Driven through the real class, on both routes, ending in that call.
+    """
+    import agent as agent_module
+    from agent.core.turn_loop import LoopDeps
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    real = agent._token_budget
+    assert real.__class__.__name__ == "TokenBudget"
+
+    from_agent = LoopDeps.of(agent)
+    from_services = _deps(token_budget=real)
+
+    for route, deps in (("of(agent)", from_agent), ("from_services", from_services)):
+        assert deps.token_budget is real, route
+        budget = deps.token_budget.retrieval_token_budget(
+            _RealCtx(), [], current_user_content="hello"
+        )
+        assert isinstance(budget, int) and budget >= 0, (route, budget)

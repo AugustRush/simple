@@ -3262,15 +3262,15 @@ def test_prepare_provider_context_compacts_without_a_context_manager(tmp_path):
     ctx.messages = _oversized_ascii_transcript()
     tools = _tools()
 
-    budget = agent._input_token_budget(ctx, tools)
-    assert agent._estimate_input_tokens(ctx.messages, ctx=ctx) >= budget, (
+    budget = agent._token_budget.input_token_budget(ctx, tools)
+    assert agent._token_budget.estimate_input_tokens(ctx.messages, ctx=ctx) >= budget, (
         "fixture must start over budget, or the test proves nothing"
     )
 
     agent._prepare_provider_context(ctx, tools)
 
     assert len(ctx.messages) < 401, "oldest turns must have been dropped"
-    assert agent._estimate_input_tokens(ctx.messages, ctx=ctx) < budget
+    assert agent._token_budget.estimate_input_tokens(ctx.messages, ctx=ctx) < budget
 
 
 def test_prepare_provider_context_without_manager_matches_the_managed_path(tmp_path):
@@ -3288,7 +3288,7 @@ def test_prepare_provider_context_without_manager_matches_the_managed_path(tmp_p
         ctx = AgentContext(system_prompt="you are an assistant")
         ctx.messages = _oversized_ascii_transcript()
         agent._prepare_provider_context(ctx, tools)
-        payloads[label] = (len(ctx.messages), agent._estimate_input_tokens(ctx.messages, ctx=ctx))
+        payloads[label] = (len(ctx.messages), agent._token_budget.estimate_input_tokens(ctx.messages, ctx=ctx))
 
     assert payloads["bare"] == payloads["managed"]
 

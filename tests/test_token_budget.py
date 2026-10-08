@@ -268,18 +268,32 @@ def test_an_allocated_budget_is_recorded_on_the_context() -> None:
     }
 
 
-# ── The agent still delegates ────────────────────────────────────────────────
+# ── The loop takes the arithmetic from the budget ────────────────────────────
 
 
-def test_the_agent_methods_agree_with_the_budget() -> None:
-    """A wrapper that silently stops wrapping is the failure mode to catch."""
+def test_the_loop_takes_its_budget_callables_from_the_budget() -> None:
+    """The four budget entries in ``LoopDeps`` are the budget's own callables.
+
+    They used to be four pass-through methods on the agent -- ``def _output_room(self, ...):
+    return self._token_budget.output_room(...)`` -- so the arithmetic travelled
+    loop -> agent -> budget to arrive back where it started.  The claim worth pinning is that
+    there is **one** implementation: the same object, not two that happen to agree today.
+    """
     import agent as agent_module
+    from agent.core.turn_loop import LoopDeps
 
     agent = agent_module.BaseAgent(
         object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
     )
     ctx = _Ctx()
-    assert agent._input_token_budget(ctx, []) == agent._token_budget.input_token_budget(ctx, [])
-    assert agent._payload_overhead(ctx, []) == agent._token_budget.payload_overhead(ctx, [])
-    assert agent._output_room(ctx, []) == agent._token_budget.output_room(ctx, [])
-    assert agent._configured_output_cap(None) == agent.max_tokens
+    budget = agent._token_budget
+    deps = LoopDeps.of(agent)
+
+    assert deps.input_token_budget == budget.input_token_budget
+    assert deps.output_room == budget.output_room
+    assert deps.configured_output_cap == budget.configured_output_cap
+    # The fourth entry is the budget itself: the loop reads per-turn arithmetic from it.
+    assert deps.token_budget is budget
+    # Identity alone would be satisfied by two broken copies of the same thing.
+    assert deps.configured_output_cap(None) == agent.max_tokens
+    assert deps.input_token_budget(ctx, []) == budget.input_token_budget(ctx, [])

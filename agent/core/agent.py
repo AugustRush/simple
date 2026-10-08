@@ -1231,6 +1231,13 @@ class BaseAgent:
         budget reads ``context_window`` / ``output_reserve`` live, so a caller
         that resizes the window after construction does not have to remember to
         rebuild this.
+
+        Callers take what they need from the object this returns.  Six
+        pass-throughs used to sit here -- ``def _output_room(self, ...): return
+        self._token_budget.output_room(...)`` and five like it -- and existed
+        only so the turn loop could read the arithmetic *off the agent*.
+        ``LoopDeps.of`` reads the budget now, which is the same arithmetic
+        without the agent in the middle.
         """
         budget = getattr(self, "_token_budget_instance", None)
         if budget is None:
@@ -1244,45 +1251,6 @@ class BaseAgent:
             )
             self._token_budget_instance = budget
         return budget
-
-    def _configured_output_cap(self, output_max_tokens: int | None) -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.configured_output_cap`."""
-        return self._token_budget.configured_output_cap(output_max_tokens)
-
-
-
-    def _payload_overhead(self, ctx: "AgentContext", tools: list[dict]) -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.payload_overhead`."""
-        return self._token_budget.payload_overhead(ctx, tools)
-
-    def _output_room(self, ctx: "AgentContext", tools: list[dict]) -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.output_room`."""
-        return self._token_budget.output_room(ctx, tools)
-
-    def _input_token_budget(
-        self,
-        ctx: "AgentContext",
-        tools: list[dict],
-        *,
-        output_max_tokens: int | None = None,
-    ) -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.input_token_budget`."""
-        return self._token_budget.input_token_budget(
-            ctx, tools, output_max_tokens=output_max_tokens
-        )
-
-    def _estimate_input_tokens(
-        self,
-        messages: list[dict],
-        *,
-        ctx: Optional["AgentContext"] = None,
-    ) -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.estimate_input_tokens`."""
-        return self._token_budget.estimate_input_tokens(messages, ctx=ctx)
-
-    def _estimate_raw_body_tokens(self, ctx: "AgentContext") -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.estimate_raw_body_tokens`."""
-        return self._token_budget.estimate_raw_body_tokens(ctx)
 
     @staticmethod
     def _protected_turn_messages(ctx: "AgentContext") -> list[dict]:
