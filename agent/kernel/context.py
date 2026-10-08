@@ -43,7 +43,7 @@ plan calls out by name:
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from agent.kernel.service import (
     MissingServiceError,
@@ -239,6 +239,24 @@ class Context:
         are separate calls rather than one.
         """
         self._install.scope.on_unwind(handler)
+
+    def on_unwind_async(self, handler: Callable[[], Awaitable[None]]) -> None:
+        """Register an *awaitable* undo on this plugin's lifetime.
+
+        For what a synchronous handler cannot release: a connection pool, a subprocess
+        that has to be waited for, a buffer that has to be flushed over the network.
+
+        It is a **separate** call rather than an overload of :meth:`on_unwind` because the
+        two run at different times.  ``unload`` is synchronous and stays that way -- making
+        it async would change every caller -- so it runs the synchronous handlers and
+        **hands back** these; whoever owns the event loop awaits them, and
+        :meth:`PluginHost.pending_async_disposals` names anything still waiting.
+
+        That last part is the point.  A teardown that is quietly never awaited is the
+        failure this design exists to prevent, so an unawaited one is *visible* here rather
+        than assumed to have happened.
+        """
+        self._install.scope.on_unwind_async(handler)
 
     def scope(self) -> ServiceScope:
         """A nested scope, reversible before this plugin unloads.

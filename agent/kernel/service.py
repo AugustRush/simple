@@ -38,7 +38,7 @@ larger idea and this codebase has not earned it yet.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Awaitable, Callable, Iterator, Mapping, Optional
 
 __all__ = [
     "resolve",
@@ -71,11 +71,16 @@ class ServiceScope:
     closes, in reverse order, exactly once.
     """
 
-    __slots__ = ("_registry", "_unwind", "_disposed")
+    __slots__ = ("_registry", "_unwind", "_unwind_async", "_disposed")
 
     def __init__(self, registry: "ServiceRegistry") -> None:
         self._registry = registry
         self._unwind: list[Callable[[], None]] = []
+        #: Awaitable teardown, kept apart from the synchronous list.  A plugin that needs
+        #: to ``await pool.close()`` or wait for a subprocess cannot do it here, and
+        #: ``dispose`` cannot await, so these are collected and handed to a caller that
+        #: can -- see :meth:`adispose`.
+        self._unwind_async: list[Callable[[], Awaitable[None]]] = []
         self._disposed = False
 
     # -- lifetime ---------------------------------------------------------
@@ -123,6 +128,59 @@ class ServiceScope:
         if self._disposed:
             raise RuntimeError("cannot register on a disposed scope")
         self._unwind.append(handler)
+
+    def on_unwind_async(self, handler: Callable[[], Awaitable[None]]) -> None:
+        """Register an *awaitable* teardown action.
+
+        The half ``on_unwind`` cannot express: ``await pool.close()``, waiting for a
+        subprocess to exit, flushing a buffer over a connection.  A sync handler cannot
+        await, and the kernel deliberately does not make ``load``/``unload`` async -- that
+        would change every caller including the composition root.
+
+        So the two halves are *separate*, and the separation is explicit rather than
+        silent.  :meth:`dispose` still runs every synchronous handler, and returns these
+        to its caller as awaitables: a caller that can await does, via :meth:`adispose`,
+        and one that cannot is left holding them rather than believing the work happened.
+        Dropping them would be the failure mode this whole class exists to avoid -- a
+        resource released nowhere and reported nowhere.
+        """
+        if self._disposed:
+            raise RuntimeError("cannot register on a disposed scope")
+        self._unwind_async.append(handler)
+
+    @property
+    def has_async_unwind(self) -> bool:
+        """Whether anything here still needs awaiting.  For a report, not a decision."""
+        return bool(self._unwind_async)
+
+    async def adispose(self) -> None:
+        """Dispose, then await the handlers that needed awaiting.
+
+        Synchronous handlers run first and in reverse order, exactly as :meth:`dispose`
+        does; the async ones follow in reverse order too.  Safe to call after
+        :meth:`dispose` -- that is the normal path, because ``unload`` is synchronous and
+        has already run it.
+        """
+        self.dispose()
+        handlers, self._unwind_async = self._unwind_async, []
+        first_error: Optional[BaseException] = None
+        for handler in reversed(handlers):
+            try:
+                await handler()
+            except BaseException as exc:  # noqa: BLE001 - teardown must continue
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def take_async_unwind(self) -> list[Callable[[], Awaitable[None]]]:
+        """Claim the awaitable handlers, for a caller that will await them elsewhere.
+
+        ``dispose`` returns them so an unload path that cannot await does not have to
+        throw them away; whoever owns the event loop collects them with this.
+        """
+        handlers, self._unwind_async = self._unwind_async, []
+        return handlers
 
     def provide(self, name: str, value: Any, *, replace: bool = False) -> None:
         """Provide *name* for the lifetime of this scope.

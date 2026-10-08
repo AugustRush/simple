@@ -1362,3 +1362,117 @@ def test_a_child_loaded_during_setup_is_still_disposed_with_its_parent() -> None
 
     assert "loaded_marker" not in host.services._services
     assert host.pending() == ()
+
+
+# ── awaitable teardown ───────────────────────────────────────────────────────
+
+
+class _AsyncTeardown:
+    """Registers both halves, so the two lifetimes can be told apart."""
+
+    name = "async_teardown"
+
+    def setup(self, ctx) -> None:
+        ctx.provide("async_marker", True)
+        ctx.on_unwind(lambda: self.sync_ran.append(True))
+        ctx.on_unwind_async(self._aclose)
+
+    sync_ran: list = []
+
+    async def _aclose(self) -> None:
+        self.closed = True
+
+    closed = False
+
+
+class _AstopPlugin:
+    name = "astop_plugin"
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def setup(self, ctx) -> None:
+        ctx.provide("astop_marker", True)
+
+    async def astop(self) -> None:
+        self.stopped = True
+
+
+def test_an_awaitable_teardown_is_claimed_and_visible_rather_than_dropped() -> None:
+    """The reason ``on_unwind_async`` is a separate call with a separate report.
+
+    ``unload`` is synchronous and stays that way -- making it async would change every
+    caller including the composition root -- so it cannot await a pool close.  It claims
+    the handler and *says so*: dropping it would release nothing and report nothing, which
+    is the failure mode this class exists to prevent.
+    """
+    import asyncio
+
+    host, _ = _host()
+    plugin = _AsyncTeardown()
+    plugin.sync_ran = []
+    host.load(plugin)
+
+    host.unload("async_teardown")
+
+    assert plugin.sync_ran == [True], "the synchronous half still runs on unload"
+    assert host.pending_async_disposals() == ("async_teardown",)
+    assert plugin.closed is False, "the awaitable half has not run yet"
+
+    asyncio.run(host.adispose())
+
+    assert plugin.closed is True
+    assert host.pending_async_disposals() == ()
+
+
+def test_aunload_awaits_for_one_plugin() -> None:
+    import asyncio
+
+    host, _ = _host()
+    plugin = _AsyncTeardown()
+    plugin.sync_ran = []
+    host.load(plugin)
+
+    asyncio.run(host.aunload("async_teardown"))
+
+    assert plugin.closed is True
+    assert host.pending_async_disposals() == ()
+
+
+def test_astop_is_awaited_like_a_registered_teardown() -> None:
+    """Both spellings, one lifetime rule.
+
+    A plugin may declare ``async def astop`` instead of registering a handler; the claim
+    and the await are the same path, so neither spelling can be the one that leaks.
+    """
+    import asyncio
+
+    host, _ = _host()
+    plugin = _AstopPlugin()
+    host.load(plugin)
+
+    host.unload("astop_plugin")
+    assert plugin.stopped is False
+    assert host.pending_async_disposals() == ("astop_plugin",)
+
+    asyncio.run(host.adispose())
+    assert plugin.stopped is True
+
+
+def test_a_synchronous_only_plugin_reports_nothing_pending() -> None:
+    """Control: the report names only plugins that actually needed awaiting."""
+    host, _ = _host()
+    host.load(_ChildLoader())
+
+    host.unload("loader")
+
+    assert host.pending_async_disposals() == ()
+
+
+def test_the_async_setup_refusal_names_the_supported_alternative() -> None:
+    """A refusal that only says no is one somebody works around badly."""
+    host, _ = _host()
+    host.load(_AsyncBoom())
+
+    error = host.failed()["async_boom"]
+    assert "astop" in error and "on_unwind_async" in error

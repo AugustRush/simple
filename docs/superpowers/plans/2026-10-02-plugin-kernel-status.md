@@ -859,6 +859,35 @@ mapping below the mounts.  A warning that is usually wrong is one people learn t
 report now runs at the **end** of the composition, where the state has settled.  That this was
 visible at all is the new report doing its job.
 
+## Review finding 3: awaitable teardown
+
+The review's third P0: the lifecycle had `setup`/`teardown`/scope-unwind and nothing that
+could await, so "close the pool", "wait for the subprocess" and "flush over the network" had
+no home.  That makes a system replaceable and unloadable but not fully hot-pluggable.
+
+**What was not done, and why.**  `async def setup` is still refused.  Supporting it means
+`load` becomes async, which changes every caller including the composition root -- and it is
+not the common need: teardown is.  The refusal message now **names the alternative** rather
+than only saying no, because a refusal that gives no route is one somebody works around badly.
+
+**What was added**, in the two spellings a plugin might want:
+
+- `ctx.on_unwind_async(handler)` -- registered, like `on_unwind`.
+- `async def astop()` -- declared, like `teardown`.
+
+Both are claimed by the synchronous `unload` and **kept under the plugin's name**, then
+awaited by `host.aunload(name)`, `host.aunload_all()` or `host.adispose()`.  The claim is the
+part that matters: `unload` cannot await, so dropping the handler would release nothing and
+report nothing, which is the failure this design exists to prevent.
+`pending_async_disposals()` names whatever is still waiting, so an unawaited teardown is
+visible rather than assumed.
+
+```
+host.unload("x")             -> ('x',)   pending_async_disposals: claimed, not run
+host.services.has("thing")   -> False    the synchronous half is complete
+await host.adispose()        -> ()       and now the awaitable half has run
+```
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

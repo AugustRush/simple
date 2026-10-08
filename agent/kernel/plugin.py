@@ -44,7 +44,7 @@ import inspect
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
 
 from agent.kernel.event import EventBus
 from agent.kernel.service import ServiceRegistry, ServiceScope
@@ -141,6 +141,12 @@ class PluginHost:
         #: "it is not in ``loaded()``" and "it was never there" looked identical, and a
         #: composition that lost a plugin to an exception could not say so.
         self._failed: dict[str, Install] = {}
+        #: Awaitable teardowns claimed from scopes that were disposed by the synchronous
+        #: ``unload``, keyed by the plugin that registered them.  Kept rather than dropped:
+        #: a scope cannot await, and a teardown that is never awaited is a resource
+        #: released nowhere -- so it waits here, by name, until something with an event
+        #: loop collects it.  ``pending_async_disposals()`` is how you see it.
+        self._async_disposals: dict[str, list[Callable[[], Awaitable[None]]]] = {}
 
     # -- introspection -------------------------------------------------------
 
@@ -360,7 +366,9 @@ class PluginHost:
                     TypeError(
                         f"plugin {install.name!r} has an async setup; the kernel calls "
                         "setup synchronously and would register nothing. Make setup "
-                        "synchronous, or do the async work in a task it starts."
+                        "synchronous, or do the async work in a task it starts. "
+                        "For awaitable *teardown*, `astop` and `ctx.on_unwind_async` "
+                        "are awaited by `aunload`/`adispose`."
                     ),
                 )
                 return False
@@ -468,7 +476,21 @@ class PluginHost:
             except Exception as exc:  # noqa: BLE001 - one bad teardown must not strand the rest
                 logger.warning("plugin %r teardown failed: %s", name, exc)
 
+        # 1b. ``astop`` -- the awaitable counterpart of ``teardown``, for a plugin that
+        #     would rather declare it than register it.  Claimed the same way and waiting
+        #     in the same place, so both spellings have one lifetime rule.
+        astop = getattr(install.plugin, "astop", None)
+        if callable(astop):
+            self._async_disposals.setdefault(name, []).append(astop)
+
         # 2. The scope: every service, every subscription, every child install.
+        #
+        # Synchronous, and it stays that way.  Whatever needed awaiting is claimed first
+        # and kept under this name, so the caller that owns a loop can await it later
+        # instead of the handlers being dropped here.
+        awaitable = install.scope.take_async_unwind()
+        if awaitable:
+            self._async_disposals.setdefault(name, []).extend(awaitable)
         install.scope.dispose()
 
         self._installs.pop(name, None)
@@ -481,6 +503,44 @@ class PluginHost:
             except ValueError:
                 pass
         return install
+
+    def pending_async_disposals(self) -> tuple[str, ...]:
+        """Names whose awaitable teardown has been claimed but not yet run.
+
+        The report that keeps ``on_unwind_async`` honest.  ``unload`` cannot await, so an
+        async handler is *claimed* and waits here; a composition that never awaits it would
+        otherwise release nothing and say nothing.
+        """
+        return tuple(name for name, items in self._async_disposals.items() if items)
+
+    async def aunload(self, name: str) -> Install:
+        """Unload *name* and await whatever teardown it registered asynchronously."""
+        install = self.unload(name)
+        await self._await_disposals(name)
+        return install
+
+    async def adispose(self) -> None:
+        """Await every claimed teardown, for a composition shutting down."""
+        for name in list(self._async_disposals):
+            await self._await_disposals(name)
+
+    async def _await_disposals(self, name: str) -> None:
+        handlers = self._async_disposals.pop(name, [])
+        first_error: Optional[BaseException] = None
+        for handler in reversed(handlers):
+            try:
+                await handler()
+            except BaseException as exc:  # noqa: BLE001 - one bad teardown must not strand the rest
+                logger.warning("plugin %r async teardown failed: %s", name, exc)
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    async def aunload_all(self) -> None:
+        """Unload every root, then await the teardowns that needed it."""
+        self.unload_all()
+        await self.adispose()
 
     def unload_all(self) -> None:
         """Unload every root, which takes the tree down with it."""
