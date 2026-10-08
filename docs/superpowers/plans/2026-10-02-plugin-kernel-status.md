@@ -1472,6 +1472,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_scheduled_run_executes_a_turn_and_records_the_answer` | the unattended path: runtime factory, a real turn, the recorded run |
 | `test_a_spawned_sub_agent_runs_with_its_own_restricted_tool_set` | a derived container: the sub-agent's request offers fewer tools, and no spawner |
 | `test_unloading_a_plugin_takes_its_tool_with_it` | load and unload inside a **running** composition, a turn either side |
+| `test_a_risky_tool_call_waits_for_the_browser_and_runs_when_approved` | the approval prompt, the reply over the same socket, the call executed |
+| `test_a_declined_approval_leaves_the_command_unrun` | the same path refusing |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1527,6 +1529,13 @@ three model calls.  The evidence that the *derived* registry was used is in what
 request offered: no ``spawn_agent``, and a shorter tool list.  A sub-agent that inherited the
 parent's registry would be able to spawn, which is the recursion the exclusion exists to
 prevent.
+
+**The approval prompt.**  The only place a turn stops and waits for the person: a command
+the shell classifier calls high-risk at the default ``permissions.shell_level: ask`` makes the
+sink ask the connected browser, the reply travels back over the same socket and is redeemed
+against the token the server minted, and the command then runs.  The refusing half is asserted
+too -- a decline reaches the tool as "no" and the turn finishes, rather than the call running
+anyway or the turn dying.
 
 **Unloading a plugin in a running composition.**  A turn, then ``unload_plugin``, then
 another turn: the plugin's tool is gone from what the model is offered, the count drops by

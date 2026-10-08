@@ -1081,3 +1081,178 @@ def test_unloading_a_plugin_takes_its_tool_with_it(home):
         assert len(second) == len(first) - 1, (len(first), len(second))
     finally:
         provider.close()
+
+
+# ── 11. The approval a turn waits for ───────────────────────────────────────
+
+
+async def _ask_with_approval(socket, text: str, message_id: str, decision: str):
+    """Send a message and answer the first approval prompt with *decision*.
+
+    Returns ``(events, prompts)``: every event up to the turn's completion, and the
+    approval prompts that were answered along the way.  A turn that never prompts simply
+    completes, which is what makes a wrongly-not-prompting build visible here.
+    """
+    import asyncio
+    import json as _json
+
+    await socket.send(
+        _json.dumps({"type": "message", "text": text, "message_id": message_id})
+    )
+    events: list[dict] = []
+    prompts: list[dict] = []
+    while True:
+        event = _json.loads(await asyncio.wait_for(socket.recv(), timeout=30))
+        events.append(event)
+        if event.get("type") == "confirm_request":
+            prompts.append(event)
+            await socket.send(
+                _json.dumps(
+                    {
+                        "type": "confirm_response",
+                        "confirmation_token": event.get("confirmation_token", ""),
+                        "decision": decision,
+                    }
+                )
+            )
+            continue
+        if event.get("type") == "turn_complete":
+            return events, prompts
+
+
+def test_a_risky_tool_call_waits_for_the_browser_and_runs_when_approved(home):
+    """The only place a turn stops and waits for the person.
+
+    ``echo hi | sh`` is classified high-risk at the default ``permissions.shell_level:
+    ask``, so the shell tool issues a pending confirmation and the sink asks the connected
+    browser.  The reply travels back over the same socket, is redeemed against the token
+    the server minted (a forged one is not accepted -- that is the pending record's job),
+    and the command then runs.
+
+    Evidence: the prompt arrives with a token, the turn completes, and the model's second
+    request carries a tool result -- so the call was executed rather than short-circuited
+    into the "confirmation required" reply a non-interactive sink would produce.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "tool": (
+                "shell",
+                {
+                    "command": "echo hi | sh",
+                    "intent": "check that a risky command waits for approval",
+                },
+            )
+        },
+        {"text": "approved and done"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run():
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-approval/stream"
+                ) as socket:
+                    return await _ask_with_approval(
+                        socket, "check the shell", "m1", "allow_once"
+                    )
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events, prompts = asyncio.run(run())
+
+        assert prompts, (
+            "a high-risk command must ask the browser: "
+            f"{[event['type'] for event in events]}"
+        )
+        prompt = prompts[0]
+        assert prompt["name"] == "shell", prompt
+        assert prompt.get("confirmation_token"), prompt
+        assert _answer(events) == "approved and done", events
+
+        tool_result = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_result, [m.get("role") for m in provider.requests[-1]["messages"]]
+        content = str(tool_result[-1].get("content", ""))
+        assert '"ok": true' in content, (
+            "the call must have been executed, not answered with the structured "
+            f"'confirmation required' reply: {content[:300]}"
+        )
+    finally:
+        provider.close()
+
+
+def test_a_declined_approval_leaves_the_command_unrun(home):
+    """The other half: a refusal is honoured, and the turn still finishes.
+
+    A decline must reach the tool as "no", not as a timeout or an exception -- the model
+    has to be able to read the outcome and continue.  Asserted on the tool result the
+    model received, because that is what the next step of the turn is based on.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "tool": (
+                "shell",
+                {
+                    "command": "echo hi | sh",
+                    "intent": "check that a refused command does not run",
+                },
+            )
+        },
+        {"text": "understood, not running it"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run():
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-decline/stream"
+                ) as socket:
+                    return await _ask_with_approval(
+                        socket, "run it anyway", "m1", "deny"
+                    )
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events, prompts = asyncio.run(run())
+
+        assert prompts, [event["type"] for event in events]
+        assert _answer(events) == "understood, not running it", events
+
+        tool_result = [
+            message
+            for message in provider.requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_result, [m.get("role") for m in provider.requests[-1]["messages"]]
+        content = str(tool_result[-1].get("content", ""))
+        assert '"ok": true' not in content, (
+            f"a declined command must not have run: {content[:300]}"
+        )
+        assert "declin" in content.lower() or "confirm" in content.lower(), content[:300]
+    finally:
+        provider.close()
