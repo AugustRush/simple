@@ -1492,6 +1492,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_content_filter_rejection_is_recovered_without_the_user_seeing_it` | the rollback-and-re-ask path, driven end to end |
 | `test_an_attached_image_reaches_the_model_as_an_image_block` | upload → attach → the file's own base64 on the wire |
 | `test_an_image_sent_to_a_provider_without_vision_is_described_instead` | control: no vision, no block -- but the file is described, not dropped |
+| `test_the_model_command_switches_the_session_and_refuses_a_typo` | `/model`: the switch reaches the next request, a typo is refused, the choice survives |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1736,6 +1737,36 @@ content, so a path that "attached" something but sent its name would fail.
 The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
+
+## `/model` said it switched, and the next turn used the default
+
+The seventh defect, pre-existing (both halves land in the same commit from 2026-09-03), and
+the second of this shape: **two statements that are each reasonable alone and contradict each
+other.**
+
+* the web channel builds every message's metadata with ``"model_override": model_override`` --
+  ``None`` when the client sent no per-message model, which is every message that is not the
+  model dropdown;
+* the channel runner read ``if "model_override" in msg.metadata`` as "this message chooses",
+  and an empty value as "choose nothing".
+
+So every plain message cleared the session's choice.  Measured before the fix:
+
+```
+/model beta-model  ->  "Switched to model: beta-model (session only)"
+next turn          ->  answer for alpha-model
+```
+
+The command had never worked in the web channel.  What it *did* do is reply confidently --
+and a reply is what a test would have looked at, which is why the functional test asserts the
+**next request's model** and then the written reply.
+
+Fixed by reading the value rather than the key: an empty or absent model is a message that
+says nothing about the model, and a choice made by a command is the session's until a command
+changes it.  The test also pins the other half -- a refused switch (a typo) must name what was
+asked for *and* what is available, and must leave the session where it was -- because a
+half-applied switch sends the next turn to an endpoint that answers with a 400 about its own
+model names rather than about the typo.
 
 ## Candidate, not changed: the content-filter vocabulary
 

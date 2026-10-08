@@ -641,13 +641,17 @@ class ChannelRunner:
             # mutable session state so AgentCore publishes it into the request
             # context without mutating the shared BaseAgent/model used by
             # other web sessions.
-            if "model_override" in msg.metadata:
-                override = msg.metadata.get("model_override")
-                state.model_override = (
-                    override
-                    if isinstance(override, str) and override.strip()
-                    else None
-                )
+            #
+            # **Empty means "this message does not choose", not "choose nothing".**  Every
+            # message from the web channel carries the key, with ``None`` when the client
+            # sent no per-message model, so reading presence as intent cleared the session's
+            # choice on every message -- which is why ``/model`` said "Switched to model:
+            # beta-model (session only)" and the next turn went to the default.  A choice
+            # made by a command is the session's; a message that says nothing about the model
+            # must not take it away.
+            override = msg.metadata.get("model_override")
+            if isinstance(override, str) and override.strip():
+                state.model_override = override
             session_skill_catalog = resolve(session_runtime, "skill_catalog", skill_catalog)
             ctx.metadata["skill_catalog"] = session_skill_catalog
             if session_id not in session_coordinators:

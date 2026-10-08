@@ -2610,3 +2610,102 @@ def test_an_image_sent_to_a_provider_without_vision_is_described_instead(home):
         )
     finally:
         provider.close()
+
+
+# ── 25. Picking a model from inside the conversation ────────────────────────
+
+
+def test_the_model_command_switches_the_session_and_refuses_a_typo(home):
+    """``/model`` is the per-session switch; the settings page is the process-wide one.
+
+    Measured before this test existed: the command replied "Switched to model: beta-model
+    (session only)" and the next turn went to **alpha** -- because every message from the web
+    channel carries the key with a ``None`` value (the client sent no per-message model), and
+    the runner read "the key is present" as "this message chooses".  So a message that says
+    nothing about the model cleared the choice, every time, forever.
+
+    Both halves are asserted: the switch takes effect, and a refusal leaves it alone.  A
+    failed switch that half-applied would send the next turn to a model the endpoint does not
+    serve, which arrives as a 400 listing the endpoint's own models rather than as anything
+    about the typo.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"echo_model": True}, {"echo_model": True}, {"echo_model": True})
+    cfg = write_config(
+        home,
+        provider,
+        channels=WEB_CHANNELS,
+        providers={
+            "scripted": {
+                "api_format": "openai",
+                "api_key": "scripted-key",
+                "base_url": provider.base_url,
+                "default_model": "alpha-model",
+                "models": ["alpha-model", "beta-model"],
+            }
+        },
+    )
+    try:
+
+        async def run() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-model/stream"
+                ) as socket:
+                    switched = await _ask(socket, "/model beta-model", "m1")
+                    after_switch = await _ask(socket, "which model are you?", "m2")
+                    typo = await _ask(socket, "/model gamma-model", "m3")
+                    after_typo = await _ask(socket, "and now?", "m4")
+                return switched, after_switch, typo, after_typo
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        switched, after_switch, typo, after_typo = asyncio.run(run())
+
+        def _shown(events: list[dict]) -> str:
+            """Everything a person would read on the page, including status lines.
+
+            A refused command reports itself as a ``status`` with ``level="error"`` and an
+            empty completion, so reading only chunk/text would see nothing at all -- which is
+            how "the reply names the typo" would pass on a build that said nothing.
+            """
+            return " ".join(
+                str(
+                    event.get("chunk")
+                    or event.get("text")
+                    or event.get("error")
+                    or ""
+                )
+                for event in events
+            )
+
+        assert "beta-model" in _shown(switched), switched
+        assert _answer(after_switch) == "answer for beta-model", (
+            "the switch must reach the next turn's request -- that is the whole command: "
+            f"{after_switch}"
+        )
+        assert "gamma-model" in _shown(typo), (
+            f"the refusal must name what was asked for: {typo}"
+        )
+        assert "alpha-model" in _shown(typo) and "beta-model" in _shown(typo), (
+            f"and what is available, so the typo is fixable from the reply: {_shown(typo)}"
+        )
+        assert _answer(after_typo) == "answer for beta-model", (
+            "and a refused switch must not move the session off the last good choice: "
+            f"{after_typo}"
+        )
+        assert [request.get("model") for request in provider.requests] == [
+            "beta-model",
+            "beta-model",
+        ], [request.get("model") for request in provider.requests]
+    finally:
+        provider.close()
