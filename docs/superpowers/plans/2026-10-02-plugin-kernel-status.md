@@ -1037,6 +1037,39 @@ both sides read the same callable.  A condition that can never be true suggests 
 that is not there, so it is gone; reading the id through a callable is what makes rebuilding
 unnecessary, and the docstring now says that instead.
 
+## Review finding 7: the composition's own plugins are data
+
+The profile mechanism resolved, and the review's description was accurate: it decides
+enable/disable/config for the plugins **found on disk**.  What it could not touch is the six
+the composition root mounts itself -- Ralph, Memory, the session log, the agent, the built-in
+tools and the turn runner -- which were five literal `mount(...)` calls in `bootstrap`.  So
+"this deployment has no memory plugin" was a question a profile **could not ask**.
+
+`agent/plugins/core.py` declares them: name, why it is core rather than discovered, and a
+factory.  Two need an argument -- the agent and tool classes -- and they arrive in a
+`CoreContext` that carries **only** those, on the same reasoning as `BaseAgent`'s one-name
+`services` mapping: a factory that can reach anything makes "what does this need" unanswerable.
+
+`PluginProfile.core` selects a subset; `None` means all of them, because every existing
+composition has all of them and a default that silently dropped one would be a behaviour change
+nobody asked for.
+
+**This was only possible because of the previous round's measurement**: all 24 mount orders
+produce the same composition.  A list that can be reordered freely is a list that can become
+data.
+
+**A four-file deletion, and how it was found.**  Replacing five `mount` calls with one loop,
+I sliced the file from the first mount to the turn runner's mount -- and everything between
+them went with it: eight `registry.set_context` calls, the bundled-skill loading, the bundled
+MCP handling, the "Plugins loaded" announcement, and the `_compose_system_prompt` call.  The
+tests caught it as `KeyError: 'system_prompt'`, which is a **misleading** symptom: it looks
+like an ordering problem, not a deletion.
+
+What found it was comparing the two versions **statement by statement** rather than reading the
+diff: `HEAD` 126 statements, mine 105, with 22 missing and 1 added.  The fix was better than
+patching the damaged file -- rebuild from `HEAD` and apply only the intended change, which the
+same comparison then confirmed as exactly 6 removed and 1 added.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

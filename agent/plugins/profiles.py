@@ -110,6 +110,17 @@ class PluginProfile:
     summary: str
     entries: tuple[PluginEntry, ...] = ()
 
+    #: Which of the composition's **own** plugins this profile includes, or ``None`` for all.
+    #:
+    #: The entries above decide the plugins found on disk; this decides the ones the
+    #: composition root mounts itself.  They were five literal ``mount`` calls in
+    #: ``bootstrap``, so "this deployment has no memory plugin" was a question a profile
+    #: could not ask -- it could narrow what was discovered and not touch what was built.
+    #:
+    #: ``None`` is the safe default: every existing composition has all of them, and a
+    #: default that silently dropped one would be a behaviour change nobody asked for.
+    core: tuple[str, ...] | None = None
+
     @property
     def plugins(self) -> tuple[str, ...]:
         """The plugins this profile turns on, in declaration order."""
@@ -121,6 +132,7 @@ class PluginProfile:
             "label": self.label,
             "summary": self.summary,
             "plugins": list(self.plugins),
+            "core": list(self.core) if self.core is not None else None,
         }
 
 

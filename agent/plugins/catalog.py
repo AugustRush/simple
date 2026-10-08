@@ -1565,6 +1565,15 @@ class PluginCatalog:
             for name, pending in sorted(self._pending.items())
         }
 
+    def core_plugin_selection(self) -> tuple[str, ...] | None:
+        """Which of the composition's own plugins this profile includes.
+
+        Read here rather than in the composition root so the profile is resolved in one
+        place.  ``None`` means "all of them" -- the default a deployment gets when it says
+        nothing, and the behaviour every existing composition has.
+        """
+        return self._plugin_profile.core
+
     def flush_pending(self) -> tuple[str, ...]:
         """Re-check the composition's waiters.  See ``PluginHost.flush_pending``."""
         return self._host.flush_pending()

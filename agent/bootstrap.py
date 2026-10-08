@@ -30,6 +30,7 @@ from agent.commands import (
 from agent.commands.composition import ensure_command_router
 from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
+from agent.plugins.core import CoreContext, core_plugins
 from agent.plugins.catalog import PluginCatalog
 from agent.channels.registry import ChannelRegistry
 from agent.memory.plugin import MemoryPlugin
@@ -727,13 +728,20 @@ async def _build_components_async(
     # What order *can* still affect is what this function does between mounts -- it calls
     # `register_spawn_capability` on the resolved agent below, for instance.  So this list
     # is a dependency graph the kernel resolves, not a sequence it needs.
-    plugin_catalog.mount(RalphPlugin())
-    plugin_catalog.mount(MemoryPlugin())
-    plugin_catalog.mount(SessionPlugin())
-    plugin_catalog.mount(AgentPlugin(BaseAgent))
+    # Which of the composition's own plugins this deployment has.  A profile may narrow
+    # it; ``None`` means all, which is what every existing composition expects.
+    _core_selection = plugin_catalog.core_plugin_selection()
+    for _core_plugin in core_plugins(enabled=_core_selection):
+        plugin_catalog.mount(
+            _core_plugin.build(
+                CoreContext(
+                    agent_class=BaseAgent,
+                    tools_class=builtin_tools_cls,
+                )
+            )
+        )
     # The built-in tool set used to be constructed here directly, which made every tool it
     # registers permanent for the life of the process.
-    plugin_catalog.mount(ToolsPlugin(builtin_tools_cls))
     # Resolved, not built: the agent is a plugin's now.  This call is the composition
     # teaching it about the spawn capability, which is composition knowledge.
     require_service(components, "agent").register_spawn_capability(
@@ -835,7 +843,6 @@ async def _build_components_async(
     # composition replaces the loop by providing ``agent_loop`` itself, and a
     # composition with no agent has no loop rather than one that fails on the first
     # turn.
-    plugin_catalog.mount(TurnRunner())
     # WebChannel uses this hook to provision one independent agent home per
     # browser session under ``~/.agent/web/sessions/<session-id>``.
     async def _session_components_factory(session_id: str) -> dict:

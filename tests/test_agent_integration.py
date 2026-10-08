@@ -397,6 +397,11 @@ user-invocable: true
         def discover_and_load(self):
             return []
 
+        def core_plugin_selection(self):
+            # Part of the surface the composition root reads.  None means "all of them",
+            # which is what the real catalog says when no profile narrows it.
+            return None
+
         def flush_pending(self):
             # Part of the surface the composition root reads.  That this list keeps growing
             # is the cost of an imperative composition root: every call it makes is

@@ -120,19 +120,29 @@ def test_it_takes_the_class_as_an_argument(wired) -> None:
 
 
 def test_bootstrap_hands_it_its_own_module_level_name() -> None:
-    """Asserted on the source because the point is *which expression* is passed."""
-    source = (REPO_ROOT / "agent/bootstrap.py").read_text(encoding="utf-8")
-    mounts = [
+    """Asserted on the source because the point is *which expression* is passed.
+
+    Moved with the seam: the tool class is handed into the ``CoreContext`` the declaration
+    builds, not into a literal ``mount`` call.
+    """
+    import ast
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "agent/bootstrap.py"
+    ).read_text(encoding="utf-8")
+    contexts = [
         node
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "mount"
-        and node.args
-        and isinstance(node.args[0], ast.Call)
-        and isinstance(node.args[0].func, ast.Name)
-        and node.args[0].func.id == "ToolsPlugin"
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CoreContext"
     ]
-    assert mounts, "the scan must find ToolsPlugin being mounted"
-    passed = mounts[0].args[0].args
-    assert passed and isinstance(passed[0], ast.Name) and passed[0].id == "builtin_tools_cls"
+    assert contexts, "the composition root must build a CoreContext for the declaration"
+    passed = {
+        kw.arg: kw.value
+        for kw in contexts[0].keywords
+        if isinstance(kw.value, ast.Name)
+    }
+    assert passed.get("tools_class") is not None
+    assert passed["tools_class"].id == "builtin_tools_cls"

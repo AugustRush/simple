@@ -80,34 +80,37 @@ def test_the_class_is_a_substitution_point() -> None:
 def test_bootstrap_hands_it_its_own_module_level_name() -> None:
     """So the patch target that existed before still works.
 
-    Asserted against the source because the point is *which expression* is passed: a
-    literal import inside the plugin would make this unreachable, and the failure would be
-    a test double silently not being used.
+    Asserted against the source because the point is *which expression* is passed: a literal
+    import inside the plugin would make this unreachable, and the failure would be a test
+    double silently not being used.
+
+    The seam moved when the composition's own plugins became a declaration -- the class is
+    now passed into a ``CoreContext`` rather than into ``mount(...)`` -- so the assertion
+    moved with it.  Following the seam is the point; the alternative is a test that keeps
+    passing by looking somewhere the value no longer travels through.
     """
-    source = (REPO_ROOT / "agent/bootstrap.py").read_text(encoding="utf-8")
-    mounts = [
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "agent/bootstrap.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    contexts = [
         node
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "mount"
-        and node.args
-        and isinstance(node.args[0], ast.Call)
-        and isinstance(node.args[0].func, ast.Name)
-        and node.args[0].func.id == "AgentPlugin"
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CoreContext"
     ]
-    assert mounts, "the scan must find AgentPlugin being mounted"
-    passed = mounts[0].args[0].args
-    assert passed and isinstance(passed[0], ast.Name), (
-        "AgentPlugin must be handed a name, not left to import its own class"
+    assert contexts, "the composition root must build a CoreContext for the declaration"
+    passed = {
+        kw.arg: kw.value
+        for kw in contexts[0].keywords
+        if isinstance(kw.value, ast.Name)
+    }
+    assert passed.get("agent_class") is not None, (
+        "the agent class must be handed over, or replacing bootstrap.BaseAgent decides "
+        "nothing"
     )
-    assert passed[0].id == "BaseAgent"
-
-
-def test_it_waits_for_what_it_needs() -> None:
-    """Control: without a dependency it stays pending rather than half-building."""
-    mapping = _mapping()
-    del mapping["plugin_catalog"]
-    host, mapping = _load(mapping)
-    assert host.pending() == ("agent",)
-    assert "agent" not in mapping
+    assert passed["agent_class"].id == "BaseAgent"

@@ -61,7 +61,9 @@ def test_the_plugin_is_handed_the_class_and_the_session_is_not() -> None:
     session builds against `bootstrap`'s own name for the same reason.
     """
     source = (REPO_ROOT / "agent/bootstrap.py").read_text(encoding="utf-8")
-    assert "AgentPlugin(BaseAgent)" in source, (
+    # The seam moved into the `CoreContext` the declaration is built with; the property is
+    # unchanged, so the assertion follows it rather than disappearing.
+    assert "agent_class=BaseAgent" in source, (
         "the plugin must be handed the module-level name, or replacing bootstrap.BaseAgent "
         "stops deciding which agent runs"
     )
