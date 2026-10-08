@@ -807,6 +807,14 @@ async def _build_components_async(
         "mcp_task": None,
         "config_revision": 0,
     })
+    # The values above were written straight into the mapping, and a direct write runs no
+    # ``setup`` -- so nothing re-checked the plugins that were waiting for them.  Measured:
+    # with the `TurnRunner` mount below removed, `ralph` stayed pending forever while
+    # `system_prompt` had been present the whole time, reported as "waiting for: ()".
+    #
+    # So the composition says when it has finished writing.
+    plugin_catalog.flush_pending()
+
     # The agent loop is mounted like any other plugin, into the composition's own
     # host, so it activates only once ``agent`` and ``system_prompt`` exist -- which
     # is why this is here rather than beside the catalog.  Mounting it means a

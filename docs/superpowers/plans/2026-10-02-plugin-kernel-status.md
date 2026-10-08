@@ -888,6 +888,46 @@ host.services.has("thing")   -> False    the synchronous half is complete
 await host.adispose()        -> ()       and now the awaitable half has run
 ```
 
+## Review finding 5, in its concrete form: the composition depended on luck
+
+The review's P1 "composition root is still a giant manual wiring" has a symptom that can be
+measured, and it was worse than "verbose".  `_build_components_async` writes the values it
+computes itself straight into the mapping --
+
+```python
+_partial_components.update({"system_prompt": system_prompt, "mcp_client": ..., ...})
+```
+
+-- and a direct write runs no `setup`, so **nothing re-checks the waiters**.  Activation was
+happening as a side effect of a *later, unrelated* mount:
+
+```
+mount(TurnRunner()) removed  ->  loaded ['agent', 'memory', 'session', 'tools']
+                                 pending ('ralph',)
+                                 waiting_for {'ralph': ()}
+```
+
+**"Pending, and waiting for nothing."**  That is a diagnostic that misleads at the one moment
+it exists for, and it was caused by a second defect: `waiting_for` derived the unmet set at
+*report* time, so once a dependency existed by any route the reason vanished while the
+pending state did not.
+
+Both are fixed: the reason is **recorded when a plugin goes pending** (`Install.missing`), and
+`flush_pending()` is public so the composition says when it has finished writing.  With the
+`TurnRunner` mount removed, `ralph` now loads correctly.
+
+The deeper point is the review's: this ordering wants to be declared rather than sequenced.
+`flush_pending()` makes the *current* form correct instead of accidental; it does not remove
+the manual ordering, and declaring the composition is still open work.
+
+**A flaky family, recorded.**  Under full-suite load, `tests/test_ralph.py` has now produced
+two different failures across this session --
+`test_verifier_escalates_for_live_process_group_after_leader_exits[caller]` earlier and
+`test_verifier_caller_cancellation_propagates_after_cleanup` now.  Both pass 3/3 in isolation
+and inside their own file, both pass on a re-run of the full suite, and both exercise
+process-group signals and cancellation.  Not diagnosed, and not dismissed: a baseline
+compared by diff has to say when it saw something once.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

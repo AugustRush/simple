@@ -1476,3 +1476,64 @@ def test_the_async_setup_refusal_names_the_supported_alternative() -> None:
 
     error = host.failed()["async_boom"]
     assert "astop" in error and "on_unwind_async" in error
+
+
+# ── why a plugin is pending, and who re-checks it ─────────────────────────────
+
+
+class _WaitsForX:
+    name = "waits_for_x"
+    inject = ("x",)
+
+    def setup(self, ctx) -> None:
+        ctx.provide("waits_for_x_up", True)
+
+
+def test_waiting_for_reports_the_reason_it_went_pending() -> None:
+    """Not the difference at report time, which can be empty while it is still pending.
+
+    The old form recomputed the unmet set when asked.  A composition that wrote its
+    services straight into the mapping -- which is what the composition root does for the
+    values it computes itself -- produced the report
+
+        ralph: pending, waiting for: ()
+
+    "pending, and waiting for nothing": a sentence that sends somebody looking in the wrong
+    place, at the one moment the report exists for.
+    """
+    host, _ = _host()
+    host.load(_WaitsForX())
+    assert host.waiting_for() == {"waits_for_x": ("x",)}
+
+    # The dependency appears by a route that runs no `setup`, so nothing re-checks.
+    host.services._services["x"] = 1
+
+    assert host.pending() == ("waits_for_x",)
+    assert host.waiting_for() == {"waits_for_x": ("x",)}, (
+        "the recorded reason, not the current difference"
+    )
+
+
+def test_flush_pending_activates_a_waiter_whose_service_appeared_quietly() -> None:
+    """The public re-check, so the composition does not rely on a later mount.
+
+    Measured before the fix: removing the `TurnRunner` mount left `ralph` pending forever,
+    with `system_prompt` present the whole time -- activation had been happening as a side
+    effect of an unrelated later `mount`, and nothing said so.
+    """
+    host, _ = _host()
+    host.load(_WaitsForX())
+    host.services._services["x"] = 1
+
+    assert host.flush_pending() == ("waits_for_x",)
+    assert host.loaded() == ("waits_for_x",)
+    assert host.pending() == ()
+    assert "waits_for_x_up" in host.services._services
+
+
+def test_flush_pending_is_empty_when_nothing_can_activate() -> None:
+    """Control: it reports what it activated, so it cannot be mistaken for a no-op."""
+    host, _ = _host()
+    host.load(_WaitsForX())
+    assert host.flush_pending() == ()
+    assert host.pending() == ("waits_for_x",)

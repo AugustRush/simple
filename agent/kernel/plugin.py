@@ -86,6 +86,8 @@ class Install:
     plugin: Any
     scope: ServiceScope
     inject: tuple[str, ...] = ()
+    #: Why this install is pending, recorded when it became pending.  See waiting_for.
+    missing: tuple[str, ...] = ()
     pending: bool = False
     unloaded: bool = False
     parent: Optional[str] = None
@@ -182,6 +184,23 @@ class PluginHost:
         """Names waiting for a dependency the composition does not supply."""
         return tuple(self._pending)
 
+    def flush_pending(self) -> tuple[str, ...]:
+        """Activate whatever can now be activated, and say which names did.
+
+        The composition root fills the mapping directly for values it computes itself
+        (``system_prompt``, ``mcp_client``), and a direct write does not run a plugin's
+        ``setup``, so nothing re-checks the waiters.  That made activation depend on some
+        *later, unrelated* mount happening to trigger a flush -- measured: removing the
+        ``TurnRunner`` mount left `ralph` pending forever, with `system_prompt` present the
+        whole time.
+
+        Exposed rather than left implicit because the alternative is a composition whose
+        correctness depends on the order of statements nobody documented.
+        """
+        before = set(self._installs)
+        self._flush_pending()
+        return tuple(n for n in self._installs if n not in before)
+
     def failed(self) -> dict[str, str]:
         """Plugins whose ``setup`` raised, by name, with the error.
 
@@ -203,7 +222,7 @@ class PluginHost:
         nothing, and "nothing happened" is the hardest kind of silence to debug.
         """
         return {
-            name: tuple(d for d in install.inject if not self.services.has(d))
+            name: tuple(install.missing)
             for name, install in self._pending.items()
         }
 
@@ -335,6 +354,12 @@ class PluginHost:
         unmet = [d for d in install.inject if not self.services.has(d)]
         if unmet:
             install.pending = True
+            #: Recorded, not recomputed later.  ``waiting_for`` used to derive this list
+            #: at *report* time, so a plugin that went pending and was then satisfied
+            #: without a flush reported ``waiting for: ()`` -- pending, and waiting for
+            #: nothing, which is exactly the sentence that sends somebody looking in the
+            #: wrong place.
+            install.missing = tuple(unmet)
             self._pending[install.name] = install
             return False
 

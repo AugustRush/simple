@@ -1565,6 +1565,10 @@ class PluginCatalog:
             for name, pending in sorted(self._pending.items())
         }
 
+    def flush_pending(self) -> tuple[str, ...]:
+        """Re-check the composition's waiters.  See ``PluginHost.flush_pending``."""
+        return self._host.flush_pending()
+
     def failed_report(self) -> dict[str, str]:
         """Plugins that were refused, by name, with the error.
 

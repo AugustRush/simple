@@ -397,6 +397,12 @@ user-invocable: true
         def discover_and_load(self):
             return []
 
+        def flush_pending(self):
+            # Part of the surface the composition root reads.  That this list keeps growing
+            # is the cost of an imperative composition root: every call it makes is
+            # something a stand-in has to answer.
+            return ()
+
         def failed_report(self):
             # Part of the surface the composition root reads.  A stand-in that lacks it
             # is not a stand-in -- the same rule that made `mount` have to *run* a plugin
