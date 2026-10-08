@@ -1574,6 +1574,21 @@ class PluginCatalog:
         """
         return self._plugin_profile.core
 
+    def service_replacements(self) -> dict[str, str]:
+        """Service name -> the plugin the profile says provides it instead."""
+        return dict(self._plugin_profile.service_replacements)
+
+    def who_provides(self, service: str) -> str | None:
+        """The plugin whose ``setup`` provided *service*, or ``None``.
+
+        Read off the installs rather than guessed, so the composition can check a declared
+        replacement instead of trusting it.
+        """
+        for name, install in self._installs.items():
+            if service in install.provided_names:
+                return name
+        return None
+
     def flush_pending(self) -> tuple[str, ...]:
         """Re-check the composition's waiters.  See ``PluginHost.flush_pending``."""
         return self._host.flush_pending()

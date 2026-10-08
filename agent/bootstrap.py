@@ -731,7 +731,10 @@ async def _build_components_async(
     # Which of the composition's own plugins this deployment has.  A profile may narrow
     # it; ``None`` means all, which is what every existing composition expects.
     _core_selection = plugin_catalog.core_plugin_selection()
-    for _core_plugin in core_plugins(enabled=_core_selection):
+    _replacements = plugin_catalog.service_replacements()
+    for _core_plugin in core_plugins(
+        enabled=_core_selection, replacements=_replacements
+    ):
         plugin_catalog.mount(
             _core_plugin.build(
                 CoreContext(
@@ -836,6 +839,20 @@ async def _build_components_async(
     #
     # So the composition says when it has finished writing.
     plugin_catalog.flush_pending()
+
+    # A declared replacement is **checked**, not trusted.  `core_plugins` decided what not to
+    # mount; whether the named plugin actually came up and actually provided the service is a
+    # different question, and the failure without this is a KeyError three layers away naming
+    # neither the profile nor the replacement.
+    for _service, _provider in sorted(_replacements.items()):
+        _actual = plugin_catalog.who_provides(_service)
+        if _actual != _provider:
+            raise RuntimeError(
+                f"profile {getattr(plugin_catalog, '_plugin_profile', None) and plugin_catalog._plugin_profile.key!r} "
+                f"declares {_service!r} is provided by {_provider!r}, but it is "
+                f"{'provided by ' + repr(_actual) if _actual else 'not provided at all'} "
+                f"-- see the plugin's own failed_report()/pending_report()"
+            )
 
     # The agent loop is mounted like any other plugin, into the composition's own
     # host, so it activates only once ``agent`` and ``system_prompt`` exist -- which

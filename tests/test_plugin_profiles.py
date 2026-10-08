@@ -49,12 +49,22 @@ def test_the_default_profile_turns_nothing_on_by_itself() -> None:
 def test_a_profile_payload_is_serialisable() -> None:
     """So the UI lists profiles without hardcoding them."""
     payload = DEFAULT_PROFILE.to_payload()
-    assert set(payload) == {"key", "label", "summary", "plugins", "core"}
+    assert set(payload) == {
+        "key",
+        "label",
+        "summary",
+        "plugins",
+        "core",
+        "service_replacements",
+    }
     assert isinstance(payload["plugins"], list)
     # `core` is the composition's own plugins, which the entries above do not describe:
     # they decide what is *discovered*, this decides what the root *mounts*.  None means
     # all of them.
     assert payload["core"] is None
+    # Service name -> the plugin providing it instead of the built-in one.  Empty by
+    # default, because "no replacements" is what every existing composition says.
+    assert payload["service_replacements"] == {}
 
 
 def test_an_entry_payload_is_serialisable() -> None:

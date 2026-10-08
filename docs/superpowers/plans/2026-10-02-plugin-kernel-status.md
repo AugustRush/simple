@@ -1181,6 +1181,32 @@ What is *not* left, contrary to the review's phrasing: `AgentCore` reads through
 is done -- `AgentSettings` holds the derivation, so what the agent carries is closer to
 "state plus collaborators" than "state plus a config bag".
 
+## Review finding 11: a profile can say where a service comes from
+
+`PluginProfile.core` says **which** of the composition's own plugins are present.  It cannot
+say that a particular **service** comes from somewhere else -- and a deployment shipping its own
+memory plugin needs exactly that: "include memory" and "memory comes from acme" are different
+statements.
+
+`PluginProfile.service_replacements` (service name -> plugin name) is that statement, and
+`core_plugins(replacements=...)` **drops any core plugin whose `provides` intersects the
+replaced set**.  By `provides`, not by name: `memory` offers both `ltm_store` and `memory`, so a
+name-based rule would drop it for one spelling and leave a collision for the other -- which the
+kernel refuses at the second `provide`, with an error naming neither the profile nor the
+replacement.
+
+**And the composition root checks the declaration rather than trusting it.**  Deciding what not
+to mount says nothing about whether the named plugin came up and actually provided the service.
+Without the check the failure is a `KeyError` three layers away; with it, the message names the
+service, the expected plugin and what actually happened -- including "not provided at all".
+
+**This was declined one round earlier as speculative, and that was the wrong call.**  The
+reason given was "the kernel already supports replacement, so a declaration is a mechanism
+without a consumer".  What changed the answer is `CoreContext`: once the composition's own
+plugins were **data**, a profile could express *which* plugins exist and not *where a service
+comes from* -- an asymmetry in the model rather than a missing feature.  The earlier judgement
+was made before that structure existed.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

@@ -397,6 +397,11 @@ user-invocable: true
         def discover_and_load(self):
             return []
 
+        def service_replacements(self):
+            # Part of the surface the composition root reads; empty means "no replacements",
+            # which is what a profile that declares none says.
+            return {}
+
         def core_plugin_selection(self):
             # Part of the surface the composition root reads.  None means "all of them",
             # which is what the real catalog says when no profile narrows it.

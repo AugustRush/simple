@@ -151,17 +151,38 @@ def core_plugin_names() -> tuple[str, ...]:
 
 
 def core_plugins(
-    *, enabled: tuple[str, ...] | None = None
+    *,
+    enabled: tuple[str, ...] | None = None,
+    replacements: Mapping[str, str] | None = None,
 ) -> tuple[CorePlugin, ...]:
     """The core plugins to mount, in declaration order.
 
     *enabled* ``None`` means all of them, which is the only safe default: every existing
     composition mounts all six, and a default that silently dropped one would be a behaviour
     change nobody asked for.
+
+    *replacements* maps a **service name** to the **plugin** that provides it instead.  A core
+    plugin whose ``provides`` intersects that set is left out, because mounting both would be
+    two providers of one name -- which the kernel refuses at the second ``provide``, with an
+    error naming neither the profile nor the replacement.  Dropping it here is how "my plugin
+    provides ``memory``" becomes a composition rather than a collision.
+
+    The caller is expected to *check* the replacement afterwards: this decides what not to
+    mount, and cannot know whether the named plugin actually came up.
     """
-    if enabled is None:
-        return CORE_PLUGINS
-    unknown = sorted(set(enabled) - set(_BY_NAME))
-    if unknown:
-        raise KeyError(f"no such core plugin: {unknown}")
-    return tuple(plugin for plugin in CORE_PLUGINS if plugin.name in set(enabled))
+    chosen = list(CORE_PLUGINS)
+    if enabled is not None:
+        unknown = sorted(set(enabled) - set(_BY_NAME))
+        if unknown:
+            raise KeyError(f"no such core plugin: {unknown}")
+        chosen = [plugin for plugin in chosen if plugin.name in set(enabled)]
+
+    if replacements:
+        replaced = set(replacements)
+        displaced = sorted(
+            plugin.name for plugin in chosen if set(plugin.provides) & replaced
+        )
+        if displaced:
+            chosen = [plugin for plugin in chosen if plugin.name not in set(displaced)]
+
+    return tuple(chosen)

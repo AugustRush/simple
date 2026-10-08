@@ -121,6 +121,18 @@ class PluginProfile:
     #: default that silently dropped one would be a behaviour change nobody asked for.
     core: tuple[str, ...] | None = None
 
+    #: Service name -> the plugin that provides it instead of the built-in one.
+    #:
+    #: This is the half `core` cannot express.  `core` says *which* of the composition's own
+    #: plugins are present; this says that a particular **service** comes from somewhere
+    #: else.  A deployment shipping its own memory plugin needs the second: "include memory"
+    #: and "memory comes from acme" are different statements.
+    #:
+    #: The mechanisms already existed -- a plugin of the same name replaces via
+    #: ``load(replace=True)``, and dependents are restored afterwards -- so this is the
+    #: declaration, not a second implementation of replacement.
+    service_replacements: Mapping[str, str] = field(default_factory=dict)
+
     @property
     def plugins(self) -> tuple[str, ...]:
         """The plugins this profile turns on, in declaration order."""
@@ -133,6 +145,7 @@ class PluginProfile:
             "summary": self.summary,
             "plugins": list(self.plugins),
             "core": list(self.core) if self.core is not None else None,
+            "service_replacements": dict(self.service_replacements),
         }
 
 
