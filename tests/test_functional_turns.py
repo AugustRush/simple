@@ -815,3 +815,136 @@ def test_a_session_turn_writes_into_the_sessions_own_output_dir(home):
         assert '"ok": true' in str(tool_result[-1].get("content", "")), tool_result[-1]
     finally:
         provider.close()
+
+
+# ── 7. The transcript a refreshed page restores ─────────────────────────────
+
+
+def test_a_turns_transcript_is_recorded_and_served_to_a_reconnecting_client(home):
+    """What a browser refresh reads: the conversation that already happened.
+
+    The WebSocket carries a turn; the durable record is what survives the tab, and
+    `/api/sessions/<id>/messages` is where the page gets it back.  Two halves of the
+    refactor are only visible here: the append path (``SessionLog`` -- one writer) and the
+    read path a restored page uses.  Nothing in the unit suite drives both through a turn,
+    and the failure mode is the one the code comments about: a trace that disappears on
+    refresh, with no error anywhere.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "I will remember that"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> dict:
+            import httpx
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-history/stream"
+                ) as socket:
+                    events = await _ask(socket, "please remember the word marco", "m1")
+                assert _answer(events) == "I will remember that", events
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"http://127.0.0.1:{port}/api/sessions/web-history/messages"
+                    )
+                assert response.status_code == 200, response.text
+                return response.json()
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        payload = asyncio.run(run())
+
+        transcript = json.dumps(payload, ensure_ascii=False)
+        assert "marco" in transcript, (
+            "the user's message must be in the durable transcript a refresh reads: "
+            f"{transcript[:600]}"
+        )
+        assert "I will remember that" in transcript, (
+            "and so must the reply: "
+            f"{transcript[:600]}"
+        )
+    finally:
+        provider.close()
+
+
+# ── 8. A scheduled run, which is an agent turn with nobody watching ─────────
+
+
+def test_a_scheduled_run_executes_a_turn_and_records_the_answer(home):
+    """The unattended path: a due task runs a real turn and reports what came back.
+
+    A scheduled run is where the composition is built *again* -- by the scheduler's
+    runtime factory, from the config on disk -- so it exercises a different entry point
+    from the ones above while still going through the agent, the loop and the provider.
+
+    Asserted on the recorded run rather than on a console: a run has nobody watching, so
+    the store is the only place its outcome exists.
+    """
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    import agent as agent_module
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
+    from agent.scheduler.plugin import SchedulerPlugin
+    from agent.scheduler.store import scheduler_store
+    from agent.kernel.service import require_service
+
+    provider = scripted({"text": "the scheduled answer"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS, scheduler={"enabled": True})
+    try:
+        # The task is created with a store of the test's own and then closed, so the
+        # store the plugin owns is the only handle while the run happens.
+        setup = scheduler_store()
+        try:
+            task = setup.create_task(
+                NewScheduledTask(
+                    name="functional-run",
+                    kind="agent_prompt",
+                    trigger=TriggerSpec.once(
+                        datetime.now(timezone.utc) - timedelta(minutes=1)
+                    ),
+                    payload={"prompt": "answer the scheduled question"},
+                    delivery_mode="standalone",
+                    delivery_target=DeliveryTarget.standalone(),
+                )
+            )
+        finally:
+            setup.close()
+
+        async def run() -> list:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            try:
+                components["plugin_catalog"].mount(SchedulerPlugin())
+                service = require_service(components, "scheduler")
+                await service.run_once()
+            finally:
+                await agent_module._close_components(components)
+            runs = scheduler_store()
+            try:
+                return runs.list_runs(task.id)
+            finally:
+                runs.close()
+
+        recorded = asyncio.run(run())
+
+        assert recorded, "the due task must have produced a run"
+        finished = [item for item in recorded if item.finished_at is not None]
+        assert finished, [item.status for item in recorded]
+        last = finished[-1]
+        assert last.status == "succeeded", last
+        assert "the scheduled answer" in (last.summary or ""), (
+            "the run's record must carry what the turn produced, because a run has "
+            f"nobody watching it: {last.summary!r}"
+        )
+        assert provider.requests, "the run must have reached the provider"
+    finally:
+        provider.close()

@@ -1468,6 +1468,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_reloading_a_plugin_runs_its_new_code` | an edit with the same size *and* mtime -- the `.pyc` trap |
 | `test_switching_provider_rebuilds_the_session_runtime` | the settings page's `activate`, then the next turn |
 | `test_a_session_turn_writes_into_the_sessions_own_output_dir` | the per-session runtime, asserted by where the file lands |
+| `test_a_turns_transcript_is_recorded_and_served_to_a_reconnecting_client` | the durable record a refreshed page reads |
+| `test_a_scheduled_run_executes_a_turn_and_records_the_answer` | the unattended path: runtime factory, a real turn, the recorded run |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1500,6 +1502,26 @@ user-visible one.
 about the product.  Where a test replaces a collaborator, ask what the real collaborator has
 that the double lacks -- a method, a binding, a container -- because that difference is
 exactly where the bug will be.
+
+## Two runs the layer did *not* have to fix
+
+Worth recording, because "the functional layer found two bugs" is not the same claim as
+"everything it drove was broken".  These two were already right, and both are now pinned
+where nothing pinned them before:
+
+**The durable transcript.**  A turn's user message and the reply are recorded and served
+back by ``GET /api/sessions/<id>/messages`` -- the path a refreshed page reads.  Both halves
+of the ``SessionLog`` change are exercised in one turn, through the product.  This is a place
+the project has been wrong before (a comment in ``channels/base.py`` describes tool traces
+vanishing on refresh), which is why it is worth a test rather than an assumption.
+
+**A scheduled run.**  A task due immediately runs a real turn -- built by the scheduler's
+runtime factory from the config on disk, so a genuinely different entry point -- reaches the
+provider, and records its outcome.  A run has nobody watching it, so the store is the only
+place its result exists: the test asserts on ``TaskRun.summary``, not on a console.
+
+Both are the shape the plan calls for: the plugin supplies the capability, and the
+assertion is made where the user would look.
 
 ## The per-call context merge was never installed
 
