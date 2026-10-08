@@ -1490,6 +1490,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_stream_with_no_usage_report_still_delivers_its_answer` | no usage chunk: the accounting is lost, not the answer |
 | `test_a_tool_call_announced_and_never_sent_does_not_wedge_the_turn` | `tool_calls` finish with none sent: the turn ends and says so |
 | `test_a_content_filter_rejection_is_recovered_without_the_user_seeing_it` | the rollback-and-re-ask path, driven end to end |
+| `test_an_attached_image_reaches_the_model_as_an_image_block` | upload → attach → the file's own base64 on the wire |
+| `test_an_image_sent_to_a_provider_without_vision_is_described_instead` | control: no vision, no block -- but the file is described, not dropped |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1720,6 +1722,20 @@ belongs to a *composition* was left pointing at a process-wide default.  Two wer
 were a plugin-scoped view standing in for a service.  That is the shape to sweep for, and a
 functional test finds it faster than reading does: it is invisible in any single object and
 obvious in a running product.
+
+## An attachment, all the way to the bytes
+
+The last shape on the "the fake was simpler than the real thing" axis that had not been
+driven: a file the user attaches.  Four separate things have to line up, and each lives
+somewhere else -- the upload endpoint stores it under the session, the message's attachment
+list is parsed back into a ``MessageAttachment``, the turn decides an image becomes a
+*direct* block only when the provider claims vision support, and the transport encodes it for
+its own wire format.  Asserted on the bytes: the base64 in the request is the file's own
+content, so a path that "attached" something but sent its name would fail.
+
+The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
+must become *words* describing the file.  Dropping it would be the quiet failure -- the user
+attached something and the model never learned it existed.
 
 ## Candidate, not changed: the content-filter vocabulary
 

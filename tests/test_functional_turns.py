@@ -2438,3 +2438,175 @@ def test_a_content_filter_rejection_is_recovered_without_the_user_seeing_it(home
         )
     finally:
         provider.close()
+
+
+# ── 24. An image the user attaches ──────────────────────────────────────────
+
+#: The smallest valid PNG: one transparent pixel.  Real bytes, because the product reads
+#: the file, base64-encodes it and puts it on the wire -- a stand-in string would test none
+#: of that.
+_ONE_PIXEL_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000a49444154789c6300010000050001a5f645400000000049454e44ae426082"
+)
+
+
+def test_an_attached_image_reaches_the_model_as_an_image_block(home):
+    """Drag a file into the chat: upload, attach, and the request carries the image.
+
+    Four things have to line up, and each is somewhere different: the upload endpoint stores
+    the file under the session, the message's attachment list is parsed back into a
+    ``MessageAttachment``, the turn decides an image is a *direct* block only when the
+    provider claims vision support, and the transport encodes it for its own wire format.
+
+    Asserted on the wire -- the base64 the model would actually receive is the file's bytes --
+    because that is where a path that "attached something" but sent its name instead would
+    show up.
+    """
+    import asyncio
+    import base64
+
+    import agent as agent_module
+
+    provider = scripted({"text": "I can see it"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    cfg["providers"]["scripted"]["supports_vision"] = True
+    (home / "config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    try:
+
+        async def run() -> tuple[list[dict], dict]:
+            import httpx
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"http://127.0.0.1:{port}/api/sessions/web-attach/attachments",
+                        files={"files": ("pixel.png", _ONE_PIXEL_PNG, "image/png")},
+                    )
+                assert response.status_code == 200, response.text
+                uploaded = response.json()["attachments"]
+                assert len(uploaded) == 1, uploaded
+                assert uploaded[0]["kind"] == "image", uploaded[0]
+
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-attach/stream"
+                ) as socket:
+                    await socket.send(
+                        json.dumps(
+                            {
+                                "type": "message",
+                                "text": "what is in this image?",
+                                "message_id": "m1",
+                                "attachments": uploaded,
+                            }
+                        )
+                    )
+                    events: list[dict] = []
+                    while True:
+                        event = json.loads(
+                            await asyncio.wait_for(socket.recv(), timeout=30)
+                        )
+                        events.append(event)
+                        if event.get("type") == "turn_complete":
+                            break
+                return events, uploaded[0]
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events, _uploaded = asyncio.run(run())
+
+        assert _answer(events) == "I can see it", events
+        assert not [e for e in events if e["type"] == "error"], events
+
+        sent = json.dumps(provider.requests[0]["messages"])
+        expected = base64.b64encode(_ONE_PIXEL_PNG).decode()
+        assert "image_url" in sent, (
+            f"the request must carry an image block: {sent[:400]}"
+        )
+        assert expected in sent, (
+            "and the block must carry the file's own bytes, base64-encoded: "
+            f"{sent[:400]}"
+        )
+        assert "data:image/png;base64," in sent, sent[:400]
+    finally:
+        provider.close()
+
+
+def test_an_image_sent_to_a_provider_without_vision_is_described_instead(home):
+    """Control: an attachment must not vanish when the model cannot see.
+
+    The turn decides what an attachment becomes: a direct image block for a provider that
+    claims vision, and otherwise a line of text describing the file.  Silently dropping it
+    would be the quiet failure -- the user attached something and the model never learned it
+    existed.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "noted the file"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    cfg["providers"]["scripted"]["supports_vision"] = False
+    (home / "config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    try:
+
+        async def run() -> list[dict]:
+            import httpx
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"http://127.0.0.1:{port}/api/sessions/web-novision/attachments",
+                        files={"files": ("pixel.png", _ONE_PIXEL_PNG, "image/png")},
+                    )
+                uploaded = response.json()["attachments"]
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-novision/stream"
+                ) as socket:
+                    await socket.send(
+                        json.dumps(
+                            {
+                                "type": "message",
+                                "text": "what is this?",
+                                "message_id": "m1",
+                                "attachments": uploaded,
+                            }
+                        )
+                    )
+                    events: list[dict] = []
+                    while True:
+                        event = json.loads(
+                            await asyncio.wait_for(socket.recv(), timeout=30)
+                        )
+                        events.append(event)
+                        if event.get("type") == "turn_complete":
+                            break
+                return events
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events = asyncio.run(run())
+
+        assert _answer(events) == "noted the file", events
+        sent = json.dumps(provider.requests[0]["messages"], ensure_ascii=False)
+        assert "image_url" not in sent, "no vision, no image block"
+        assert "pixel.png" in sent, (
+            "the attachment must be described in words instead of disappearing: "
+            f"{sent[:400]}"
+        )
+    finally:
+        provider.close()
