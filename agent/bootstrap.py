@@ -713,20 +713,25 @@ async def _build_components_async(
     )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
-    # Mounted before the blocks below, because those resolve what these provide.  Ralph
-    # and Memory are the two plugins the composition root mounts itself; everything else
-    # is discovered from disk.
+    # The plugins the composition root mounts itself; everything else is discovered from
+    # disk.
+    #
+    # **The order below is for a reader, not for the kernel.**  Measured: all 24 orders of
+    # memory / session / agent / tools produce the same complete composition, because
+    # activation is by dependency name -- a plugin whose dependency is absent stays pending
+    # and is activated when a provider appears.  The comments here used to record ordering
+    # constraints ("After Memory: it injects `ltm_store`"), and those constraints had
+    # already stopped existing; stating them made the composition look more fragile than
+    # it is.
+    #
+    # What order *can* still affect is what this function does between mounts -- it calls
+    # `register_spawn_capability` on the resolved agent below, for instance.  So this list
+    # is a dependency graph the kernel resolves, not a sequence it needs.
     plugin_catalog.mount(RalphPlugin())
     plugin_catalog.mount(MemoryPlugin())
-    # After Memory: it injects `ltm_store`.
     plugin_catalog.mount(SessionPlugin())
-    # Last of the three composition-owned plugins: it injects `context_manager`
-    # and `plugin_catalog`, both provided by the time this runs.
-    # Handed the class, so this composition still decides which one runs: the name below
-    # is the module-level `BaseAgent`, which is what a substitution replaces.
     plugin_catalog.mount(AgentPlugin(BaseAgent))
-    # After the three above: it injects `memory`, `context_manager` and the rest.  The
-    # built-in tool set used to be constructed here directly, which made every tool it
+    # The built-in tool set used to be constructed here directly, which made every tool it
     # registers permanent for the life of the process.
     plugin_catalog.mount(ToolsPlugin(builtin_tools_cls))
     # Resolved, not built: the agent is a plugin's now.  This call is the composition

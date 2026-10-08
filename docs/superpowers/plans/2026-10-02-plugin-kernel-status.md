@@ -956,6 +956,27 @@ Along the way `EventBus.emit` turned out to be a **coroutine**, so calling it wi
 returned an object that did nothing, and the first version "passed" the negative half for
 entirely the wrong reason.
 
+## The ordering constraints in the composition root were stale
+
+The previous section ended by saying the manual ordering was still open work.  Measuring it
+changed the picture, and in the composition's favour:
+
+**All 24 orders** of memory / session / agent / tools produce the same complete composition.
+Activation is by dependency **name**, so a plugin whose dependency is absent stays pending and
+activates when a provider appears -- the order genuinely does not matter.
+
+Which means the comments recording constraints -- "After Memory: it injects `ltm_store`",
+"Last of the three composition-owned plugins" -- described something that had **already
+stopped being true**.  A reader who believes them preserves an order that carries no meaning,
+and a composition that looks fragile is one nobody dares reorder.
+
+The comments now say what is measured, and `tests/test_composition_order.py` pins it: all 24
+orders, plus a control that the tool set actually registered rather than merely loading.
+
+**This is the precondition for declaring the composition rather than sequencing it** -- a
+list that can be reordered freely is a list that can become data -- and it is why the
+remaining work is now smaller than the review estimated.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
