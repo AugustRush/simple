@@ -1362,3 +1362,70 @@ def test_a_tool_from_an_mcp_server_can_be_called_by_the_agent(home, monkeypatch)
         assert client.closed, "and the composition's teardown closed it"
     finally:
         provider.close()
+
+
+# ── 13. The task loop, driven as a command ──────────────────────────────────
+
+
+def test_the_ralph_task_loop_runs_through_the_command_router(home):
+    """``/ralph`` runs the task loop in a session, against the composed agent.
+
+    Ralph is the piece with the longest dependency list (seven services) and the one whose
+    iterations each drive a *turn* through the agent, so this exercises the plugin
+    activating, its store, and a loop that calls the model more than once -- through the
+    command router, which is how a person starts it.
+
+    Asserted on the task the store kept as well as on the reply: a loop that ran and did not
+    record itself has lost the only durable trace of what it did.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "iteration done"}, {"text": "still done"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> tuple[list[dict], list]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-ralph/stream"
+                ) as socket:
+                    events = await _ask(
+                        socket, "/ralph make the test pass --max 2", "m1"
+                    )
+                service = components.get("ralph_service")
+                tasks = service.list_tasks() if service is not None else []
+                return events, tasks
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        events, tasks = asyncio.run(run())
+
+        text = " ".join(
+            str(event.get("chunk") or event.get("text") or "") for event in events
+        )
+        assert not [e for e in events if e["type"] == "error"], events
+        assert tasks, (
+            "the loop must record its task; the reply was: "
+            f"{text[:300]}"
+        )
+        task = tasks[-1]
+        assert task.goal == "make the test pass", task
+        assert task.max_iterations == 2, task
+        assert task.status == "max_iterations_reached", (
+            f"two iterations of a goal nothing verifies end here: {task.status}"
+        )
+        assert task.current_iteration == 2, task
+        assert len(provider.requests) >= 2, (
+            "the loop must drive a turn per iteration, not one turn for the command: "
+            f"{len(provider.requests)} request(s)"
+        )
+    finally:
+        provider.close()

@@ -1475,6 +1475,7 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_a_risky_tool_call_waits_for_the_browser_and_runs_when_approved` | the approval prompt, the reply over the same socket, the call executed |
 | `test_a_declined_approval_leaves_the_command_unrun` | the same path refusing |
 | `test_a_tool_from_an_mcp_server_can_be_called_by_the_agent` | an external server's tool: offered to the model, called, closed by teardown |
+| `test_the_ralph_task_loop_runs_through_the_command_router` | `/ralph … --max 2`: the seven-dependency plugin, its store, a turn per iteration |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1530,6 +1531,12 @@ three model calls.  The evidence that the *derived* registry was used is in what
 request offered: no ``spawn_agent``, and a shorter tool list.  A sub-agent that inherited the
 parent's registry would be able to spawn, which is the recursion the exclusion exists to
 prevent.
+
+**The task loop.**  `/ralph make the test pass --max 2` over a session's socket: the plugin
+with the longest dependency list activates, the loop drives a turn per iteration, and the task
+it kept says so -- ``max_iterations_reached``, ``current_iteration == 2``, and at least two
+provider requests.  Asserted on the store as well as on the reply, because a loop that ran and
+did not record itself has lost the only durable trace of what it did.
 
 **The approval prompt.**  The only place a turn stops and waits for the person: a command
 the shell classifier calls high-risk at the default ``permissions.shell_level: ask`` makes the
