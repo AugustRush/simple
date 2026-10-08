@@ -3014,3 +3014,184 @@ def test_an_unattended_run_refuses_rather_than_leaving_a_token(home):
     assert sink.audit.decisions, (
         "and the refusal has to be recorded, or nobody learns it was asked"
     )
+
+
+# ── 29. Turning a plugin off from the plugins page ──────────────────────────
+
+
+def test_toggling_a_plugin_off_takes_its_tool_out_of_a_live_session(home):
+    """The hot-swap promise, through the HTTP API a person clicks.
+
+    Turning a plugin off writes the config, reloads the catalog, and bumps the config
+    revision -- and the *session* has to notice: its runtime was built before the change and
+    holds a registry.  Three turns on one socket, with the toggle between them, because the
+    failure this guards against is state that only the *next* turn would reveal: the page
+    says "disabled" while the conversation keeps offering the tool.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "one"}, {"text": "two"}, {"text": "three"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    write_plugin(home, "v1")
+    try:
+
+        async def run() -> tuple[list[dict], dict, list[dict], dict, list[dict]]:
+            import httpx
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-toggle/stream"
+                ) as socket:
+                    before = await _ask(socket, "first", "m1")
+                    async with httpx.AsyncClient() as client:
+                        off = (
+                            await client.post(
+                                f"http://127.0.0.1:{port}/api/plugins/recorder/toggle",
+                                json={"enabled": False},
+                            )
+                        ).json()
+                    during = await _ask(socket, "second", "m2")
+                    async with httpx.AsyncClient() as client:
+                        on = (
+                            await client.post(
+                                f"http://127.0.0.1:{port}/api/plugins/recorder/toggle",
+                                json={"enabled": True},
+                            )
+                        ).json()
+                    after = await _ask(socket, "third", "m3")
+                return before, off, during, on, after
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        _before, off, _during, on, _after = asyncio.run(run())
+
+        assert off.get("ok") is True, off
+        assert on.get("ok") is True, on
+
+        def _offered(index: int) -> list[str]:
+            return [
+                tool["function"]["name"]
+                for tool in provider.requests[index].get("tools", [])
+            ]
+
+        assert "plugin_echo" in _offered(0), _offered(0)
+        assert "plugin_echo" not in _offered(1), (
+            "a disabled plugin's tool must leave the session's next turn: "
+            f"{_offered(1)[:12]}"
+        )
+        assert "plugin_echo" in _offered(2), (
+            "and turning it back on must bring it back: "
+            f"{_offered(2)[:12]}"
+        )
+    finally:
+        provider.close()
+
+
+# ── 30. Switching a skill off from the skills page ──────────────────────────
+
+
+def test_toggling_a_skill_off_changes_the_next_prompt_and_the_tool(home):
+    """A skill switch is applied **without** rebuilding the session: the prompt is recomposed.
+
+    The toggle endpoint is explicit that this is the whole of it -- "marking the catalog dirty
+    recomposes the prompt before the next turn, for sessions that are already open, without
+    rebuilding their runtime underneath them" -- so it exercises a path the plugin toggle does
+    not: state that reaches an *open* session through the prompt rather than through a
+    rebuild.
+
+    Both halves are asserted: the switched-off skill must leave the prompt (otherwise the
+    model keeps being told about a skill it cannot use) and ``activate_skill`` must refuse it
+    by name (otherwise the switch is cosmetic).
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {"text": "one"},
+        {"tool": ("activate_skill", {"skill_name": "passphrase-skill"})},
+        {"text": "refused"},
+        {"text": "three"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    _write_skill(home, "passphrase-skill", "swordfish")
+    try:
+
+        async def run():
+            import httpx
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/web-skilltoggle/stream"
+                ) as socket:
+                    first = await _ask(socket, "first", "m1")
+                    async with httpx.AsyncClient() as client:
+                        off = (
+                            await client.post(
+                                f"http://127.0.0.1:{port}/api/skills/passphrase-skill/toggle",
+                                json={"enabled": False},
+                            )
+                        ).json()
+                    second = await _ask(socket, "load the skill", "m2")
+                    async with httpx.AsyncClient() as client:
+                        on = (
+                            await client.post(
+                                f"http://127.0.0.1:{port}/api/skills/passphrase-skill/toggle",
+                                json={"enabled": True},
+                            )
+                        ).json()
+                    third = await _ask(socket, "third", "m3")
+                return first, off, second, on, third
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        first, off, second, on, third = asyncio.run(run())
+
+        assert off.get("ok") is True, off
+        assert on.get("ok") is True, on
+        assert _answer(first) == "one", first
+        assert _answer(third) == "three", third
+
+        def _prompt(index: int) -> str:
+            return "\n".join(
+                str(message.get("content") or "")
+                for message in provider.requests[index]["messages"]
+                if message.get("role") == "system"
+            )
+
+        assert "passphrase-skill" in _prompt(0), _prompt(0)[-400:]
+        assert "passphrase-skill" not in _prompt(2), (
+            "a switched-off skill must leave the prompt of an open session: "
+            f"{_prompt(2)[-400:]}"
+        )
+        assert "passphrase-skill" in _prompt(3), (
+            f"and come back when switched on: {_prompt(3)[-400:]}"
+        )
+
+        refused = [
+            message
+            for message in provider.requests[2]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert refused, [m.get("role") for m in provider.requests[2]["messages"]]
+        assert "switched off" in str(refused[-1].get("content", "")), (
+            "and asking for it by name must say why it cannot be used: "
+            f"{str(refused[-1])[:300]}"
+        )
+        assert "swordfish" not in str(refused[-1].get("content", "")), (
+            "the disabled skill's instructions must not leak through the refusal"
+        )
+    finally:
+        provider.close()

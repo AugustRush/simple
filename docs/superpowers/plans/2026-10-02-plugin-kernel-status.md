@@ -1497,6 +1497,8 @@ OpenAI-compatible endpoint whose *answers* are scripted.  Six paths:
 | `test_auto_approving_a_session_stops_the_questions` | `/auto-approve session on`: two derivations of one session key agree |
 | `test_a_gateway_style_approval_is_redeemed_by_a_chat_command` | a sink that cannot ask: the token survives, `/confirm` redeems it, the retry runs |
 | `test_an_unattended_run_refuses_rather_than_leaving_a_token` | control: a *policy* refusal is not "nobody could ask" |
+| `test_toggling_a_plugin_off_takes_its_tool_out_of_a_live_session` | the plugins page: off, gone from an open session; on, back |
+| `test_toggling_a_skill_off_changes_the_next_prompt_and_the_tool` | the skills page: prompt recomposed without a rebuild, and the tool refuses by name |
 
 **What the last one found, immediately.**  Switching provider rebuilt the session runtime
 correctly -- the log showed the new active provider and the new endpoint -- and the next
@@ -1741,6 +1743,26 @@ content, so a path that "attached" something but sent its name would fail.
 The control is the half that is easy to lose: with ``supports_vision: false`` the attachment
 must become *words* describing the file.  Dropping it would be the quiet failure -- the user
 attached something and the model never learned it existed.
+
+## The two switches on the pages, driven
+
+Both are "an HTTP call writes state; a turn already in progress must read it", which is the
+shape of the `/model` defect -- and both work.
+
+**The plugins page.**  ``POST /api/plugins/<name>/toggle`` writes the config, reloads the
+catalog and bumps the config revision; a *session* whose runtime was built before the change
+has to notice.  Three turns on one socket with the toggle between them: the tool is offered,
+disabled, offered again.  The state-only-next-turn half is the point -- the page saying
+"disabled" while the conversation keeps offering the tool is exactly what a test that only
+looked at the API response would miss.
+
+**The skills page.**  Its endpoint is explicit that the switch is applied *without* rebuilding
+the session -- "marking the catalog dirty recomposes the prompt before the next turn, for
+sessions that are already open, without rebuilding their runtime underneath them" -- so this
+is a different route to the same requirement, through the prompt rather than through a rebuild.
+Asserted on both ends: the switched-off skill leaves the prompt of the open session and comes
+back when re-enabled, and ``activate_skill`` refuses it **by name** without leaking its
+instructions, because a switch that only changed the listing would be cosmetic.
 
 ## `/confirm` could never work, because "nobody could ask" read as "no"
 
