@@ -1637,6 +1637,51 @@ def test_a_composition_starts_with_an_unused_provider_uncredentialed(monkeypatch
     )
 
 
+def test_the_composed_agent_holds_the_composition_registry(monkeypatch, tmp_path):
+    """The plugin-provided agent must be given the registry, not a scoped view of it.
+
+    Asserted against the **real** ``ToolRegistry``, because the defect was invisible to a
+    stand-in: the agent-plugin test's mapping held a plain ``object()``, which has no
+    ``scoped`` method, so ``ctx.get`` returned it unchanged and could not show the
+    difference.  The real registry offers a view, ``ctx.get`` takes it, and the agent then
+    held something whose shared context it could not write.
+
+    What that cost: the turn loop writes ``turn_request`` on the registry before anything
+    else, so every turn on the composed agent raised
+    ``'ScopedTools' object has no attribute 'set_context'``, and the web UI received a
+    ``turn_complete`` with no text and no error.  "Nothing happens" was the whole symptom.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg, announce=True: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = asyncio.run(
+        agent_module._build_components_async(cfg, announce=False)
+    )
+
+    registry = components["registry"]
+    agent = components["agent"]
+    assert agent.registry is registry, (
+        "the agent must configure the composition's registry, not a plugin's view of it"
+    )
+
+    # The write the loop makes first, and the read the tool implementations rely on.
+    agent.registry.set_context("turn_request", "hello")
+    assert registry.get_context("turn_request") == "hello"
+
+
 def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path):
     import asyncio
     import agent as agent_module

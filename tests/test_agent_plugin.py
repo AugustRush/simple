@@ -114,3 +114,60 @@ def test_bootstrap_hands_it_its_own_module_level_name() -> None:
         "nothing"
     )
     assert passed["agent_class"].id == "BaseAgent"
+
+
+class _Registry:
+    """A registry shaped like the real one: a service that also offers a scoped view."""
+
+    def __init__(self) -> None:
+        self.context: dict = {}
+
+    def set_context(self, key: str, value) -> None:
+        self.context[key] = value
+
+    def get_context(self, key: str, default=None):
+        return self.context.get(key, default)
+
+    def scoped(self, ctx):
+        return _ScopedView(self)
+
+
+class _ScopedView:
+    """What ``ctx.get("registry")`` returns: contribution, not configuration."""
+
+    def __init__(self, registry: _Registry) -> None:
+        self._registry = registry
+
+    def get_context(self, key: str, default=None):
+        return self._registry.get_context(key, default)
+
+
+def test_the_agent_is_handed_the_registry_not_a_scoped_view_of_it() -> None:
+    """The view is for *contributing* tools; the agent configures the registry.
+
+    ``ctx.get("registry")`` returns a plugin-scoped view because ``ToolRegistry`` offers
+    ``scoped(ctx)`` -- which is what a plugin registering tools wants, since every
+    registration then comes back out when it unloads.  The agent is not that plugin: its
+    turn loop writes the registry's shared context (``turn_request``, on ``prepare_turn``)
+    and the tool implementations read it back.  Handed a view, the first turn dies with
+    ``'ScopedTools' object has no attribute 'set_context'`` -- before any model call, so
+    what a user sees is a message that produces nothing at all.
+
+    The stand-in offers ``scoped`` **because the real one does**.  The mapping this file
+    used before did not, so ``ctx.get`` handed over the raw object and the double could not
+    tell the two apart: a stand-in simpler than the thing it stands in for, in exactly the
+    way that hides the defect.
+    """
+    registry = _Registry()
+    mapping = _mapping(registry=registry)
+    _load(mapping)
+
+    agent = mapping["agent"]
+    assert agent.registry is registry, (
+        "the agent must hold the composition's registry, not a view of it"
+    )
+    assert type(agent.registry) is _Registry, "and specifically not the scoped view"
+
+    # The exact call the turn loop makes on every turn -- the one that failed.
+    agent.registry.set_context("turn_request", "hello")
+    assert registry.get_context("turn_request") == "hello"

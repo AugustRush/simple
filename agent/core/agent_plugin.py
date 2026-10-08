@@ -73,9 +73,26 @@ class AgentPlugin:
     def setup(self, ctx: Any) -> None:
         cfg = ctx.get("cfg", None) or {}
 
+        # The registry **itself**, not the plugin-scoped view ``ctx.get`` would return.
+        #
+        # ``Context.get`` hands an injectable service to its plugin through a per-plugin
+        # view when the service offers one, and ``ToolRegistry`` does -- that is what makes
+        # ``ctx.tools.register(tool)`` reversible, and it is right for every plugin that
+        # *contributes* a tool.  The agent contributes none.  It **configures** the
+        # registry: the turn loop writes ``turn_request`` on it at the start of every turn
+        # and tool implementations read that back, so what it needs is the object the rest
+        # of the composition holds.  Given the view, the first turn raised
+        # ``'ScopedTools' object has no attribute 'set_context'`` -- before any model call,
+        # which is why the symptom was a message that produced nothing at all rather than an
+        # error anybody could read.
+        #
+        # ``inject`` still names ``registry``: this plugin must not activate before the
+        # service exists, and that is a separate statement from which object it is handed.
+        registry = ctx.services.get("registry")
+
         agent = self._agent_class(
             ctx.get("client"),
-            ctx.get("registry"),
+            registry,
             model=str(ctx.get("model")),
             max_tokens=int(ctx.get("max_tokens")),
             api_format=str(ctx.get("api_format")),

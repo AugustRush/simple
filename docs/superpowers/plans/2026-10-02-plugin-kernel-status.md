@@ -1395,6 +1395,57 @@ answered with something that is not a result).  The test drives the real path --
 `process_one_job` against a client that raises -- and asserts the *event*, because that is
 where the log line comes from.
 
+## The scoped view is for contributing, and the agent does not contribute
+
+Reported as "the web chat does nothing at all".  Reproduced with a WebSocket client against
+a running gateway: sending a message returned
+
+```
+{"type":"turn_complete","text":"","tool_calls":[],"turn_id":"m1"}
+```
+
+-- one empty completion, immediately, and nothing else.  No error, no text.  The server log
+had the answer:
+
+```
+component=agent event=turn_started ...
+component=agent event=turn_finished status=ok steps=0 content_len=0 duration_ms=0.6
+component=channel_runner event=turn_failed error=set_context
+```
+
+A stack trace, obtained by instrumenting `ScopedTools` to print one:
+
+```
+turn_loop.py:341  prepare_turn   deps.registry.set_context("turn_request", user_message)
+```
+
+`agent_plugin` constructed the agent with `ctx.get("registry")`, and `Context.get` hands an
+injectable service to a plugin through its per-plugin **view** when the service offers one --
+`ToolRegistry` does.  That is exactly right for `ToolsPlugin`, whose registrations must come
+back out when it unloads.  The agent contributes no tools: it *configures* the registry
+(``turn_request`` on every turn, read back by the tool implementations), so the view was the
+wrong object.  `prepare_turn` raised before any model call, which is why the symptom was
+silence rather than an error anybody could read.
+
+Fixed by resolving the service itself (`ctx.services.get("registry")`) while keeping
+`registry` in `inject` -- "must not activate before it exists" and "which object it is
+handed" are separate statements.  Verified end to end: `stream_chunk` then `turn_complete`
+with the text, and `simple chat "..."` printing an answer.
+
+**Why no test saw it: the stand-in was simpler than the real thing.**  `test_agent_plugin`'s
+mapping held `"registry": object()`, which has no `scoped` method -- so `ctx.get` returned it
+unchanged and the double could not tell a view from a service.  That test now uses a double
+that offers `scoped` *because the real one does*, and a composition-level test
+(`test_the_composed_agent_holds_the_composition_registry`) asserts the identity against the
+real `ToolRegistry`.  Both fail if `agent_plugin` goes back to `ctx.get`.
+
+The wider check, since this is a class of mistake rather than one mistake: the services that
+offer a view are `registry`, `agents`, `commands`, `channels`, and every other consumer of
+them is a *contributor* (`ctx.commands.add`, `ctx.agents.add`, `ctx.channels.add`,
+`ctx.tools.register`).  The command modules resolve `registry` from the component mapping, so
+they were always getting the service.  `agent_plugin` was the only configuration-side
+consumer, and it was the only one wrong.
+
 ## Not built, and why
 
 Re-measured against a DSH-style plan (Cordis kernel / typed events / profiles / per-agent
