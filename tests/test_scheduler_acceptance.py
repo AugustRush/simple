@@ -735,7 +735,7 @@ def test_the_run_payload_carries_the_verdict_beside_the_status(tmp_path):
     A run's status and its verdict are different answers, and the whole point
     of separating them is lost if the API sends only one.
     """
-    from agent.channels.web import _scheduler_run_payload, _scheduler_task_payload
+    from agent.channels.web_payloads import scheduler_run_payload, scheduler_task_payload
 
     store = make_store(tmp_path)
     try:
@@ -748,12 +748,12 @@ def test_the_run_payload_carries_the_verdict_beside_the_status(tmp_path):
         asyncio.run(run_to_terminal(make_service(store)))
         run = store.list_runs(task.id)[0]
 
-        payload = _scheduler_run_payload(run, with_snapshot=False)
+        payload = scheduler_run_payload(run, with_snapshot=False)
         assert payload["status"] == "succeeded"
         assert payload["verdict"] == VERDICT_PASSED
         assert payload["verification"]["status"] == "passed"
 
-        task_payload = _scheduler_task_payload(task)
+        task_payload = scheduler_task_payload(task)
         assert task_payload["acceptance"] == {
             "criteria": ["the tests pass"],
             "verify_command": "true",
@@ -765,12 +765,12 @@ def test_the_run_payload_carries_the_verdict_beside_the_status(tmp_path):
 def test_a_task_with_no_criterion_still_reports_an_acceptance_object(tmp_path):
     """Always an object, never absent: the client reads the fields without
     checking whether the key exists, and "nothing was declared" is a value."""
-    from agent.channels.web import _scheduler_task_payload
+    from agent.channels.web_payloads import scheduler_task_payload
 
     store = make_store(tmp_path)
     try:
         task = make_task(store, workspace_root=str(tmp_path))
-        payload = _scheduler_task_payload(task)
+        payload = scheduler_task_payload(task)
         assert payload["acceptance"] == {"criteria": [], "verify_command": ""}
     finally:
         store.close()

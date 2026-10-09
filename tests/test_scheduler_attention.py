@@ -23,7 +23,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent.channels.web import _attention_payload
+from agent.channels.web_payloads import attention_payload
 from agent.scheduler import (
     ATTENTION_STATUSES,
     DeliveryTarget,
@@ -574,7 +574,7 @@ def test_the_payload_number_is_the_length_of_the_list_it_carries(tmp_path):
     task = _new_task(store)
     run_id = _run_to_terminal(store, task, "failed")
 
-    payload = _attention_payload(store)
+    payload = attention_payload(store)
 
     assert payload["unseen_attention"] == 1
     assert len(payload["attention_runs"]) == 1
@@ -588,7 +588,7 @@ def test_the_payload_names_the_task_so_the_row_can_be_recognised(tmp_path):
     task = _new_task(store, name="A股模拟盘每日结算")
     _run_to_terminal(store, task, "failed")
 
-    item = _attention_payload(store)["attention_runs"][0]
+    item = attention_payload(store)["attention_runs"][0]
 
     assert item["task_name"] == "A股模拟盘每日结算"
     assert item["error"] == "boom"
@@ -627,7 +627,7 @@ def test_the_payload_says_when_the_workflow_is_gone(tmp_path):
 
     store.delete_workflow(workflow.id)
 
-    item = _attention_payload(store)["attention_runs"][0]
+    item = attention_payload(store)["attention_runs"][0]
 
     assert item["run_id"] == claimed.run.id
     assert item["workflow_id"] == workflow.id
@@ -639,7 +639,7 @@ def test_an_empty_payload_is_zero_and_no_rows(tmp_path):
     store = _store(tmp_path)
     _new_task(store)
 
-    payload = _attention_payload(store)
+    payload = attention_payload(store)
 
     assert payload["unseen_attention"] == 0
     assert payload["attention_runs"] == []
