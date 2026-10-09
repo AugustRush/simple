@@ -28,6 +28,13 @@ from agent.channels.feishu import (
     _clean_at_mentions,
     _extract_post_content,
 )
+from agent.channels.feishu_render import (
+    build_card_elements,
+    detect_msg_format,
+    markdown_to_post,
+    parse_md_table,
+    split_elements_by_table_limit,
+)
 from agent import (
     IncomingMessage,
     SubAgentProgressEvent,
@@ -320,53 +327,53 @@ def test_feishu_channel_audio_download_retries_as_file_on_invalid_param(tmp_path
 
 
 def test_detect_msg_format_short_plain_text():
-    assert FeishuOutputSink._detect_msg_format("hello world") == "text"
+    assert detect_msg_format("hello world") == "text"
 
 
 def test_detect_msg_format_medium_plain_text():
     text = "A" * 250  # > 200 chars, ≤ 2000, no formatting
-    assert FeishuOutputSink._detect_msg_format(text) == "post"
+    assert detect_msg_format(text) == "post"
 
 
 def test_detect_msg_format_long_plain_text():
     text = "A" * 2100
-    assert FeishuOutputSink._detect_msg_format(text) == "interactive"
+    assert detect_msg_format(text) == "interactive"
 
 
 def test_detect_msg_format_code_block():
     assert (
-        FeishuOutputSink._detect_msg_format("```python\nprint()\n```") == "interactive"
+        detect_msg_format("```python\nprint()\n```") == "interactive"
     )
 
 
 def test_detect_msg_format_heading():
-    assert FeishuOutputSink._detect_msg_format("# Title\n\nBody text") == "interactive"
+    assert detect_msg_format("# Title\n\nBody text") == "interactive"
 
 
 def test_detect_msg_format_table():
     table = "| A | B |\n|---|---|\n| 1 | 2 |"
-    assert FeishuOutputSink._detect_msg_format(table) == "interactive"
+    assert detect_msg_format(table) == "interactive"
 
 
 def test_detect_msg_format_bold():
     assert (
-        FeishuOutputSink._detect_msg_format("This is **bold** text.") == "interactive"
+        detect_msg_format("This is **bold** text.") == "interactive"
     )
 
 
 def test_detect_msg_format_unordered_list():
     assert (
-        FeishuOutputSink._detect_msg_format("- item one\n- item two") == "interactive"
+        detect_msg_format("- item one\n- item two") == "interactive"
     )
 
 
 def test_detect_msg_format_ordered_list():
-    assert FeishuOutputSink._detect_msg_format("1. first\n2. second") == "interactive"
+    assert detect_msg_format("1. first\n2. second") == "interactive"
 
 
 def test_detect_msg_format_link():
     text = "See [docs](https://example.com) for details."
-    assert FeishuOutputSink._detect_msg_format(text) == "post"
+    assert detect_msg_format(text) == "post"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,7 +382,7 @@ def test_detect_msg_format_link():
 
 
 def test_markdown_to_post_plain_line():
-    result = json.loads(FeishuOutputSink._markdown_to_post("Hello world"))
+    result = json.loads(markdown_to_post("Hello world"))
     paragraphs = result["zh_cn"]["content"]
     assert len(paragraphs) == 1
     assert paragraphs[0][0]["tag"] == "text"
@@ -384,7 +391,7 @@ def test_markdown_to_post_plain_line():
 
 def test_markdown_to_post_with_link():
     result = json.loads(
-        FeishuOutputSink._markdown_to_post("See [docs](https://example.com) here.")
+        markdown_to_post("See [docs](https://example.com) here.")
     )
     elements = result["zh_cn"]["content"][0]
     tags = [el["tag"] for el in elements]
@@ -396,7 +403,7 @@ def test_markdown_to_post_with_link():
 
 def test_parse_md_table_valid():
     table = "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |"
-    result = FeishuOutputSink._parse_md_table(table)
+    result = parse_md_table(table)
     assert result is not None
     assert result["tag"] == "table"
     assert len(result["columns"]) == 2
@@ -404,28 +411,25 @@ def test_parse_md_table_valid():
 
 
 def test_parse_md_table_too_few_lines():
-    assert FeishuOutputSink._parse_md_table("| A |\n|---|") is None
+    assert parse_md_table("| A |\n|---|") is None
 
 
 def test_parse_md_table_strips_bold_from_headers():
     table = "| **Name** | Age |\n|----------|-----|\n| Alice | 30 |"
-    result = FeishuOutputSink._parse_md_table(table)
+    result = parse_md_table(table)
     assert result is not None
     assert result["columns"][0]["display_name"] == "Name"
 
 
 def test_build_card_elements_plain_text():
-    elements = FeishuOutputSink(MagicMock(), "open_id", "x")._build_card_elements(
-        "Hello"
-    )
+    elements = build_card_elements("Hello")
     assert len(elements) >= 1
     assert elements[0]["tag"] in ("markdown", "div")
 
 
 def test_build_card_elements_with_heading():
     content = "# Section\n\nSome text here."
-    sink = FeishuOutputSink(MagicMock(), "open_id", "x")
-    elements = sink._build_card_elements(content)
+    elements = build_card_elements(content)
     tags = [el["tag"] for el in elements]
     assert "div" in tags  # heading becomes div
 
@@ -436,7 +440,7 @@ def test_split_elements_by_table_limit_one_table():
         {"tag": "table", "page_size": 3, "columns": [], "rows": []},
         {"tag": "markdown", "content": "outro"},
     ]
-    groups = FeishuOutputSink._split_elements_by_table_limit(elements, max_tables=1)
+    groups = split_elements_by_table_limit(elements, max_tables=1)
     assert len(groups) == 1
     assert sum(1 for el in groups[0] if el["tag"] == "table") == 1
 
@@ -447,7 +451,7 @@ def test_split_elements_by_table_limit_two_tables_split():
         {"tag": "markdown", "content": "between"},
         {"tag": "table", "page_size": 2, "columns": [], "rows": []},
     ]
-    groups = FeishuOutputSink._split_elements_by_table_limit(elements, max_tables=1)
+    groups = split_elements_by_table_limit(elements, max_tables=1)
     assert len(groups) == 2
 
 
