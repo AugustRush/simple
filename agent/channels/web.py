@@ -141,30 +141,35 @@ def _list_run_artifacts(root: Path, task_id: str, run_id: str) -> list[dict[str,
     return artifacts
 
 
-def _web_session_output_dir(session_id: str) -> Path:
-    """Return the isolated output directory for a Web session."""
+def _web_session_dir(session_id: str, leaf: str) -> Path:
+    """One directory inside a session's isolated home.
+
+    The two callers below differ only in the leaf, so the rule that matters --
+    resolve the session's home, and if its id cannot be resolved say so *loudly*
+    rather than share a directory with another session -- lives here once.  Every
+    caller validates the id first, so reaching the fallback means something
+    upstream let an unresolvable id through, and two sessions would then share
+    one home: the isolation the web channel exists to provide.
+    """
     try:
-        return shared.web_session_home(str(session_id)) / "output"
+        return shared.web_session_home(str(session_id)) / leaf
     except ValueError:
-        # Never silent: every caller validates the id first, so reaching this
-        # means two sessions would share one directory -- the isolation the web
-        # channel exists to provide.  Log it rather than fall back quietly.
         logger.warning(
-            "unresolvable web session id, sharing the unknown output home: %r",
+            "unresolvable web session id, sharing the unknown %s home: %r",
+            leaf,
             session_id,
         )
-        return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "output"
+        return shared.AGENT_HOME / "web" / "sessions" / "unknown" / leaf
+
+
+def _web_session_output_dir(session_id: str) -> Path:
+    """The session's output directory: where its artifacts are written."""
+    return _web_session_dir(session_id, "output")
 
 
 def _web_session_upload_dir(session_id: str) -> Path:
-    try:
-        return shared.web_session_home(str(session_id)) / "uploads"
-    except ValueError:
-        logger.warning(
-            "unresolvable web session id, sharing the unknown upload home: %r",
-            session_id,
-        )
-        return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "uploads"
+    """The session's upload directory: where the browser's uploads land."""
+    return _web_session_dir(session_id, "uploads")
 
 
 

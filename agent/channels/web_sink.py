@@ -109,25 +109,36 @@ def _svg_has_raster_sibling(path: Path) -> bool:
     return False
 
 
+def _identity_tag(key: str, value: object) -> dict[str, str]:
+    """One-key event tag, *omitted* when the identity is unknown.
+
+    The omission is the rule, not an accident of formatting: a client that sees
+    no ``turn_id`` knows it cannot attribute the event, whereas an empty string
+    reads as a turn whose id is "".  The two wrappers below keep each wire key
+    spelled exactly once, so a call site cannot misspell it into a field the
+    client silently ignores.
+    """
+    clean = str(value or "").strip()
+    return {key: clean} if clean else {}
+
+
 def _turn_tag(turn_id: str) -> dict[str, str]:
-    """The turn a socket event belongs to, omitted when unknown.
+    """The turn a socket event belongs to.
 
     A client that cannot tell which turn produced an event has to assume every
     event belongs to the one it is watching, which is how a reply delivered for
     a withdrawn or restarted message ends up appended to the wrong turn.
     """
-    clean = str(turn_id or "").strip()
-    return {"turn_id": clean} if clean else {}
+    return _identity_tag("turn_id", turn_id)
 
 
 def _operation_tag(operation_id: str) -> dict[str, str]:
-    """The tool call an event belongs to, omitted when unknown.
+    """The tool call an event belongs to.
 
     Without it a client can only match a tool's result to its start by name, so
     two concurrent calls to the same tool overwrite each other's rows.
     """
-    clean = str(operation_id or "").strip()
-    return {"operation_id": clean} if clean else {}
+    return _identity_tag("operation_id", operation_id)
 
 
 def _jsonable(value: Any) -> Any:

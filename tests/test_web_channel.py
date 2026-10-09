@@ -668,6 +668,42 @@ def _run_shell_approval(decision_payload):
         shell_session_allowlist_clear()
 
 
+def test_the_event_tags_name_their_key_and_omit_an_unknown_identity():
+    """The tag is a client contract: the key spelling and the omission.
+
+    ``_turn_tag`` and ``_operation_tag`` were the same rule written twice, so a
+    change to one (the omit-when-empty rule decides whether the client sees the
+    field at all) could land without the other.
+    """
+    from agent.channels.web_sink import _operation_tag, _turn_tag
+
+    assert _turn_tag("t-1") == {"turn_id": "t-1"}
+    assert _operation_tag("op-1") == {"operation_id": "op-1"}
+    # Unknown identity: the field is absent, not empty.
+    for value in ("", "   ", None):
+        assert _turn_tag(value) == {}, value
+        assert _operation_tag(value) == {}, value
+
+
+def test_both_session_directories_share_one_rule_and_one_fallback():
+    """The two directories differ only by leaf, so the rule is not written twice."""
+    from agent import shared
+
+    from agent.channels.web import _web_session_output_dir, _web_session_upload_dir
+
+    output = _web_session_output_dir("s-1")
+    uploads = _web_session_upload_dir("s-1")
+    assert output.name == "output" and uploads.name == "uploads"
+    assert output.parent == uploads.parent == shared.web_session_home("s-1")
+
+    # An id the storage layer refuses lands in the same shared home, for both.
+    bad_output = _web_session_output_dir("bad id")
+    bad_uploads = _web_session_upload_dir("bad id")
+    assert bad_output.parent == bad_uploads.parent
+    assert bad_output.parent.name == "unknown"
+    assert bad_output.name == "output" and bad_uploads.name == "uploads"
+
+
 def test_the_web_sink_owns_only_attachments_in_the_sessions_output_dir(tmp_path):
     """The contract: true only after irrevocably assuming responsibility.
 
