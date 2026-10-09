@@ -982,3 +982,70 @@ measured** — which is the point of marking them "not yet independently verifie
 
 The `_register` table (a design change, §5) and the two helpers too small to
 justify a module of their own (`_current_time`, `_ws_reconnect_delay`).
+
+## 8. What testing the plugin path actually found
+
+The extractions left `plugin_tools.py` new and battle-untested in anger, so the
+install path was exercised end to end against **real plugins in a scratch home**
+(`SIMPLE_AGENT_HOME`, the user's own `~/.agent` untouched): a native
+`plugin.json` + `commands/` plugin, a Codex / Claude Code layout
+(`.claude-plugin/plugin.json` + `commands/`), a Python plugin (`__init__.py`
+with `register_slash_commands`), and an MCP-shaped one (`.mcp.json`), plus
+uninstall. All four installed, hot-reloaded, and their commands ran; the
+executable-content gate refused the Python plugin until it was approved, and the
+identical retry then went through.
+
+Three findings came out of it, and one of them is a claim this document has to
+correct about *itself*.
+
+### 8.1 A plugin could take a bare command name (`923a214`)
+
+`markdown` commands are namespaced by the plugin, derived from the path
+(`<plugin>:<stem>`). Python ones were registered under whatever key the author
+returned, so a user plugin declaring `{"stats": handler}` took over the built-in
+evolution plugin's `/stats`.
+
+Measured, not assumed: right after installing it, `/stats` ran the user plugin;
+in a **fresh process** the load order put evolution last and evolution won. So
+the same command meant different things before and after a hot reload, and the
+only notice was one line on the server console — which a person in a chat UI
+never sees.
+
+The rule now: **installed plugins are namespaced by the plugin; built-in plugins
+keep their bare names**, because `/evolve` and `/generate-tool` are documented
+user interface. A key that already carries `:` is left alone.
+
+### 8.2 `simple chat "<line>"` had its own meaning for a slash (`3a4211e`)
+
+`simple` (interactive) runs input through `CommandCoordinator`; `simple chat`
+handed the text straight to the agent core. Two implementations of "what did the
+user just say", and they had drifted: `simple chat "/demo-dsh:hello"` made the
+model *improvise an execution* — it read the command name from its own prompt,
+could not read the body, and reported success for a command that never ran.
+
+`chat` now shares one pipeline with the interactive loop (`_command_coordinator`
++ `_run_cli_turn`). The merge is safe because the classifier already refuses to
+swallow prose: `tests/test_commands.py` pins that pasted paths, grep hits and
+diff lines reaching the model as text, and that typo'd names still get feedback.
+
+### 8.3 A correction: the description mechanism was already there (`26a0046`)
+
+The third finding — Python commands showing up in `/help` as bare names — was
+diagnosed **wrongly at first**. The hypothesis was that `_command_metadata`
+should fall back to the handler's docstring. It broke
+`test_reload_validation_failure_rolls_back_catalog_and_router`, which asserts that
+a markdown command's *registry metadata* is exactly what the file declared, and
+the fallback pulled in the placeholder docstring the markdown path writes
+(`Run /<cmd>`).
+
+Measuring the real source showed that `CommandRouter.register_plugin_catalog`
+already falls back to `inspect.getdoc(legacy_handler)`. The mechanism was never
+missing: `/evolve` and `/stats` were bare because **those handlers had no
+docstrings**. So the fix is data plus two tests — one pinning the mechanism (a
+docstring becomes the description, and no docstring is honestly empty), one
+pinning the data (every built-in command explains itself).
+
+The lesson is the one this document keeps relearning: **the first hypothesis is
+a guess until it is measured**, and a shared helper is the wrong place to put a
+convention that only one caller follows.
+

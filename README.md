@@ -666,6 +666,28 @@ Plugin hooks:
 | `compose_system_prompt` | System prompt build | Append behavior rules |
 | `register_slash_commands` | Startup | Register /commands |
 
+#### How a plugin's commands are named
+
+A plugin does not own the bare namespace. Its commands are namespaced by the
+plugin, so the name says who owns it and two plugins cannot claim the same word:
+
+| the plugin declares | the command is |
+|---|---|
+| `commands/deploy.md` | `/myplugin:deploy` |
+| `register_slash_commands() → {"deploy": handler}` | `/myplugin:deploy` |
+| `register_slash_commands() → {"mine:deploy": handler}` | `/mine:deploy` (already qualified) |
+
+Built-in plugins are the exception, because they are this app's own vocabulary:
+`/evolve`, `/generate-tool` and `/stats` are documented here and keep their bare
+names. Anything you install is reachable only under its own prefix — a user
+plugin declaring `stats` used to take over the built-in `/stats`, and which one
+won depended on whether it had been installed before or after the process
+started.
+
+`/help` lists every command with its description, taken from the command file's
+`description` front-matter for a markdown command and from the handler's
+docstring for a Python one — so write one.
+
 ### Memory management
 
 ```bash
