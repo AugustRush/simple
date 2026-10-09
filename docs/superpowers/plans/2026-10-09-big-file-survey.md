@@ -922,24 +922,63 @@ lose the session's context in production.
 ## 7. The verified findings, and what happened to each
 
 The survey's §1–§3 each recorded findings that were **not** folded into a move,
-because a move preserves behaviour and these needed a decision.  They are being
-worked through the same way as the moves: a test that fails first where the
-failure is observable, the full suite's FAILED set diffed against the frozen
-`workspace-write` baseline, and a repository-style commit per finding.
+because a move preserves behaviour and these needed a decision.  They were then
+worked through on the same discipline as the moves: a test that fails first
+wherever the failure is observable, the full suite's FAILED set diffed against
+the frozen `workspace-write` baseline, and a repository-style commit per finding.
 
-| finding | disposition |
-| --- | --- |
-| `web.py`: `_stream` discards the tasks it creates (`add_done_callback(discard)`), so a failing turn is invisible | **fixed** (`59cc66d`) — `process_message` reports through the sink, and the callback retrieves what still escapes. The failing test *timed out* against the old code: the browser was told nothing at all |
-| `web.py`: three disagreeing session-id rules (`web_session_home` 1–64, the upload endpoint 8–128, `re.sub(...)[:32]` in the stream) | **fixed** (`1e5435e`) — one predicate, `shared.is_valid_web_session_id`; endpoints validate and refuse instead of rewriting. A 40-character session used to run in the 32-character one's home |
-| `web.py`: `/api/health` was the only `/api` route without `_authorized`, and returned the absolute `AGENT_HOME` | **fixed** (`b041ef8`) — same gate as everything else, and the field is gone: nothing (frontend, tests, docs) ever read it |
-| `web.py`: `_schedule_run_artifacts` materialised `sorted(root.rglob("*"))` before its cap, and called `path.stat()` unguarded | **fixed** (`e02c0ad`) — the listing moved out of the endpoint into `_list_run_artifacts` (so it can be tested at all), a vanished entry is skipped, and the walk is bounded. The order the frontend renders in is deliberately unchanged |
-| `feishu.py`: `if TYPE_CHECKING: pass`, the unread `_progress_phase_closed` write, the duplicated `_stream_flush_pending = False` | **fixed** (`f620074`) — dead code that tells the reader something untrue |
-| `web_sink.py`: `CONFIRM_DECISIONS` declared but read by nobody | **fixed** (`55c4894`) — the vocabulary is now enforced at the one door client input comes through, which matters because the caller treats "not deny, not allow_session" as **approval** |
-| `builtin_tools.py`: `web_search` advertised a DuckDuckGo `region` the Tavily backend ignores | **fixed** (`8e393b1`) — schema, parameter and the explanatory `note` all gone, with a guard that the advertised properties equal the accepted parameters |
-| `builtin_tools.py`: the authorization scope spelled out in two clusters | **fixed** (`6995333`) — one definition in `agent/security/shell.py`, with a test proving both clusters ask it |
-| `web_sink.py`: `defer_temporary_attachment_cleanup` returns `True` unconditionally — the sink claims a cleanup responsibility it never performs | **open** — needs a decision (own the file and clean it later, or decline and let the coordinator delete it) and a test; the contract says a sink may only answer `True` after *irrevocably* assuming responsibility |
-| `builtin_tools.py`: capabilities declared twice (at registration and in `_DEFAULT_TOOL_CAPABILITIES`) with nothing asserting they agree | **open** — the first-principles answer is one home, or a guard test that the two never disagree |
+**Every one of them is now closed.**  Ten were defects, three were duplicates of
+a *rule* rather than of a spelling, and **three claims did not survive being
+measured** — which is the point of marking them "not yet independently verified".
 
-Two more items from §3 stay open by decision rather than by omission: the
-`_register` table (a design change, §5) and `_current_time` /
-`_ws_reconnect_delay` (too small to justify a module of their own).
+### 7.1 Fixed
+
+| finding | commit | what it was |
+| --- | --- | --- |
+| `_stream` discards the tasks it creates, so a failing turn is invisible | `59cc66d` | the failing test **timed out** against the old code: the browser was told nothing at all |
+| three disagreeing session-id rules (1–64 / 8–128 / `[:32]`) | `1e5435e` | a 65-char id was accepted then written into the shared `unknown` home; a 40-char session ran in the 32-char one's home |
+| `/api/health` was the only `/api` route without `_authorized`, and returned the absolute `AGENT_HOME` | `b041ef8` | nothing (frontend, tests, docs) ever read that field |
+| `_schedule_run_artifacts` materialised `sorted(rglob("*"))` before its cap, and called `stat()` unguarded | `e02c0ad` | the old inline body raised `OSError` on a file that vanished mid-listing → 500 |
+| `if TYPE_CHECKING: pass`, the unread `_progress_phase_closed` write, the duplicated `_stream_flush_pending = False` | `f620074` | dead code that tells the reader something untrue |
+| `CONFIRM_DECISIONS` declared but read by nobody | `55c4894` | the caller treats "not deny, not allow_session" as **approval**, so the vocabulary is now enforced at the one door |
+| `web_search` advertised a DuckDuckGo `region` the Tavily backend ignores | `8e393b1` | a model that set it believed it had localised a search it had not |
+| the authorization scope built identically in two clusters | `6995333` | it is the key the allowlist and permission level are stored under |
+| `defer_temporary_attachment_cleanup` returned `True` unconditionally | `bcf1aef` | the sink claimed a cleanup it never performed; it now owns only files inside the session's own output directory (which `delete_session_async` removes), and refuses — loudly — anything else |
+| five builtin tools with no capability in either place | `034a075` | the table's own comment records the doctrine: unclassified reads as "nobody classified this yet". A read-only profile was dropping the read tools; a `state_write` profile could not use `report_outcome` |
+
+### 7.2 Duplicated rules, deduped
+
+| finding | commit | the rule that now has one home |
+| --- | --- | --- |
+| `_turn_tag` / `_operation_tag` | `328c6a0` | the tag is *omitted* when the identity is unknown |
+| `_web_session_output_dir` / `_web_session_upload_dir` | `328c6a0` | resolve the session home, and say so loudly when the id cannot be resolved |
+| the `user_plugins_dir` lookup, three spellings | `c36e687` | read the key once, and expand `~` the same way for listing and installing |
+| the `**Tool Call**` markdown fragment, twice | `2074005` | one event, two surfaces: `feishu_render.tool_call_markdown` |
+| `_extract_message_attachments` had no production caller | `2074005` | production now *uses* the composition — the four tests were covering a path the product did not take |
+| `split_long_markdown_text`'s "word boundaries" comment | `2074005` | the comment was the lie, not the code: it cuts at `start + limit` |
+| the batch-line prologue | `2074005` | `batch_execution_mode`, because "what counts as a parallel batch" is what could drift |
+
+### 7.3 Claims that measurement did not support
+
+- **"Seven tools declare their capabilities twice."**  Thirteen registration
+  sites declare `("state_write", "requires_intent")`, and the default table has
+  **no entry for any of them** under any source: there is no double declaration
+  today.  The *hazard* the survey named is real, though — a registration-site
+  value wins over the table, so a contradictory default would be a lie a reader
+  would trust.  That is what the three-way guard in `034a075` now prevents.
+- **"`_format_batch_started_event` / `_format_batch_finished_event` repeat a
+  prologue."**  Those names do not exist in today's code; the extraction had
+  already made them `feishu_progress.format_batch_*`.  The prologue part was
+  true and is deduped above.
+- **"`_flush_stream_async` and `_flush_progress_async` are identical but for the
+  flag name."**  They are — but the shared part (`_flush_primary_surface_async`)
+  is already shared, and what remains is "clear *my own* pending flag".  Merging
+  them would need `setattr(self, "_stream_flush_pending", ...)`: a stringly-typed
+  attribute name where one misspelled letter silently creates a new attribute and
+  never clears the real flag.  Recorded as a **false duplication**, deliberately
+  left.
+
+### 7.4 Deliberately not done
+
+The `_register` table (a design change, §5) and the two helpers too small to
+justify a module of their own (`_current_time`, `_ws_reconnect_delay`).
