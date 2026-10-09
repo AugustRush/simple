@@ -615,24 +615,64 @@ The two ceilings moved too, and now have one home: the schemas still quote
 calls (`tools.` and `handoff.`) became `._step_output_tools.read(...)` with no
 assertion touched, so the 15 guards around this tool are the same guards.
 
+### 4.13 builtin_tools.py — scheduler + workflows, one move (`00683a8`)
+
+`agent/tools/builtin_tools.py` **4854 → 3441 lines** — the largest single
+reduction in the series — with all twenty-one methods landing in
+`agent/tools/schedule_tools.py` as `ScheduleTools`.
+
+**One class, not two, and that was measured.** The workflow half reads five of
+the scheduler's own helpers (`schedule_store`, `schedule_target`,
+`schedule_trigger`, `action_payload`, `workflow_steps`) and eighteen names from
+`agent.scheduler`. Splitting them into two classes would have converted all
+those calls into constructor parameters, so they are one extraction.
+
+**The injected surface was measured before anything moved.** An AST pass over
+the twenty-one methods collected every `self.X(...)` call whose `X` is *not* in
+the cluster, and the answer was exactly five: `_schedule_store` (15 calls),
+`_error` (26), `_ok` (12), `_active_workspace_root` (3),
+`_chosen_workspace_root` (3). That is the constructor. The store accessor
+deliberately **stays on the host**, because three clusters share it — signals,
+step output, and the host itself — and moving it would cut the shared seam.
+
+**The free-name scan fired before the tests did, and that is the point.** A
+verbatim move copies the body, not the names it stands on: `_run_detail` reads
+`_clip` and the three `RUN_*` bounds, none of which travelled. The scan reported
+all four, and they moved too once it was clear nothing else read them — this is
+the memory-cluster lesson applied *before* the suite instead of after. One
+residue was still caught by a test rather than by the scan:
+`test_schedule_runs_clips_a_reason_that_would_flood_the_window` imported
+`RUN_REASON_CHARS` from the old home, and now imports it from the new one.
+
+The mechanical remainder: twelve registration lines point at
+`self._schedule_tools.<public name>`; fifteen direct test calls (`tools._workflow_create(…)`
+and friends) became `tools._schedule_tools.workflow_create(…)` with **no
+assertion changed**; three documentation references to `_schedule_create`,
+`_schedule_delete` and `_action_payload` were renamed with the methods; and
+`normalize_products` / `_active_schedule_target` no longer exist in
+`builtin_tools.py` at all.
+
 ## 5. Next
 
-The order in §1–§3 is the plan; the cheapest nine entries are now done (web
-payloads and sink, feishu renderer / progress / attachment leases / inbound
-parsing, builtin memory / web / output / signals / step output). What remains:
+The order in §1–§3 is the plan; everything except the four most entangled
+clusters has moved. **Progress so far: the three files went from 12292 lines to
+8618** (web.py 4191 → 3204, feishu.py 2587 → 1973, builtin_tools.py 5514 →
+3441), with twelve modules holding what left. What remains, and why it is last:
 
-1. **builtin_tools.py: scheduler + workflows, as one move** (749 + 527 lines).
-   The survey measured that they cannot be separated: the six workflow methods
-   read four scheduler-cluster methods (`_schedule_store` ×5, `_schedule_target`,
-   `_schedule_trigger`, `_action_payload`) and eighteen names from
-   `agent.scheduler`. This is the largest remaining piece, and the first whose
-   extraction has to decide what happens to the **store construction** rather
-   than just to a method.
-2. Then, in this order, because the coupling grows along it: **files** (248,
-   including the `_file_service` property's four-way resolution), **audio**
-   (105, straddling files and shell), **shell** (306, eleven registry keys and
-   ten sandbox names), **context** (151, the thinnest guard at two tests).
-3. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
+1. **files** (248 lines, 13 methods, 14 guards). Not a plain move: it carries
+   the `_file_service` **property**, which resolves the provider through four
+   fallbacks (context override → injected → registry context → a new default
+   `FileService`). Extracting the cluster means deciding where that resolution
+   lives and what the constructor surface becomes.
+2. **audio** (105 lines, 4 guards) — straddles files (`_resolve_tool_path`) and
+   shell (`_terminate_process`), so it is cheap *after* those, awkward before.
+3. **shell** (306 lines, 24 guards) — eleven registry context keys, nine sibling
+   methods and ten names from `agent.security.filesystem_sandbox`; the most
+   entangled cluster in the file, and the one that most deserves to be last.
+4. **context** (151 lines, **2 guards — the thinnest**). Small and low-coupled,
+   but the guard is thin enough that the move should add tests the way §4.5 did,
+   rather than trust two.
+5. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
    trio — move with the clusters that call them (the channel's reconnect loop
    and the download path), not on their own.
 
