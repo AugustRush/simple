@@ -7525,6 +7525,47 @@ def test_evolve_uses_qualified_component_cleanup(monkeypatch):
     assert calls["closed"] == 1
 
 
+def test_chat_sends_the_line_through_the_command_coordinator(monkeypatch):
+    """``simple chat "<line>"`` is one line of the interactive prompt.
+
+    It used to hand the text straight to the agent core, so a slash command
+    reached the model as prose: the model saw the command's name in its prompt,
+    could not read the body, and improvised an execution nobody had run.
+    """
+    import agent.cli as cli_module
+
+    handled: list[str] = []
+
+    class _FakeCoordinator:
+        async def handle(self, turn_input, state, sink):
+            handled.append(turn_input.text)
+
+    components = {
+        "system_prompt": "sys",
+        "command_coordinator_factory": lambda **kwargs: _FakeCoordinator(),
+    }
+
+    async def fake_build_quiet(cfg):
+        return components
+
+    async def fake_await_mcp_ready(components, timeout=None):
+        return None
+
+    async def fake_close(components):
+        return None
+
+    monkeypatch.setattr(cli_module.agent_module, "load_config", lambda: ({}, False))
+    monkeypatch.setattr(cli_module, "_build_quiet_cli_components", fake_build_quiet)
+    monkeypatch.setattr(
+        cli_module.agent_module, "await_mcp_ready", fake_await_mcp_ready
+    )
+    monkeypatch.setattr(cli_module.agent_module, "_close_components", fake_close)
+
+    cli_module.chat(question="/demo:thing")
+
+    assert handled == ["/demo:thing"]
+
+
 def test_gateway_starts_background_scheduler(monkeypatch):
     import agent.cli as cli_module
     import agent.scheduler.build as scheduler_build

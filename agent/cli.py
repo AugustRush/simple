@@ -725,6 +725,53 @@ async def _interactive_loop_coro(
         shared.CONSOLE = original_console
 
 
+def _command_coordinator(
+    components: dict,
+    cfg: dict,
+    *,
+    cancel_token_factory: Optional[Callable[[], Any]] = None,
+) -> CommandCoordinator:
+    """Build the pipeline one line of user input goes through.
+
+    Both the interactive loop and ``simple chat`` use this, because a slash
+    command has to mean the same thing wherever it was typed.  ``chat`` used to
+    hand its text straight to the agent core, so ``/plugin:command`` reached the
+    model as prose: the model saw the command's name in its prompt, could not
+    read the body, and improvised an "execution" nobody had run.
+    """
+    coordinator_factory = components.get("command_coordinator_factory")
+    if callable(coordinator_factory):
+        return coordinator_factory(cancel_token_factory=cancel_token_factory)
+    router = components.get("command_router")
+    if router is None:
+        router = ensure_command_router(components)
+    return CommandCoordinator(
+        _agent_core_for_components(components),
+        router,
+        components=components,
+        config=cfg,
+        cancel_token_factory=cancel_token_factory,
+    )
+
+
+async def _run_cli_turn(
+    components: dict,
+    cfg: dict,
+    text: str,
+    sink: Any,
+) -> None:
+    """Run one user line through the coordinator, once."""
+    coordinator = _command_coordinator(components, cfg)
+    state = RuntimeSessionState(
+        ctx=AgentContext(system_prompt=components["system_prompt"])
+    )
+    await coordinator.handle(
+        TurnInput.from_text(text, channel_name="cli"),
+        state,
+        sink,
+    )
+
+
 async def _interactive_loop_body(
     components: dict,
     cfg: dict,
@@ -800,21 +847,13 @@ async def _interactive_loop_body(
         return token
 
     router = components.get("command_router")
-    coordinator_factory = components.get("command_coordinator_factory")
-    if callable(coordinator_factory):
-        coordinator = coordinator_factory(
-            cancel_token_factory=_new_cli_cancel_token,
-        )
-    else:
-        if router is None:
-            router = ensure_command_router(components)
-        coordinator = CommandCoordinator(
-            _agent_core_for_components(components),
-            router,
-            components=components,
-            config=cfg,
-            cancel_token_factory=_new_cli_cancel_token,
-        )
+    coordinator = _command_coordinator(
+        components,
+        cfg,
+        cancel_token_factory=_new_cli_cancel_token,
+    )
+    if router is None:
+        router = ensure_command_router(components)
     _set_cli_router(router)
 
     # Queue staged turns left behind by sessions that died before consolidating
@@ -1144,16 +1183,13 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
             components,
             timeout=float(timeout) if timeout is not None else None,
         )
-        ctx = AgentContext(system_prompt=components["system_prompt"])
-        state = RuntimeSessionState(ctx=ctx)
         sink = CliOutputSink(shared.CONSOLE)
         sink.begin_turn()
         try:
-            await _agent_core_for_components(components).handle_turn(
-                TurnInput.from_text(question, channel_name="cli"),
-                state,
-                sink=sink,
-            )
+            # Through the command pipeline, exactly like one line typed at the
+            # interactive prompt: a slash command has one meaning, not one per
+            # door it came through.
+            await _run_cli_turn(components, cfg, question, sink)
         finally:
             await agent_module._close_components(components)
 
