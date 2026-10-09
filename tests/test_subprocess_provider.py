@@ -62,7 +62,7 @@ def test_both_spawn_points_share_one_injected_provider(tmp_path):
     registry.set_context("shell_sandbox_mode", "none")
 
     tools = _tools(tmp_path, registry)
-    asyncio.run(tools._shell("echo hi", intent="exercise the seam"))
+    asyncio.run(tools._shell_tools.run("echo hi", intent="exercise the seam"))
 
     tools_root = tmp_path / "tools"
     tools_root.mkdir()

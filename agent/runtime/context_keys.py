@@ -138,7 +138,7 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         writers=("agent/bootstrap.py", "agent/commands/builtin.py",),
         readers=(
             "agent/tools/file_tools.py",
-            "agent/tools/builtin_tools.py",
+            "agent/tools/shell_tools.py",
             "agent/tools/user_tool_runner.py",
         ),
     ),
@@ -147,32 +147,32 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="shell_permission_level",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/shell_tools.py",),
     ),
     ContextKey(
         key="shell_sandbox_mode",
         writers=("agent/bootstrap.py",),
-        readers=("agent/bootstrap.py", "agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=("agent/bootstrap.py", "agent/tools/shell_tools.py", "agent/tools/user_tool_runner.py",),
     ),
     ContextKey(
         key="shell_allowed_commands",
         writers=("agent/bootstrap.py", "agent/commands/builtin.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/shell_tools.py",),
     ),
     ContextKey(
         key="shell_blocked_commands",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/shell_tools.py",),
     ),
     ContextKey(
         key="shell_secret_paths",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=("agent/tools/shell_tools.py", "agent/tools/user_tool_runner.py",),
     ),
     ContextKey(
         key="shell_devices",
         writers=("agent/bootstrap.py",),
-        readers=("agent/bootstrap.py", "agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=("agent/bootstrap.py", "agent/tools/shell_tools.py", "agent/tools/user_tool_runner.py",),
     ),
     ContextKey(
         key="supports_vision",
@@ -207,7 +207,7 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         writers=(),
         readers=(
             "agent/tools/file_tools.py",
-            "agent/tools/builtin_tools.py",
+            "agent/tools/shell_tools.py",
             "agent/tools/user_tool_runner.py",
         ),
         note=(

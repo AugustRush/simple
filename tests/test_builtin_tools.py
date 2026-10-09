@@ -844,7 +844,7 @@ def test_shell_timeout_is_reported_as_an_error_not_a_hang(tmp_path):
 
     reg.set_context("subprocess_provider", TimingOutProvider())
 
-    result = asyncio.run(tools._shell("sleep 10", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("sleep 10", timeout=1))
 
     assert result["ok"] is False
     assert "timed out" in result["error"].lower()
@@ -871,7 +871,7 @@ def test_shell_passes_roots_to_subprocess_environment(tmp_path, monkeypatch):
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    result = asyncio.run(tools._shell("echo ok", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("echo ok", timeout=1))
 
     assert result["ok"] is True
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
@@ -901,7 +901,7 @@ def test_shell_defaults_to_selected_workspace(tmp_path, monkeypatch):
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    result = asyncio.run(tools._shell("echo ok", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("echo ok", timeout=1))
 
     assert result["ok"] is True
     assert captured["cwd"] == str(workspace.resolve())
@@ -927,7 +927,7 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
     )
 
     result = asyncio.run(
-        tools._shell("echo ok", timeout=1, cwd=str(output_dir))
+        tools._shell_tools.run("echo ok", timeout=1, cwd=str(output_dir))
     )
 
     assert result["ok"] is True
@@ -952,10 +952,10 @@ def test_shell_resolves_relative_cwd_inside_declared_root(tmp_path, monkeypatch)
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    asyncio.run(tools._shell("echo ok", timeout=1, root="workspace", cwd="sub"))
+    asyncio.run(tools._shell_tools.run("echo ok", timeout=1, root="workspace", cwd="sub"))
     assert captured["cwd"] == str((workspace / "sub").resolve())
 
-    asyncio.run(tools._shell("echo ok", timeout=1, root="output_dir", cwd="sub"))
+    asyncio.run(tools._shell_tools.run("echo ok", timeout=1, root="output_dir", cwd="sub"))
     assert captured["cwd"] == str((output_dir / "sub").resolve())
 
 
@@ -963,7 +963,7 @@ def test_shell_rejects_relative_cwd_escaping_declared_root(tmp_path):
     tools, _reg, _workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
 
     result = asyncio.run(
-        tools._shell(
+        tools._shell_tools.run(
             "echo ok",
             timeout=1,
             root="output_dir",
@@ -978,7 +978,7 @@ def test_shell_rejects_relative_cwd_escaping_declared_root(tmp_path):
 def test_shell_rejects_unknown_root(tmp_path):
     tools, _reg, _workspace = make_builtin_tools(tmp_path)
 
-    result = asyncio.run(tools._shell("echo ok", timeout=1, root="bogus"))
+    result = asyncio.run(tools._shell_tools.run("echo ok", timeout=1, root="bogus"))
 
     assert result["ok"] is False
     assert "root" in result["error"]
@@ -992,7 +992,7 @@ def test_shell_output_domain_relocates_workspace_files_without_sandbox(tmp_path)
     registry.set_context("shell_sandbox_mode", "none")
 
     result = asyncio.run(
-        tools._shell(
+        tools._shell_tools.run(
             f"mkdir -p {workspace}/polluted && "
             f"touch {workspace}/polluted/new.txt",
             timeout=10,
@@ -1015,7 +1015,7 @@ def test_shell_workspace_domain_keeps_files_without_sandbox(tmp_path):
     registry.set_context("shell_sandbox_mode", "none")
 
     result = asyncio.run(
-        tools._shell(
+        tools._shell_tools.run(
             "mkdir -p newdir && touch newdir/new.txt",
             timeout=10,
             root="workspace",
@@ -1053,7 +1053,7 @@ def test_shell_blocks_workspace_write_by_default(tmp_path):
     (workspace / "a.txt").write_text("keep", encoding="utf-8")
 
     result = asyncio.run(
-        tools._shell(f"touch {workspace}/new.txt", timeout=10)
+        tools._shell_tools.run(f"touch {workspace}/new.txt", timeout=10)
     )
 
     assert not (workspace / "new.txt").exists()
@@ -1076,7 +1076,7 @@ def test_shell_allows_output_dir_writes(tmp_path):
     tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
 
     result = asyncio.run(
-        tools._shell(f"touch {output_dir}/made.txt", timeout=10)
+        tools._shell_tools.run(f"touch {output_dir}/made.txt", timeout=10)
     )
 
     assert result["ok"] is True
@@ -1087,7 +1087,7 @@ def test_shell_allows_output_dir_writes(tmp_path):
 def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
     tools, _, _ = make_builtin_tools(tmp_path)
 
-    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
 
     assert result["ok"] is False
     assert result["requires_confirmation"] is True
@@ -1123,7 +1123,7 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
     )
     active = _active_agent_context.set(ctx)
     try:
-        first = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+        first = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
     finally:
         _active_agent_context.reset(active)
     captured = {}
@@ -1146,7 +1146,7 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
     assert shell_command_confirm(first["confirmation_token"], scope=scope) is True
     active = _active_agent_context.set(ctx)
     try:
-        result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+        result = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
     finally:
         _active_agent_context.reset(active)
 
@@ -1160,7 +1160,7 @@ def test_shell_rejects_model_supplied_confirmation_token(tmp_path):
 
     with pytest.raises(TypeError, match="confirmation_token"):
         asyncio.run(
-            tools._shell(
+            tools._shell_tools.run(
                 "mkfs /dev/disk0",
                 timeout=1,
                 confirmation_token="model-controlled",
@@ -1171,7 +1171,7 @@ def test_shell_rejects_model_supplied_confirmation_token(tmp_path):
 def test_shell_rejects_inline_cwd_escape(tmp_path):
     tools, _, _ = make_builtin_tools(tmp_path)
 
-    result = asyncio.run(tools._shell("cd /tmp && echo ok", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("cd /tmp && echo ok", timeout=1))
 
     assert result["ok"] is False
     assert result["risk_level"] == "high"
@@ -1197,7 +1197,7 @@ def test_shell_allowed_commands_context_skips_confirmation(tmp_path, monkeypatch
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
 
     assert result["ok"] is True
     assert spawned
@@ -1222,7 +1222,7 @@ def test_shell_permission_level_context_skips_confirmation(tmp_path, monkeypatch
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
 
     assert result["ok"] is True
     assert spawned
@@ -1253,7 +1253,7 @@ def test_unsandboxed_full_access_skips_sandbox_exec(tmp_path, monkeypatch):
     registry.set_context("shell_sandbox_mode", "none")
     spawned = _fake_proc_spawn(monkeypatch)
 
-    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
 
     assert result["ok"] is True
     assert spawned
@@ -1269,7 +1269,7 @@ def test_unsandboxed_without_full_level_falls_back_to_sandbox(
     registry.set_context("shell_sandbox_mode", "none")
     spawned = _fake_proc_spawn(monkeypatch)
 
-    result = asyncio.run(tools._shell("mv a b", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mv a b", timeout=1))
 
     assert result["ok"] is True
     assert spawned
@@ -1298,7 +1298,7 @@ def test_session_sandbox_override_unsandboxes(tmp_path, monkeypatch):
     )
     active = _active_agent_context.set(ctx)
     try:
-        result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+        result = asyncio.run(tools._shell_tools.run("mkfs /dev/disk0", timeout=1))
     finally:
         _active_agent_context.reset(active)
         shell_session_allowlist_clear()
@@ -1312,7 +1312,7 @@ def test_shell_devices_defaults_open_and_can_be_disabled(tmp_path, monkeypatch):
     tools, registry, _ = make_builtin_tools(tmp_path)
     spawned = _fake_proc_spawn(monkeypatch)
 
-    result = asyncio.run(tools._shell("mv a b", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mv a b", timeout=1))
 
     assert result["ok"] is True
     assert spawned
@@ -1323,7 +1323,7 @@ def test_shell_devices_defaults_open_and_can_be_disabled(tmp_path, monkeypatch):
 
     registry.set_context("shell_devices", False)
     spawned.clear()
-    result = asyncio.run(tools._shell("mv a b", timeout=1))
+    result = asyncio.run(tools._shell_tools.run("mv a b", timeout=1))
     assert result["ok"] is True
     assert spawned
     profile = Path(spawned[0][2]).read_text(encoding="utf-8")
@@ -1359,7 +1359,7 @@ def test_shell_wrapped_high_risk_commands_require_confirmation(
 ):
     tools, _, _ = make_builtin_tools(tmp_path)
 
-    result = asyncio.run(tools._shell(command, timeout=1))
+    result = asyncio.run(tools._shell_tools.run(command, timeout=1))
 
     assert result["ok"] is False
     assert result.get("requires_confirmation") is True

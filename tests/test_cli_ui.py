@@ -90,7 +90,7 @@ def _run_with_context(active_sink, *, cancelled: bool = False, **kwargs):
         cancel_token.cancel()
     cancel_var_token = shared._active_cancel_token.set(cancel_token)
     try:
-        return asyncio.run(kwargs["tools"]._shell(kwargs["command"], timeout=1))
+        return asyncio.run(kwargs["tools"]._shell_tools.run(kwargs["command"], timeout=1))
     finally:
         shared._active_cancel_token.reset(cancel_var_token)
         _active_sink.reset(sink_token)
@@ -383,8 +383,8 @@ def test_parallel_identical_medium_risk_commands_ask_for_consent_once(
 
         async def scenario():
             return await asyncio.gather(
-                tools._shell("mkfs /dev/disk0", timeout=1),
-                tools._shell("mkfs /dev/disk0", timeout=1),
+                tools._shell_tools.run("mkfs /dev/disk0", timeout=1),
+                tools._shell_tools.run("mkfs /dev/disk0", timeout=1),
             )
 
         results = asyncio.run(scenario())

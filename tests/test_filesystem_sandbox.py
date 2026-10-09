@@ -460,7 +460,7 @@ def test_shell_tool_does_not_leak_a_scratch_dir_per_call(tmp_path):
 
     for _ in range(3):
         result = asyncio.run(
-            tools._shell("echo hi", intent="test scratch cleanup")
+            tools._shell_tools.run("echo hi", intent="test scratch cleanup")
         )
         assert result.get("ok") is True, result
 
