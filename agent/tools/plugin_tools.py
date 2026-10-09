@@ -163,6 +163,20 @@ class PluginTools:
         # composition's directory while the session watched.
         self.registry = registry
 
+    def _user_plugins_dir(self) -> Path:
+        """The user-plugins directory this session installs into.
+
+        Read *once*: the registry's context is a ``ContextVar``, so the same key
+        read twice inside one expression can in principle answer twice.  This
+        lookup had three spellings -- two of them byte-identical, each reading
+        the key twice -- and only one of the three expanded ``~``, so listing
+        the installed plugins and installing one could disagree about where they
+        live.
+        """
+        raw = self.registry.get_context("user_plugins_dir")
+        root = Path(str(raw)) if raw else shared.USER_PLUGINS_DIR
+        return root.expanduser()
+
     async def create_tool(
         self, tool_id: str, code: str, intent: str = ""
     ) -> dict:
@@ -259,7 +273,7 @@ class PluginTools:
             name = re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
 
         try:
-            target = _resolve_user_plugin_target(name, self.registry.get_context("user_plugins_dir") and Path(str(self.registry.get_context("user_plugins_dir"))))
+            target = _resolve_user_plugin_target(name, self._user_plugins_dir())
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -505,7 +519,7 @@ class PluginTools:
         import shutil
 
         try:
-            target = _resolve_user_plugin_target(name, self.registry.get_context("user_plugins_dir") and Path(str(self.registry.get_context("user_plugins_dir"))))
+            target = _resolve_user_plugin_target(name, self._user_plugins_dir())
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         if not target.is_dir():
@@ -541,7 +555,7 @@ class PluginTools:
 
         on_disk: list[dict] = []
         user_dir_loaded_count = 0
-        user_plugins_dir = Path(str(self.registry.get_context("user_plugins_dir") or shared.USER_PLUGINS_DIR))
+        user_plugins_dir = self._user_plugins_dir()
         if user_plugins_dir.is_dir():
             for entry in sorted(user_plugins_dir.iterdir()):
                 if not entry.is_dir():

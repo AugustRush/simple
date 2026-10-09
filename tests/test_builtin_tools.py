@@ -155,6 +155,43 @@ def test_memory_clear_uses_human_confirmation_and_storage_api(tmp_path):
     assert registry.tool_capabilities("memory_clear") == frozenset({"state_write"})
 
 
+def test_the_user_plugins_directory_is_read_once_and_expanded(tmp_path, monkeypatch):
+    """One lookup, read once.
+
+    The key was read twice inside a single expression, in two byte-identical
+    spellings, plus a third that did not expand ``~`` -- so listing the installed
+    plugins and installing one could disagree about where they live.
+    """
+    from pathlib import Path
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    reads: list[str] = []
+    real_get = registry.get_context
+
+    def counting_get(key, *args, **kwargs):
+        if key == "user_plugins_dir":
+            reads.append(key)
+        return real_get(key, *args, **kwargs)
+
+    monkeypatch.setattr(registry, "get_context", counting_get)
+
+    registry.set_context("user_plugins_dir", str(tmp_path / "plugins"))
+    resolved = tools._plugin_tools._user_plugins_dir()
+
+    assert resolved == tmp_path / "plugins"
+    assert reads == ["user_plugins_dir"], reads
+
+    # An unset context falls back to the shared default, and ``~`` is expanded
+    # so that installing and listing cannot point at different directories.
+    from agent import shared
+
+    registry.set_context("user_plugins_dir", "")
+    assert tools._plugin_tools._user_plugins_dir() == shared.USER_PLUGINS_DIR.expanduser()
+    registry.set_context("user_plugins_dir", "~/agent-plugins-test")
+    assert tools._plugin_tools._user_plugins_dir() == Path.home() / "agent-plugins-test"
+
+
 def test_every_builtin_tool_has_one_capability_classification(tmp_path):
     """A capability is what a restricted profile filters on, so the two places
     it can be declared must not disagree and nothing may be left unclassified.
