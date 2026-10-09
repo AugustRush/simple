@@ -25,12 +25,10 @@ Two names stay shared, and stay single-homed:
 - ``_normalize_confirm_decision`` is used by the sink and by the socket
   handler.
 
-Behaviour is preserved exactly, including two pairs that look duplicated and
-were left alone on purpose: ``_turn_tag`` / ``_operation_tag`` each carry a
-docstring explaining a *different* failure they prevent, and
-``CONFIRM_DECISIONS`` is the declared vocabulary that the normaliser's branches
-already spell out.  Both are recorded in the survey rather than tidied inside a
-move.
+Behaviour is preserved exactly, including one pair that looks duplicated and was
+left alone on purpose: ``_turn_tag`` / ``_operation_tag`` each carry a docstring
+explaining a *different* failure they prevent.  That is recorded in the survey
+rather than tidied inside a move.
 """
 
 from __future__ import annotations
@@ -65,15 +63,23 @@ def _normalize_confirm_decision(payload: dict[str, Any]) -> str:
     Accepts both the rich ``{"decision": "allow_session"}`` form and the
     original ``{"approved": true}`` boolean, so an already-open browser tab
     keeps working across a backend upgrade.
+
+    This is the one door client input comes through, so the vocabulary is
+    *closed* here.  It matters because of how the answer is read downstream: the
+    caller tests for ``deny`` and for ``allow_session`` and treats everything
+    else as approval, so a value outside the vocabulary would fail **open**.  A
+    reply nobody can classify is a denial.
     """
     raw = str(payload.get("decision") or "").strip().casefold()
     if raw == "allow_session":
-        return "allow_session"
-    if raw in ("allow_once", "allow", "approve"):
-        return "allow_once"
-    if raw in ("deny", "reject"):
-        return "deny"
-    return "allow_once" if payload.get("approved") else "deny"
+        decision = "allow_session"
+    elif raw in ("allow_once", "allow", "approve"):
+        decision = "allow_once"
+    elif raw in ("deny", "reject"):
+        decision = "deny"
+    else:
+        decision = "allow_once" if payload.get("approved") else "deny"
+    return decision if decision in CONFIRM_DECISIONS else "deny"
 
 
 # File extensions treated as attachable media (image/audio/video).

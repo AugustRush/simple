@@ -668,6 +668,44 @@ def _run_shell_approval(decision_payload):
         shell_session_allowlist_clear()
 
 
+def test_the_confirmation_vocabulary_is_closed_and_fails_closed():
+    """The one door client input comes through has a closed vocabulary.
+
+    The caller reads the answer by testing for ``deny`` and for
+    ``allow_session`` and treating everything else as approval, so a value
+    outside ``CONFIRM_DECISIONS`` would fail *open*.  Nothing may leave this
+    function that the rest of the system cannot classify.
+    """
+    from agent.channels.web_sink import (
+        CONFIRM_DECISIONS,
+        _normalize_confirm_decision,
+    )
+
+    # The accepted forms, including the legacy boolean an already-open tab
+    # still sends across a backend upgrade.
+    assert _normalize_confirm_decision({"decision": "allow_session"}) == "allow_session"
+    assert _normalize_confirm_decision({"decision": "ALLOW_SESSION"}) == "allow_session"
+    assert _normalize_confirm_decision({"decision": "allow_once"}) == "allow_once"
+    assert _normalize_confirm_decision({"decision": "approve"}) == "allow_once"
+    assert _normalize_confirm_decision({"approved": True}) == "allow_once"
+    assert _normalize_confirm_decision({"decision": "deny"}) == "deny"
+    assert _normalize_confirm_decision({"decision": "reject"}) == "deny"
+    assert _normalize_confirm_decision({"approved": False}) == "deny"
+
+    # A reply nobody can classify is a denial, not an approval.
+    for payload in (
+        {},
+        {"decision": "something else"},
+        {"decision": 7},
+        {"decision": None},
+        {"unrelated": True},
+        {"approved": False, "decision": "maybe"},
+    ):
+        decision = _normalize_confirm_decision(payload)
+        assert decision == "deny", (payload, decision)
+        assert decision in CONFIRM_DECISIONS, payload
+
+
 def test_web_confirm_request_advertises_session_scope():
     req, _summary, _still = _run_shell_approval({"decision": "deny"})
     assert req["allow_session"] is True
