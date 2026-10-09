@@ -488,22 +488,76 @@ The receiver guard needed the opposite polarity this time: `strip_html` and
 `make_tavily_request` are `@staticmethod`, so "every method keeps its receiver"
 is false for them. The guard is now decorator-aware (`static ⇔ no self`).
 
+### 4.8 builtin_tools.py — output housekeeping (`03971b3`)
+
+`agent/tools/builtin_tools.py` **5187 → 5155 lines**; `_clean_output` (33 lines)
+became `OutputTools.clean` in `agent/tools/output_tools.py`.
+
+The cluster is small, and the interesting part is what was deliberately **not**
+done. `clean_output` is the only tool whose registration is conditional
+(`if self._output_dir is not None`), and the survey suggested the condition
+"becomes structural once it lives with the output directory". It does not in
+this round: the condition stays in `_register`, beside the other 43
+registrations, because that is where "which tools this deployment has" is
+decided. What moved is the behaviour — the containment check on `subdir`, the
+age filter, files before the directories they empty, and a result that reports
+counts plus at most ten per-file errors rather than failing the call.
+
+The proof that the split is in the right place is a test that did not change:
+`test_clean_output_not_registered_when_no_output_dir` still asserts the
+condition, and it still passes untouched. Six `bt._clean_output(...)` call sites
+in `tests/test_output_dir.py` became `bt._output_tools.clean(...)`.
+
+### 4.9 feishu.py — attachment leases and capacity (`e74606a`)
+
+`agent/channels/feishu.py` **2152 → 2048 lines**; the lease trio
+(`_AttachmentLease`, `_QueuedAttachment`, `_AttachmentBatchCapacityLease`),
+`_cleanup_attachment_path`, and the process-wide capacity semaphore with its
+lock and error string moved to `agent/channels/feishu_attachments.py`.
+
+They were already module-level, so the work here was not unwinding a class but
+**choosing a home** — and the justification is that they are about threads,
+files and ownership rather than about Feishu, and never touch the lark client,
+so they can be read and tested without the SDK.
+
+Two things stayed, on purpose. `_ATTACHMENT_CANCEL_GRACE_SECONDS` stayed in
+`feishu.py` because the sink is what waits on it. The capacity semaphore is
+defined **and read in the new module only**, because three tests shrink it
+through `monkeypatch.setattr("agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+…, raising=False)` — and that call would have become a **silent no-op** after
+the move: `raising=False` means no error, while the class reads the new module's
+global.
+
+Because that is exactly the "guard quietly stopped guarding" failure, it was
+measured rather than assumed:
+
+| patch target | `try_acquire(2)` with capacity 1 | verdict |
+| --- | --- | --- |
+| `agent.channels.feishu_attachments` (new) | `None` | effective |
+| `agent.channels.feishu` (old, `create=True`) | a lease | a no-op |
+
+and `hasattr(agent.channels.feishu, "_ATTACHMENT_BATCH_CAPACITY")` is now
+`False`, so without `raising=False` the three tests would have failed loudly
+instead. The targets were updated to the module that actually reads the name.
+
+One ledger note followed the code: `agent/runtime/state_ledger.py`'s "not
+scanned, and why" list recorded `_ATTACHMENT_BATCH_CAPACITY_LOCK` at
+`agent/channels/feishu.py:85`; its coordinates are now
+`agent/channels/feishu_attachments.py:44`.
+
 ## 5. Next
 
-The order in §1–§3 is the plan; the cheapest five entries are now done (web
-payloads and sink, feishu renderer and progress, builtin memory and web). What
-remains, cheapest first:
+The order in §1–§3 is the plan; the cheapest six entries are now done (web
+payloads and sink, feishu renderer, progress and attachment leases, builtin
+memory, web and output). What remains, cheapest first:
 
-1. builtin_tools.py **output housekeeping** (`_clean_output`, 33 lines, leaf
-   state `{_output_dir}`, 7 guards). Small, but it is the one cluster whose
-   registration is *conditional* (`if self._output_dir is not None`), so the
-   move has to decide where the condition lives rather than just where the
-   method lives — that is the whole of the work.
-2. feishu.py **A** (the attachment lease trio, 92 lines plus the module-level
-   semaphore) and **M** (the module-level parsing helpers) — both already
-   module-level, so the task is choosing their home rather than unwinding a
-   class.
-3. builtin_tools.py **signals + step output**, then **scheduler + workflows** as
+1. feishu.py **M** — the module-level parsing helpers (`_ws_reconnect_delay`,
+   `_clean_at_mentions`, `_is_group_chat_type`, `_extract_post_content`, and the
+   resource-filename trio). Already module-level, so this is a home to choose,
+   not a class to unwind; note that `_clean_at_mentions` and
+   `_extract_post_content` are imported by name in the tests, so `feishu.py`
+   should keep re-exporting them.
+2. builtin_tools.py **signals + step output**, then **scheduler + workflows** as
    one move (the survey measured that they cannot be separated), then **files**,
    **audio**, **shell**, **context** — in that order, because the coupling grows
    monotonically along it.
