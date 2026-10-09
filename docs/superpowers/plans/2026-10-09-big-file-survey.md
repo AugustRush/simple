@@ -918,3 +918,28 @@ lose the session's context in production.
   whether the browser is expected to fetch that path later.
 - **The Profile/Bundle layer** from the closing report remains not done; it is a
   new functional layer, not a refactor of these three files.
+
+## 7. The verified findings, and what happened to each
+
+The survey's §1–§3 each recorded findings that were **not** folded into a move,
+because a move preserves behaviour and these needed a decision.  They are being
+worked through the same way as the moves: a test that fails first where the
+failure is observable, the full suite's FAILED set diffed against the frozen
+`workspace-write` baseline, and a repository-style commit per finding.
+
+| finding | disposition |
+| --- | --- |
+| `web.py`: `_stream` discards the tasks it creates (`add_done_callback(discard)`), so a failing turn is invisible | **fixed** (`59cc66d`) — `process_message` reports through the sink, and the callback retrieves what still escapes. The failing test *timed out* against the old code: the browser was told nothing at all |
+| `web.py`: three disagreeing session-id rules (`web_session_home` 1–64, the upload endpoint 8–128, `re.sub(...)[:32]` in the stream) | **fixed** (`1e5435e`) — one predicate, `shared.is_valid_web_session_id`; endpoints validate and refuse instead of rewriting. A 40-character session used to run in the 32-character one's home |
+| `web.py`: `/api/health` was the only `/api` route without `_authorized`, and returned the absolute `AGENT_HOME` | **fixed** (`b041ef8`) — same gate as everything else, and the field is gone: nothing (frontend, tests, docs) ever read it |
+| `web.py`: `_schedule_run_artifacts` materialised `sorted(root.rglob("*"))` before its cap, and called `path.stat()` unguarded | **fixed** (`e02c0ad`) — the listing moved out of the endpoint into `_list_run_artifacts` (so it can be tested at all), a vanished entry is skipped, and the walk is bounded. The order the frontend renders in is deliberately unchanged |
+| `feishu.py`: `if TYPE_CHECKING: pass`, the unread `_progress_phase_closed` write, the duplicated `_stream_flush_pending = False` | **fixed** (`f620074`) — dead code that tells the reader something untrue |
+| `web_sink.py`: `CONFIRM_DECISIONS` declared but read by nobody | **fixed** (`55c4894`) — the vocabulary is now enforced at the one door client input comes through, which matters because the caller treats "not deny, not allow_session" as **approval** |
+| `builtin_tools.py`: `web_search` advertised a DuckDuckGo `region` the Tavily backend ignores | **fixed** (`8e393b1`) — schema, parameter and the explanatory `note` all gone, with a guard that the advertised properties equal the accepted parameters |
+| `builtin_tools.py`: the authorization scope spelled out in two clusters | **fixed** (`6995333`) — one definition in `agent/security/shell.py`, with a test proving both clusters ask it |
+| `web_sink.py`: `defer_temporary_attachment_cleanup` returns `True` unconditionally — the sink claims a cleanup responsibility it never performs | **open** — needs a decision (own the file and clean it later, or decline and let the coordinator delete it) and a test; the contract says a sink may only answer `True` after *irrevocably* assuming responsibility |
+| `builtin_tools.py`: capabilities declared twice (at registration and in `_DEFAULT_TOOL_CAPABILITIES`) with nothing asserting they agree | **open** — the first-principles answer is one home, or a guard test that the two never disagree |
+
+Two more items from §3 stay open by decision rather than by omission: the
+`_register` table (a design change, §5) and `_current_time` /
+`_ws_reconnect_delay` (too small to justify a module of their own).
