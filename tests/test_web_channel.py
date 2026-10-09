@@ -493,12 +493,14 @@ def test_web_confirm_request_survives_a_tab_switch(monkeypatch):
     """
     from starlette.testclient import TestClient
 
-    from agent.channels import web as web_channel
+    from agent.channels import web_sink
 
     # A short clock, so a regression fails an assertion instead of hanging:
     # without the re-offer the waiter still times out into a denial, which
     # arrives on the second socket and shows up here as the wrong first event.
-    monkeypatch.setattr(web_channel, "CONFIRMATION_TIMEOUT_SECONDS", 3)
+    # Patched where it is read: the sink sets the prompt's deadline and the
+    # channel's waiter reads the same module global.
+    monkeypatch.setattr(web_sink, "CONFIRMATION_TIMEOUT_SECONDS", 3)
 
     channel = _channel()
     channel.bind_runtime({}, {})
