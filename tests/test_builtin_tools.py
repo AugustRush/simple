@@ -257,7 +257,7 @@ def test_read_file_returns_bounded_window_and_revision(tmp_path):
     path = workspace / "large.txt"
     path.write_text("\n".join(f"line{i}" for i in range(10)) + "\n", encoding="utf-8")
 
-    result = tools._read_file(
+    result = tools._file_tools.read_file(
         root="workspace", path="large.txt", start_line=3, line_count=2
     )
 
@@ -275,7 +275,7 @@ def test_read_file_rejects_invalid_utf8_content(tmp_path):
     tools, _, workspace = make_builtin_tools(tmp_path)
     (workspace / "binary.bin").write_bytes(b"\x00\x01\x02abc")
 
-    result = tools._read_file(root="workspace", path="binary.bin")
+    result = tools._file_tools.read_file(root="workspace", path="binary.bin")
 
     assert result["ok"] is False
     assert result["error"]["code"] == "unsupported_encoding"
@@ -291,14 +291,14 @@ def test_list_files_respects_recursive_and_max_results(tmp_path):
     nested.mkdir()
     (nested / "c.txt").write_text("c", encoding="utf-8")
 
-    flat = tools._list_files(
+    flat = tools._file_tools.list_files(
         root="workspace",
         path="files",
         pattern="*.txt",
         recursive=False,
         max_results=10,
     )
-    recursive = tools._list_files(
+    recursive = tools._file_tools.list_files(
         root="workspace",
         path="files",
         pattern="*.txt",
@@ -313,7 +313,7 @@ def test_list_files_respects_recursive_and_max_results(tmp_path):
     assert recursive["truncated"] is True
     assert recursive["next_cursor"] is not None
 
-    resumed = tools._list_files(
+    resumed = tools._file_tools.list_files(
         root="workspace",
         path="files",
         pattern="*.txt",
@@ -330,7 +330,7 @@ def test_read_file_rejects_paths_outside_workspace(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
 
-    result = tools._read_file(root="workspace", path=str(outside))
+    result = tools._file_tools.read_file(root="workspace", path=str(outside))
 
     assert result["ok"] is False
     assert result["error"]["code"] == "invalid_path"
@@ -341,7 +341,7 @@ def test_read_file_allows_text_files_in_output_dir(tmp_path):
     artifact = output / "result.txt"
     artifact.write_text("generated", encoding="utf-8")
 
-    result = tools._read_file(root="output_dir", path="result.txt")
+    result = tools._file_tools.read_file(root="output_dir", path="result.txt")
 
     assert result["ok"] is True
     assert result["path"] == "result.txt"
@@ -353,7 +353,7 @@ def test_list_files_allows_output_dir(tmp_path):
     artifact = output / "phoenix_fire.jpeg"
     artifact.write_bytes(b"fake")
 
-    result = tools._list_files(root="output_dir", path=".")
+    result = tools._file_tools.list_files(root="output_dir", path=".")
 
     assert result["ok"] is True
     assert [item["path"] for item in result["items"]] == ["phoenix_fire.jpeg"]
@@ -363,7 +363,7 @@ def test_write_file_rejects_paths_outside_workspace(tmp_path):
     tools, _, _workspace = make_builtin_tools(tmp_path)
     outside = tmp_path / "outside.txt"
 
-    result = tools._write_file(
+    result = tools._file_tools.write_file(
         root="workspace", path=str(outside), mode="create", content="secret"
     )
 
@@ -374,7 +374,7 @@ def test_write_file_rejects_paths_outside_workspace(tmp_path):
 def test_write_file_explicit_output_dir(tmp_path):
     tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
 
-    result = tools._write_file(
+    result = tools._file_tools.write_file(
         root="output_dir",
         path="report.md",
         mode="create",
@@ -414,7 +414,7 @@ def test_write_file_allows_scoped_workspace_write(tmp_path):
         file_service=service,
     )
 
-    result = tools._write_file(
+    result = tools._file_tools.write_file(
         root="workspace",
         path="src/app.py",
         mode="create",
@@ -425,7 +425,7 @@ def test_write_file_allows_scoped_workspace_write(tmp_path):
     assert result["path"] == "src/app.py"
     assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
 
-    forbidden = tools._write_file(
+    forbidden = tools._file_tools.write_file(
         root="workspace",
         path="other.txt",
         mode="create",
@@ -1037,7 +1037,7 @@ def test_workspace_artifact_relocation_does_not_follow_symlinks(tmp_path):
     link = workspace / "secret-link"
     link.symlink_to(outside)
 
-    moved = tools._move_new_workspace_files_to_output_dir(
+    moved = tools._file_tools.move_new_workspace_files_to_output_dir(
         before=set(), cwd=workspace
     )
 

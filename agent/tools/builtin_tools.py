@@ -8,7 +8,6 @@ import re
 import shutil
 import shlex
 import signal
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +15,7 @@ from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from agent import shared
-from agent.core.output import OutputSink, _active_sink
+from agent.core.output import _active_sink
 from agent.exec import ExecRequest, provider_from
 from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
@@ -33,17 +32,12 @@ from agent.security.filesystem_sandbox import (
     release_scratch_dir,
 )
 from agent.security.shell import shell_command_uses_shell_features
-from agent.tools.files import (
-    FileAccessPolicy,
-    FileProvider,
-    FileService,
-    _normalize_write_scope,
-    write_scope_allows,
-)
+from agent.tools.files import FileProvider, _normalize_write_scope
 
 from .executor import report_tool_progress
 from .memory_tools import MemoryTools
 from .output_tools import OutputTools
+from .file_tools import FileTools
 from .signal_tools import SignalTools
 from .schedule_tools import ScheduleTools
 from .step_output_tools import (
@@ -324,66 +318,38 @@ class BuiltinTools:
         )
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
         self._memory_tools = MemoryTools(
-            memory, self.chapter_normalizer, self._ok, self._error
+            self.registry, memory, self.chapter_normalizer, self._ok, self._error
         )
         self._web_tools = WebTools(self.registry, self._ok, self._error)
         self._output_dir = output_dir
-        self._output_tools = OutputTools(output_dir, self._ok, self._error)
+        self._output_tools = OutputTools(
+            self.registry, output_dir, self._ok, self._error
+        )
         self._signal_tools = SignalTools(
-            self._schedule_store, self._ok, self._error
+            self.registry, self._schedule_store, self._ok, self._error
         )
         self._step_output_tools = StepOutputTools(
-            self._schedule_store, self._ok, self._error
+            self.registry, self._schedule_store, self._ok, self._error
         )
         self._schedule_tools = ScheduleTools(
+            self.registry,
             self._schedule_store,
             self._active_workspace_root,
             self._chosen_workspace_root,
             self._ok,
             self._error,
         )
-        self._injected_file_service = file_service
-        self._fallback_file_service: FileProvider | None = None
+        self._file_tools = FileTools(
+            self.registry,
+            self.workspace_root,
+            file_service,
+            self._active_workspace_root,
+            self._process_output_dir,
+            self._ok,
+            self._error,
+        )
         self._cached_schedule_store: Any = None
         self._register()
-
-    @property
-    def _file_service(self) -> FileProvider:
-        """The file provider, resolved late so injection always wins.
-
-        Resolved on use rather than in ``__init__`` because the registry
-        context is not necessarily populated by the time the tools are built —
-        bootstrap injects the constructor argument first and sets the context
-        afterwards.  Reading the context eagerly would silently miss a
-        provider that arrives a few lines later, and the fallback below would
-        take its place: a second service, with default policy, that nobody
-        asked for.
-        """
-        # Constructor injection remains the default for ordinary CLI calls;
-        # a forked session may override it through ToolRegistry's ContextVar.
-        override = getattr(self.registry, "_context_override", None)
-        active_override = override.get() if override is not None else None
-        if isinstance(active_override, dict) and "file_service" in active_override:
-            return active_override["file_service"]
-        if self._injected_file_service is not None:
-            return self._injected_file_service
-        from_context = self.registry.get_context("file_service")
-        if from_context is not None:
-            return from_context
-        if self._fallback_file_service is None:
-            # Default policy mirrors the startup defaults: a readable,
-            # non-writable workspace plus an always-usable output_dir.
-            # The write_scope is resolved per call from the active registry
-            # context so sub-agent scopes apply even though the policy is
-            # immutable.
-            self._fallback_file_service = FileService(
-                FileAccessPolicy(
-                    workspace_root=self.workspace_root,
-                    output_root=self._process_output_dir(),
-                ),
-                write_scope=lambda: self.registry.get_context("write_scope") or (),
-            )
-        return self._fallback_file_service
 
     def _active_workspace_root(self) -> Path:
         raw = self.registry.get_context("workspace_root")
@@ -525,7 +491,7 @@ class BuiltinTools:
                 "required": ["path"],
                 "additionalProperties": False,
             },
-            self._read_file,
+            self._file_tools.read_file,
             source="builtin",
         )
 
@@ -555,8 +521,8 @@ class BuiltinTools:
                 "required": ["root", "path", "mode", "content"],
                 "additionalProperties": False,
             },
-            self._write_file,
-            authorizer=self._file_mutation_authorizer,
+            self._file_tools.write_file,
+            authorizer=self._file_tools.file_mutation_authorizer,
             source="builtin",
         )
 
@@ -573,7 +539,7 @@ class BuiltinTools:
                 },
                 "required": ["path"],
             },
-            self._send_file,
+            self._file_tools.send_file,
             source="builtin",
         )
 
@@ -643,7 +609,7 @@ class BuiltinTools:
                 "required": [],
                 "additionalProperties": False,
             },
-            self._list_files,
+            self._file_tools.list_files,
             source="builtin",
         )
 
@@ -681,8 +647,8 @@ class BuiltinTools:
                 "required": ["root", "path", "expected_revision", "replacements"],
                 "additionalProperties": False,
             },
-            self._edit_file,
-            authorizer=self._file_mutation_authorizer,
+            self._file_tools.edit_file,
+            authorizer=self._file_tools.file_mutation_authorizer,
             source="builtin",
         )
 
@@ -2563,53 +2529,6 @@ class BuiltinTools:
     def _error(self, message: str, **payload: Any) -> dict[str, Any]:
         return {"ok": False, "error": message, **payload}
 
-    def _file_mutation_authorizer(
-        self,
-        tool_input: dict[str, Any],
-        registry: ToolRegistry,
-    ) -> dict[str, Any] | None:
-        """Call-aware authorization for root-dependent file mutations.
-
-        ``write_file``/``edit_file`` carry the base ``output_write``
-        capability and are available in every Agent profile for
-        ``output_dir``.  A workspace target additionally requires the
-        ``workspace_write`` capability (implementation profile with an
-        explicit write_scope), the startup workspace write switch, and
-        containment in the effective write scope.
-        """
-        if tool_input.get("root") != "workspace":
-            return None
-        profile = registry.get_context("capability_profile")
-        if profile is not None and profile != "full":
-            if profile != "implementation":
-                return self._structured_access_denied(
-                    "workspace writes require the workspace_write capability"
-                )
-            scope = registry.get_context("write_scope") or ()
-            path = tool_input.get("path", "")
-            if not write_scope_allows(scope, path):
-                return self._structured_access_denied(
-                    f"path is outside the effective write scope: {path}"
-                )
-        policy = registry.get_context("file_access_policy")
-        if policy is not None and not policy.workspace_write:
-            return self._structured_access_denied(
-                "workspace writes are disabled by the file access policy"
-            )
-        return None
-
-    @staticmethod
-    def _structured_access_denied(message: str) -> dict[str, Any]:
-        return {
-            "ok": False,
-            "error": {
-                "code": "access_denied",
-                "message": message,
-                "details": {},
-                "retryable": False,
-            },
-        }
-
     async def _try_interactive_confirmation(
         self,
         *,
@@ -2685,92 +2604,6 @@ class BuiltinTools:
                     scope=authorization_scope,
                 )
             )
-
-    def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
-        return resolve_workspace_path(
-            path,
-            workspace_root=self._active_workspace_root(),
-            output_dir=self._process_output_dir(),
-        )
-
-    def _resolve_output_path(self, path: str) -> tuple[Path, str]:
-        """Resolve relative paths against the output directory.
-
-        Generated/downloaded files belong in output_dir, not the
-        workspace (repo).  Absolute paths are accepted when they are already
-        inside an allowed root.
-        """
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            output_dir = self._process_output_dir()
-            path = str(output_dir / candidate)
-        return resolve_workspace_path(
-            path,
-            workspace_root=self._active_workspace_root(),
-            output_dir=self._process_output_dir(),
-        )
-
-    def _path_is_inside_workspace(self, path: Path) -> bool:
-        return path_contains(
-            self._active_workspace_root(),
-            path.expanduser().resolve(strict=False),
-        )
-
-    def _workspace_file_snapshot(self) -> set[Path]:
-        """Return files currently in the workspace, ignoring agent outputs."""
-        files: set[Path] = set()
-        workspace_root = self._active_workspace_root()
-        output_dir = self._process_output_dir()
-        if not workspace_root.exists():
-            return files
-        for path in workspace_root.rglob("*"):
-            if path.is_symlink():
-                continue
-            resolved = path.resolve(strict=False)
-            if path.is_dir():
-                if path.name in {".git", "__pycache__", ".pytest_cache"}:
-                    continue
-                continue
-            if path_contains(output_dir, resolved):
-                continue
-            files.add(resolved)
-        return files
-
-    def _move_new_workspace_files_to_output_dir(
-        self,
-        *,
-        before: set[Path],
-        cwd: Path,
-    ) -> list[dict[str, str]]:
-        output_dir = self._process_output_dir()
-        workspace_root = self._active_workspace_root()
-        moved: list[dict[str, str]] = []
-        for path in sorted(self._workspace_file_snapshot() - before):
-            if not path.is_file() or path_contains(output_dir, path):
-                continue
-            try:
-                relative = path.relative_to(workspace_root)
-            except ValueError:
-                relative = path.name
-            dest = output_dir / "workspace-artifacts" / relative
-            if dest.exists():
-                dest = dest.with_name(f"{dest.stem}-{uuid.uuid4().hex[:8]}{dest.suffix}")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(path), str(dest))
-            moved.append({"from": str(path), "to": str(dest)})
-
-            # Clean up empty directories left by nested generated artifacts,
-            # stopping at cwd/workspace boundaries.
-            parent = path.parent
-            stop_dirs = {workspace_root, cwd.resolve(strict=False)}
-            while parent not in stop_dirs and parent != parent.parent:
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
-                parent = parent.parent
-        return moved
-
 
     async def _shell(
         self,
@@ -2925,9 +2758,9 @@ class BuiltinTools:
             # invariant still holds at the tool layer — output-domain calls
             # must not leave new files in the workspace.
             if call_root == "output_dir":
-                workspace_before = self._workspace_file_snapshot()
+                workspace_before = self._file_tools.workspace_file_snapshot()
         else:
-            if not workspace_read and self._path_is_inside_workspace(
+            if not workspace_read and self._file_tools.path_is_inside_workspace(
                 resolved_cwd
             ):
                 return self._error(
@@ -3014,7 +2847,7 @@ class BuiltinTools:
                     result += f"\n\n{hint}"
             moved_artifacts: list[dict[str, str]] = []
             if workspace_before is not None:
-                moved_artifacts = self._move_new_workspace_files_to_output_dir(
+                moved_artifacts = self._file_tools.move_new_workspace_files_to_output_dir(
                     before=workspace_before,
                     cwd=resolved_cwd,
                 )
@@ -3043,37 +2876,6 @@ class BuiltinTools:
             # wrote into it) leaked once per shell invocation, unbounded for
             # a long-running gateway.
             release_scratch_dir(scratch_dir)
-
-    def _send_file(self, path: str) -> dict[str, Any]:
-        try:
-            resolved, _root_kind = self._resolve_output_path(path)
-            if not resolved.exists():
-                return self._error(f"'{path}' does not exist", path=str(resolved))
-            if not resolved.is_file():
-                return self._error(f"'{path}' is not a regular file", path=str(resolved))
-            sink = _active_sink.get()
-            if sink is None:
-                return self._error(
-                    "Current channel does not support sending files in this context.",
-                    path=str(resolved),
-                )
-            # Channels that support attachments override queue_attachment.
-            # Base class no-op means the channel doesn't support file delivery.
-            has_override = (
-                type(sink).queue_attachment
-                is not OutputSink.queue_attachment
-            )
-            if not has_override:
-                return self._error(
-                    "Current channel does not support sending files in this context.",
-                    path=str(resolved),
-                )
-            sink.queue_attachment(resolved)
-            return self._ok(path=str(resolved), queued=True)
-        except ValueError as e:
-            return self._error(str(e))
-        except Exception as e:
-            return self._error(f"Error queueing file: {e}")
 
     def _audio_transcription_command(self) -> str:
         raw = self.registry.get_context("audio_transcription_command", "")
@@ -3120,7 +2922,7 @@ class BuiltinTools:
         timeout: int = 300,
     ) -> dict[str, Any]:
         try:
-            resolved, _root_kind = self._resolve_tool_path(path)
+            resolved, _root_kind = self._file_tools.resolve_tool_path(path)
             if not resolved.exists():
                 return self._error(f"'{path}' does not exist", path=str(resolved))
             if not resolved.is_file():
@@ -3218,68 +3020,6 @@ class BuiltinTools:
                     proc.kill()
         with contextlib.suppress(Exception):
             await proc.communicate()
-
-    def _read_file(
-        self,
-        root: str = "workspace",
-        path: str = "",
-        start_line: int = 1,
-        line_count: Optional[int] = None,
-    ) -> dict[str, Any]:
-        return self._file_service.read_file(
-            root,
-            path,
-            start_line=start_line,
-            line_count=line_count,
-        )
-
-    def _write_file(
-        self,
-        root: str,
-        path: str,
-        mode: str,
-        content: str,
-        expected_revision: Optional[str] = None,
-    ) -> dict[str, Any]:
-        return self._file_service.write_file(
-            root,
-            path,
-            mode=mode,
-            content=content,
-            expected_revision=expected_revision,
-        )
-
-    def _edit_file(
-        self,
-        root: str,
-        path: str,
-        expected_revision: str,
-        replacements: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return self._file_service.edit_file(
-            root,
-            path,
-            expected_revision=expected_revision,
-            replacements=replacements,
-        )
-
-    def _list_files(
-        self,
-        root: str = "workspace",
-        path: str = ".",
-        pattern: str = "*",
-        recursive: bool = False,
-        cursor: Optional[str] = None,
-        max_results: Optional[int] = None,
-    ) -> dict[str, Any]:
-        return self._file_service.list_files(
-            root,
-            path,
-            recursive=recursive,
-            pattern=pattern,
-            cursor=cursor,
-            max_results=max_results,
-        )
 
     def _context_retrieve(
         self,

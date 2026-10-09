@@ -90,10 +90,16 @@ class StepOutputTools:
 
     def __init__(
         self,
+        registry: Any,
         schedule_store: Callable[[], Any],
         ok: Callable[..., dict[str, Any]],
         error: Callable[..., dict[str, Any]],
     ) -> None:
+        # Public on purpose: ``ToolRegistry.call`` reads ``fn.__self__.registry``
+        # to install the calling registry's merged context on the registry this
+        # tool implementation reads.  A cluster that hid it would silently stop
+        # receiving a session's own write scope, workspace and output dir.
+        self.registry = registry
         self._schedule_store = schedule_store
         self._ok = ok
         self._error = error

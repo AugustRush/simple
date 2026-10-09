@@ -39,11 +39,17 @@ class MemoryTools:
 
     def __init__(
         self,
+        registry: Any,
         memory: Any,
         chapter_normalizer: Callable[[str], str],
         ok: Callable[..., dict[str, Any]],
         error: Callable[..., dict[str, Any]],
     ) -> None:
+        # Public on purpose: ``ToolRegistry.call`` reads ``fn.__self__.registry``
+        # to install the calling registry's merged context on the registry this
+        # tool implementation reads.  A cluster that hid it would silently stop
+        # receiving a session's own write scope, workspace and output dir.
+        self.registry = registry
         self._memory = memory
         self._normalize_chapter = chapter_normalizer
         self._ok = ok

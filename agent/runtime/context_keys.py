@@ -131,12 +131,16 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="file_service",
         writers=("agent/commands/builtin.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/file_tools.py",),
     ),
     ContextKey(
         key="file_access_policy",
         writers=("agent/bootstrap.py", "agent/commands/builtin.py",),
-        readers=("agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=(
+            "agent/tools/file_tools.py",
+            "agent/tools/builtin_tools.py",
+            "agent/tools/user_tool_runner.py",
+        ),
     ),
 
     # ── shell permissions and policy ──
@@ -190,7 +194,7 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="capability_profile",
         writers=(),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/file_tools.py",),
         note=(
             "Filled as a literal in the derive(context={...}) call that builds a "
             "sub-agent's registry view, so the scanner's set_context pattern does "
@@ -201,7 +205,11 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="write_scope",
         writers=(),
-        readers=("agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=(
+            "agent/tools/file_tools.py",
+            "agent/tools/builtin_tools.py",
+            "agent/tools/user_tool_runner.py",
+        ),
         note=(
             "Same as capability_profile: a derive(context={...}) literal, present "
             "only when the scope is narrowed."

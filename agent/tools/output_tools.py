@@ -31,10 +31,16 @@ class OutputTools:
 
     def __init__(
         self,
+        registry: Any,
         output_dir: Optional[Path],
         ok: Callable[..., dict[str, Any]],
         error: Callable[..., dict[str, Any]],
     ) -> None:
+        # Public on purpose: ``ToolRegistry.call`` reads ``fn.__self__.registry``
+        # to install the calling registry's merged context on the registry this
+        # tool implementation reads.  A cluster that hid it would silently stop
+        # receiving a session's own write scope, workspace and output dir.
+        self.registry = registry
         self._output_dir = output_dir
         self._ok = ok
         self._error = error

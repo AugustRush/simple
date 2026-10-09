@@ -80,8 +80,8 @@ def test_a_registry_injected_provider_is_not_bypassed(tmp_path):
 
     tools = _tools(tmp_path, registry)
 
-    assert tools._read_file("workspace", "anything.txt")["who"] == "recording"
-    assert tools._list_files("workspace", ".")["who"] == "recording"
+    assert tools._file_tools.read_file("workspace", "anything.txt")["who"] == "recording"
+    assert tools._file_tools.list_files("workspace", ".")["who"] == "recording"
     assert provider.calls == ["read_file", "list_files"]
 
 
@@ -100,7 +100,7 @@ def test_a_provider_published_after_construction_still_wins(tmp_path):
     provider = RecordingFileProvider()
     registry.set_context("file_service", provider)
 
-    assert tools._read_file("workspace", "anything.txt")["who"] == "recording"
+    assert tools._file_tools.read_file("workspace", "anything.txt")["who"] == "recording"
 
 
 def test_the_constructor_argument_outranks_the_registry(tmp_path):
@@ -113,7 +113,7 @@ def test_the_constructor_argument_outranks_the_registry(tmp_path):
     registry.set_context("file_service", ignored)
 
     tools = _tools(tmp_path, registry, file_service=explicit)
-    tools._read_file("workspace", "anything.txt")
+    tools._file_tools.read_file("workspace", "anything.txt")
 
     assert explicit.calls == ["read_file"]
     assert ignored.calls == []
@@ -125,8 +125,8 @@ def test_the_fallback_is_built_once_not_per_call(tmp_path):
 
     tools = _tools(tmp_path, ToolRegistry())
 
-    first = tools._file_service
-    second = tools._file_service
+    first = tools._file_tools.file_service
+    second = tools._file_tools.file_service
 
     assert first is second
     assert isinstance(first, FileService)
@@ -143,7 +143,7 @@ def test_the_fallback_still_honours_the_live_write_scope(tmp_path):
 
     registry = ToolRegistry()
     tools = _tools(tmp_path, registry)
-    service: Any = tools._file_service
+    service: Any = tools._file_tools.file_service
 
     registry.set_context("write_scope", ("reports",))
     assert service._effective_write_scope() == ("reports",)

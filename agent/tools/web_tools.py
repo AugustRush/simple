@@ -66,7 +66,11 @@ class WebTools:
         ok: Callable[..., dict[str, Any]],
         error: Callable[..., dict[str, Any]],
     ) -> None:
-        self._registry = registry
+        # Public on purpose: ``ToolRegistry.call`` reads ``fn.__self__.registry``
+        # to install the calling registry's merged context on the registry this
+        # tool implementation reads.  A cluster that hid it would silently stop
+        # receiving a session's own write scope, workspace and output dir.
+        self.registry = registry
         self._ok = ok
         self._error = error
 
@@ -102,7 +106,7 @@ class WebTools:
         because of ambient configuration — so the choice is made here, where an
         operator can also override it.
         """
-        raw = self._registry.get_context("web_proxy", "")
+        raw = self.registry.get_context("web_proxy", "")
         if isinstance(raw, str) and raw.strip():
             text = raw.strip()
             if text.lower() in _WEB_PROXY_DISABLED:
@@ -174,7 +178,7 @@ class WebTools:
         return json.loads(raw.decode("utf-8"))
 
     def resolve_tavily_api_key(self) -> str:
-        raw = self._registry.get_context("tavily_api_key", "")
+        raw = self.registry.get_context("tavily_api_key", "")
         if isinstance(raw, str) and raw.startswith("$"):
             return os.environ.get(raw[1:], "")
         if raw:

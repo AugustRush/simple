@@ -780,7 +780,7 @@ def test_the_write_scope_gate_reads_the_caller_registry_by_hand() -> None:
         {"capability_profile": "implementation", "write_scope": ["allowed/only"]},
     )
 
-    denial = tools._file_mutation_authorizer(
+    denial = tools._file_tools.file_mutation_authorizer(
         {"root": "workspace", "path": "outside.txt"}, narrowed
     )
 
@@ -793,7 +793,7 @@ def test_the_write_scope_gate_reads_the_caller_registry_by_hand() -> None:
         {"capability_profile": "implementation", "write_scope": ["outside.txt"]},
     )
     assert (
-        tools._file_mutation_authorizer(
+        tools._file_tools.file_mutation_authorizer(
             {"root": "workspace", "path": "outside.txt"}, permitted
         )
         is None
