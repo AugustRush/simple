@@ -652,29 +652,95 @@ assertion changed**; three documentation references to `_schedule_create`,
 `normalize_products` / `_active_schedule_target` no longer exist in
 `builtin_tools.py` at all.
 
+### 4.14 builtin_tools.py — the file cluster, and the defect the six earlier moves hid (`c1f89fc`)
+
+`agent/tools/builtin_tools.py` **3441 → 3181 lines**; the file layer —
+the four CRUD tools, `send_file`, the path resolvers, the write authorizer, the
+workspace snapshot/move helpers and the `file_service` **property** — became
+`FileTools` in `agent/tools/file_tools.py`.
+
+**The property is why this cluster is not a plain move.** `file_service`
+resolves the provider through four fallbacks — a session's `ContextVar`
+override, the constructor's injected provider, the registry's `file_service`
+context, and a default `FileService` built from the workspace root and output
+directory — and it resolves **on use**, not in `__init__`, because bootstrap
+injects the constructor argument before it sets the context. Both the order and
+the laziness moved intact. Only four members are read from outside the cluster
+(`_shell` three, `_transcribe_audio` one), measured with an AST pass first, and
+they are reached through the host's `self._file_tools` handle.
+
+**What this move exposed is the important part, and it was a defect in the six
+extractions that came before it.** `ToolRegistry.call` installs the calling
+registry's merged context on the registry the tool implementation reads:
+
+```python
+owner = getattr(fn, "__self__", None)
+owner_registry = getattr(owner, "registry", None)      # <- the convention
+owner_registry._context_override.set(merged_context)
+```
+
+Once a method moves into a cluster object, `fn.__self__` is **the cluster, not
+`BuiltinTools`** — and those clusters stored the registry as `_registry` or not
+at all, so `owner_registry` became `None` and **the merge silently stopped
+happening**. A session's own `workspace_root`, `output_dir`, `file_service` and
+`write_scope` stopped reaching the tools, which fell back to the composition's.
+
+The unit tests could not see it: they call a tool through the *same* registry it
+was registered on, where no merge is needed. The functional layer caught it —
+`test_a_session_turn_writes_into_the_sessions_own_output_dir` and
+`test_switching_a_sessions_workspace_moves_where_its_tools_write` — as a file
+landing in the composition's `output/` instead of
+`web/sessions/<id>/output/`.
+
+The diagnosis was measured rather than guessed: a temporary print inside
+`file_service` showed `override_keys=None` **and** `injected=True` on the
+composition's registry, i.e. no merged context had been installed on the object
+the tool actually reads. Following `runtime.py:551-567` back to the convention,
+and then to its two existing users (`ScopedTools.registry`,
+`MCPClient.registry`), gave the fix: **every cluster that provides registered
+tools exposes a public `registry`**. All seven now do (`WebTools`/`FileTools`
+renamed from `_registry`; the other five take it as a constructor argument), and
+each `__init__` says why it must stay public, so a later tidy-up cannot quietly
+make it private again.
+
+That is the rule for the clusters still to move: **a cluster whose methods are
+registered as tools must expose `registry`, or the composition's context wins
+silently.**
+
+Two imports left the host with the cluster (`FileAccessPolicy`, `FileService`,
+`write_scope_allows`, `OutputSink`, `time` — five in total), as did
+`_injected_file_service` / `_fallback_file_service`, which the property owned.
+The ledger followed: `file_service` and `capability_profile` now name
+`agent/tools/file_tools.py` as the reader, and `file_access_policy` /
+`write_scope` list it alongside the host.
+
 ## 5. Next
 
-The order in §1–§3 is the plan; everything except the four most entangled
+The order in §1–§3 is the plan; everything except the three most entangled
 clusters has moved. **Progress so far: the three files went from 12292 lines to
-8618** (web.py 4191 → 3204, feishu.py 2587 → 1973, builtin_tools.py 5514 →
-3441), with twelve modules holding what left. What remains, and why it is last:
+8358** (web.py 4191 → 3204, feishu.py 2587 → 1973, builtin_tools.py 5514 →
+3181), with thirteen modules holding what left — and one defect found and fixed
+that the first six of those modules had introduced (§4.14).
 
-1. **files** (248 lines, 13 methods, 14 guards). Not a plain move: it carries
-   the `_file_service` **property**, which resolves the provider through four
-   fallbacks (context override → injected → registry context → a new default
-   `FileService`). Extracting the cluster means deciding where that resolution
-   lives and what the constructor surface becomes.
-2. **audio** (105 lines, 4 guards) — straddles files (`_resolve_tool_path`) and
-   shell (`_terminate_process`), so it is cheap *after* those, awkward before.
-3. **shell** (306 lines, 24 guards) — eleven registry context keys, nine sibling
+What remains:
+
+1. **audio** (105 lines, 4 guards) — straddles files (`resolve_tool_path`, now a
+   `FileTools` method) and shell (`_terminate_process`), so it is cheap now that
+   files has moved and awkward before shell does.
+2. **shell** (306 lines, 24 guards) — eleven registry context keys, nine sibling
    methods and ten names from `agent.security.filesystem_sandbox`; the most
-   entangled cluster in the file, and the one that most deserves to be last.
-4. **context** (151 lines, **2 guards — the thinnest**). Small and low-coupled,
+   entangled cluster in the file. It calls three `FileTools` methods, which is
+   the shape the audio cluster set: reach them through `self._file_tools`.
+3. **context** (151 lines, **2 guards — the thinnest**). Small and low-coupled,
    but the guard is thin enough that the move should add tests the way §4.5 did,
    rather than trust two.
-5. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
+4. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
    trio — move with the clusters that call them (the channel's reconnect loop
    and the download path), not on their own.
+
+**For every one of these: expose `registry`** (§4.14). The next cluster whose
+methods are registered as tools and which hides that attribute will pass its
+unit tests and lose the session's context in production.
 
 `_register`'s 1656 lines still stay: the survey's answer is that each cluster
 module owns its own registration table, and that is a larger piece than the
