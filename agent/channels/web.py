@@ -351,7 +351,16 @@ class WebChannel(Channel):
     async def _health(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
-        return JSONResponse({"ok": True, "home": str(shared.AGENT_HOME)})
+        # Every other /api route checks this.  The one route that does not is a
+        # hole in the gate, not a convenience: with a token configured the
+        # operator closed the surface deliberately, and liveness is exactly what
+        # an unauthenticated caller wants to learn.
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        # Liveness only.  The response used to carry the absolute AGENT_HOME
+        # path, which names the user and the layout of their disk; nothing --
+        # frontend, tests, docs -- ever read it.
+        return JSONResponse({"ok": True})
 
     async def _commands(self, request: Any) -> Any:
         from starlette.responses import JSONResponse

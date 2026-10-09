@@ -395,6 +395,48 @@ def test_web_health_and_sessions_endpoints():
         assert messages.json()["messages"] == []
 
 
+def test_the_health_endpoint_is_behind_the_same_gate_as_everything_else():
+    """With a token configured the operator closed the whole surface.
+
+    One route that answers without the token is a hole in that gate rather than
+    a convenience: it told an unauthenticated caller that the server was up and
+    what it was looking at.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel(auth_token="secret")
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        assert client.get("/api/health").status_code == 401
+        authorized = client.get(
+            "/api/health", headers={"authorization": "Bearer secret"}
+        )
+        assert authorized.status_code == 200
+        assert authorized.json()["ok"] is True
+
+
+def test_the_health_endpoint_does_not_hand_out_the_agent_home():
+    """Liveness is the contract (``README``: "Health check").
+
+    The response used to carry the absolute ``AGENT_HOME`` path, which names
+    the user and the layout of their disk.  Nothing read it -- not the
+    frontend, not a test, not the docs -- so it was a leak with no reader.
+    """
+    from starlette.testclient import TestClient
+
+    from agent import shared
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        response = client.get("/api/health")
+
+    assert response.json() == {"ok": True}
+    assert str(shared.AGENT_HOME) not in response.text
+
+
 def test_web_session_permissions_are_scoped_to_session():
     from starlette.testclient import TestClient
     from agent.security.shell import (
