@@ -196,6 +196,74 @@ def test_plugin_registers_slash_command(tmp_path):
     assert components["_called"] is True
 
 
+def test_a_python_commands_docstring_is_what_the_command_list_shows(tmp_path):
+    """Where a plugin command's description comes from.
+
+    The router already falls back to ``inspect.getdoc``; the built-in plugins
+    simply had no docstrings, so ``/evolve`` and ``/stats`` appeared in the
+    command list as bare names while their markdown siblings explained
+    themselves.  This pins the mechanism so it cannot silently regress.
+    """
+    from agent import PluginCatalog
+    from agent.commands import CommandRouter
+
+    _write_plugin(
+        tmp_path / "documented",
+        """
+        def register():
+            class P:
+                name = "documented"
+                def register_slash_commands(self):
+                    async def handler(raw_cmd, components):
+                        '''Summarise the thing.'''
+                    return {"thing": handler}
+            return P()
+    """,
+    )
+    _write_plugin(
+        tmp_path / "undocumented",
+        """
+        def register():
+            class P:
+                name = "undocumented"
+                def register_slash_commands(self):
+                    async def handler(raw_cmd, components):
+                        pass
+                    return {"silent": handler}
+            return P()
+    """,
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+    descriptions = {
+        descriptor.name: descriptor.description
+        for descriptor in router.visible_descriptors("cli")
+    }
+
+    assert descriptions["thing"] == "Summarise the thing."
+    # A handler without a docstring is honestly described as having none.
+    assert descriptions["silent"] == ""
+
+
+def test_the_builtin_evolution_commands_explain_themselves():
+    """The built-in's own commands are the visible instance of the same gap.
+
+    They are the app's vocabulary -- the README documents ``/evolve`` and
+    ``/generate-tool`` -- so somebody typing ``/help`` should be able to read
+    what they do instead of seeing three bare names.
+    """
+    from agent._builtin.plugins.evolution import register
+
+    handlers = register().register_slash_commands()
+
+    assert handlers, "the built-in declares no commands"
+    for key, handler in handlers.items():
+        assert (handler.__doc__ or "").strip(), f"/{key} has no description"
+
+
 def test_a_user_plugins_command_is_namespaced_and_cannot_take_a_bare_name(tmp_path):
     """A plugin does not own the bare namespace.
 

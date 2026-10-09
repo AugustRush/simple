@@ -329,6 +329,7 @@ class EvolutionPlugin:
         )
 
     async def _handle_evolve(self, raw_cmd: str, components: dict) -> Any:
+        """Rewrite the system prompt from this session's history."""
         from agent.commands import CommandResult
 
         if self._engine is None:
@@ -349,6 +350,7 @@ class EvolutionPlugin:
         return CommandResult(response_text="System prompt updated.")
 
     async def _handle_generate_tool(self, raw_cmd: str, components: dict) -> Any:
+        """Write a user tool from a description, verify it, then install it."""
         from agent.commands import CommandResult
 
         if self._engine is None:
@@ -402,6 +404,7 @@ class EvolutionPlugin:
         )
 
     async def _handle_stats(self, raw_cmd: str, components: dict) -> Any:
+        """Show self-evolution statistics for this session."""
         from agent.commands import CommandResult
 
         stats: list[tuple[str, Any]] = []
