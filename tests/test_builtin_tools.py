@@ -178,6 +178,78 @@ def test_web_search_advertises_exactly_the_parameters_it_accepts(tmp_path):
     assert "region" not in advertised
 
 
+def test_shell_and_plugin_tools_share_one_authorization_scope(tmp_path, monkeypatch):
+    """A scope keys the session allowlist and the permission level.
+
+    The shell tool and the plugin installer each used to build one from the same
+    three metadata keys, so the two could drift into two answers to "whose
+    permission is this".  Both now ask the one definition.
+    """
+    from agent.exec.subprocess import ExecResult
+    from agent.security.shell import ShellAuthorizationScope
+    from agent.tools import plugin_tools, shell_tools
+
+    marker = ShellAuthorizationScope("the-one", "the-channel", "the-user")
+    calls: list[str] = []
+
+    def fake_scope() -> ShellAuthorizationScope:
+        calls.append("asked")
+        return marker
+
+    monkeypatch.setattr(
+        shell_tools, "shell_authorization_scope_from_active_context", fake_scope
+    )
+    monkeypatch.setattr(
+        plugin_tools, "shell_authorization_scope_from_active_context", fake_scope
+    )
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    class FakeProvider:
+        async def run(self, request):
+            return ExecResult(stdout=b"ok", returncode=0)
+
+    registry.set_context("subprocess_provider", FakeProvider())
+
+    result = asyncio.run(tools._shell_tools.run("echo hi", timeout=5))
+
+    assert result["ok"] is True, result
+    assert tools._plugin_tools.authorization_scope() == marker
+    assert calls == ["asked", "asked"]
+
+
+def test_the_authorization_scope_reads_the_active_turn(tmp_path):
+    """The mapping, and the narrow reading of an absent context."""
+    from agent.core.agent import _active_agent_context
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_authorization_scope_from_active_context,
+    )
+
+    class _Named:
+        metadata = {"session_id": "s-1", "channel_name": "web", "user_id": "u-1"}
+
+    class _Bare:
+        metadata = {}
+
+    token = _active_agent_context.set(_Named())
+    try:
+        assert shell_authorization_scope_from_active_context() == (
+            ShellAuthorizationScope("s-1", "web", "u-1")
+        )
+    finally:
+        _active_agent_context.reset(token)
+
+    token = _active_agent_context.set(_Bare())
+    try:
+        # Never wider than what was recorded: default/cli, with no user.
+        assert shell_authorization_scope_from_active_context() == (
+            ShellAuthorizationScope("default", "cli", "")
+        )
+    finally:
+        _active_agent_context.reset(token)
+
+
 def test_file_tool_schemas_are_rooted_and_closed(tmp_path):
     tools, registry, _ = make_builtin_tools(tmp_path)
 

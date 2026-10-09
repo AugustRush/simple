@@ -55,6 +55,7 @@ from typing import Any, Callable, Optional
 from agent.exec import ExecRequest, provider_from
 from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
+from agent.security.shell import shell_authorization_scope_from_active_context
 from agent.security.filesystem_sandbox import (
     SANDBOX_MODE_NONE,
     SandboxUnavailableError,
@@ -148,20 +149,12 @@ class ShellTools:
         )
         import agent as agent_module
 
-        from agent.core.agent import _active_agent_context
         from agent.security.shell import (
-            ShellAuthorizationScope,
             shell_effective_permission_level,
             shell_session_sandbox_get,
         )
 
-        active_context = _active_agent_context.get()
-        metadata = active_context.metadata if active_context is not None else {}
-        authorization_scope = ShellAuthorizationScope(
-            str(metadata.get("session_id") or "default"),
-            str(metadata.get("channel_name") or "cli"),
-            str(metadata.get("user_id") or ""),
-        )
+        authorization_scope = shell_authorization_scope_from_active_context()
         # Sandbox mode is linked to the permission level: an unsandboxed
         # (danger-full-access) run is only honored when the effective level
         # is "full"; otherwise it fails safe back to the read-all profile.

@@ -55,6 +55,7 @@ from typing import Any, Optional
 
 from agent import shared
 from agent.core.output import _active_sink
+from agent.security.shell import shell_authorization_scope_from_active_context
 
 from .executor import report_tool_progress
 
@@ -459,16 +460,7 @@ class PluginTools:
 
     @staticmethod
     def authorization_scope() -> Any:
-        from agent.core.agent import _active_agent_context
-        from agent.security.shell import ShellAuthorizationScope
-
-        active_context = _active_agent_context.get()
-        metadata = active_context.metadata if active_context is not None else {}
-        return ShellAuthorizationScope(
-            str(metadata.get("session_id") or "default"),
-            str(metadata.get("channel_name") or "cli"),
-            str(metadata.get("user_id") or ""),
-        )
+        return shell_authorization_scope_from_active_context()
 
     async def confirm_plugin_install(
         self,

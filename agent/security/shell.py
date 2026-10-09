@@ -245,6 +245,31 @@ def _authorization_scope(
     return scope or _DEFAULT_SCOPE
 
 
+def shell_authorization_scope_from_active_context() -> ShellAuthorizationScope:
+    """The scope of the agent turn that is running, or a safe default.
+
+    A scope is what the approval machinery, the session allowlist and the
+    per-session permission level are keyed on, so two spellings of it are two
+    answers to "whose permission is this".  The shell tool and the plugin
+    installer each used to build one from the same three metadata keys with the
+    same three fallbacks; this is that construction, once.
+
+    The import is local because ``agent.core.agent`` reaches back into this
+    package's callers, and the fallbacks are deliberately the *narrowest*
+    reading of an absent context: a session nobody can name is "default" on the
+    "cli" channel with no user, never a broader scope than what was recorded.
+    """
+    from agent.core.agent import _active_agent_context
+
+    active_context = _active_agent_context.get()
+    metadata = active_context.metadata if active_context is not None else {}
+    return ShellAuthorizationScope(
+        str(metadata.get("session_id") or "default"),
+        str(metadata.get("channel_name") or "cli"),
+        str(metadata.get("user_id") or ""),
+    )
+
+
 def _authorization_time(now: datetime | None) -> datetime:
     value = now or datetime.now(timezone.utc)
     if value.tzinfo is None:
