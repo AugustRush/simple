@@ -50,7 +50,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from agent import _fmt_tool_inputs, shared
 from agent.channels import Channel, IncomingMessage
@@ -83,9 +83,6 @@ from agent.channels.feishu_render import (
     markdown_to_post,
     split_elements_by_table_limit,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -779,7 +776,6 @@ class FeishuOutputSink(OutputSink):
             self._progress_buf = _FeishuStreamBuf()
             self._tool_progress_lines = OrderedDict()
             self._stream_flush_pending = False
-            self._stream_flush_pending = False
 
     async def _send_response_async(self, text: str) -> None:
         """Send the final response using the optimal Feishu message format."""
@@ -1149,7 +1145,6 @@ class FeishuOutputSink(OutputSink):
     def _append_progress_text(self, line: str) -> None:
         if not line.strip():
             return
-        self._progress_phase_closed = False
         if not self._progress_buf.text:
             self._progress_buf.text = "## Multi-Agent Progress\n\n" + line
             return
