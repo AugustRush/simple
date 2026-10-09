@@ -7525,6 +7525,31 @@ def test_evolve_uses_qualified_component_cleanup(monkeypatch):
     assert calls["closed"] == 1
 
 
+def test_gateway_guidance_names_the_local_channel_and_the_real_situation():
+    """An unhelpful message sends people down the harder path.
+
+    "Add channels.feishu.enabled=true" named only the option that needs an app
+    id, a secret and an external service, while the local web channel needs
+    nothing -- and it said the same thing when a channel *was* enabled and had
+    failed, which is a different problem with a different fix.
+    """
+    import agent.cli as cli_module
+
+    nothing_enabled = cli_module._gateway_channel_guidance({})
+    assert '"channels"' in nothing_enabled
+    assert "web" in nothing_enabled
+    assert "feishu" in nothing_enabled.lower()
+    assert "8787" in nothing_enabled
+
+    enabled_but_failed = cli_module._gateway_channel_guidance(
+        {"channels": {"web": {"enabled": True}}}
+    )
+    assert "web" in enabled_but_failed
+    # Not the "how to enable one" message: it is already enabled.
+    assert '"channels"' not in enabled_but_failed
+    assert "8787" not in enabled_but_failed
+
+
 def test_chat_sends_the_line_through_the_command_coordinator(monkeypatch):
     """``simple chat "<line>"`` is one line of the interactive prompt.
 

@@ -1059,6 +1059,38 @@ def main_callback(
             home_lock.release()
 
 
+def _gateway_channel_guidance(cfg: dict) -> str:
+    """What to tell somebody whose gateway started no channels.
+
+    Two different situations used to get one message, and that message named
+    only Feishu -- the option that needs an app id, a secret and an external
+    service -- while the local web channel needs nothing and can serve the
+    bundled UI immediately.  A person who enables ``channels.web`` and still
+    gets "add channels.feishu.enabled=true" is being sent down the harder path.
+
+    So: say which situation this is, and name the local option first.
+    """
+    sections = cfg.get("channels") or {}
+    enabled = sorted(
+        str(name)
+        for name, section in sections.items()
+        if isinstance(section, dict) and section.get("enabled")
+    )
+    if enabled:
+        return (
+            f"[yellow]Channel(s) enabled but not started: {', '.join(enabled)}. "
+            "The channel itself reported why above.[/yellow]"
+        )
+    return (
+        "[yellow]No channels are enabled, so the gateway has nothing to run.\n"
+        'Add one to the "channels" section of your config, for example:\n'
+        '  "channels": {"web": {"enabled": true}}     '
+        "# local web UI on http://127.0.0.1:8787\n"
+        '  "channels": {"feishu": {"enabled": true}}  '
+        "# needs a Feishu app id/secret[/yellow]"
+    )
+
+
 @app.command()
 def gateway(
     name: Optional[str] = typer.Option(
@@ -1119,10 +1151,7 @@ def gateway(
         try:
             channels = _build_gateway_channels(cfg)
             if not channels:
-                shared.CONSOLE.print(
-                    "[yellow]No channels configured or none could be initialised.\n"
-                    "Add channels.feishu.enabled=true to ~/.agent/config.json[/yellow]"
-                )
+                shared.CONSOLE.print(_gateway_channel_guidance(cfg))
                 return
             shared.CONSOLE.print(
                 f"[dim]Gateway starting {len(channels)} channel(s). "
