@@ -668,6 +668,33 @@ def _run_shell_approval(decision_payload):
         shell_session_allowlist_clear()
 
 
+def test_the_web_sink_owns_only_attachments_in_the_sessions_output_dir(tmp_path):
+    """The contract: true only after irrevocably assuming responsibility.
+
+    ``/send`` snapshots the file into the output directory and marks the
+    snapshot temporary, so the coordinator would delete it at the end of the
+    turn -- breaking the URL the browser was just given.  The sink therefore has
+    to take ownership, but "I own this" needs a plan: this sink's plan is session
+    storage, and anything outside it is a file it could never clean up.
+    """
+    from agent.channels.web_sink import WebOutputSink
+
+    output_dir = tmp_path / "sessions" / "s-1" / "output"
+    output_dir.mkdir(parents=True)
+    inside = output_dir / "snapshot.bin"
+    inside.write_bytes(b"x")
+    outside = tmp_path / "elsewhere" / "snapshot.bin"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x")
+
+    sink = WebOutputSink(output_dir=output_dir)
+
+    assert sink.defer_temporary_attachment_cleanup(str(inside)) is True
+    assert sink.defer_temporary_attachment_cleanup(str(outside)) is False
+    # A sink built without a session output directory has no plan for anything.
+    assert WebOutputSink().defer_temporary_attachment_cleanup(str(inside)) is False
+
+
 def test_the_confirmation_vocabulary_is_closed_and_fails_closed():
     """The one door client input comes through has a closed vocabulary.
 

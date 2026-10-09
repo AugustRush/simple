@@ -581,7 +581,38 @@ class WebOutputSink(OutputSink):
             logger.exception("auto-attach media scan failed")
 
     def defer_temporary_attachment_cleanup(self, receipt: object) -> bool:
-        return True
+        """Own the attachment only when the session already stores it.
+
+        The web channel hands the browser a URL, so the file has to outlive the
+        turn -- which is why this used to answer ``True`` for everything.  But a
+        sink that says "I own this" has to have a plan for the file, and this
+        sink's only plan is session storage: the file belongs inside the
+        session's own output directory, which is deleted with the session
+        (``SessionService.delete_session_async`` removes the validated home) and
+        can be purged with ``clean_output``.
+
+        Anything else is a file this sink has no way to clean up, so the honest
+        answer is ``False`` and the coordinator's cleanup runs.  The warning is
+        the point: declining is a real outcome, not a silent drop, because the
+        browser has already been given the URL.
+        """
+        if not self._output_dir:
+            return False
+        try:
+            output_dir = (
+                Path(str(self._output_dir)).expanduser().resolve(strict=False)
+            )
+            path = Path(str(receipt or "")).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if path == output_dir or output_dir in path.parents:
+            return True
+        logger.warning(
+            "web sink cannot own a temporary attachment outside the session's "
+            "output directory: %s",
+            receipt,
+        )
+        return False
 
     async def on_tool_confirmation(
         self,
