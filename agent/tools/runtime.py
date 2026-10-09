@@ -364,6 +364,18 @@ class ToolRegistry:
         ("builtin", "web_search"): frozenset({"read"}),
         ("builtin", "web_fetch"): frozenset({"read"}),
         ("builtin", "tavily_search"): frozenset({"read"}),
+        # Five tools were missing from this table entirely, which read as
+        # "no capabilities" -- the same answer as a tool nobody had classified
+        # yet, and the same one the workflow trio above was rescued from.  A
+        # profile that allows reads dropped the read tools; `report_outcome`
+        # records a verdict into the run, so it is a state write (and it takes
+        # no `intent`, so it is not `requires_intent` -- its whole purpose is
+        # the declaration).
+        ("builtin", "list_tools"): frozenset({"read"}),
+        ("builtin", "list_signals"): frozenset({"read"}),
+        ("builtin", "list_installed_plugins"): frozenset({"read"}),
+        ("builtin", "read_step_output"): frozenset({"read"}),
+        ("builtin", "report_outcome"): frozenset({"state_write"}),
         ("builtin", "write_file"): frozenset({"output_write"}),
         ("builtin", "edit_file"): frozenset({"output_write"}),
         ("builtin", "clean_output"): frozenset({"output_write"}),

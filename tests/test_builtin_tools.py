@@ -155,6 +155,49 @@ def test_memory_clear_uses_human_confirmation_and_storage_api(tmp_path):
     assert registry.tool_capabilities("memory_clear") == frozenset({"state_write"})
 
 
+def test_every_builtin_tool_has_one_capability_classification(tmp_path):
+    """A capability is what a restricted profile filters on, so the two places
+    it can be declared must not disagree and nothing may be left unclassified.
+
+    A tool may declare its capabilities where it is registered, or leave them to
+    ``_DEFAULT_TOOL_CAPABILITIES``.  Both are fine.  What may not happen:
+
+    - **a default that contradicts a registration** -- the registration wins, so
+      the table entry becomes a lie a reader would trust;
+    - **a default for a tool that does not exist** -- a stale classification;
+    - **a registered builtin tool with neither** -- which reads as "nobody
+      classified this yet" and is dropped by any allowlist profile.  That is the
+      answer the workflow trio was rescued from, and five more tools were still
+      in it.
+    """
+    from agent.tools.runtime import ToolRegistry
+
+    tools, registry, _, _ = make_builtin_tools_with_output_dir(tmp_path)
+    table = ToolRegistry._DEFAULT_TOOL_CAPABILITIES
+
+    for (source, name), declared in table.items():
+        tool = registry._tools.get(name)
+        if tool is None or tool.source != source:
+            continue
+        assert tool.capabilities == declared, (
+            f"{name}: registered {sorted(tool.capabilities)} != table {sorted(declared)}"
+        )
+
+    stale = sorted(
+        name
+        for (source, name) in table
+        if source == "builtin" and name not in registry._tools
+    )
+    assert stale == [], f"default capabilities for tools that do not exist: {stale}"
+
+    unclassified = sorted(
+        name
+        for name, tool in registry._tools.items()
+        if tool.source == "builtin" and not tool.capabilities
+    )
+    assert unclassified == [], f"builtin tools with no capability: {unclassified}"
+
+
 def test_web_search_advertises_exactly_the_parameters_it_accepts(tmp_path):
     """A tool schema is a contract with the model, not documentation.
 
