@@ -714,57 +714,89 @@ The ledger followed: `file_service` and `capability_profile` now name
 `agent/tools/file_tools.py` as the reader, and `file_access_policy` /
 `write_scope` list it alongside the host.
 
+### 4.15 builtin_tools.py — the audio tool (`0cfbb21`)
+
+`agent/tools/builtin_tools.py` **3181 → 3081 lines**; `transcribe_audio` and its
+two helpers became `AudioTools` in `agent/tools/audio_tools.py`.
+
+The argv builder is a security boundary, not a convenience, which is why the
+cluster is worth a file: the command template comes from **configuration**, so a
+template containing shell operators would be a way to run arbitrary shell from a
+config value. `shell_command_uses_shell_features` refuses it outright rather
+than letting a shell parse it; what is left is split with `shlex` and
+substituted literally, and a template that cannot be split (or splits to
+nothing) is refused with the reason.
+
+The subprocess runs in the agent's output directory with `AGENT_OUTPUT_DIR` and
+`AGENT_WORKSPACE_ROOT` in its environment. Both are resolved **at call time**
+through injected callables — a session's own output dir has to win over the
+composition's. `resolve_tool_path` is injected from `FileTools` (the sibling
+cluster moved in §4.14) as a bound method rather than reaching back into the
+host.
+
+### 4.16 builtin_tools.py — context, and the guard it was missing (`71135a9`)
+
+`agent/tools/builtin_tools.py` **3081 → 2932 lines**; `context_retrieve` and
+`clear_context` became `ContextTools` in `agent/tools/context_tools.py`.
+
+This was the **least-guarded pair in the file** — the survey measured two tests
+— so the move added a direct test module rather than trust them:
+[`tests/test_context_tools.py`](../../../tests/test_context_tools.py), eleven
+assertions on rules that only the pair enforced. Moving code whose rules are
+held up by accident, and leaving them held up by accident, is not preserving
+behaviour.
+
+Three documented rules travelled into the module's docstring, each written
+because the obvious version is wrong:
+
+- **`queries` is plural on purpose, and a bare string is accepted on purpose.**
+  A model filling an array parameter with a single string is routine, and
+  iterating that string would yield its *characters* — one good query silently
+  becoming dozens of one-character ones.
+- **The manager is resolved from the active turn**, not captured at
+  construction: tool definitions are shared across multiplexed sessions, and the
+  bootstrap manager's staging session is not user-facing. The current turn is
+  also excluded from the search, or the answer comes back as though it were a
+  memory.
+- **An empty result is a hint, not an error** — it is far more often a
+  badly-shaped query than an absent memory.
+
+The two methods are not adjacent: the shared `_schedule_store` accessor sits
+between them and **stayed**, since three clusters share it. Six direct test calls
+were rewired with no assertion changed, the host produced no unused imports, and
+the ledger was untouched (this cluster reads no context keys).
+
 ## 5. Next
 
-The order in §1–§3 is the plan; everything except the three most entangled
-clusters has moved. **Progress so far: the three files went from 12292 lines to
-8358** (web.py 4191 → 3204, feishu.py 2587 → 1973, builtin_tools.py 5514 →
-3181), with thirteen modules holding what left — and one defect found and fixed
-that the first six of those modules had introduced (§4.14).
+The order in §1–§3 is the plan; **only one cluster remains**. Progress so far:
+the three files went from **12292 to 8109 lines** (web.py 4191 → 3204, feishu.py
+2587 → 1973, builtin_tools.py 5514 → 2932), with fifteen modules holding what
+left — and one defect found and fixed that the first six of those modules had
+introduced (§4.14).
 
 What remains:
 
-1. **audio** (105 lines, 4 guards) — straddles files (`resolve_tool_path`, now a
-   `FileTools` method) and shell (`_terminate_process`), so it is cheap now that
-   files has moved and awkward before shell does.
-2. **shell** (306 lines, 24 guards) — eleven registry context keys, nine sibling
-   methods and ten names from `agent.security.filesystem_sandbox`; the most
-   entangled cluster in the file. It calls three `FileTools` methods, which is
-   the shape the audio cluster set: reach them through `self._file_tools`.
-3. **context** (151 lines, **2 guards — the thinnest**). Small and low-coupled,
-   but the guard is thin enough that the move should add tests the way §4.5 did,
-   rather than trust two.
-4. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
+1. **shell** (306 lines: `_shell` 271 + `_terminate_process` 35; 24 guards).
+   The most entangled cluster in the file, and the last one:
+   - **eight** registry context keys (`shell_permission_level`,
+     `shell_sandbox_mode`, `shell_allowed_commands`, `shell_blocked_commands`,
+     `shell_devices`, `shell_secret_paths`, plus `file_access_policy` and
+     `write_scope`), and nine reads of `self.registry` rather than the one or two
+     the other clusters had;
+   - it calls three `FileTools` methods (the §4.14 pattern: reach them through
+     the injected handle), and `_sandbox_dir` / `_resource_home` /
+     `_process_output_dir` from the host's "runtime shared" group;
+   - **`_try_interactive_confirmation` (75 lines) is shared with the plugin
+     install path**, so it cannot simply travel with shell: either it is
+     injected into both, or it becomes the approval service the survey
+     suggested. That decision is the first thing to measure next round.
+2. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
    trio — move with the clusters that call them (the channel's reconnect loop
    and the download path), not on their own.
 
-**For every one of these: expose `registry`** (§4.14). The next cluster whose
-methods are registered as tools and which hides that attribute will pass its
-unit tests and lose the session's context in production.
-
-`_register`'s 1656 lines still stay: the survey's answer is that each cluster
-module owns its own registration table, and that is a larger piece than the
-increments above.
-
-The findings listed in §1–§3 that are **behavioural** (the web sink's claimed
-temporary-attachment ownership, the session-id validator disagreeing with
-`web_session_home`, `_stream` discarding its tasks' exceptions, the dead
-`_progress_phase_closed` write, `CONFIRM_DECISIONS` having no reader) are
-deliberately not in this queue: each needs a decision and a test that fails
-first, which is a different kind of change from a move.
-
-`_register`'s 1656 lines stay for now: the survey's answer is that each cluster
-module owns its own registration table, and that is a larger piece than the
-increments above.
-
-The findings listed in §1–§3 that are **behavioural** (the web sink's claimed
-temporary-attachment ownership, the session-id validator disagreeing with
-`web_session_home`, `_stream` discarding its tasks' exceptions, the dead
-`_progress_phase_closed` write, `CONFIRM_DECISIONS` having no reader) are
-deliberately not in this queue: each needs a decision and a test that fails
-first, which is a different kind of change from a move.
-
----
+**For the shell move: expose `registry`** (§4.14). The cluster whose methods are
+registered as tools and which hides that attribute will pass its unit tests and
+lose the session's context in production.
 
 ## 6. Explicitly out of scope
 
