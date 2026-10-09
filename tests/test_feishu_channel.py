@@ -25,9 +25,8 @@ from agent.channels.feishu import (
     FeishuConfig,
     FeishuOutputSink,
     FEISHU_UPLOAD_MAX_BYTES,
-    _clean_at_mentions,
-    _extract_post_content,
 )
+from agent.channels.feishu_parsing import clean_at_mentions, extract_post_content
 from agent.channels.feishu_render import (
     build_card_elements,
     detect_msg_format,
@@ -87,13 +86,13 @@ def test_feishu_config_allow_from_is_independent():
 
 
 def test_clean_at_mentions_removes_placeholders():
-    assert _clean_at_mentions("@_user_1 hello world") == "hello world"
-    assert _clean_at_mentions("@_user_42 @_user_3 hi") == "hi"
+    assert clean_at_mentions("@_user_1 hello world") == "hello world"
+    assert clean_at_mentions("@_user_42 @_user_3 hi") == "hi"
 
 
 def test_clean_at_mentions_no_op_when_no_placeholder():
     text = "hello @real_user how are you"
-    assert _clean_at_mentions(text) == text
+    assert clean_at_mentions(text) == text
 
 
 def test_extract_post_content_direct():
@@ -103,7 +102,7 @@ def test_extract_post_content_direct():
             [{"tag": "text", "text": "Hello"}, {"tag": "text", "text": " world"}]
         ],
     }
-    text, imgs = _extract_post_content(payload)
+    text, imgs = extract_post_content(payload)
     assert "Hello" in text
     assert "world" in text
     assert imgs == []
@@ -116,7 +115,7 @@ def test_extract_post_content_localized_zh_cn():
             "content": [[{"tag": "text", "text": "你好"}]],
         }
     }
-    text, imgs = _extract_post_content(payload)
+    text, imgs = extract_post_content(payload)
     assert "你好" in text
 
 
@@ -130,7 +129,7 @@ def test_extract_post_content_wrapped_post():
             }
         }
     }
-    text, imgs = _extract_post_content(payload)
+    text, imgs = extract_post_content(payload)
     assert "link text" in text
 
 
@@ -140,7 +139,7 @@ def test_extract_post_content_code_block():
             [{"tag": "code_block", "language": "python", "text": "print('hi')"}]
         ]
     }
-    text, _ = _extract_post_content(payload)
+    text, _ = extract_post_content(payload)
     assert "print" in text
     assert "```" in text
 
@@ -154,12 +153,12 @@ def test_extract_post_content_image_keys():
             ]
         ]
     }
-    text, imgs = _extract_post_content(payload)
+    text, imgs = extract_post_content(payload)
     assert imgs == ["img_key_123"]
 
 
 def test_extract_post_content_empty():
-    text, imgs = _extract_post_content({})
+    text, imgs = extract_post_content({})
     assert text == ""
     assert imgs == []
 

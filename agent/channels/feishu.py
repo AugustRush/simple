@@ -60,6 +60,11 @@ from agent.channels.feishu_progress import (
     format_mode_aware_subagent_event,
     format_tool_progress_line,
 )
+from agent.channels.feishu_parsing import (
+    clean_at_mentions,
+    extract_post_content,
+    is_group_chat_type,
+)
 from agent.channels.feishu_attachments import (
     _ATTACHMENT_BATCH_CAPACITY_ERROR,
     _AttachmentBatchCapacityLease,
@@ -166,86 +171,6 @@ class _FeishuStreamBuf:
     sequence: int = 0
     last_edit: float = 0.0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Message parsing helpers  (adapted from nanobot reference implementation)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Regex to strip Feishu @-mention placeholders (@_user_N) from message text.
-_AT_PLACEHOLDER_RE = re.compile(r"@_user_\d+\s*")
-
-
-def _clean_at_mentions(text: str) -> str:
-    """Remove @_user_N placeholders left by Feishu in message text."""
-    return _AT_PLACEHOLDER_RE.sub("", text).strip()
-
-
-def _is_group_chat_type(chat_type: str) -> bool:
-    normalized = str(chat_type or "").strip().lower()
-    return normalized in {"group", "group_chat", "chat"}
-
-
-def _extract_post_content(content_json: dict) -> tuple[str, list[str]]:
-    """Extract plain text and embedded image keys from a Feishu *post* message.
-
-    Handles three payload shapes:
-    - Direct:    ``{"title": "...", "content": [[...]]}``
-    - Localized: ``{"zh_cn": {"title": "...", "content": [...]}}``
-    - Wrapped:   ``{"post": {"zh_cn": {...}}}``
-
-    Returns ``(text, image_keys)``.
-    """
-
-    def _parse_block(block: dict) -> tuple[Optional[str], list[str]]:
-        if not isinstance(block, dict) or not isinstance(block.get("content"), list):
-            return None, []
-        texts: list[str] = []
-        images: list[str] = []
-        if title := block.get("title"):
-            texts.append(str(title))
-        for row in block["content"]:
-            if not isinstance(row, list):
-                continue
-            for el in row:
-                if not isinstance(el, dict):
-                    continue
-                tag = el.get("tag")
-                if tag in ("text", "a"):
-                    texts.append(el.get("text", ""))
-                elif tag == "at":
-                    texts.append(f"@{el.get('user_name', 'user')}")
-                elif tag == "code_block":
-                    lang = el.get("language", "")
-                    code = el.get("text", "")
-                    texts.append(f"\n```{lang}\n{code}\n```\n")
-                elif tag == "img" and (key := el.get("image_key")):
-                    images.append(key)
-        return (" ".join(texts).strip() or None), images
-
-    root = content_json
-    if isinstance(root, dict) and isinstance(root.get("post"), dict):
-        root = root["post"]
-    if not isinstance(root, dict):
-        return "", []
-
-    if "content" in root:
-        text, imgs = _parse_block(root)
-        if text or imgs:
-            return text or "", imgs
-
-    for locale in ("zh_cn", "en_us", "ja_jp"):
-        if locale in root:
-            text, imgs = _parse_block(root[locale])
-            if text or imgs:
-                return text or "", imgs
-
-    for val in root.values():
-        if isinstance(val, dict):
-            text, imgs = _parse_block(val)
-            if text or imgs:
-                return text or "", imgs
-
-    return "", []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1544,7 +1469,7 @@ class FeishuChannel(Channel):
         assert self._client is not None, "FeishuChannel.start() not called"
         chat_id = msg.metadata["chat_id"]
         chat_type = msg.metadata.get("chat_type", "p2p")
-        receive_id_type = "chat_id" if _is_group_chat_type(chat_type) else "open_id"
+        receive_id_type = "chat_id" if is_group_chat_type(chat_type) else "open_id"
         sink = FeishuOutputSink(
             client=self._client,
             receive_id_type=receive_id_type,
@@ -1598,7 +1523,7 @@ class FeishuChannel(Channel):
                 )
                 specs.append((str(key), "image", filename))
         elif msg_type == "post":
-            _text, image_keys = _extract_post_content(content_json)
+            _text, image_keys = extract_post_content(content_json)
             for key in image_keys:
                 specs.append(
                     (
@@ -1816,7 +1741,7 @@ class FeishuChannel(Channel):
                 return
 
             # ── Group policy ─────────────────────────────────────────────────
-            is_group_chat = _is_group_chat_type(chat_type)
+            is_group_chat = is_group_chat_type(chat_type)
             if is_group_chat and not self._is_bot_mentioned(message):
                 if self._config.group_policy != "open":
                     logger.debug("Feishu: skipping group message (not mentioned)")
@@ -1868,14 +1793,14 @@ class FeishuChannel(Channel):
 
             if msg_type == "text":
                 raw = content_json.get("text", "")
-                cleaned = _clean_at_mentions(raw)
+                cleaned = clean_at_mentions(raw)
                 if cleaned:
                     content_parts.append(cleaned)
 
             elif msg_type == "post":
-                text, _ = _extract_post_content(content_json)
+                text, _ = extract_post_content(content_json)
                 if text:
-                    content_parts.append(_clean_at_mentions(text))
+                    content_parts.append(clean_at_mentions(text))
 
             elif msg_type in ("image", "audio", "file", "sticker", "media"):
                 content_parts.append(f"[{msg_type}]")
