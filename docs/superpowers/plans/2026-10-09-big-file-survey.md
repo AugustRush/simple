@@ -312,36 +312,90 @@ workflows (one move, not two) → files → audio → shell → context.
 
 ---
 
-## 4. The first increment
+## 4. What landed
 
-**Move the web payload cluster (C1) out of `agent/channels/web.py` into
-`agent/channels/web_payloads.py`.**
+Both increments below are on the branch, each verified by running the full
+suite and diffing the FAILED set against the baseline above.
 
-Why this one first, in the roadmap's own terms ("a survey, not a rewrite"):
+### 4.1 web.py — the payload shape (`d51d166`)
 
-- It is the largest self-contained, provably pure block in the largest file:
-  299 lines, 8 functions, zero `self`, zero request handling, zero component
-  access.
-- It is guarded by tests in **four** modules, three of which import the helpers
-  by name — so the guard is real and the move is measurable, not a matter of
-  opinion.
-- It sets the module-per-cluster shape the rest of web.py will follow, on the
-  cheapest possible example.
+`agent/channels/web.py` **4191 → 3881 lines**; the C1 cluster (299 lines, 8
+functions, zero `self`) moved to `agent/channels/web_payloads.py`.
 
-The move keeps `agent/channels/web.py` importing the names, so existing callers
-and the three test modules that import them by name keep working unchanged. The
-new module carries the docstrings that explain *why* each payload looks the way
-it does (`with_snapshot`, `verdict` vs `status`, `in_flight` for a queued
-signal-woken run) — those comments are the reason the cluster is worth its own
-file.
+It was chosen first, in the roadmap's own terms ("a survey, not a rewrite"),
+because it is the largest self-contained, provably pure block in the largest
+file, and it is guarded by tests in **four** modules — three of which imported
+the helpers by name. Following the repository's convention for extracted
+modules (`spawn_planning`, `token_budget`), the helpers took public names, and
+the 15 call sites in `web.py` plus the three test import lines were updated;
+**no test body changed**, so the guards are the same guards.
 
-**Verification:** the four payload-guarding test modules, then the full suite,
-comparing the FAILED set against the baseline above rather than reading the pass
-count.
+The new module carries the comments that explain why each payload looks the way
+it does — `status` vs `verdict`, why `with_snapshot` is off inside a list, why
+`in_flight` cannot be re-derived by the client — because those are the reason
+the cluster is worth a file.
+
+### 4.2 feishu.py — the pure renderer half (`385f1de`)
+
+`agent/channels/feishu.py` **2587 → 2326 lines**; the R cluster (216 lines plus
+36 lines of constants) moved to `agent/channels/feishu_render.py` as eight
+public functions.
+
+The boundary was measured before anything moved: four of the eight functions are
+called only from `_send_response_async`, and the other four only from
+`build_card_elements`; no consumer exists outside `feishu.py` and one test
+block. Twelve renderer regexes and the three size ceilings moved with them —
+except `MD_ELEMENT_CHAR_LIMIT`, which `_render_primary_markdown` still reads, so
+`feishu.py` imports it rather than defining a second copy of the same number.
+The 19 direct renderer assertions now call the module functions; the assertions
+themselves are unchanged.
+
+The move deliberately preserved two warts rather than tidying them on the way
+out, and says so in the module docstring: `split_long_markdown_text`'s "word
+boundaries" comment describes an intent the loop does not implement, and its
+long-line branch mixes three- and four-space indentation.
+
+### 4.3 A mistake worth recording
+
+The first version of the feishu script used the rename pattern
+`(?<![\w.])_name`, which silently skips every `self._name` / `cls._name`
+reference — the exact form the renderer used. The result would have been a
+module full of `self._TABLE_RE`. It was caught by grepping the generated module
+for `self.`/`cls.`, then `git checkout -- agent/channels/feishu.py` restored the
+file from HEAD and the whole extraction was redone rather than patched in
+place. The same rewrite also had the constant range off by one line (it took
+`_IMAGE_EXTS = {` too); `py_compile`'s `IndentationError` caught that, and the
+ranges were then taken from `git show HEAD:... | grep -n` instead of counted
+from unnumbered output.
+
+Both are the failure mode the closing report named: **the splice risk is the
+definition next to the block, not the block.**
+
+## 5. Next
+
+The order in §1–§3 is the plan, and the two cheapest entries are now done. The
+next candidates, cheapest first:
+
+1. web.py C14 + the tier-0 helpers (`_turn_tag`/`_operation_tag` twins,
+   `_jsonable`, `_normalize_confirm_decision`) → a small `web_text.py`-shaped
+   module; the twin helpers de-duplicate as they move.
+2. feishu.py P — the progress formatters (168 lines). Directly guarded only
+   through `on_subagent_event`, so the move should add a direct test.
+3. builtin_tools.py — the memory cluster first (84 lines, leaf state
+   `{memory, chapter_normalizer}`), then web (235 lines, two registry keys).
+   `_register`'s 1656 lines are measured but stay: the survey's answer is that
+   each cluster module owns its own registration table, which is a larger piece
+   than one round.
+
+The findings listed in §1–§3 that are **behavioural** (the web sink's claimed
+temporary-attachment ownership, the session-id validator disagreeing with
+`web_session_home`, `_stream` discarding its tasks' exceptions) are deliberately
+not in this queue: each needs a decision and a test that fails first, which is a
+different kind of change from a move.
 
 ---
 
-## 5. Explicitly out of scope
+## 6. Explicitly out of scope
 
 - **No rewrite.** No cluster below the "first increment" line is touched in this
   round.
