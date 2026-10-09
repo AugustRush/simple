@@ -104,7 +104,7 @@ def test_clean_output_deletes_all_files(tmp_path):
     bt = BuiltinTools(mem, reg, output_dir=output)
 
     assert "clean_output" in reg.list_tools()
-    result = bt._clean_output(max_age_hours=0)
+    result = bt._output_tools.clean(max_age_hours=0)
     assert result["ok"] is True
     assert result["deleted"] == 2
     # Files gone, empty subdirs cleaned up
@@ -130,7 +130,7 @@ def test_clean_output_respects_max_age(tmp_path):
     reg = ToolRegistry()
     bt = BuiltinTools(_StubMemory(), reg, output_dir=output)
 
-    result = bt._clean_output(max_age_hours=1)
+    result = bt._output_tools.clean(max_age_hours=1)
     assert result["ok"] is True
     assert result["deleted"] == 1
     assert not old_file.exists()
@@ -149,7 +149,7 @@ def test_clean_output_subdir_only(tmp_path):
     reg = ToolRegistry()
     bt = BuiltinTools(_StubMemory(), reg, output_dir=output)
 
-    result = bt._clean_output(max_age_hours=0, subdir="tmp")
+    result = bt._output_tools.clean(max_age_hours=0, subdir="tmp")
     assert result["ok"] is True
     assert result["deleted"] == 1
     assert (output / "keep.txt").exists()
@@ -165,7 +165,7 @@ def test_clean_output_nonexistent_dir(tmp_path):
     reg = ToolRegistry()
     bt = BuiltinTools(_StubMemory(), reg, output_dir=output)
 
-    result = bt._clean_output(subdir="nonexistent")
+    result = bt._output_tools.clean(subdir="nonexistent")
     assert result["ok"] is True
     assert result["deleted"] == 0
 
@@ -179,7 +179,7 @@ def test_clean_output_rejects_path_outside_output_dir(tmp_path):
     outside.write_text("keep")
 
     bt = BuiltinTools(_StubMemory(), ToolRegistry(), output_dir=output)
-    result = bt._clean_output(subdir="..")
+    result = bt._output_tools.clean(subdir="..")
 
     assert result["ok"] is False
     assert outside.read_text() == "keep"
