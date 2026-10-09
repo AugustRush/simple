@@ -82,6 +82,7 @@ from agent.channels.feishu_render import (
     detect_msg_format,
     markdown_to_post,
     split_elements_by_table_limit,
+    tool_call_markdown,
 )
 
 logger = logging.getLogger(__name__)
@@ -321,7 +322,7 @@ class FeishuOutputSink(OutputSink):
         if self.streaming:
             if self._progress_fail_count >= 3:
                 return
-            self._stream_buf.text += f"\n\n**Tool Call**\n\n```text\n{hint}\n```\n\n"
+            self._stream_buf.text += f"\n\n{tool_call_markdown(hint)}\n\n"
             if not self._stream_flush_pending:
                 self._stream_flush_pending = True
                 self._schedule(
@@ -822,7 +823,7 @@ class FeishuOutputSink(OutputSink):
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": f"**Tool Call**\n\n```text\n{hint}\n```",
+                    "content": tool_call_markdown(hint),
                 }
             ],
         }
@@ -1562,11 +1563,21 @@ class FeishuChannel(Channel):
         message_id: str,
         msg_type: str,
         content_json: dict,
-    ) -> tuple[MessageAttachment, ...]:
-        return await self._download_message_attachments(
+    ) -> tuple[list[tuple[str, str, str]], tuple[MessageAttachment, ...]]:
+        """The attachments of one inbound message, and the specs they came from.
+
+        Both halves are returned because the caller needs both: the downloader
+        hands back only what it managed to fetch, and the difference is reported
+        as a download failure.  This existed as a composition whose only callers
+        were its tests, while the message path spelled the same two calls out by
+        hand -- so the tests covered a path the product did not take.
+        """
+        specs = self._message_attachment_specs(msg_type, content_json)
+        attachments = await self._download_message_attachments(
             message_id=message_id,
-            specs=self._message_attachment_specs(msg_type, content_json),
+            specs=specs,
         )
+        return specs, attachments
 
     async def _download_message_resource(
         self,
@@ -1756,10 +1767,10 @@ class FeishuChannel(Channel):
                 content_json = json.loads(message.content) if message.content else {}
             except json.JSONDecodeError:
                 content_json = {}
-            attachment_specs = self._message_attachment_specs(msg_type, content_json)
-            attachments = await self._download_message_attachments(
+            attachment_specs, attachments = await self._extract_message_attachments(
                 message_id=message_id,
-                specs=attachment_specs,
+                msg_type=msg_type,
+                content_json=content_json,
             )
             attachment_download_failed_count = max(0, len(attachment_specs) - len(attachments))
 

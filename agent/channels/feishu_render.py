@@ -26,10 +26,10 @@ answer:
   short plain text fits in a text message -- with 200 and 2000 as the two
   ceilings, named ``TEXT_MAX_LEN`` and ``POST_MAX_LEN``.
 
-Behaviour is preserved exactly, including two warts this move did not tidy:
-``split_long_markdown_text``'s "word boundaries" comment describes an intent
-the loop does not implement (it cuts at ``start + limit``), and its long-line
-branch mixes three- and four-space indentation.
+Behaviour is preserved exactly, including one wart this move did not tidy: the
+long-line branch of ``split_long_markdown_text`` mixes three- and four-space
+indentation.  Its "word boundaries" comment, which described an intent the loop
+does not implement, has since been corrected to say what the code does.
 """
 
 from __future__ import annotations
@@ -80,6 +80,18 @@ MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
 TEXT_MAX_LEN = 200  # plain-text ceiling; longer → post
 POST_MAX_LEN = 2000  # post ceiling; longer → interactive card
 MD_ELEMENT_CHAR_LIMIT = 5000  # Feishu card markdown element char limit
+
+
+def tool_call_markdown(hint: str) -> str:
+    """A tool call as one markdown fragment.
+
+    The same event is rendered on two surfaces -- appended to the live stream
+    and sent as a card of its own -- and it used to be spelled out at both, so a
+    change to the wording would have reached one of them and not the other.  A
+    person reading the stream and a person reading the card are looking at the
+    same turn.
+    """
+    return f"**Tool Call**\n\n```text\n{hint}\n```"
 
 
 def detect_msg_format(content: str) -> str:
@@ -251,7 +263,7 @@ def split_long_markdown_text(text: str, limit: int) -> list[str]:
                    else:
                        chunks.append(line)
                 else:
-                   # Single line too long — hard split at sentence or word boundaries
+                   # Single line too long — split at sentence boundaries first
                    # Try sentence boundaries first
                    sentences = re.split(r"(?<=[.。!！?？])\s+", line)
                    for sent in sentences:
@@ -261,7 +273,9 @@ def split_long_markdown_text(text: str, limit: int) -> list[str]:
                            else:
                                chunks.append(sent)
                        else:
-                           # Hard split at word boundaries
+                           # No sentence fits: cut at a character offset.
+                           # Mid-word cuts are possible and harmless; the
+                           # limit is what Feishu enforces.
                            start = 0
                            while start < len(sent):
                                if chunks and chunks[-1]:

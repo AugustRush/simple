@@ -179,7 +179,7 @@ def test_feishu_channel_extracts_image_attachment(monkeypatch, tmp_path):
 
     monkeypatch.setattr(channel, "_download_message_resource", fake_download)
 
-    attachments = asyncio.run(
+    _specs, attachments = asyncio.run(
         channel._extract_message_attachments(
             message_id="msg_1",
             msg_type="image",
@@ -206,7 +206,7 @@ def test_feishu_channel_extracts_post_image_attachments(monkeypatch, tmp_path):
 
     monkeypatch.setattr(channel, "_download_message_resource", fake_download)
 
-    attachments = asyncio.run(
+    _specs, attachments = asyncio.run(
         channel._extract_message_attachments(
             message_id="msg_1",
             msg_type="post",
@@ -235,7 +235,7 @@ def test_feishu_channel_extracts_file_attachment(monkeypatch, tmp_path):
 
     monkeypatch.setattr(channel, "_download_message_resource", fake_download)
 
-    attachments = asyncio.run(
+    _specs, attachments = asyncio.run(
         channel._extract_message_attachments(
             message_id="msg_1",
             msg_type="file",
@@ -266,7 +266,7 @@ def test_feishu_channel_extracts_audio_attachment_with_default_extension(
 
     monkeypatch.setattr(channel, "_download_message_resource", fake_download)
 
-    attachments = asyncio.run(
+    _specs, attachments = asyncio.run(
         channel._extract_message_attachments(
             message_id="msg_1",
             msg_type="audio",
@@ -2072,6 +2072,41 @@ def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
         loop.run_until_complete(_run())
     finally:
         loop.close()
+
+
+def test_a_tool_call_is_rendered_identically_in_the_stream_and_in_its_card():
+    """One event, two surfaces: the fragment is built once so they cannot drift.
+
+    It used to be spelled out at both -- appended to the live stream and sent as
+    a card of its own -- so a change to the wording would have reached one
+    surface and not the other, while both are the same turn to the reader.
+    """
+    import json
+
+    from agent import _fmt_tool_inputs
+    from agent.channels.feishu_render import tool_call_markdown
+
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    sent: list[tuple[str, str]] = []
+    sink._do_send = lambda kind, body: sent.append((kind, body))
+    hint = "bash" + _fmt_tool_inputs("bash", {"command": "ls"})
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            sink.on_tool_start("bash", {"command": "ls"})
+            await sink.drain()
+            await sink._send_tool_hint_async(hint)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    assert tool_call_markdown(hint) in sink._stream_buf.text
+    card = json.loads(sent[0][1])
+    assert card["elements"][0]["content"] == tool_call_markdown(hint)
 
 
 def test_feishu_sink_tool_start_appends_inline_to_stream_buf_for_chronological_order():

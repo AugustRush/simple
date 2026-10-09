@@ -110,9 +110,20 @@ def pluralize(value: int, singular: str) -> str:
     return singular if value == 1 else f"{singular}s"
 
 
+def batch_execution_mode(event: SubAgentProgressEvent) -> str:
+    """What kind of batch this is, read the one way both lines need.
+
+    ``execution_mode`` decides which line is even possible, and the started and
+    finished lines each spelled the same three statements out -- so the two
+    could disagree about what counts as a "parallel batch".
+    """
+    metrics = event.metrics or {}
+    return str(metrics.get("execution_mode", "") or "").strip().lower()
+
+
 def format_batch_started_event(event: SubAgentProgressEvent) -> str | None:
     metrics = event.metrics or {}
-    mode = str(metrics.get("execution_mode", "") or "").strip().lower()
+    mode = batch_execution_mode(event)
     spec_count = event_spec_count(event)
     if mode == "parallel" and spec_count is not None:
         max_parallel_agents = positive_int(metrics.get("max_parallel_agents"))
@@ -142,7 +153,7 @@ def format_batch_started_event(event: SubAgentProgressEvent) -> str | None:
 
 def format_batch_finished_event(event: SubAgentProgressEvent) -> str | None:
     metrics = event.metrics or {}
-    mode = str(metrics.get("execution_mode", "") or "").strip().lower()
+    mode = batch_execution_mode(event)
     spec_count = event_spec_count(event)
     completed = positive_int(event.completed) or 0
     duration = format_seconds(metrics.get("duration_seconds"), precision=2)
