@@ -50,7 +50,8 @@ them would make the guard test assert something it never verified:
   (``agent/shared.py:510``) is constructed once and used, never reassigned.
   ``_SYNC_TOOL_EXECUTOR_LOCK`` (``agent/tools/runtime.py:80``),
   ``_IN_PROCESS_LOCKS_GUARD`` (``agent/tools/files.py:225``) and
-  ``_ATTACHMENT_BATCH_CAPACITY_LOCK`` (``agent/channels/feishu.py:85``) are the
+  ``_ATTACHMENT_BATCH_CAPACITY_LOCK``
+  (``agent/channels/feishu_attachments.py:44``) are the
   same shape: built at import, called, never replaced.
 - **``ContextVar`` declared inside a function.** ``runtime_event_buffer``
   (``agent/channels/base.py:562``) is created per channel runner, so it is

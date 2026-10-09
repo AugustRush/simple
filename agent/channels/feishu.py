@@ -60,6 +60,12 @@ from agent.channels.feishu_progress import (
     format_mode_aware_subagent_event,
     format_tool_progress_line,
 )
+from agent.channels.feishu_attachments import (
+    _ATTACHMENT_BATCH_CAPACITY_ERROR,
+    _AttachmentBatchCapacityLease,
+    _AttachmentLease,
+    _QueuedAttachment,
+)
 from agent.channels.feishu_render import (
     MD_ELEMENT_CHAR_LIMIT,
     build_card_elements,
@@ -86,15 +92,9 @@ FEISHU_WS_RECONNECT_MAX_SECONDS = 60.0
 # failure starts back-off over rather than inheriting the previous streak.
 FEISHU_WS_HEALTHY_CONNECTION_SECONDS = 30.0
 _ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
-_ATTACHMENT_MAX_IN_FLIGHT = 2
 # Soft cap on remembered message ids. Soft because an in-flight id is never
 # evicted: double-processing a live message is worse than overshooting here.
 _DEDUP_CACHE_LIMIT = 1000
-_ATTACHMENT_BATCH_CAPACITY = threading.BoundedSemaphore(
-    _ATTACHMENT_MAX_IN_FLIGHT
-)
-_ATTACHMENT_BATCH_CAPACITY_LOCK = threading.Lock()
-_ATTACHMENT_BATCH_CAPACITY_ERROR = "Feishu attachment upload capacity exhausted"
 
 
 def _ws_reconnect_delay(failures: int) -> float:
@@ -110,110 +110,6 @@ def _ws_reconnect_delay(failures: int) -> float:
     # Jitter first, then clamp, so the cap is a true ceiling.
     return min(delay * random.uniform(0.8, 1.2), FEISHU_WS_RECONNECT_MAX_SECONDS)
 
-
-def _cleanup_attachment_path(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-        path.parent.rmdir()
-    except OSError:
-        logger.exception(
-            "deferred Feishu attachment cleanup failed: attachment=%s",
-            path,
-        )
-
-
-class _AttachmentLease:
-    """Opaque cleanup receipt shared by the coordinator and batch worker."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._state = "pending"
-        self._cleanup_owned = False
-        self._lock = threading.Lock()
-
-    def run(self, operation: Callable[[Path], None]) -> bool:
-        with self._lock:
-            if self._state == "cancelled":
-                return False
-            if self._state != "pending":
-                raise RuntimeError("attachment lease is not pending")
-            self._state = "running"
-        try:
-            operation(self.path)
-        finally:
-            self._finish()
-        return True
-
-    def cancel_pending(self) -> None:
-        cleanup = False
-        with self._lock:
-            if self._state == "pending":
-                self._state = "cancelled"
-                cleanup = self._cleanup_owned
-        if cleanup:
-            _cleanup_attachment_path(self.path)
-
-    def transfer_cleanup(self) -> bool:
-        cleanup = False
-        with self._lock:
-            if self._cleanup_owned:
-                return True
-            self._cleanup_owned = True
-            cleanup = self._state in ("cancelled", "finished")
-        if cleanup:
-            _cleanup_attachment_path(self.path)
-        return True
-
-    def _finish(self) -> None:
-        cleanup = False
-        with self._lock:
-            self._state = "finished"
-            cleanup = self._cleanup_owned
-        if cleanup:
-            _cleanup_attachment_path(self.path)
-
-
-@dataclass(frozen=True)
-class _QueuedAttachment:
-    path: Path
-    lease: _AttachmentLease
-
-
-class _AttachmentBatchCapacityLease:
-    """A fixed-size, idempotently released reservation of global capacity."""
-
-    def __init__(
-        self,
-        capacity: threading.BoundedSemaphore,
-        size: int,
-    ) -> None:
-        self._capacity = capacity
-        self._size = size
-        self._released = False
-        self._lock = threading.Lock()
-
-    @classmethod
-    def try_acquire(cls, size: int) -> "_AttachmentBatchCapacityLease | None":
-        capacity = _ATTACHMENT_BATCH_CAPACITY
-        with _ATTACHMENT_BATCH_CAPACITY_LOCK:
-            acquired = 0
-            for _index in range(size):
-                if capacity.acquire(blocking=False):
-                    acquired += 1
-                    continue
-                for _rollback in range(acquired):
-                    capacity.release()
-                return None
-        return cls(capacity, acquired)
-
-    def release(self) -> None:
-        with self._lock:
-            if self._released:
-                return
-            self._released = True
-            with _ATTACHMENT_BATCH_CAPACITY_LOCK:
-                for _index in range(self._size):
-                    self._capacity.release()
 
 
 def build_feishu_client(config: "FeishuConfig") -> Any:

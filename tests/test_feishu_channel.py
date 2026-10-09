@@ -713,7 +713,7 @@ def test_feishu_attachment_batches_are_globally_bounded_across_sinks(
 ):
     async def scenario() -> None:
         monkeypatch.setattr(
-            "agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            "agent.channels.feishu_attachments._ATTACHMENT_BATCH_CAPACITY",
             threading.BoundedSemaphore(2),
             raising=False,
         )
@@ -821,7 +821,7 @@ def test_feishu_batch_reserves_global_capacity_for_each_attachment(
 ):
     async def scenario() -> None:
         monkeypatch.setattr(
-            "agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            "agent.channels.feishu_attachments._ATTACHMENT_BATCH_CAPACITY",
             threading.BoundedSemaphore(2),
         )
         release_worker = threading.Event()
@@ -916,7 +916,7 @@ def test_feishu_excess_command_returns_and_cleans_while_capacity_is_blocked(
 ):
     async def scenario() -> None:
         monkeypatch.setattr(
-            "agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            "agent.channels.feishu_attachments._ATTACHMENT_BATCH_CAPACITY",
             threading.BoundedSemaphore(1),
         )
         release_worker = threading.Event()
