@@ -65,7 +65,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="registry",
         owners=(
             "agent/bootstrap.py",
-            "agent/tools/builtin_tools.py",
+            "agent/tools/plugin_tools.py",
         ),
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
@@ -85,7 +85,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="skill_catalog",
         owners=(
             "agent/bootstrap.py",
-            "agent/tools/builtin_tools.py",
+            "agent/tools/plugin_tools.py",
         ),
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
@@ -228,7 +228,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="mcp_client",
         owners=(
             "agent/bootstrap.py",
-            "agent/tools/builtin_tools.py",
+            "agent/tools/plugin_tools.py",
         ),
         consumers=(
             "agent/bootstrap.py",

@@ -238,7 +238,7 @@ def test_list_installed_plugins_counts_only_listed_user_plugins(tmp_path, monkey
 
     registry.set_context("plugin_catalog", _Catalog())
 
-    result = tools._list_installed_plugins()
+    result = tools._plugin_tools.list_installed_plugins()
 
     assert result["ok"] is True
     assert result["loaded_count"] == 1

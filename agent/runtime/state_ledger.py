@@ -206,7 +206,7 @@ LEDGER: tuple[StateEntry, ...] = (
                "A process-wide pool so blocking tools cannot starve the event loop. "
                "Deliberately not the loop's default executor, because channels push "
                "their own blocking calls through that one; a single pool is the point."),
-    StateEntry("_PLUGIN_INSTALL_LOCK", "agent/tools/builtin_tools.py", 309, "REBOUND", "process", "service", 5,
+    StateEntry("_PLUGIN_INSTALL_LOCK", "agent/tools/plugin_tools.py", 126, "REBOUND", "process", "service", 5,
                "Serializes plugin installs process-wide."),
     StateEntry("_IN_PROCESS_LOCKS", "agent/tools/files.py", 224, "CONTAINER", "process", "stays", None,
                "Per-path write locks keyed by (root kind, root path, relative path). "

@@ -99,34 +99,34 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="user_plugins_dir",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/plugin_tools.py",),
     ),
 
     # ── services and catalogues ──
     ContextKey(
         key="registry",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/plugin_tools.py",),
     ),
     ContextKey(
         key="skill_catalog",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/plugin_tools.py",),
     ),
     ContextKey(
         key="plugin_catalog",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/plugin_tools.py",),
     ),
     ContextKey(
         key="command_router",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/plugin_tools.py",),
     ),
     ContextKey(
         key="mcp_client",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/plugin_tools.py",),
     ),
     ContextKey(
         key="file_service",

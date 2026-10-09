@@ -2199,7 +2199,7 @@ def test_install_plugin_canonicalizes_git_protocol_to_https(tmp_path, monkeypatc
 
 
 def test_canonicalize_plugin_source_keeps_working_transports():
-    from agent.tools.builtin_tools import _canonicalize_plugin_source
+    from agent.tools.plugin_tools import _canonicalize_plugin_source
 
     assert (
         _canonicalize_plugin_source("git://github.com/example/plugin.git")
@@ -2272,7 +2272,7 @@ def _run_install_with_sink(tools, source: str, sink, *, name=None, replace=False
     sink_token = _active_sink.set(sink)
     try:
         return asyncio.run(
-            tools._install_plugin(
+            tools._plugin_tools.install_plugin(
                 source=source,
                 intent="install test plugin",
                 name=name,
@@ -2304,7 +2304,7 @@ def test_install_plugin_cleans_partial_target_on_clone_failure(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_clone)
 
     result = asyncio.run(
-        tools._install_plugin(
+        tools._plugin_tools.install_plugin(
             source="git://github.com/example/plugin.git",
             intent="test clone failure cleanup",
         )
@@ -2338,11 +2338,11 @@ def test_install_plugin_concurrent_installs_serialize(tmp_path, monkeypatch):
 
     async def scenario():
         return await asyncio.gather(
-            tools._install_plugin(
+            tools._plugin_tools.install_plugin(
                 source="https://github.com/example/plugin.git",
                 intent="test",
             ),
-            tools._install_plugin(
+            tools._plugin_tools.install_plugin(
                 source="https://github.com/example/plugin.git",
                 intent="test",
             ),
@@ -2370,20 +2370,20 @@ def test_install_plugin_replace_upgrades_existing(tmp_path, monkeypatch):
     )
 
     first = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install")
+        tools._plugin_tools.install_plugin(source=str(source), intent="install")
     )
     assert first["ok"] is True
     installed = user_plugins / "source"
     (installed / "v1.txt").write_text("1", encoding="utf-8")
 
     duplicate = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install")
+        tools._plugin_tools.install_plugin(source=str(source), intent="install")
     )
     assert duplicate["ok"] is False
     assert "already exists" in duplicate["error"]
 
     replaced = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install", replace=True)
+        tools._plugin_tools.install_plugin(source=str(source), intent="install", replace=True)
     )
     assert replaced["ok"] is True
     assert replaced.get("replaced") is True
@@ -2403,9 +2403,9 @@ def test_install_plugin_rolls_back_when_reload_fails(tmp_path, monkeypatch):
     async def failing_reload():
         return {"ok": False, "error": "mcp connect boom"}
 
-    monkeypatch.setattr(tools, "_reload_plugins", failing_reload)
+    monkeypatch.setattr(tools._plugin_tools, "reload_plugins", failing_reload)
     result = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install")
+        tools._plugin_tools.install_plugin(source=str(source), intent="install")
     )
     assert result["ok"] is False
     assert "rolled back" in result["error"]
@@ -2421,17 +2421,17 @@ def test_install_plugin_rolls_back_when_reload_fails(tmp_path, monkeypatch):
             "total_loaded": 0,
         }
 
-    monkeypatch.setattr(tools, "_reload_plugins", good_reload)
+    monkeypatch.setattr(tools._plugin_tools, "reload_plugins", good_reload)
     first = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install")
+        tools._plugin_tools.install_plugin(source=str(source), intent="install")
     )
     assert first["ok"] is True
     installed = user_plugins / "source"
     (installed / "v1.txt").write_text("1", encoding="utf-8")
 
-    monkeypatch.setattr(tools, "_reload_plugins", failing_reload)
+    monkeypatch.setattr(tools._plugin_tools, "reload_plugins", failing_reload)
     failed = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install", replace=True)
+        tools._plugin_tools.install_plugin(source=str(source), intent="install", replace=True)
     )
     assert failed["ok"] is False
     assert (installed / "v1.txt").read_text(encoding="utf-8") == "1"
@@ -2570,7 +2570,7 @@ def test_install_plugin_rejects_noncanonical_explicit_name_before_io(
         io_guard.setattr(shutil, "copytree", unexpected_io)
         io_guard.setattr(asyncio, "create_subprocess_exec", unexpected_io)
         result = asyncio.run(
-            tools._install_plugin(
+            tools._plugin_tools.install_plugin(
                 source=str(source),
                 intent="boundary regression",
                 name=name,
@@ -2621,7 +2621,7 @@ def test_uninstall_plugin_rejects_noncanonical_name_before_io(
         io_guard.setattr(Path, "is_dir", unexpected_io)
         io_guard.setattr(shutil, "rmtree", unexpected_io)
         result = asyncio.run(
-            tools._uninstall_plugin(name=name, intent="boundary regression")
+            tools._plugin_tools.uninstall_plugin(name=name, intent="boundary regression")
         )
 
     assert result["ok"] is False
@@ -2649,7 +2649,7 @@ def test_install_plugin_accepts_canonical_explicit_name(tmp_path, monkeypatch, n
     registry.set_context("components", {"plugin_catalog": catalog})
 
     result = asyncio.run(
-        tools._install_plugin(source=str(source), intent="install", name=name)
+        tools._plugin_tools.install_plugin(source=str(source), intent="install", name=name)
     )
 
     assert result["ok"] is True

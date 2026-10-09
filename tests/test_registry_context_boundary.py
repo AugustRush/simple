@@ -175,12 +175,12 @@ def test_user_tool_resolution_falls_back_when_nothing_is_provided() -> None:
 
 
 def test_plugin_reload_rebuilds_the_container_from_named_keys() -> None:
-    """``_reload_plugins`` must pass on exactly the four keys, and no more.
+    """``reload_plugins`` must pass on exactly the four keys, and no more.
 
     Passing more would quietly restore the old dependency; passing fewer would
     break reload.  Asserting the exact set is the point.
     """
-    from agent.tools.builtin_tools import BuiltinTools
+    from agent.tools.plugin_tools import PluginTools
 
     registry = _bootstrap_shaped_registry()
 
@@ -192,11 +192,11 @@ def test_plugin_reload_rebuilds_the_container_from_named_keys() -> None:
             return {"ok": True, "reloaded": True}
 
     registry.set_context("plugin_catalog", _RecordingCatalog())
-    tool = object.__new__(BuiltinTools)
+    tool = object.__new__(PluginTools)
     tool.registry = registry
 
     import asyncio
 
-    result = asyncio.run(BuiltinTools._reload_plugins(tool))
+    result = asyncio.run(PluginTools.reload_plugins(tool))
     assert result == {"ok": True, "reloaded": True}
     assert set(seen) == set(RELOAD_DEPENDENCIES)
