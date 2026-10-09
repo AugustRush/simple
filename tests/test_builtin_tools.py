@@ -753,7 +753,7 @@ def test_context_retrieve_returns_conversation_history_sections(tmp_path):
         channel="feishu",
     )
 
-    result = tools._context_retrieve("刚才我们聊了什么", top_k=5)
+    result = tools._context_tools.retrieve("刚才我们聊了什么", top_k=5)
 
     assert result["ok"] is True
     assert result["count"] >= 1
@@ -802,7 +802,7 @@ def test_context_retrieve_uses_active_session_manager(tmp_path):
     ctx = AgentContext(metadata={"context_manager": cli_manager})
     token = _active_agent_context.set(ctx)
     try:
-        result = tools._context_retrieve("刚才我们聊了什么", top_k=5)
+        result = tools._context_tools.retrieve("刚才我们聊了什么", top_k=5)
     finally:
         _active_agent_context.reset(token)
 

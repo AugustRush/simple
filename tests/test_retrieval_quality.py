@@ -185,10 +185,10 @@ def test_a_bare_string_is_one_query_not_a_bag_of_characters(tmp_path):
     """
     tools = _tools_with_memory(tmp_path)
 
-    result = tools._context_retrieve(queries="kubernetes deployment")
+    result = tools._context_tools.retrieve(queries="kubernetes deployment")
     assert result["queries"] == ["kubernetes deployment"]
 
-    result = tools._context_retrieve(queries=["a", "b"], query="c")
+    result = tools._context_tools.retrieve(queries=["a", "b"], query="c")
     assert result["queries"] == ["a", "b", "c"]
 
 
@@ -199,7 +199,7 @@ def test_empty_search_tells_the_model_to_reformulate(tmp_path):
     """
     tools = _tools_with_memory(tmp_path)
 
-    result = tools._context_retrieve(queries=["zzzz nonexistent qqqq"])
+    result = tools._context_tools.retrieve(queries=["zzzz nonexistent qqqq"])
     assert result["count"] == 0
     assert "lexical" in result["hint"]
 
@@ -207,7 +207,7 @@ def test_empty_search_tells_the_model_to_reformulate(tmp_path):
 def test_missing_queries_is_an_explicit_error(tmp_path):
     tools = _tools_with_memory(tmp_path)
 
-    result = tools._context_retrieve()
+    result = tools._context_tools.retrieve()
     assert result["ok"] is False
 
 
