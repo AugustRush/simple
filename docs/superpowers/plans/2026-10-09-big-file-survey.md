@@ -314,8 +314,8 @@ workflows (one move, not two) → files → audio → shell → context.
 
 ## 4. What landed
 
-Both increments below are on the branch, each verified by running the full
-suite and diffing the FAILED set against the baseline above.
+Every increment below is on the branch, each verified by running the full suite
+and diffing the FAILED set against the baseline above.
 
 ### 4.1 web.py — the payload shape (`d51d166`)
 
@@ -371,34 +371,123 @@ from unnumbered output.
 Both are the failure mode the closing report named: **the splice risk is the
 definition next to the block, not the block.**
 
+### 4.4 web.py — the outbound half (`de9adb8`)
+
+`agent/channels/web.py` **3881 → 3204 lines**; `WebOutputSink` (595 lines) and
+the helpers that had no other reader moved to `agent/channels/web_sink.py`.
+The class body is byte-identical after the move (checked against `HEAD`), and
+the boundary was measured with `ast` rather than assumed: `_turn_tag`,
+`_operation_tag`, `_jsonable`, `_MEDIA_EXTS`, `_RASTER_EXTS` and
+`_svg_has_raster_sibling` have **zero** references outside the class, so they
+travelled with it.
+
+Two names stayed shared, and the move gave them a **single home**:
+`CONFIRMATION_TIMEOUT_SECONDS` is read by the sink and by
+`WebChannel.wait_for_confirmation`, so `web.py` now reads it *through the sink
+module* instead of importing a copy — two copies would have been the very
+"one bound, two names" smell the survey found in `builtin_tools.py`, and it
+would have quietly weakened the test that shortens the clock (the monkeypatch
+target moved to `web_sink`, the assertions did not change).
+`_normalize_confirm_decision` is imported by name.
+
+Two pairs were deliberately **not** de-duplicated, which supersedes what §5
+said about the twins: `_turn_tag` / `_operation_tag` each carry a docstring
+describing a *different* failure, and `CONFIRM_DECISIONS` is the vocabulary the
+normaliser's branches already spell out.
+
+### 4.5 feishu.py — the progress wordings, and a missing guard (`6df57ac`)
+
+`agent/channels/feishu.py` **2326 → 2152 lines**; the ten progress formatters
+moved to `agent/channels/feishu_progress.py`. The reason this move was worth
+more than its 168 lines: the survey measured that **no test called any of
+these functions directly** — the only coverage was indirect, through
+`on_subagent_event` and `_render_primary_markdown` asserting a finished card.
+
+So this increment added a guard as well as a move:
+[`tests/test_feishu_progress.py`](../../../tests/test_feishu_progress.py), 16
+direct assertions on the cases the code deliberately refuses to guess — a
+boolean that is an `int`, a denominator that is *missing* rather than zero, a
+parallel batch with no declared concurrency, a pipeline that lost subtasks, and
+an event nobody recognises. The moved bodies are identical after dropping the
+receiver parameters (146 lines compared).
+
+One thing was checked and **not** changed: `agent/core/output.py:1062` has a
+same-named `_format_subagent_event`, but it is the CLI console's wording
+(`"Sub-agents running: …"`, no emoji) rather than the card's. Two surfaces, two
+renderings — not a duplicate to merge.
+
+### 4.6 builtin_tools.py — memory, and what the guards caught (`2298a4b`)
+
+`agent/tools/builtin_tools.py` **5514 → 5428 lines**; the six memory tools
+became `MemoryTools` in `agent/tools/memory_tools.py`.
+
+The form is dependency injection, and it was chosen over the alternative the
+survey offered (a shared `ok()` / `error()` module, which would have meant
+touching **108** call sites and pre-empting the decision for the eleven
+clusters not yet moved). The two response builders are passed in, so the shape
+still has exactly one definition and twelve modules cannot drift into twelve
+spellings of "ok". Every memory test already drove the tools through
+`registry.call(...)`, so what is guarded is the registration boundary.
+
+**Two mistakes, both caught by guards written for the purpose:**
+
+1. The first attempt de-indented the methods to module level, as the three
+   previous extractions had. The AST guard (*every method keeps its receiver*)
+   failed immediately: the target here is a **class**, not a module, so the
+   indentation had to stay. The guard itself was wrong once too — `clear` is an
+   `AsyncFunctionDef`, and a check that only counted `FunctionDef` reported the
+   wrong method list.
+2. The verbatim move copied the body but not the names it was standing on:
+   `clear` reads `_active_sink`, a module global of its **old** home. The tool
+   executor turned the resulting `NameError` into an ordinary tool error, so
+   `memory_clear` answered `ok: False` — and
+   `test_memory_clear_uses_human_confirmation_and_storage_api` caught it. The
+   fix imports it in the new module, with a comment saying why.
+
+A free-name scan over all five extracted modules now reports no dangling
+globals; it is worth turning into a repository guard, since the failure mode it
+found is invisible to a reader and only surfaces on the path a test happens to
+cover.
+
 ## 5. Next
 
-The order in §1–§3 is the plan, and the two cheapest entries are now done. The
-next candidates, cheapest first:
+The order in §1–§3 is the plan; the cheapest four entries are now done (web
+payloads and sink, feishu renderer and progress, memory). What remains, cheapest
+first:
 
-1. web.py C14 + the tier-0 helpers (`_turn_tag`/`_operation_tag` twins,
-   `_jsonable`, `_normalize_confirm_decision`) → a small `web_text.py`-shaped
-   module; the twin helpers de-duplicate as they move.
-2. feishu.py P — the progress formatters (168 lines). Directly guarded only
-   through `on_subagent_event`, so the move should add a direct test.
-3. builtin_tools.py — the memory cluster first (84 lines, leaf state
-   `{memory, chapter_normalizer}`), then web (235 lines, two registry keys).
-   `_register`'s 1656 lines are measured but stay: the survey's answer is that
-   each cluster module owns its own registration table, which is a larger piece
-   than one round.
+1. builtin_tools.py **web** (235 lines, 9 methods, leaf state `registry` with
+   two context keys, 8 guards) — same injected-responder form as `MemoryTools`,
+   and now that the form exists the move is mechanical.
+2. builtin_tools.py **output housekeeping** (`_clean_output`, 33 lines, leaf
+   state `{_output_dir}`, 7 guards) — the smallest remaining cluster, and the
+   only conditional registration, which becomes structural once it lives with
+   the output directory.
+3. feishu.py **A** (the attachment lease trio, 92 lines plus the module-level
+   semaphore) and **M** (the module-level parsing helpers) — both already
+   module-level, so the work is choosing their home rather than unwinding a
+   class.
+4. builtin_tools.py **signals + step output**, then **scheduler + workflows**
+   as one move (the survey measured that they cannot be separated), then
+   **files**, **audio**, **shell**, **context** — in that order, because the
+   coupling grows monotonically along it.
+
+`_register`'s 1656 lines stay for now: the survey's answer is that each cluster
+module owns its own registration table, and that is a larger piece than the
+increments above.
 
 The findings listed in §1–§3 that are **behavioural** (the web sink's claimed
 temporary-attachment ownership, the session-id validator disagreeing with
-`web_session_home`, `_stream` discarding its tasks' exceptions) are deliberately
-not in this queue: each needs a decision and a test that fails first, which is a
-different kind of change from a move.
+`web_session_home`, `_stream` discarding its tasks' exceptions, the dead
+`_progress_phase_closed` write, `CONFIRM_DECISIONS` having no reader) are
+deliberately not in this queue: each needs a decision and a test that fails
+first, which is a different kind of change from a move.
 
 ---
 
 ## 6. Explicitly out of scope
 
-- **No rewrite.** No cluster below the "first increment" line is touched in this
-  round.
+- **No rewrite.** Only the clusters listed in §4 have moved; everything below
+  the line in §5 is untouched.
 - **No behaviour changes.** The findings in §1–§3 are recorded as decisions to
   be taken deliberately with a test each, not folded into a move. The
   temporary-attachment ownership question in web.py is the clearest example:
