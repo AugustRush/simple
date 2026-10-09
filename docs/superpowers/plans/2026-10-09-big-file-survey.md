@@ -766,35 +766,100 @@ between them and **stayed**, since three clusters share it. Six direct test call
 were rewired with no assertion changed, the host produced no unused imports, and
 the ledger was untouched (this cluster reads no context keys).
 
+### 4.17 builtin_tools.py — the shell tool, and the last cluster (`61d582b`)
+
+`agent/tools/builtin_tools.py` **2932 → 2611 lines**; `_shell` (271 lines),
+`_terminate_process` and the model-facing `_SHELL_CONFIRMATION_GUIDANCE` became
+`ShellTools` in `agent/tools/shell_tools.py`.
+
+This is the tool everything else is measured against, and the most entangled
+cluster in the file: **eight** registry context keys and nine reads of the
+registry. Ten callables are injected — the workspace root, the output directory,
+the resource home, the confirmation prompt, the two response builders, and three
+operations borrowed from `FileTools` — so the class depends on ten functions
+rather than on a class with forty tools in it.
+
+Five decisions travelled with the code, each of which looks like something to
+simplify:
+
+- **The sandbox mode is linked to the permission level.**  `none` is honoured
+  only when the *effective* level is `full`; otherwise it fails safe back to
+  `read_all`.  Turning the sandbox off must not be reachable by a config edit
+  the permission level never agreed to.
+- **The pre/post snapshot is not an authorization mechanism.**  It is a
+  file-domain invariant on top of the OS boundary: an `output_dir` call under
+  danger-full-access must still not leave new files in the workspace.
+- **A sandbox denial is answered with the narrow knob that would have worked.**
+- **The scratch dir is released in a `finally`** — otherwise it leaked once per
+  invocation, unbounded for a long-running gateway.
+- **The blocklist is checked before any subprocess exists**, and a
+  confirmation-required command is **re-checked** after approval.
+
+The survey's open question was answered by measurement: `_try_interactive_confirmation`
+(75 lines) is shared with the plugin install path, so it **stayed on the host**
+and is injected. `_resource_home` stayed too (the ledger records it as shared
+with `scheduler/build.py`); `_sandbox_dir` had exactly one caller and moved.
+`AudioTools` now borrows `shell_tools.terminate_process`, the same
+sibling-injection shape as `file_tools.resolve_tool_path` in §4.15.
+
+**Three mistakes were caught, and two of them by tests:**
+
+1. The script that trimmed the host's unused imports also removed
+   `from __future__ import annotations` — which immediately turned a
+   **pre-existing** lazy annotation (`-> SchedulerStore`, a type that was never
+   imported) into a `NameError`. Restored, and the annotation left as it was:
+   it is a PEP 563 dependency, not this round's debt.
+2. The receiver census used `[A-Za-z_]*\._shell(` and missed
+   `kwargs["tools"]._shell(` — the bracket. The `AttributeError` found it.
+3. The rename covered `def _sandbox_dir(` but not the internal call
+   `self._sandbox_dir()`. Also found by a test.
+
+The ledger moved eight keys (`shell_permission_level`, `shell_sandbox_mode`,
+`shell_allowed_commands`, `shell_blocked_commands`, `shell_secret_paths`,
+`shell_devices`, `file_access_policy`, `write_scope`) from
+`agent/tools/builtin_tools.py` to `agent/tools/shell_tools.py`; `resource_home`
+did not move. Thirty test call sites became `_shell_tools.run(...)` with no
+assertion changed.
+
 ## 5. Next
 
-The order in §1–§3 is the plan; **only one cluster remains**. Progress so far:
-the three files went from **12292 to 8109 lines** (web.py 4191 → 3204, feishu.py
-2587 → 1973, builtin_tools.py 5514 → 2932), with fifteen modules holding what
-left — and one defect found and fixed that the first six of those modules had
-introduced (§4.14).
+**A correction first.** §5 previously said "only one cluster remains" after the
+context move. That was wrong: the survey's own list has **plugins + user tools**
+(427 lines, 13 methods) as a cluster in its own right, and an earlier rewrite of
+this section dropped it. It is still in `builtin_tools.py`, and it is measured
+here rather than quietly forgotten.
 
-What remains:
+Progress: the three files went from **12292 to 7781 lines** (web.py 4191 → 3204,
+feishu.py 2587 → 1973, builtin_tools.py 5514 → 2604), with sixteen modules
+holding what left — plus one defect found and fixed that the first six of those
+modules had introduced (§4.14).
 
-1. **shell** (306 lines: `_shell` 271 + `_terminate_process` 35; 24 guards).
-   The most entangled cluster in the file, and the last one:
-   - **eight** registry context keys (`shell_permission_level`,
-     `shell_sandbox_mode`, `shell_allowed_commands`, `shell_blocked_commands`,
-     `shell_devices`, `shell_secret_paths`, plus `file_access_policy` and
-     `write_scope`), and nine reads of `self.registry` rather than the one or two
-     the other clusters had;
-   - it calls three `FileTools` methods (the §4.14 pattern: reach them through
-     the injected handle), and `_sandbox_dir` / `_resource_home` /
-     `_process_output_dir` from the host's "runtime shared" group;
-   - **`_try_interactive_confirmation` (75 lines) is shared with the plugin
-     install path**, so it cannot simply travel with shell: either it is
-     injected into both, or it becomes the approval service the survey
-     suggested. That decision is the first thing to measure next round.
-2. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
-   trio — move with the clusters that call them (the channel's reconnect loop
-   and the download path), not on their own.
+What is left in `builtin_tools.py` (2604 lines) is:
 
-**For the shell move: expose `registry`** (§4.14). The cluster whose methods are
+| piece | lines | note |
+| --- | --- | --- |
+| `_register` | 1656 | the registration table itself; §3's answer is that each cluster module should own its own, which is a larger change than a move |
+| **plugins + user tools** | 427 | 13 methods, six registry context keys, and service-side guards (`test_plugin_catalog.py` 120 + `test_user_tools.py` 24) |
+| `_current_time` | 21 | a pure tool that only ever sat next to the web cluster |
+| shared accessors | ~110 | `_ok`, `_error`, `_schedule_store`, `_try_interactive_confirmation`, the workspace roots, `__init__` |
+
+So the remaining move is **plugins + user tools**, with two things already
+measured for it:
+
+1. **The authz-scope duplication is now cross-module.**  `_plugin_authorization_scope`
+   builds the same `ShellAuthorizationScope` from the same three metadata keys
+   that `ShellTools.run` builds inline (§1's finding, still open). One of the two
+   moves should leave a shared helper behind rather than a second copy.
+2. **`_try_interactive_confirmation` is already shared** — it stayed on the host
+   in §4.17 precisely so the plugin install path could keep using it.
+   `install_plugin` is one of its callers, so the plugin cluster takes it by
+   injection, exactly as shell does.
+
+Then feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
+trio — move with the clusters that call them (the channel's reconnect loop and
+the download path), not on their own.
+
+**For any of these: expose `registry`** (§4.14). A cluster whose methods are
 registered as tools and which hides that attribute will pass its unit tests and
 lose the session's context in production.
 
