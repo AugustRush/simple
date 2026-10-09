@@ -48,6 +48,7 @@ from agent.tools.files import (
 )
 
 from .executor import report_tool_progress
+from .memory_tools import MemoryTools
 from .runtime import ToolRegistry
 
 
@@ -502,6 +503,9 @@ class BuiltinTools:
             else None
         )
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
+        self._memory_tools = MemoryTools(
+            memory, self.chapter_normalizer, self._ok, self._error
+        )
         self._output_dir = output_dir
         self._injected_file_service = file_service
         self._fallback_file_service: FileProvider | None = None
@@ -870,7 +874,7 @@ class BuiltinTools:
                 },
                 "required": ["chapter", "name", "content"],
             },
-            self._memory_write,
+            self._memory_tools.write,
             source="builtin",
         )
 
@@ -906,7 +910,7 @@ class BuiltinTools:
                 },
                 "required": [],
             },
-            self._set_identity,
+            self._memory_tools.set_identity,
             source="builtin",
         )
 
@@ -927,7 +931,7 @@ class BuiltinTools:
                 },
                 "required": ["chapter", "name"],
             },
-            self._memory_read,
+            self._memory_tools.read,
             source="builtin",
         )
 
@@ -946,7 +950,7 @@ class BuiltinTools:
                 },
                 "required": ["query"],
             },
-            self._memory_search,
+            self._memory_tools.search,
             source="builtin",
         )
 
@@ -954,7 +958,7 @@ class BuiltinTools:
             "memory_index",
             "Show the memory palace index.",
             {"type": "object", "properties": {}, "required": []},
-            self._memory_index,
+            self._memory_tools.index,
             source="builtin",
         )
 
@@ -968,7 +972,7 @@ class BuiltinTools:
                 "do not use shell/SQLite and do not ask for a separate chat confirmation."
             ),
             {"type": "object", "properties": {}, "required": []},
-            self._memory_clear,
+            self._memory_tools.clear,
             source="builtin",
         )
 
@@ -3666,96 +3670,6 @@ class BuiltinTools:
             pattern=pattern,
             cursor=cursor,
             max_results=max_results,
-        )
-
-    def _memory_write(
-        self, chapter: str, name: str, content: str, append: bool = False
-    ) -> dict[str, Any]:
-        self.memory.write(chapter, name, content, append=append)
-        normalized = self.chapter_normalizer(chapter)
-        return self._ok(
-            action="append" if append else "write",
-            path=f"{normalized}/{name}",
-            bytes=len(content.encode("utf-8")),
-        )
-
-    def _set_identity(
-        self,
-        subject: str = "assistant",
-        name: Optional[str] = None,
-        role: Optional[str] = None,
-        persona: Optional[str] = None,
-    ) -> dict[str, Any]:
-        if name is None and role is None and persona is None:
-            return self._error(
-                "Nothing to set: provide at least one of name, role, or persona."
-            )
-        try:
-            applied = self.memory.set_identity(
-                subject=subject, name=name, role=role, persona=persona
-            )
-        except ValueError as exc:
-            return self._error(str(exc))
-        return self._ok(subject=subject, applied=applied)
-
-    def _memory_read(self, chapter: str, name: str) -> dict[str, Any]:
-        content = self.memory.read(chapter, name)
-        normalized = self.chapter_normalizer(chapter)
-        if not content:
-            return self._error(f"No memory file: {normalized}/{name}")
-        return self._ok(path=f"{normalized}/{name}", content=content)
-
-    def _memory_search(self, query: str, top_k: int = 10) -> dict[str, Any]:
-        results = self.memory.search(query)
-        top_k = max(1, min(int(top_k), 20))
-        items = results[:top_k]
-        return self._ok(query=query, count=len(items), items=items)
-
-    def _memory_index(self) -> dict[str, Any]:
-        return self._ok(content=self.memory.read_index())
-
-    async def _memory_clear(self) -> dict[str, Any]:
-        """Clear memory only after consent from the active human sink."""
-        from agent.core.output import _APPROVAL_LOCK
-
-        sink = _active_sink.get()
-        if sink is None or not getattr(sink, "interactive_confirmation", False):
-            return self._error(
-                "Clearing memory requires interactive human approval.",
-                requires_confirmation=True,
-            )
-        async with _APPROVAL_LOCK:
-            approved = await sink.on_tool_confirmation(
-                "memory_clear",
-                command=(
-                    "永久清空全部长期记忆、可检索对话历史、事实索引、"
-                    "工作状态和待整理记忆"
-                ),
-                risk_level="high",
-                reason="该操作不可恢复",
-                confirmation_token="",
-                scope=None,
-            )
-        if not approved:
-            return self._error("Memory clear was declined by the user.")
-
-        context_manager = None
-        with contextlib.suppress(Exception):
-            from agent.core.agent import _active_agent_context
-
-            active_ctx = _active_agent_context.get()
-            context_manager = (
-                active_ctx.metadata.get("context_manager")
-                if active_ctx is not None
-                else None
-            )
-        if context_manager is not None:
-            context_manager.on_memory_cleared()
-        deleted = self.memory.clear()
-        return self._ok(
-            action="clear",
-            deleted=sum(deleted.values()),
-            deleted_by_store=deleted,
         )
 
     def _context_retrieve(
