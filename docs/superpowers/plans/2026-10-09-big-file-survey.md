@@ -821,45 +821,89 @@ The ledger moved eight keys (`shell_permission_level`, `shell_sandbox_mode`,
 did not move. Thirty test call sites became `_shell_tools.run(...)` with no
 assertion changed.
 
+### 4.18 builtin_tools.py — plugins + user tools, the last cluster (`4de794f`)
+
+`agent/tools/builtin_tools.py` **2604 → 2067 lines**; thirteen methods and the
+six module-level helpers only they used became `PluginTools` in
+`agent/tools/plugin_tools.py`.
+
+**This cluster needed nothing from the host but the registry** — one injected
+value, no callbacks, which makes it the cleanest of the eighteen. Its six
+context keys reached through that registry are the whole dependency.
+
+The helpers travelled with it, and each carries a decision worth keeping:
+
+- **`canonicalize_plugin_source` rewrites `git://` to https** — port 9418 is a
+  legacy transport that home and corporate networks routinely block and that
+  carries no credentials; https, ssh and local paths are legitimate and stay.
+- **`plugin_executable_content` names what will *run*** — a Python entry point,
+  an MCP server or hooks is equivalent to executing arbitrary code, and the
+  install path must be able to say which one it is before a person approves it.
+- **`resolve_user_plugin_target` is a path-traversal boundary** for a name that
+  arrives from a model: canonical slug, direct child of the plugins directory.
+- **`plugin_install_lock` serialises installs process-wide** — an install is a
+  clone/validate/swap/reload transaction that two calls would interleave.
+- **`_PluginInstallError` is control flow, not failure** — it carries the
+  structured payload out of the middle of the transaction so a failed upgrade
+  can roll back and report the same shape.
+
+**Three structural ledgers followed the code**, which is this repository's
+guards doing the bookkeeping a move would otherwise get wrong:
+
+| ledger | what it said |
+| --- | --- |
+| `context_keys.py` | six keys' readers move to `plugin_tools.py` |
+| `state_ledger.py` | `_PLUGIN_INSTALL_LOCK` is a **REBOUND** global (assigned after `global`), so its coordinates moved — the guard first reported *"module-level mutable state outside the state ledger"*, then *"ledger entries that no longer exist"*, both pointing at the same line |
+| `core_services.py` | the owners of `registry`, `skill_catalog` and `mcp_client` moved with their writer |
+
+The tests showed the same coupling shape as the shell move, in a new place:
+**three `monkeypatch.setattr(tools, "_reload_plugins", …)` calls had to move onto
+`tools._plugin_tools`**, because the internal call is `self.reload_plugins()` on
+the cluster object — patching the host instance would no longer be seen. And
+`test_registry_context_boundary.py`, which drives `reload_plugins` *unbound*
+(`BuiltinTools._reload_plugins(tool)`), now drives `PluginTools.reload_plugins(tool)`.
+No assertion changed in either.
+
+Two cleanups came with it: the dead alias
+`_atomic_write_text = shared._atomic_write_text` (recorded in §3, verified as the
+only occurrence in the file and imported by nobody) is gone, and seven host
+imports that only this cluster used were removed.
+
+Two mistakes were caught by the guards written for the purpose: the AST check
+took *the first* `ClassDef` in the new module — which is `_PluginInstallError`,
+not `PluginTools` — and reported a class with only `__init__`; and the helper
+region's end was computed as three blank lines when the file has four.
+
 ## 5. Next
 
-**A correction first.** §5 previously said "only one cluster remains" after the
-context move. That was wrong: the survey's own list has **plugins + user tools**
-(427 lines, 13 methods) as a cluster in its own right, and an earlier rewrite of
-this section dropped it. It is still in `builtin_tools.py`, and it is measured
-here rather than quietly forgotten.
+**Every cluster in §1–§3 has now moved.** The three files went from **12292 to
+7244 lines** (web.py 4191 → 3204, feishu.py 2587 → 1973, builtin_tools.py 5514 →
+2067), with **seventeen** modules holding what left — and one defect found and
+fixed that the first six of those modules had introduced (§4.14).
 
-Progress: the three files went from **12292 to 7781 lines** (web.py 4191 → 3204,
-feishu.py 2587 → 1973, builtin_tools.py 5514 → 2604), with sixteen modules
-holding what left — plus one defect found and fixed that the first six of those
-modules had introduced (§4.14).
+What is left, and what each piece is:
 
-What is left in `builtin_tools.py` (2604 lines) is:
+1. **`_register`, 1656 lines of `builtin_tools.py`** — the registration table
+   itself, mounting forty-odd tools onto the cluster objects. §3's answer stands:
+   the extraction-friendly form is each cluster owning its own registrations
+   (a `TOOLS = (ToolSpec(...), ...)` per module), which is a **design change, not
+   a move**. It is deliberately not attempted here: every increment in this
+   document is behaviour-preserving by construction, and a registration
+   refactor is where "which tools does this deployment have" would become a
+   question with a different answer. It should be its own piece of work with its
+   own survey.
+2. **feishu.py's two leftovers** — `_ws_reconnect_delay` (12 lines, tested via
+   the WS back-off cases) and the resource-filename trio
+   (`_safe_resource_filename`, `_resource_fallback_filename`,
+   `_attachment_mime_type`, ~25 lines). Both should move with the clusters that
+   call them — the channel's reconnect loop and the download path — rather than
+   on their own, which is why they have waited.
+3. **`_current_time`** (21 lines) — a pure tool that has only ever sat next to
+   the web cluster. It belongs with whatever module ends up owning the
+   "miscellaneous single tools", or in a file of its own; it is small enough
+   that the choice is not worth a round on its own.
 
-| piece | lines | note |
-| --- | --- | --- |
-| `_register` | 1656 | the registration table itself; §3's answer is that each cluster module should own its own, which is a larger change than a move |
-| **plugins + user tools** | 427 | 13 methods, six registry context keys, and service-side guards (`test_plugin_catalog.py` 120 + `test_user_tools.py` 24) |
-| `_current_time` | 21 | a pure tool that only ever sat next to the web cluster |
-| shared accessors | ~110 | `_ok`, `_error`, `_schedule_store`, `_try_interactive_confirmation`, the workspace roots, `__init__` |
-
-So the remaining move is **plugins + user tools**, with two things already
-measured for it:
-
-1. **The authz-scope duplication is now cross-module.**  `_plugin_authorization_scope`
-   builds the same `ShellAuthorizationScope` from the same three metadata keys
-   that `ShellTools.run` builds inline (§1's finding, still open). One of the two
-   moves should leave a shared helper behind rather than a second copy.
-2. **`_try_interactive_confirmation` is already shared** — it stayed on the host
-   in §4.17 precisely so the plugin install path could keep using it.
-   `install_plugin` is one of its callers, so the plugin cluster takes it by
-   injection, exactly as shell does.
-
-Then feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
-trio — move with the clusters that call them (the channel's reconnect loop and
-the download path), not on their own.
-
-**For any of these: expose `registry`** (§4.14). A cluster whose methods are
+**For any further move: expose `registry`** (§4.14). A cluster whose methods are
 registered as tools and which hides that attribute will pass its unit tests and
 lose the session's context in production.
 
