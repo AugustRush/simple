@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import html
 import json
 import os
 import re
@@ -10,7 +9,6 @@ import shutil
 import shlex
 import signal
 import time
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,10 +21,6 @@ from agent.exec import ExecRequest, provider_from
 from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.scheduler.models import LOCAL_TIMEZONE, normalize_products
-from agent.security.network import (
-    fetch_public_http_url,
-    parse_proxy_url,
-)
 from agent.security.filesystem_sandbox import (
     SANDBOX_MODE_NONE,
     SandboxUnavailableError,
@@ -49,6 +43,7 @@ from agent.tools.files import (
 
 from .executor import report_tool_progress
 from .memory_tools import MemoryTools
+from .web_tools import TAVILY_SEARCH_MAX_RESULTS, WebTools
 from .runtime import ToolRegistry
 
 
@@ -56,11 +51,6 @@ from .runtime import ToolRegistry
 
 _atomic_write_text = shared._atomic_write_text
 
-WEB_FETCH_MAX_BYTES = 512 * 1024
-WEB_FETCH_TIMEOUT = 20
-
-#: ``web_proxy`` values that mean "never proxy", overriding the environment.
-_WEB_PROXY_DISABLED = frozenset({"none", "off", "no", "direct", "disable", "disabled"})
 
 #: How much of an upstream step's output ``read_step_output`` hands back.
 #:
@@ -81,12 +71,6 @@ READ_STEP_OUTPUT_MAX_CHARS = 40000
 #: characters of Chinese is 40000 tokens.  A quarter is a read that cannot by
 #: itself exhaust the window, and a run that wants more reads it in pieces.
 READ_STEP_OUTPUT_BUDGET_SHARE = 4
-WEB_SEARCH_MAX_RESULTS = 10
-TAVILY_SEARCH_MAX_RESULTS = 10
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-WEB_USER_AGENT = (
-    "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
-)
 #: How much of a failed run's text a tool result carries.
 #:
 #: The reason is what a caller acts on, and the whole of it -- along with the
@@ -506,6 +490,7 @@ class BuiltinTools:
         self._memory_tools = MemoryTools(
             memory, self.chapter_normalizer, self._ok, self._error
         )
+        self._web_tools = WebTools(self.registry, self._ok, self._error)
         self._output_dir = output_dir
         self._injected_file_service = file_service
         self._fallback_file_service: FileProvider | None = None
@@ -1899,7 +1884,7 @@ class BuiltinTools:
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": f"Maximum number of results to return (1-{WEB_SEARCH_MAX_RESULTS})",
+                        "description": f"Maximum number of results to return (1-{TAVILY_SEARCH_MAX_RESULTS})",
                         "default": 5,
                     },
                     "region": {
@@ -1910,7 +1895,7 @@ class BuiltinTools:
                 },
                 "required": ["query"],
             },
-            self._web_search,
+            self._web_tools.search,
             source="builtin",
         )
 
@@ -1941,7 +1926,7 @@ class BuiltinTools:
                 },
                 "required": ["url"],
             },
-            self._web_fetch,
+            self._web_tools.fetch,
             source="builtin",
         )
 
@@ -1976,7 +1961,7 @@ class BuiltinTools:
                 },
                 "required": ["query"],
             },
-            self._tavily_search,
+            self._web_tools.tavily_search,
             source="builtin",
         )
 
@@ -2700,119 +2685,6 @@ class BuiltinTools:
         except Exception as exc:
             return {"ok": False, "error": f"reload failed: {exc}"}
 
-    # ── Web tools ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _strip_html(raw: str) -> str:
-        """Very lightweight HTML → plain-text: remove tags, decode entities."""
-        # Remove <script> and <style> blocks entirely
-        raw = re.sub(
-            r"<(script|style)[^>]*>.*?</(script|style)>",
-            " ",
-            raw,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        # Remove all remaining tags
-        raw = re.sub(r"<[^>]+>", " ", raw)
-        # Decode HTML entities (e.g. &amp; &lt; &#39;)
-        raw = html.unescape(raw)
-        # Collapse whitespace
-        raw = re.sub(r"[ \t]+", " ", raw)
-        raw = re.sub(r"\n{3,}", "\n\n", raw)
-        return raw.strip()
-
-    def _web_proxy_for(self, url: str) -> tuple[Any, bool]:
-        """``(proxy, trust_env)`` for one fetch.
-
-        ``web_proxy`` in config wins outright: a proxy URL names the proxy to
-        use, and the words in ``_WEB_PROXY_DISABLED`` turn proxying off even
-        when the environment asks for one.  With no config value the standard
-        environment variables decide.
-
-        The network boundary deliberately does not read the environment on its
-        own — a security boundary must not change which address it dials
-        because of ambient configuration — so the choice is made here, where an
-        operator can also override it.
-        """
-        raw = self.registry.get_context("web_proxy", "")
-        if isinstance(raw, str) and raw.strip():
-            text = raw.strip()
-            if text.lower() in _WEB_PROXY_DISABLED:
-                return None, False
-            parsed = parse_proxy_url(text)
-            if parsed is not None:
-                return parsed, False
-        return None, True
-
-    def _make_urllib_request(self, url: str, timeout: int = WEB_FETCH_TIMEOUT) -> bytes:
-        """Fetch *url* through the validated network boundary.
-
-        Proxied when config or the environment names a proxy.  A machine behind
-        a fake-IP resolver needs this: every name answers with a reserved
-        address, which the direct path correctly refuses, so without the proxy
-        path nothing can be fetched at all.
-        """
-        proxy, trust_env = self._web_proxy_for(url)
-        result = fetch_public_http_url(
-            url,
-            timeout=timeout,
-            max_bytes=WEB_FETCH_MAX_BYTES,
-            proxy=proxy,
-            trust_env=trust_env,
-            headers={
-                "User-Agent": WEB_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            on_progress=lambda bytes_done, total: report_tool_progress(
-                status="downloading",
-                current=bytes_done,
-                total=total,
-                bytes_done=bytes_done,
-                bytes_total=total,
-            ),
-        )
-        return result.body
-
-    @staticmethod
-    def _make_tavily_request(
-        api_key: str,
-        query: str,
-        max_results: int,
-        search_depth: str,
-        include_answer: bool,
-    ) -> dict[str, Any]:
-        payload = json.dumps(
-            {
-                "api_key": api_key,
-                "query": query,
-                "max_results": max_results,
-                "search_depth": search_depth,
-                "include_answer": include_answer,
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            TAVILY_SEARCH_URL,
-            data=payload,
-            method="POST",
-            headers={
-                "User-Agent": WEB_USER_AGENT,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=WEB_FETCH_TIMEOUT) as resp:
-            raw = resp.read(WEB_FETCH_MAX_BYTES)
-        return json.loads(raw.decode("utf-8"))
-
-    def _resolve_tavily_api_key(self) -> str:
-        raw = self.registry.get_context("tavily_api_key", "")
-        if isinstance(raw, str) and raw.startswith("$"):
-            return os.environ.get(raw[1:], "")
-        if raw:
-            return str(raw)
-        return os.environ.get("TAVILY_API_KEY", "")
-
     def _current_time(self, timezone_name: str = "local") -> dict[str, Any]:
         try:
             if timezone_name == "local":
@@ -2834,119 +2706,6 @@ class BuiltinTools:
             utc_time=utc_now.isoformat(),
             unix_timestamp=int(local_now.timestamp()),
         )
-
-    async def _web_fetch(
-        self,
-        url: str,
-        max_chars: int = 8000,
-        raw_html: bool = False,
-    ) -> dict[str, Any]:
-        """Fetch a single URL and return its text content."""
-        url = url.strip()
-        if not url.startswith(("http://", "https://")):
-            return self._error("URL must start with http:// or https://", url=url)
-        max_chars = max(100, min(int(max_chars), WEB_FETCH_MAX_BYTES))
-        try:
-            raw_bytes = await asyncio.to_thread(self._make_urllib_request, url)
-            # Decode – UTF-8 with replacement (never raises)
-            raw_text = raw_bytes.decode("utf-8", errors="replace")
-            # The network layer caps the body at WEB_FETCH_MAX_BYTES and does
-            # not signal the cut, so a page that fills the cap must be reported
-            # as truncated even when the char limit below would not have.
-            truncated_network = len(raw_bytes) >= WEB_FETCH_MAX_BYTES
-
-            if raw_html:
-                body = raw_text[:max_chars]
-                truncated = truncated_network or len(raw_text) > max_chars
-            else:
-                body = self._strip_html(raw_text)
-                truncated = truncated_network or len(body) > max_chars
-                body = body[:max_chars]
-
-            return self._ok(
-                url=url,
-                content=body,
-                truncated=truncated,
-                chars=len(body),
-            )
-        except Exception as exc:
-            return self._error(f"Fetch failed: {exc}", url=url)
-
-    async def _web_search(
-        self,
-        query: str,
-        max_results: int = 5,
-        region: str = "wt-wt",
-    ) -> dict[str, Any]:
-        """Search the web through the Tavily backend under the generic tool name."""
-        response = await self._tavily_search(
-            query=query,
-            max_results=max_results,
-            search_depth="basic",
-            include_answer=False,
-        )
-        if response.get("ok"):
-            response["backend"] = "tavily"
-            if region != "wt-wt":
-                response["note"] = (
-                    "web_search now uses Tavily; DuckDuckGo region hints are ignored."
-                )
-        return response
-
-    async def _tavily_search(
-        self,
-        query: str,
-        max_results: int = 5,
-        search_depth: str = "basic",
-        include_answer: bool = False,
-    ) -> dict[str, Any]:
-        api_key = self._resolve_tavily_api_key()
-        if not api_key:
-            return self._error(
-                "Tavily API key not configured. Set TAVILY_API_KEY or registry context 'tavily_api_key'.",
-                query=query,
-            )
-
-        max_results = max(1, min(int(max_results), TAVILY_SEARCH_MAX_RESULTS))
-        search_depth = str(search_depth).strip().lower() or "basic"
-        if search_depth not in {"basic", "advanced"}:
-            return self._error(
-                "search_depth must be 'basic' or 'advanced'",
-                query=query,
-                search_depth=search_depth,
-            )
-
-        try:
-            payload = await asyncio.to_thread(
-                self._make_tavily_request,
-                api_key,
-                query.strip(),
-                max_results,
-                search_depth,
-                include_answer,
-            )
-        except Exception as exc:
-            return self._error(f"Tavily search failed: {exc}", query=query)
-
-        items = []
-        for result in payload.get("results", [])[:max_results]:
-            items.append(
-                {
-                    "title": result.get("title", ""),
-                    "url": result.get("url", ""),
-                    "snippet": result.get("content", ""),
-                    "score": result.get("score"),
-                }
-            )
-
-        response = self._ok(
-            query=query,
-            count=len(items),
-            results=items,
-        )
-        if payload.get("answer"):
-            response["answer"] = payload["answer"]
-        return response
 
     def _ok(self, **payload: Any) -> dict[str, Any]:
         return {"ok": True, **payload}

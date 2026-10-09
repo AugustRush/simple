@@ -234,12 +234,12 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="web_proxy",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/web_tools.py",),
     ),
     ContextKey(
         key="tavily_api_key",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/web_tools.py",),
     ),
     ContextKey(
         key="audio_transcription_command",

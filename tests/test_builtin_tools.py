@@ -1376,7 +1376,7 @@ def test_tavily_search_requires_api_key(tmp_path):
 
 
 def test_tavily_search_returns_normalized_results(tmp_path, monkeypatch):
-    from agent import BuiltinTools
+    from agent.tools.web_tools import WebTools
 
     tools, registry, _ = make_builtin_tools(tmp_path)
     registry.set_context("tavily_api_key", "test-key")
@@ -1400,7 +1400,7 @@ def test_tavily_search_returns_normalized_results(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(
-        BuiltinTools, "_make_tavily_request", staticmethod(fake_request)
+        WebTools, "make_tavily_request", staticmethod(fake_request)
     )
 
     result = asyncio.run(
@@ -1431,7 +1431,7 @@ def test_tavily_search_returns_normalized_results(tmp_path, monkeypatch):
 
 
 def test_web_search_delegates_to_tavily_backend(tmp_path, monkeypatch):
-    from agent import BuiltinTools
+    from agent.tools.web_tools import WebTools
 
     tools, registry, _ = make_builtin_tools(tmp_path)
 
@@ -1449,7 +1449,7 @@ def test_web_search_delegates_to_tavily_backend(tmp_path, monkeypatch):
             ],
         }
 
-    monkeypatch.setattr(BuiltinTools, "_tavily_search", fake_tavily)
+    monkeypatch.setattr(WebTools, "tavily_search", fake_tavily)
 
     result = asyncio.run(
         registry.call("web_search", {"query": "latest ai news", "max_results": 3})
@@ -1462,8 +1462,6 @@ def test_web_search_delegates_to_tavily_backend(tmp_path, monkeypatch):
 
 
 def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
-    from agent import BuiltinTools
-
     tools, _, _ = make_builtin_tools(tmp_path)
     called = {}
 
@@ -1474,10 +1472,10 @@ def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
 
-    result = asyncio.run(tools._web_fetch("https://example.com"))
+    result = asyncio.run(tools._web_tools.fetch("https://example.com"))
 
     assert result["ok"] is True
-    assert called["fn"] == tools._make_urllib_request
+    assert called["fn"] == tools._web_tools.make_urllib_request
     assert called["args"] == ("https://example.com",)
 
 
@@ -1491,22 +1489,22 @@ def test_web_proxy_config_overrides_the_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
 
     # No config: defer to the environment.
-    proxy, trust_env = tools._web_proxy_for("https://example.com/")
+    proxy, trust_env = tools._web_tools.proxy_for("https://example.com/")
     assert (proxy, trust_env) == (None, True)
 
     # An explicit URL wins, and the environment is then not consulted.
     registry.set_context("web_proxy", "http://127.0.0.1:7897")
-    proxy, trust_env = tools._web_proxy_for("https://example.com/")
+    proxy, trust_env = tools._web_tools.proxy_for("https://example.com/")
     assert (proxy.host, proxy.port, trust_env) == ("127.0.0.1", 7897, False)
 
     # "none" forces direct connections even when the environment asks.
     registry.set_context("web_proxy", "none")
-    assert tools._web_proxy_for("https://example.com/") == (None, False)
+    assert tools._web_tools.proxy_for("https://example.com/") == (None, False)
 
     # An unusable value is not silently treated as "no proxy": the environment
     # still applies, so a typo degrades to the previous behaviour.
     registry.set_context("web_proxy", "socks5://127.0.0.1:1080")
-    proxy, trust_env = tools._web_proxy_for("https://example.com/")
+    proxy, trust_env = tools._web_tools.proxy_for("https://example.com/")
     assert (proxy, trust_env) == (None, True)
 
 
@@ -1528,7 +1526,7 @@ def test_web_fetch_reports_download_progress(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(
-        "agent.tools.builtin_tools.fetch_public_http_url",
+        "agent.tools.web_tools.fetch_public_http_url",
         fake_fetch,
     )
 
@@ -1558,8 +1556,6 @@ def test_web_fetch_reports_download_progress(tmp_path, monkeypatch):
 
 
 def test_tavily_search_uses_asyncio_to_thread(tmp_path, monkeypatch):
-    from agent import BuiltinTools
-
     tools, registry, _ = make_builtin_tools(tmp_path)
     registry.set_context("tavily_api_key", "test-key")
     called = {}
@@ -1575,7 +1571,7 @@ def test_tavily_search_uses_asyncio_to_thread(tmp_path, monkeypatch):
     payload = json.loads(result)
 
     assert payload["ok"] is True
-    assert called["fn"] == tools._make_tavily_request
+    assert called["fn"] == tools._web_tools.make_tavily_request
     assert called["args"] == ("test-key", "latest ai news", 5, "basic", False)
 
 
