@@ -785,6 +785,108 @@ def test_a_turn_that_raises_tells_the_browser_instead_of_going_quiet():
             assert "machinery broke" in event["error"], events
 
 
+def test_one_definition_of_a_web_session_id():
+    """An id names a directory, so one predicate has to decide what is valid.
+
+    The endpoint used to accept 8-128 characters while ``web_session_home``
+    accepted at most 64.  A 65-character id therefore passed validation and was
+    then written into the shared ``unknown`` directory -- two such sessions
+    sharing one home, which is the isolation the web channel exists to provide.
+    """
+    from agent import shared
+
+    assert shared.is_valid_web_session_id("a" * 64)
+    assert shared.is_valid_web_session_id("web-isolation_2")
+    for rejected in ("a" * 65, "", "   ", "with space", "slash/yes", "dot.dot"):
+        assert not shared.is_valid_web_session_id(rejected), rejected
+
+    # The predicate is exactly what the storage layer enforces: an id this says
+    # yes to must be one ``web_session_home`` can resolve, and no other.
+    for value in ("a" * 64, "a" * 65, "", "with space", "web-isolation_2"):
+        try:
+            shared.web_session_home(value)
+            resolvable = True
+        except ValueError:
+            resolvable = False
+        assert resolvable == shared.is_valid_web_session_id(value), value
+
+
+def test_the_upload_endpoint_refuses_an_id_the_storage_cannot_resolve():
+    """What this endpoint accepts, the storage layer must be able to resolve.
+
+    The check used to be ``{8,128}`` while ``web_session_home`` allowed at most
+    64, so a 65-character id was accepted and then written into the shared
+    ``unknown`` directory.  The endpoint now asks the same question the storage
+    layer asks, which also means the minimum moved to 1 -- the length was never
+    what made an id safe, and the storage rule is the one that matters.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        too_long = client.post(
+            f"/api/sessions/{'a' * 65}/attachments",
+            files={"files": ("note.txt", b"hello", "text/plain")},
+        )
+        assert too_long.status_code == 400, too_long.text
+
+        # The other direction of the same agreement: an id the storage layer
+        # accepts is one this endpoint serves.
+        short = client.post(
+            f"/api/sessions/{'a' * 7}/attachments",
+            files={"files": ("note.txt", b"hello", "text/plain")},
+        )
+        assert short.status_code == 200, short.text
+
+
+def test_the_stream_refuses_an_id_it_cannot_resolve_instead_of_truncating():
+    """An id that cannot name a session must not be served from another home."""
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = _echo_handler
+
+    with TestClient(channel.app) as client:
+        with client.websocket_connect(f"/api/sessions/{'a' * 65}/stream") as ws:
+            ws.send_json({"type": "message", "text": "hi"})
+            event = ws.receive_json()
+            assert event["type"] == "error", event
+            assert "invalid session id" in event["error"]
+
+
+def test_a_session_id_binds_the_turn_to_that_sessions_own_home():
+    """``re.sub(...)[:32]`` used to rewrite the id, so a 40-character session
+    ran in the 32-character one's home -- a different session, silently.  The
+    sink the handler receives now names the home of the id that was asked for.
+    """
+    from starlette.testclient import TestClient
+
+    from agent import shared
+
+    seen: dict[str, str] = {}
+
+    async def recording_handler(msg, sink):
+        seen["output_dir"] = str(getattr(sink, "_output_dir", ""))
+        sink.on_turn_complete("done", [])
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = recording_handler
+    sid = "a" * 40
+
+    with TestClient(channel.app) as client:
+        with client.websocket_connect(f"/api/sessions/{sid}/stream") as ws:
+            ws.send_json({"type": "message", "text": "hi"})
+            while ws.receive_json()["type"] != "turn_complete":
+                pass
+
+    assert seen["output_dir"] == str(shared.web_session_home(sid) / "output")
+    assert seen["output_dir"] != str(shared.web_session_home(sid[:32]) / "output")
+
+
 def test_web_auth_token_required():
     from starlette.testclient import TestClient
 

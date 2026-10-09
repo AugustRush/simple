@@ -47,10 +47,23 @@ def web_session_root() -> Path:
     return AGENT_HOME / "web" / "sessions"
 
 
+#: What a Web session id may be.  One definition, because an id is not just a
+#: label: it becomes a directory name under ``web_session_root()``, so anything
+#: an endpoint accepts has to be something the storage layer can resolve.  Two
+#: rules is how an accepted id ends up silently served from a shared home.
+_WEB_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+
+
+def is_valid_web_session_id(session_id: object) -> bool:
+    """Whether *session_id* names a Web session this process can resolve."""
+    clean = str(session_id or "").strip()
+    return bool(clean) and _WEB_SESSION_ID_RE.fullmatch(clean) is not None
+
+
 def web_session_home(session_id: str) -> Path:
     """Return the filesystem home for one Web session."""
     clean = str(session_id or "").strip()
-    if not clean or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", clean) is None:
+    if not is_valid_web_session_id(clean):
         raise ValueError("invalid web session id")
     return web_session_root() / clean
 

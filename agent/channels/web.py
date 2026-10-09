@@ -86,6 +86,13 @@ def _web_session_output_dir(session_id: str) -> Path:
     try:
         return shared.web_session_home(str(session_id)) / "output"
     except ValueError:
+        # Never silent: every caller validates the id first, so reaching this
+        # means two sessions would share one directory -- the isolation the web
+        # channel exists to provide.  Log it rather than fall back quietly.
+        logger.warning(
+            "unresolvable web session id, sharing the unknown output home: %r",
+            session_id,
+        )
         return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "output"
 
 
@@ -93,6 +100,10 @@ def _web_session_upload_dir(session_id: str) -> Path:
     try:
         return shared.web_session_home(str(session_id)) / "uploads"
     except ValueError:
+        logger.warning(
+            "unresolvable web session id, sharing the unknown upload home: %r",
+            session_id,
+        )
         return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "uploads"
 
 
@@ -743,7 +754,12 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         session_id = str(request.path_params["session_id"])
-        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+        # The same predicate the storage layer uses, so an id this endpoint
+        # accepts is always one ``web_session_home`` can resolve.  Its own
+        # regex used to allow up to 128 characters while the home allowed 64:
+        # a 65-character id was accepted here and then written into the shared
+        # ``unknown`` directory, silently sharing it with every other such id.
+        if not shared.is_valid_web_session_id(session_id):
             return JSONResponse({"error": "invalid session id"}, status_code=400)
         try:
             form = await request.form()
@@ -2601,15 +2617,20 @@ class WebChannel(Channel):
         if not text and not body.get("attachments"):
             return JSONResponse({"error": "text is required"}, status_code=400)
 
-        session_id = request.path_params["session_id"]
+        session_id = str(request.path_params["session_id"])
+        # Refuse rather than rewrite.  The id names a directory, and the old
+        # sanitise-and-truncate turned an unusable id into a *different* valid
+        # one: the turn then ran in another session's home (or the shared
+        # ``unknown`` one) while answering this request.
+        if not shared.is_valid_web_session_id(session_id):
+            return JSONResponse({"error": "invalid session id"}, status_code=400)
         message_id = str(body.get("message_id") or uuid.uuid4().hex)
-        clean_sid = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
         sink = WebOutputSink(
             collect=True,
             on_attachment=lambda path, name: self._record_attachment(
                 session_id, path, name, turn_id=message_id
             ),
-            output_dir=_web_session_output_dir(clean_sid),
+            output_dir=_web_session_output_dir(session_id),
             turn_id=message_id,
         )
         sink.mark_turn_start()
@@ -2693,8 +2714,13 @@ class WebChannel(Channel):
             await websocket.close(code=1011)
             return
 
-        session_id = websocket.path_params["session_id"]
-        clean_sid = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
+        session_id = str(websocket.path_params["session_id"])
+        if not shared.is_valid_web_session_id(session_id):
+            # Same reason as the HTTP path above: an id that cannot name a
+            # session must not be served from another one's home.
+            await websocket.send_json({"type": "error", "error": "invalid session id"})
+            await websocket.close(code=1008)
+            return
         # A previous tab may have been switched away while this session was
         # still generating. Rebind its sinks to the new socket and publish the
         # text generated so far before receiving new input.
@@ -2763,7 +2789,7 @@ class WebChannel(Channel):
             # reset its turn markers and make queued messages look completed.
             sink = WebOutputSink(
                 websocket=websocket,
-                output_dir=_web_session_output_dir(clean_sid),
+                output_dir=_web_session_output_dir(session_id),
                 confirmation_handler=wait_for_confirmation,
                 turn_id=message_id,
             )
