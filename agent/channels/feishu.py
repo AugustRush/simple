@@ -65,6 +65,11 @@ from agent.channels.feishu_parsing import (
     extract_post_content,
     is_group_chat_type,
 )
+from agent.channels.feishu_files import (
+    attachment_mime_type,
+    resource_fallback_filename,
+    safe_resource_filename,
+)
 from agent.channels.feishu_attachments import (
     _ATTACHMENT_BATCH_CAPACITY_ERROR,
     _AttachmentBatchCapacityLease,
@@ -1482,32 +1487,6 @@ class FeishuChannel(Channel):
         self._active_sinks.append(sink)
         return sink
 
-    @staticmethod
-    def _safe_resource_filename(filename: str, fallback: str) -> str:
-        name = Path(str(filename or fallback)).name.strip()
-        return name or fallback
-
-    def _attachment_mime_type(self, path: Path, msg_type: str) -> str:
-        guessed = mimetypes.guess_type(path.name)[0]
-        if guessed:
-            return guessed
-        if msg_type == "image":
-            return "image/png"
-        if msg_type == "audio":
-            return "audio/mpeg"
-        if msg_type in ("media", "video"):
-            return "video/mp4"
-        return "application/octet-stream"
-
-    def _resource_fallback_filename(self, resource_key: str, resource_type: str) -> str:
-        if resource_type == "image":
-            return f"{resource_key}.png"
-        if resource_type == "audio":
-            return f"{resource_key}.mp3"
-        if resource_type in ("media", "video"):
-            return f"{resource_key}.mp4"
-        return resource_key
-
     def _message_attachment_specs(
         self,
         msg_type: str,
@@ -1517,9 +1496,9 @@ class FeishuChannel(Channel):
         if msg_type == "image":
             key = content_json.get("image_key") or content_json.get("file_key")
             if key:
-                filename = self._safe_resource_filename(
+                filename = safe_resource_filename(
                     content_json.get("file_name", ""),
-                    self._resource_fallback_filename(str(key), "image"),
+                    resource_fallback_filename(str(key), "image"),
                 )
                 specs.append((str(key), "image", filename))
         elif msg_type == "post":
@@ -1529,7 +1508,7 @@ class FeishuChannel(Channel):
                     (
                         str(key),
                         "image",
-                        self._resource_fallback_filename(str(key), "image"),
+                        resource_fallback_filename(str(key), "image"),
                     )
                 )
         elif msg_type in ("file", "audio", "media", "video"):
@@ -1540,9 +1519,9 @@ class FeishuChannel(Channel):
             )
             if key:
                 resource_type = "file" if msg_type == "file" else msg_type
-                filename = self._safe_resource_filename(
+                filename = safe_resource_filename(
                     content_json.get("file_name", "") or content_json.get("name", ""),
-                    self._resource_fallback_filename(str(key), resource_type),
+                    resource_fallback_filename(str(key), resource_type),
                 )
                 specs.append((str(key), resource_type, filename))
         return specs
@@ -1563,7 +1542,7 @@ class FeishuChannel(Channel):
             )
             if path is None:
                 continue
-            mime_type = self._attachment_mime_type(path, resource_type)
+            mime_type = attachment_mime_type(path, resource_type)
             try:
                 size = path.stat().st_size
             except OSError:
@@ -1602,7 +1581,7 @@ class FeishuChannel(Channel):
         filename: str,
     ) -> Optional[Path]:
         assert self._client is not None, "FeishuChannel.start() not called"
-        safe_name = self._safe_resource_filename(filename, resource_key)
+        safe_name = safe_resource_filename(filename, resource_key)
         output_dir = self._input_dir / message_id
         path = output_dir / safe_name
 
