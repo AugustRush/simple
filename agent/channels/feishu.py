@@ -56,6 +56,10 @@ from agent import _fmt_tool_inputs, shared
 from agent.channels import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core import OutputSink, SubAgentProgressEvent
+from agent.channels.feishu_progress import (
+    format_mode_aware_subagent_event,
+    format_tool_progress_line,
+)
 from agent.channels.feishu_render import (
     MD_ELEMENT_CHAR_LIMIT,
     build_card_elements,
@@ -519,7 +523,7 @@ class FeishuOutputSink(OutputSink):
         if not self.streaming or self._progress_fail_count >= 3:
             return
         operation_id = str(progress.get("operation_id") or name)
-        self._tool_progress_lines[operation_id] = self._format_tool_progress_line(
+        self._tool_progress_lines[operation_id] = format_tool_progress_line(
             name,
             progress,
         )
@@ -599,7 +603,7 @@ class FeishuOutputSink(OutputSink):
             self._last_batch_progress_key = key
         elif event.kind == "batch_finished":
             self._last_batch_progress_key = None
-        line = self._format_mode_aware_subagent_event(event)
+        line = format_mode_aware_subagent_event(event)
         if not line:
             return
         if not self.streaming:
@@ -1078,38 +1082,6 @@ class FeishuOutputSink(OutputSink):
         for attachment in self._attachments:
             await self._send_file_async(attachment.path)
 
-    @staticmethod
-    def _format_byte_count(value: Any) -> str | None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        size = float(value)
-        units = ("B", "KB", "MB", "GB")
-        for unit in units:
-            if size < 1024 or unit == units[-1]:
-                return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
-            size /= 1024
-        return None
-
-    def _format_tool_progress_line(self, name: str, progress: dict[str, Any]) -> str:
-        status = str(progress.get("status") or "running").replace("_", " ")
-        message = str(progress.get("message") or "").strip()
-        current = progress.get("current")
-        total = progress.get("total")
-        suffix = ""
-        if isinstance(current, (int, float)) and isinstance(total, (int, float)) and total:
-            suffix = f" {float(current) / float(total) * 100:.0f}%"
-
-        bytes_done = self._format_byte_count(progress.get("bytes_done"))
-        bytes_total = self._format_byte_count(progress.get("bytes_total"))
-        byte_part = ""
-        if bytes_done and bytes_total:
-            byte_part = f" ({bytes_done}/{bytes_total})"
-        elif bytes_done:
-            byte_part = f" ({bytes_done})"
-
-        detail = f" - {message}" if message else ""
-        return f"- **{name}**: {status}{suffix}{byte_part}{detail}"
-
     # ── Synchronous Feishu API calls (run in thread-pool) ─────────────────────
 
     def _create_streaming_card_sync(self) -> str | None:
@@ -1356,152 +1328,6 @@ class FeishuOutputSink(OutputSink):
             self._progress_buf.text = "## Multi-Agent Progress\n\n" + line
             return
         self._progress_buf.text += "\n\n" + line
-
-    def _format_mode_aware_subagent_event(self, event: SubAgentProgressEvent) -> str:
-        if event.kind == "batch_started":
-            formatted = self._format_batch_started_event(event)
-            if formatted:
-                return formatted
-        if event.kind == "batch_finished":
-            formatted = self._format_batch_finished_event(event)
-            if formatted:
-                return formatted
-        return self._format_subagent_event(event)
-
-    @staticmethod
-    def _positive_int(value: Any) -> int | None:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            candidate = int(value)
-            return candidate if candidate > 0 else None
-        return None
-
-    @classmethod
-    def _event_spec_count(cls, event: SubAgentProgressEvent) -> int | None:
-        return cls._positive_int(event.metrics.get("spec_count")) or cls._positive_int(
-            event.total
-        )
-
-    @classmethod
-    def _format_seconds(cls, value: Any, *, precision: int) -> str | None:
-        if isinstance(value, bool):
-            return None
-        if not isinstance(value, (int, float)):
-            return None
-        return f"{float(value):.{precision}f}s"
-
-    @staticmethod
-    def _pluralize(value: int, singular: str) -> str:
-        return singular if value == 1 else f"{singular}s"
-
-    def _format_batch_started_event(self, event: SubAgentProgressEvent) -> str | None:
-        metrics = event.metrics or {}
-        mode = str(metrics.get("execution_mode", "") or "").strip().lower()
-        spec_count = self._event_spec_count(event)
-        if mode == "parallel" and spec_count is not None:
-            max_parallel_agents = self._positive_int(metrics.get("max_parallel_agents"))
-            if max_parallel_agents is None:
-                return None
-            return (
-                f"Parallel batch: {spec_count} subtasks, "
-                f"max concurrency {max_parallel_agents}"
-            )
-        if mode == "pipeline" and spec_count is not None:
-            return (
-                f"Pipeline batch: {spec_count} subtasks, "
-                "dependency-driven execution"
-            )
-        if mode == "rendezvous" and spec_count is not None:
-            max_rounds = self._positive_int(
-                metrics.get("max_rounds") or metrics.get("max_rendezvous_rounds")
-            )
-            if max_rounds is not None:
-                return (
-                    f"Rendezvous batch: {spec_count} subtasks, "
-                    f"max {max_rounds} {self._pluralize(max_rounds, 'round')}"
-                )
-            return f"Rendezvous batch: {spec_count} subtasks"
-        return None
-
-    def _format_batch_finished_event(self, event: SubAgentProgressEvent) -> str | None:
-        metrics = event.metrics or {}
-        mode = str(metrics.get("execution_mode", "") or "").strip().lower()
-        spec_count = self._event_spec_count(event)
-        completed = self._positive_int(event.completed) or 0
-        duration = self._format_seconds(metrics.get("duration_seconds"), precision=2)
-
-        if mode == "parallel" and spec_count is not None and completed and duration:
-            line = f"Parallel batch finished: {completed}/{spec_count} in {duration}"
-            scope_check = self._format_seconds(
-                metrics.get("write_scope_check_seconds"),
-                precision=3,
-            )
-            if scope_check is not None:
-                line += f" (scope check {scope_check})"
-            return line
-
-        if mode == "pipeline" and spec_count is not None and completed and duration:
-            stage_count = self._positive_int(metrics.get("stage_count"))
-            if stage_count is None:
-                return None
-            prefix = (
-                "Pipeline batch ended early"
-                if completed < spec_count
-                else "Pipeline batch finished"
-            )
-            return (
-                f"{prefix}: {completed}/{spec_count} across {stage_count} "
-                f"{self._pluralize(stage_count, 'stage')} in {duration}"
-            )
-
-        if mode == "rendezvous" and spec_count is not None and duration:
-            rounds_completed = self._positive_int(metrics.get("rounds_completed"))
-            if rounds_completed is None:
-                return None
-            return (
-                f"Rendezvous batch finished: {spec_count} subtasks, "
-                f"{rounds_completed} {self._pluralize(rounds_completed, 'round')} "
-                f"in {duration}"
-            )
-
-        return None
-
-    @staticmethod
-    def _format_subagent_event(event: SubAgentProgressEvent) -> str:
-        role = event.role or "agent"
-        kind = event.kind
-        # Phase events: runtime generates good messages; prefix with an
-        # emoji for visual hierarchy.
-        if kind == "phase_started":
-            prefix = "▸ "
-            return f"{prefix}{event.message}" if event.message else f"{prefix}Started"
-        if kind == "phase_finished":
-            prefix = "▾ "
-            return f"{prefix}{event.message}" if event.message else f"{prefix}Complete"
-        if kind == "phase_note":
-            return f"💬 {event.message}" if event.message else ""
-        # Agent lifecycle events: always use the new structured format
-        # since it includes role, status, and duration.
-        if kind == "agent_started":
-            return f"→ **{role}** started"
-        if kind == "agent_finished":
-            dur = event.metrics.get("duration_seconds")
-            dur_str = f" ({dur:.1f}s)" if isinstance(dur, (int, float)) else ""
-            return f"✓ **{role}** finished{dur_str}"
-        if kind == "agent_failed":
-            return f"✗ **{role}** failed"
-        if kind == "agent_retry":
-            return f"↻ **{role}** retry"
-        # Batch-level events: use the runtime's pre-computed message
-        # when available, otherwise a minimal fallback.
-        if kind == "batch_started":
-            return event.message or f"Starting {event.total} sub-agents"
-        if kind == "batch_progress":
-            return event.message or f"Running: {event.completed}/{event.total}"
-        if kind == "batch_finished":
-            return event.message or f"Batch finished: {event.completed}/{event.total}"
-        return event.message or ""
 
     def _do_send(self, msg_type: str, content: str) -> None:
         """Send one message, using Reply API for the first message of a response."""
