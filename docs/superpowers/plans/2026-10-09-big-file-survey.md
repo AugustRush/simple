@@ -444,32 +444,69 @@ spellings of "ok". Every memory test already drove the tools through
    `test_memory_clear_uses_human_confirmation_and_storage_api` caught it. The
    fix imports it in the new module, with a comment saying why.
 
-A free-name scan over all five extracted modules now reports no dangling
-globals; it is worth turning into a repository guard, since the failure mode it
-found is invisible to a reader and only surfaces on the path a test happens to
-cover.
+A free-name scan over all five extracted modules reported no dangling globals
+after the fix. **It was then measured as a candidate repository guard and
+rejected**: run across `agent/`, the same scanner produces 452 findings, almost
+all of them false — closure variables, walrus bindings, `with … as` targets and
+comprehension variables that a naive scope walk cannot see. Turning it into a
+guard would mean writing a real scope analyser, not a heuristic. The defect it
+found was caught by the suite anyway (`memory_clear`'s test); the scanner's
+value was in pointing at *why* the test failed, not in replacing it.
+
+### 4.7 builtin_tools.py — the web cluster, and one bound with two names (`015d03a`)
+
+`agent/tools/builtin_tools.py` **5428 → 5187 lines**; the three registrations
+that make up `web_fetch` / `web_search` / `tavily_search` (eight methods) became
+`WebTools` in `agent/tools/web_tools.py`, in the same injected-responder form as
+`MemoryTools`.
+
+The recorded finding about the search bound was closed on the way: the schemas
+advertised `WEB_SEARCH_MAX_RESULTS` while the handler clamped with
+`TAVILY_SEARCH_MAX_RESULTS` — two names, both `10`, free to drift. The schemas
+now quote the enforced constant and the advertised-only name is gone.
+
+This move is the first one whose blast radius was mostly in the **tests**, and
+it is worth recording what that looked like, because it is the splice risk in
+test form:
+
+- two `monkeypatch.setattr(BuiltinTools, "_make_tavily_request" / "_tavily_search", …)`
+  targeted private methods by class;
+- one patch targeted a **module path**,
+  `agent.tools.builtin_tools.fetch_public_http_url` — the function moved house,
+  so the patch's address had to move too, or the test would have silently
+  stopped exercising the thing it was written to exercise;
+- four direct calls into `tools._web_*`, and two now-unused `BuiltinTools`
+  imports.
+
+A structural guard caught the rest on its own: `tests/test_context_keys.py`
+holds the ledger of which file reads each context key, and it failed with
+*"web_proxy: agent/tools/builtin_tools.py does not read it; web_tools.py reads
+it but is not listed"* — exactly the sentence needed to fix
+`agent/runtime/context_keys.py`. That is the ledger doing the job it exists for.
+
+The receiver guard needed the opposite polarity this time: `strip_html` and
+`make_tavily_request` are `@staticmethod`, so "every method keeps its receiver"
+is false for them. The guard is now decorator-aware (`static ⇔ no self`).
 
 ## 5. Next
 
-The order in §1–§3 is the plan; the cheapest four entries are now done (web
-payloads and sink, feishu renderer and progress, memory). What remains, cheapest
-first:
+The order in §1–§3 is the plan; the cheapest five entries are now done (web
+payloads and sink, feishu renderer and progress, builtin memory and web). What
+remains, cheapest first:
 
-1. builtin_tools.py **web** (235 lines, 9 methods, leaf state `registry` with
-   two context keys, 8 guards) — same injected-responder form as `MemoryTools`,
-   and now that the form exists the move is mechanical.
-2. builtin_tools.py **output housekeeping** (`_clean_output`, 33 lines, leaf
-   state `{_output_dir}`, 7 guards) — the smallest remaining cluster, and the
-   only conditional registration, which becomes structural once it lives with
-   the output directory.
-3. feishu.py **A** (the attachment lease trio, 92 lines plus the module-level
+1. builtin_tools.py **output housekeeping** (`_clean_output`, 33 lines, leaf
+   state `{_output_dir}`, 7 guards). Small, but it is the one cluster whose
+   registration is *conditional* (`if self._output_dir is not None`), so the
+   move has to decide where the condition lives rather than just where the
+   method lives — that is the whole of the work.
+2. feishu.py **A** (the attachment lease trio, 92 lines plus the module-level
    semaphore) and **M** (the module-level parsing helpers) — both already
-   module-level, so the work is choosing their home rather than unwinding a
+   module-level, so the task is choosing their home rather than unwinding a
    class.
-4. builtin_tools.py **signals + step output**, then **scheduler + workflows**
-   as one move (the survey measured that they cannot be separated), then
-   **files**, **audio**, **shell**, **context** — in that order, because the
-   coupling grows monotonically along it.
+3. builtin_tools.py **signals + step output**, then **scheduler + workflows** as
+   one move (the survey measured that they cannot be separated), then **files**,
+   **audio**, **shell**, **context** — in that order, because the coupling grows
+   monotonically along it.
 
 `_register`'s 1656 lines stay for now: the survey's answer is that each cluster
 module owns its own registration table, and that is a larger piece than the
