@@ -1603,11 +1603,6 @@ class BuiltinTools:
                         "description": f"Maximum number of results to return (1-{TAVILY_SEARCH_MAX_RESULTS})",
                         "default": 5,
                     },
-                    "region": {
-                        "type": "string",
-                        "description": "DuckDuckGo region code, e.g. 'wt-wt' (worldwide), 'us-en', 'cn-zh'. Default: 'wt-wt'",
-                        "default": "wt-wt",
-                    },
                 },
                 "required": ["query"],
             },

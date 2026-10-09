@@ -226,9 +226,13 @@ class WebTools:
         self,
         query: str,
         max_results: int = 5,
-        region: str = "wt-wt",
     ) -> dict[str, Any]:
-        """Search the web through the Tavily backend under the generic tool name."""
+        """Search the web through the Tavily backend under the generic tool name.
+
+        There is no ``region`` parameter: it was a DuckDuckGo hint, Tavily has no
+        equivalent, and advertising a knob that does nothing is how a model comes
+        to believe it localised a search it did not.
+        """
         response = await self.tavily_search(
             query=query,
             max_results=max_results,
@@ -237,10 +241,6 @@ class WebTools:
         )
         if response.get("ok"):
             response["backend"] = "tavily"
-            if region != "wt-wt":
-                response["note"] = (
-                    "web_search now uses Tavily; DuckDuckGo region hints are ignored."
-                )
         return response
 
     async def tavily_search(

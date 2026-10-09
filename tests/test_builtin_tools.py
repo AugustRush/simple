@@ -155,6 +155,29 @@ def test_memory_clear_uses_human_confirmation_and_storage_api(tmp_path):
     assert registry.tool_capabilities("memory_clear") == frozenset({"state_write"})
 
 
+def test_web_search_advertises_exactly_the_parameters_it_accepts(tmp_path):
+    """A tool schema is a contract with the model, not documentation.
+
+    ``web_search`` advertised a DuckDuckGo ``region`` parameter that the Tavily
+    backend ignored -- and answered with a ``note`` explaining that it ignored
+    it.  A model that set it believed it had localised a search it had not,
+    which is worse than not offering the knob at all.
+    """
+    import inspect
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    advertised = set(registry._tools["web_search"].parameters["properties"])
+    accepted = {
+        name
+        for name in inspect.signature(tools._web_tools.search).parameters
+        if name != "self"
+    }
+
+    assert advertised == accepted, (advertised, accepted)
+    assert "region" not in advertised
+
+
 def test_file_tool_schemas_are_rooted_and_closed(tmp_path):
     tools, registry, _ = make_builtin_tools(tmp_path)
 
