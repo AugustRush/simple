@@ -680,7 +680,7 @@ def test_report_outcome_refuses_outside_a_scheduled_run():
     tools = BuiltinTools(memory=memory, registry=registry)
 
     with pytest.raises(ValueError) as caught:
-        tools._report_outcome("could not finish")
+        tools._signal_tools.report_outcome("could not finish")
     assert "只能在定时任务的运行中使用" in str(caught.value)
 
 
@@ -697,7 +697,7 @@ def test_report_outcome_records_only_a_failure(tmp_path):
     report = RunSelfReport()
     token = _active_run_self_report.set(report)
     try:
-        tools._report_outcome("the source was empty")
+        tools._signal_tools.report_outcome("the source was empty")
     finally:
         _active_run_self_report.reset(token)
 
@@ -719,7 +719,7 @@ def test_report_outcome_requires_a_reason():
     token = _active_run_self_report.set(report)
     try:
         with pytest.raises(ValueError):
-            tools._report_outcome("   ")
+            tools._signal_tools.report_outcome("   ")
     finally:
         _active_run_self_report.reset(token)
 
