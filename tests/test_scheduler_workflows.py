@@ -2751,7 +2751,7 @@ def test_workflow_create_materializes_each_step_as_a_task(tmp_path):
     store = make_store(tmp_path)
     try:
         tools = _handoff_tools(store, tmp_path)
-        result = tools._workflow_create("nightly report", _chain_steps())
+        result = tools._schedule_tools.workflow_create("nightly report", _chain_steps())
 
         assert result["ok"] is True
         workflow = result["workflow"]
@@ -2802,7 +2802,7 @@ def test_workflow_create_refuses_a_dependent_step_that_also_names_a_trigger(
         steps[1]["time_of_day"] = "10:00"
 
         with pytest.raises(ValueError) as error:
-            tools._workflow_create("morning chain", steps)
+            tools._schedule_tools.workflow_create("morning chain", steps)
 
         # Both the step and the fields it should not have written are named,
         # because "步骤「analyze」既有上游（collect）" is what tells the caller
@@ -2836,7 +2836,7 @@ def test_workflow_create_refuses_a_chain_with_no_entry_at_all(tmp_path):
         ]
 
         with pytest.raises(ValueError) as error:
-            tools._workflow_create("orphan", steps)
+            tools._schedule_tools.workflow_create("orphan", steps)
 
         assert "collect" in str(error.value)
         # Worded as the interface words it.  Both surfaces put this refusal in
@@ -2880,7 +2880,7 @@ def test_workflow_create_refuses_a_cycle_before_anything_is_written(tmp_path):
         ]
 
         with pytest.raises(ValueError) as error:
-            tools._workflow_create("ring", ring)
+            tools._schedule_tools.workflow_create("ring", ring)
 
         # The ring itself, not just the fact of one: "which steps" is the
         # actionable part of the message.
@@ -2896,7 +2896,7 @@ def test_workflow_create_refuses_a_graph_with_no_steps(tmp_path):
     try:
         tools = _handoff_tools(store, tmp_path)
         with pytest.raises(ValueError) as error:
-            tools._workflow_create("empty", [])
+            tools._schedule_tools.workflow_create("empty", [])
         assert "至少要有一个步骤" in str(error.value)
         assert store.list_workflows() == []
     finally:
@@ -2918,7 +2918,7 @@ def test_workflow_create_carries_a_steps_acceptance_into_its_task(tmp_path):
         steps[1]["criteria"] = ["the numbers add up"]
         steps[1]["verify_command"] = "true"
 
-        result = tools._workflow_create("checked chain", steps)
+        result = tools._schedule_tools.workflow_create("checked chain", steps)
 
         workflow = result["workflow"]
         assert workflow["steps"][1]["acceptance"] == {
@@ -2940,9 +2940,9 @@ def test_workflow_list_shows_the_steps_and_their_edges(tmp_path):
     store = make_store(tmp_path)
     try:
         tools = _handoff_tools(store, tmp_path)
-        created = tools._workflow_create("nightly report", _chain_steps())
+        created = tools._schedule_tools.workflow_create("nightly report", _chain_steps())
 
-        listed = tools._workflow_list()
+        listed = tools._schedule_tools.workflow_list()
 
         assert listed["ok"] is True
         assert listed["count"] == 1
@@ -2968,14 +2968,14 @@ def test_workflow_delete_disables_the_steps_and_keeps_the_runs(tmp_path):
     store = make_store(tmp_path)
     try:
         tools = _handoff_tools(store, tmp_path)
-        created = tools._workflow_create("nightly report", _chain_steps())
+        created = tools._schedule_tools.workflow_create("nightly report", _chain_steps())
         workflow_id = created["workflow"]["id"]
         tasks = store.step_tasks(workflow_id)
         make_due(store, tasks["collect"].id)
         run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
         assert store.list_runs(tasks["collect"].id)
 
-        result = tools._workflow_delete(workflow_id)
+        result = tools._schedule_tools.workflow_delete(workflow_id)
 
         assert result["ok"] is True
         assert result["deleted"] is True
@@ -3122,17 +3122,17 @@ def test_the_delete_tool_refuses_a_live_step_and_takes_an_orphan(tmp_path):
     store = make_store(tmp_path)
     try:
         tools = _handoff_tools(store, tmp_path)
-        created = tools._workflow_create("nightly report", _chain_steps())
+        created = tools._schedule_tools.workflow_create("nightly report", _chain_steps())
         workflow_id = created["workflow"]["id"]
         tasks = store.step_tasks(workflow_id)
 
         with pytest.raises(ValueError) as refused:
-            tools._schedule_delete(tasks["analyze"].id)
+            tools._schedule_tools.schedule_delete(tasks["analyze"].id)
         assert "流程中的步骤" in str(refused.value)
         assert store.get_task(tasks["analyze"].id) is not None
 
-        tools._workflow_delete(workflow_id)
-        result = tools._schedule_delete(tasks["analyze"].id)
+        tools._schedule_tools.workflow_delete(workflow_id)
+        result = tools._schedule_tools.schedule_delete(tasks["analyze"].id)
         assert result["ok"] is True
         assert result["deleted"] is True
         assert store.get_task(tasks["analyze"].id) is None
@@ -3151,7 +3151,7 @@ def test_a_chain_records_the_sentence_that_asked_for_it(tmp_path):
     store = make_store(tmp_path)
     try:
         tools = _handoff_tools(store, tmp_path)
-        created = tools._workflow_create(
+        created = tools._schedule_tools.workflow_create(
             "nightly report",
             _chain_steps(),
             intent="每天跑一遍收集、分析、发布这三步",

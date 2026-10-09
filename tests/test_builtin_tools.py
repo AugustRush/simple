@@ -2628,7 +2628,7 @@ def test_schedule_runs_clips_a_reason_that_would_flood_the_window(tmp_path):
     A reason that ends mid-sentence reads as the whole reason, and the caller
     stops looking -- with the rest of it sitting on disk unread.
     """
-    from agent.tools.builtin_tools import RUN_REASON_CHARS
+    from agent.tools.schedule_tools import RUN_REASON_CHARS
 
     _tools, registry, _workspace = make_builtin_tools(tmp_path)
     created = _create_scheduled_task(registry, name="chatty")
