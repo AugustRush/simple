@@ -545,22 +545,107 @@ scanned, and why" list recorded `_ATTACHMENT_BATCH_CAPACITY_LOCK` at
 `agent/channels/feishu.py:85`; its coordinates are now
 `agent/channels/feishu_attachments.py:44`.
 
+### 4.10 feishu.py — inbound parsing (`2a1b64a`)
+
+`agent/channels/feishu.py` **2048 → 1973 lines**; `clean_at_mentions`,
+`is_group_chat_type` and `extract_post_content` moved to
+`agent/channels/feishu_parsing.py` as public functions.
+
+The justification is not size — it is that these three import nothing from
+Feishu and nothing from lark, so they are the part of a 1973-line channel file
+that a reader can verify without the SDK. `extract_post_content` is the one that
+earns the file: the same message arrives direct, under a locale key, or wrapped
+in `{"post": …}`, and a reader that handled one shape would **silently drop the
+text** of a message that arrived in another.
+
+The eight tests that already called two of them were moved to the new module's
+import path and their call sites renamed; **no assertion changed**. The private
+`_AT_PLACEHOLDER_RE` stayed private, because only `clean_at_mentions` reads it.
+
+A slip worth recording: while batch-renaming here I typed `_clean_placeholder(`
+instead of `clean_at_mentions(`; the next command changed it back, and a
+repo-wide grep confirms no residue. The habit that caught it is the one this
+document keeps recommending — grep after every rename rather than trusting the
+last one.
+
+### 4.11 builtin_tools.py — the signal tools (`973e829`)
+
+`agent/tools/builtin_tools.py` **5155 → 5042 lines**; `report_outcome`,
+`emit_signal` and `list_signals` became `SignalTools` in
+`agent/tools/signal_tools.py`.
+
+This is the first cluster whose extraction depended on a **sibling** rather than
+on leaf state: all three reach the scheduler through `_schedule_store()`. The
+move therefore injects the accessor (`SignalTools(self._schedule_store, …)`)
+instead of dragging the store along — which is the concrete meaning of the
+survey's "it is a god-*namespace*, not a god-object": the dependency is
+declarable.
+
+Two properties travelled with the code into the module's docstring.
+`report_outcome` has **no success case** — an unattended run is judged by its
+acceptance check, and an agent's own assurance is a claim rather than evidence,
+so a parameter usable only in the harmful direction is not offered; outside a
+scheduled run it refuses rather than quietly accepting. And `emit_signal` does
+**not** run the subscriber: it may be called from inside the run the scheduler
+is executing, and starting another from there would nest one scheduler lifetime
+inside another.
+
+Three imports that only this cluster used (`_active_run_self_report`,
+`_active_signal_context`, `VERDICT_FAILED`) left the mid-file `# noqa: E402`
+block with it, leaving only `_active_schedule_target`.
+
+### 4.12 builtin_tools.py — step output (`7bd1ee1`)
+
+`agent/tools/builtin_tools.py` **5042 → 4854 lines**; `read_step_output`, its
+private budget helper, the graph-walking `_workflow_ancestors` and the three
+`READ_STEP_OUTPUT_*` bounds moved to `agent/tools/step_output_tools.py`.
+
+The tool's safety property is what the file is named for: it is not a file
+reader with a narrower name, it is a lookup into **this workflow's own history**
+— only `output_path` values the scheduler recorded are ever read, so a path it
+was not told about is not reachable through it. Addressing is by step key, the
+workflow comes from the run being served rather than from an argument, and only
+*ancestors* are readable, because a step beside it has not run this round and a
+step below it has not run at all.
+
+The two ceilings moved too, and now have one home: the schemas still quote
+`READ_STEP_OUTPUT_MAX_CHARS` / `READ_STEP_OUTPUT_DEFAULT_CHARS`, so
+`builtin_tools.py` imports them from the new module, while
+`READ_STEP_OUTPUT_BUDGET_SHARE` no longer exists there at all. The 14 direct test
+calls (`tools.` and `handoff.`) became `._step_output_tools.read(...)` with no
+assertion touched, so the 15 guards around this tool are the same guards.
+
 ## 5. Next
 
-The order in §1–§3 is the plan; the cheapest six entries are now done (web
-payloads and sink, feishu renderer, progress and attachment leases, builtin
-memory, web and output). What remains, cheapest first:
+The order in §1–§3 is the plan; the cheapest nine entries are now done (web
+payloads and sink, feishu renderer / progress / attachment leases / inbound
+parsing, builtin memory / web / output / signals / step output). What remains:
 
-1. feishu.py **M** — the module-level parsing helpers (`_ws_reconnect_delay`,
-   `_clean_at_mentions`, `_is_group_chat_type`, `_extract_post_content`, and the
-   resource-filename trio). Already module-level, so this is a home to choose,
-   not a class to unwind; note that `_clean_at_mentions` and
-   `_extract_post_content` are imported by name in the tests, so `feishu.py`
-   should keep re-exporting them.
-2. builtin_tools.py **signals + step output**, then **scheduler + workflows** as
-   one move (the survey measured that they cannot be separated), then **files**,
-   **audio**, **shell**, **context** — in that order, because the coupling grows
-   monotonically along it.
+1. **builtin_tools.py: scheduler + workflows, as one move** (749 + 527 lines).
+   The survey measured that they cannot be separated: the six workflow methods
+   read four scheduler-cluster methods (`_schedule_store` ×5, `_schedule_target`,
+   `_schedule_trigger`, `_action_payload`) and eighteen names from
+   `agent.scheduler`. This is the largest remaining piece, and the first whose
+   extraction has to decide what happens to the **store construction** rather
+   than just to a method.
+2. Then, in this order, because the coupling grows along it: **files** (248,
+   including the `_file_service` property's four-way resolution), **audio**
+   (105, straddling files and shell), **shell** (306, eleven registry keys and
+   ten sandbox names), **context** (151, the thinnest guard at two tests).
+3. feishu.py's two leftovers — `_ws_reconnect_delay` and the resource-filename
+   trio — move with the clusters that call them (the channel's reconnect loop
+   and the download path), not on their own.
+
+`_register`'s 1656 lines still stay: the survey's answer is that each cluster
+module owns its own registration table, and that is a larger piece than the
+increments above.
+
+The findings listed in §1–§3 that are **behavioural** (the web sink's claimed
+temporary-attachment ownership, the session-id validator disagreeing with
+`web_session_home`, `_stream` discarding its tasks' exceptions, the dead
+`_progress_phase_closed` write, `CONFIRM_DECISIONS` having no reader) are
+deliberately not in this queue: each needs a decision and a test that fails
+first, which is a different kind of change from a move.
 
 `_register`'s 1656 lines stay for now: the survey's answer is that each cluster
 module owns its own registration table, and that is a larger piece than the
