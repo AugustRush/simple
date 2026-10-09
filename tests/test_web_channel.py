@@ -2148,6 +2148,70 @@ def test_web_schedule_run_history_and_output(tmp_path, monkeypatch):
         assert missing.status_code == 404
 
 
+def test_the_artifact_listing_skips_a_file_that_vanishes_mid_listing(tmp_path, monkeypatch):
+    """A run may still be writing; an entry that disappears between the walk and
+    the size lookup is not a reason to fail the whole listing for the browser.
+    """
+    from pathlib import Path
+
+    from agent.channels.web import _list_run_artifacts
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    (root / "kept.txt").write_text("kept", encoding="utf-8")
+    (root / "gone.txt").write_text("gone", encoding="utf-8")
+
+    real_stat = Path.stat
+    calls = {"gone": 0}
+
+    def flaky_stat(self, *args, **kwargs):
+        # The race, exactly: the walk sees the file (``is_file`` stats it), and
+        # by the time its size is wanted it has been removed.
+        if self.name == "gone.txt":
+            calls["gone"] += 1
+            if calls["gone"] > 1:
+                raise OSError("vanished")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    listed = _list_run_artifacts(root, "task", "run")
+
+    assert [item["name"] for item in listed] == ["kept.txt"]
+    assert calls["gone"] > 1, "the guard was never reached"
+
+
+def test_the_artifact_listing_returns_at_most_the_response_limit(tmp_path):
+    from agent.channels.web import _ARTIFACT_RESPONSE_LIMIT, _list_run_artifacts
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    for index in range(_ARTIFACT_RESPONSE_LIMIT + 20):
+        (root / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
+
+    listed = _list_run_artifacts(root, "task", "run")
+
+    assert len(listed) == _ARTIFACT_RESPONSE_LIMIT
+    # Order is part of the response the frontend renders in: sorted by path.
+    assert listed[0]["name"] == "file-0000.txt"
+
+
+def test_the_artifact_listing_bounds_the_walk_not_only_the_response(tmp_path, monkeypatch):
+    """The cap bounded the response; the walk still materialised everything."""
+    from agent.channels import web as web_module
+
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    for index in range(10):
+        (root / f"file-{index}.txt").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(web_module, "_ARTIFACT_WALK_LIMIT", 4)
+
+    listed = web_module._list_run_artifacts(root, "task", "run")
+
+    assert len(listed) == 4, "the walk did not stop at the limit"
+
+
 def test_web_schedule_controls_delegate_to_live_scheduler(tmp_path, monkeypatch):
     from datetime import datetime, timezone
     from starlette.testclient import TestClient

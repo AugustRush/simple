@@ -81,6 +81,66 @@ async def _pick_workspace_directory() -> str | None:
     return selected or None
 
 
+#: How many artifacts one listing returns.
+_ARTIFACT_RESPONSE_LIMIT = 500
+
+#: How many directory entries one listing is willing to look at.  The cap above
+#: bounds the response; this bounds the work, because a run that cloned a
+#: repository can leave a tree nobody wants walked to show 500 names.  Trees up
+#: to this size keep the exact order they always had.
+_ARTIFACT_WALK_LIMIT = 20_000
+
+
+def _list_run_artifacts(root: Path, task_id: str, run_id: str) -> list[dict[str, Any]]:
+    """Describe the files a run left under *root*, at most the response limit.
+
+    Two rules that the endpoint used to carry inline and unguarded:
+
+    - **An entry that vanishes mid-listing is skipped, not fatal.**  A run may
+      still be writing, and a file the walk saw a moment ago is allowed to be
+      gone by the time its size is asked for.
+    - **The walk is bounded.**  Sorting the whole traversal first materialised
+      every path under the run's output to then return at most 500 of them.
+    """
+    if not root.is_dir():
+        return []
+    candidates: list[Path] = []
+    for path in root.rglob("*"):
+        candidates.append(path)
+        if len(candidates) >= _ARTIFACT_WALK_LIMIT:
+            logger.warning(
+                "run artifact listing stopped at %d entries under %s",
+                _ARTIFACT_WALK_LIMIT,
+                root,
+            )
+            break
+    artifacts: list[dict[str, Any]] = []
+    for path in sorted(candidates):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            continue
+        artifacts.append(
+            {
+                "path": relative,
+                "name": path.name,
+                "mime_type": mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream",
+                "size_bytes": size_bytes,
+                "url": (
+                    f"/api/schedules/{quote(task_id, safe='')}/runs/"
+                    f"{quote(run_id, safe='')}/artifacts/{quote(relative, safe='/')}"
+                ),
+            }
+        )
+        if len(artifacts) >= _ARTIFACT_RESPONSE_LIMIT:
+            break
+    return artifacts
+
+
 def _web_session_output_dir(session_id: str) -> Path:
     """Return the isolated output directory for a Web session."""
     try:
@@ -1423,28 +1483,9 @@ class WebChannel(Channel):
         if run is None:
             return JSONResponse({"error": "run not found"}, status_code=404)
         root = self._schedule_artifact_root(task_id, run)
-        artifacts = []
-        if root.is_dir():
-            for path in sorted(root.rglob("*")):
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(root).as_posix()
-                mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-                artifacts.append(
-                    {
-                        "path": relative,
-                        "name": path.name,
-                        "mime_type": mime_type,
-                        "size_bytes": path.stat().st_size,
-                        "url": (
-                            f"/api/schedules/{quote(task_id, safe='')}/runs/"
-                            f"{quote(run_id, safe='')}/artifacts/{quote(relative, safe='/')}"
-                        ),
-                    }
-                )
-                if len(artifacts) >= 500:
-                    break
-        return JSONResponse({"artifacts": artifacts})
+        return JSONResponse(
+            {"artifacts": _list_run_artifacts(root, task_id, run_id)}
+        )
 
     async def _schedule_run_artifact(self, request: Any) -> Any:
         from starlette.responses import FileResponse, JSONResponse
