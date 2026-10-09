@@ -1790,7 +1790,7 @@ def test_read_step_output_returns_what_the_upstream_step_produced(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output("collect")
+            result = tools._step_output_tools.read("collect")
         finally:
             _active_agent_context.reset(token)
 
@@ -1817,7 +1817,7 @@ def test_read_step_output_refuses_a_step_of_another_workflow(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(mine.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output("join")
+            result = tools._step_output_tools.read("join")
         finally:
             _active_agent_context.reset(token)
 
@@ -1841,7 +1841,7 @@ def test_read_step_output_refuses_to_read_the_current_step(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output("analyze")
+            result = tools._step_output_tools.read("analyze")
         finally:
             _active_agent_context.reset(token)
 
@@ -1861,7 +1861,7 @@ def test_read_step_output_refuses_outside_a_workflow(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of("", "", "some-standalone-task")
         try:
-            result = tools._read_step_output("step2")
+            result = tools._step_output_tools.read("step2")
         finally:
             _active_agent_context.reset(token)
 
@@ -1884,7 +1884,7 @@ def test_read_step_output_says_so_when_there_is_nothing_to_read(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output("collect")
+            result = tools._step_output_tools.read("collect")
         finally:
             _active_agent_context.reset(token)
 
@@ -1908,7 +1908,7 @@ def test_read_step_output_refuses_a_step_that_is_not_upstream(tmp_path):
 
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output("publish")
+            result = tools._step_output_tools.read("publish")
         finally:
             _active_agent_context.reset(token)
 
@@ -1957,7 +1957,7 @@ def test_read_step_output_allows_a_step_two_edges_up(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "publish", tasks["publish"].id)
         try:
-            result = tools._read_step_output("collect")
+            result = tools._step_output_tools.read("collect")
         finally:
             _active_agent_context.reset(token)
 
@@ -2004,7 +2004,7 @@ def test_read_step_output_truncates_and_says_that_it_did(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output("collect", max_chars=100)
+            result = tools._step_output_tools.read("collect", max_chars=100)
         finally:
             _active_agent_context.reset(token)
 
@@ -2275,7 +2275,7 @@ def test_the_step_below_can_read_a_step_that_only_notified_a_channel(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "publish", tasks["publish"].id)
         try:
-            result = tools._read_step_output("analyze")
+            result = tools._step_output_tools.read("analyze")
         finally:
             _active_agent_context.reset(token)
 
@@ -2450,7 +2450,7 @@ def test_read_step_output_clamps_to_a_share_of_the_input_budget(tmp_path):
     the run then died of the limit it had just walked into, losing everything
     it had done and reporting a provider error that names no tool."""
     from agent.core.agent import _active_agent_context
-    from agent.tools.builtin_tools import READ_STEP_OUTPUT_MAX_CHARS
+    from agent.tools.step_output_tools import READ_STEP_OUTPUT_MAX_CHARS
 
     store = make_store(tmp_path)
     try:
@@ -2461,7 +2461,7 @@ def test_read_step_output_clamps_to_a_share_of_the_input_budget(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id, budget=4000)
         try:
-            result = tools._read_step_output(
+            result = tools._step_output_tools.read(
                 "collect", max_chars=READ_STEP_OUTPUT_MAX_CHARS
             )
         finally:
@@ -2481,7 +2481,7 @@ def test_read_step_output_clamps_to_a_share_of_the_input_budget(tmp_path):
 
 def test_read_step_output_keeps_a_comfortable_read_when_the_budget_allows(tmp_path):
     from agent.core.agent import _active_agent_context
-    from agent.tools.builtin_tools import READ_STEP_OUTPUT_DEFAULT_CHARS
+    from agent.tools.step_output_tools import READ_STEP_OUTPUT_DEFAULT_CHARS
 
     store = make_store(tmp_path)
     try:
@@ -2492,7 +2492,7 @@ def test_read_step_output_keeps_a_comfortable_read_when_the_budget_allows(tmp_pa
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id, budget=200000)
         try:
-            result = tools._read_step_output("collect")
+            result = tools._step_output_tools.read("collect")
         finally:
             _active_agent_context.reset(token)
 
@@ -2508,7 +2508,7 @@ def test_read_step_output_uses_the_static_ceiling_when_no_budget_is_known(tmp_pa
     """A tool can be called outside a run -- from a test, or straight off the
     registry -- and then there is no window to size against."""
     from agent.core.agent import _active_agent_context
-    from agent.tools.builtin_tools import READ_STEP_OUTPUT_MAX_CHARS
+    from agent.tools.step_output_tools import READ_STEP_OUTPUT_MAX_CHARS
 
     store = make_store(tmp_path)
     try:
@@ -2519,7 +2519,7 @@ def test_read_step_output_uses_the_static_ceiling_when_no_budget_is_known(tmp_pa
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
         try:
-            result = tools._read_step_output(
+            result = tools._step_output_tools.read(
                 "collect", max_chars=READ_STEP_OUTPUT_MAX_CHARS
             )
         finally:
@@ -2545,7 +2545,7 @@ def test_read_step_output_asks_for_more_when_the_budget_is_tiny(tmp_path):
         tools = _handoff_tools(store, tmp_path)
         token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id, budget=400)
         try:
-            result = tools._read_step_output("collect")
+            result = tools._step_output_tools.read("collect")
         finally:
             _active_agent_context.reset(token)
 
@@ -2598,7 +2598,7 @@ def test_the_tool_clamps_against_the_budget_the_core_publishes(tmp_path):
         handoff = _handoff_tools(store, tmp_path)
         token = _active_agent_context.set(ctx)
         try:
-            result = handoff._read_step_output("collect", max_chars=40000)
+            result = handoff._step_output_tools.read("collect", max_chars=40000)
         finally:
             _active_agent_context.reset(token)
 
