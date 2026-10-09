@@ -196,6 +196,86 @@ def test_plugin_registers_slash_command(tmp_path):
     assert components["_called"] is True
 
 
+def test_a_user_plugins_command_is_namespaced_and_cannot_take_a_bare_name(tmp_path):
+    """A plugin does not own the bare namespace.
+
+    A user plugin declaring ``stats`` used to take over the built-in evolution
+    plugin's ``/stats``, and *which* one won depended on whether the plugin had
+    been installed before or after the process started: the same command meant
+    different things before and after a hot reload.  A plugin's markdown
+    commands are already namespaced by the plugin; its Python ones now are too.
+    """
+    from agent import PluginCatalog
+
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_plugin(
+        builtin / "evolutionish",
+        """
+        def register():
+            class P:
+                name = "evolutionish"
+                def register_slash_commands(self):
+                    async def handler(raw_cmd, components):
+                        return "builtin"
+                    return {"stats": handler}
+            return P()
+    """,
+    )
+    _write_plugin(
+        user / "shadow",
+        """
+        def register():
+            class P:
+                name = "shadow"
+                def register_slash_commands(self):
+                    async def handler(raw_cmd, components):
+                        return "user"
+                    return {"stats": handler}
+            return P()
+    """,
+    )
+
+    catalog = PluginCatalog(builtin_dir=builtin, user_dir=user)
+    catalog.discover_and_load()
+    commands = catalog.get_slash_commands()
+
+    # The built-in speaks the app's vocabulary and keeps the bare name ...
+    assert "stats" in commands
+    assert asyncio.run(commands["stats"]("stats", {})) == "builtin"
+    # ... while the user plugin's is reachable only under its own name.
+    assert "shadow:stats" in commands
+    assert asyncio.run(commands["shadow:stats"]("shadow:stats", {})) == "user"
+
+
+def test_a_plugin_command_that_names_its_own_namespace_is_left_alone(tmp_path):
+    """An author may qualify the name; the loader does not double it."""
+    from agent import PluginCatalog
+
+    user = tmp_path / "user"
+    _write_plugin(
+        user / "explicit",
+        """
+        def register():
+            class P:
+                name = "explicit"
+                def register_slash_commands(self):
+                    async def handler(raw_cmd, components):
+                        return "explicit"
+                    return {"mine:cmd": handler, "bare": handler}
+            return P()
+    """,
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path / "builtin", user_dir=user)
+    catalog.discover_and_load()
+    commands = catalog.get_slash_commands()
+
+    assert "mine:cmd" in commands
+    assert "explicit:mine:cmd" not in commands
+    assert "explicit:bare" in commands
+
+
 def test_python_plugin_exposes_detached_slash_command_metadata(tmp_path):
     from agent import PluginCatalog
 

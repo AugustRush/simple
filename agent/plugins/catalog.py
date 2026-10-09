@@ -1047,9 +1047,10 @@ class _CatalogPlugin:
         # Slash commands the plugin declares in Python, as opposed to the markdown
         # files handled above.
         if hasattr(self._plugin, "register_slash_commands"):
-            for cmd_key, handler in (
+            for declared, handler in (
                 self._plugin.register_slash_commands() or {}
             ).items():
+                cmd_key = self._plugin_command_key(str(declared))
                 if catalog._commands.has(cmd_key):
                     existing = catalog._commands.owner(cmd_key) or "?"
                     shared.CONSOLE.print(
@@ -1065,6 +1066,32 @@ class _CatalogPlugin:
                         owner=self.name,
                     )
                 )
+
+    def _plugin_command_key(self, declared: str) -> str:
+        """The name a plugin's Python-declared command is registered under.
+
+        A plugin does not own the bare namespace.  Its markdown commands are
+        already namespaced by the plugin -- ``<plugin>:<stem>``, derived from the
+        path -- and its Python ones have to be too, or two plugins can claim the
+        same word: a user plugin declaring ``stats`` took over the built-in
+        evolution plugin's ``/stats``, and *which* one won depended on whether it
+        had been installed before or after the process started, so the same
+        command meant different things before and after a hot reload.  The
+        console warning below was the only notice, and a person in a chat UI
+        never sees it.
+
+        Built-in plugins are the exception, because they are the app's own
+        vocabulary: ``/evolve`` and ``/generate-tool`` are documented in the
+        README, and prefixing them would break a documented interface to buy
+        consistency it does not need -- a built-in ships with the app and is
+        tested with it.
+
+        A key that already carries a namespace is left alone, so an author who
+        wants ``mine:cmd`` gets it rather than ``plugin:mine:cmd``.
+        """
+        if ":" in declared or self._meta.source == "builtin":
+            return declared
+        return f"{self.name}:{declared}"
 
     def __getattr__(self, item: str) -> Any:
         # Only reached for names this adapter does not define, which is exactly the
