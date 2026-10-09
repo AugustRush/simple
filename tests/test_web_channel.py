@@ -751,6 +751,40 @@ def test_web_stream_emits_json_events():
             assert "turn_complete" in types
 
 
+def test_a_turn_that_raises_tells_the_browser_instead_of_going_quiet():
+    """Every message the client sent must reach a terminal state it can see.
+
+    The handler runs inside a task whose only done-callback discarded it, and
+    ``process_message`` had a ``finally`` but no ``except``: the exception was
+    left unretrieved, so asyncio reported it when the task was collected --
+    long after the turn looked alive -- and the browser was told nothing.  A
+    spinner that never stops is what the user sees, and the frontend treats an
+    ``error`` event as terminal (it clears ``isStreaming``), so the fix is to
+    send one.
+    """
+    from starlette.testclient import TestClient
+
+    async def exploding_handler(msg, sink):
+        sink.on_stream_chunk("partial answer")
+        raise RuntimeError("machinery broke")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = exploding_handler
+
+    with TestClient(channel.app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        with client.websocket_connect(f"/api/sessions/{sid}/stream") as ws:
+            ws.send_json({"type": "message", "text": "hi"})
+            events = []
+            while True:
+                event = ws.receive_json()
+                events.append(event)
+                if event["type"] == "error":
+                    break
+            assert "machinery broke" in event["error"], events
+
+
 def test_web_auth_token_required():
     from starlette.testclient import TestClient
 

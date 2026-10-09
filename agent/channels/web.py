@@ -2809,6 +2809,24 @@ class WebChannel(Channel):
                     ):
                         sink.on_turn_complete("", [])
                         await sink.flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A message the client sent must reach a terminal state it can
+                # see.  Without this the exception escaped as an unretrieved
+                # task exception: asyncio reported it when the task was
+                # collected -- long after the turn looked alive -- and the
+                # browser was told nothing, which the user experiences as a
+                # spinner that never stops.  An ``error`` event is what the
+                # client treats as terminal (it clears ``isStreaming``).
+                logger.exception(
+                    "web message handling failed: session=%s message=%s",
+                    session_id,
+                    message_id,
+                )
+                with contextlib.suppress(Exception):
+                    sink.on_error(f"{type(exc).__name__}: {exc}")
+                    await sink.flush()
             finally:
                 self._live_sinks.get(session_id, set()).discard(sink)
                 await sink.close()
@@ -2847,7 +2865,29 @@ class WebChannel(Channel):
                     name=f"web-message-{message_id}",
                 )
                 active_tasks.add(task)
-                task.add_done_callback(active_tasks.discard)
+
+                def _observe(finished: asyncio.Task) -> None:
+                    """Retrieve the task's result, so nothing is left unreported.
+
+                    ``process_message`` reports what it can through the sink, but
+                    it cannot report a failure that happened while building the
+                    sink.  Asking for the exception here is the difference
+                    between a logged failure and one asyncio only mentions when
+                    the task is collected.
+                    """
+                    active_tasks.discard(finished)
+                    if finished.cancelled():
+                        return
+                    exc = finished.exception()
+                    if exc is not None:
+                        logger.error(
+                            "web message task failed: session=%s message=%s",
+                            session_id,
+                            message_id,
+                            exc_info=exc,
+                        )
+
+                task.add_done_callback(_observe)
         except Exception:
             pass
         finally:
