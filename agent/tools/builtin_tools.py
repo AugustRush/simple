@@ -6,7 +6,6 @@ import json
 import os
 import re
 import shutil
-import shlex
 import signal
 import uuid
 from datetime import datetime, timezone
@@ -31,13 +30,13 @@ from agent.security.filesystem_sandbox import (
     new_scratch_dir,
     release_scratch_dir,
 )
-from agent.security.shell import shell_command_uses_shell_features
 from agent.tools.files import FileProvider, _normalize_write_scope
 
 from .executor import report_tool_progress
 from .memory_tools import MemoryTools
 from .output_tools import OutputTools
 from .file_tools import FileTools
+from .audio_tools import AudioTools
 from .signal_tools import SignalTools
 from .schedule_tools import ScheduleTools
 from .step_output_tools import (
@@ -348,6 +347,15 @@ class BuiltinTools:
             self._ok,
             self._error,
         )
+        self._audio_tools = AudioTools(
+            self.registry,
+            self._active_workspace_root,
+            self._process_output_dir,
+            self._file_tools.resolve_tool_path,
+            self._terminate_process,
+            self._ok,
+            self._error,
+        )
         self._cached_schedule_store: Any = None
         self._register()
 
@@ -565,7 +573,7 @@ class BuiltinTools:
                 },
                 "required": ["path"],
             },
-            self._transcribe_audio,
+            self._audio_tools.transcribe,
             source="builtin",
         )
 
@@ -2876,114 +2884,6 @@ class BuiltinTools:
             # wrote into it) leaked once per shell invocation, unbounded for
             # a long-running gateway.
             release_scratch_dir(scratch_dir)
-
-    def _audio_transcription_command(self) -> str:
-        raw = self.registry.get_context("audio_transcription_command", "")
-        if isinstance(raw, str) and raw.startswith("$"):
-            return os.environ.get(raw[1:], "")
-        if raw:
-            return str(raw)
-        return os.environ.get("SIMPLE_AUDIO_TRANSCRIBE_COMMAND", "")
-
-    def _build_audio_transcription_argv(
-        self, command_template: str, audio_path: Path, language: str
-    ) -> list[str]:
-        if shell_command_uses_shell_features(command_template):
-            raise ValueError(
-                "unsafe audio transcription command: shell operators are not allowed"
-            )
-        try:
-            template_parts = shlex.split(command_template)
-        except ValueError as e:
-            raise ValueError(
-                f"unsafe audio transcription command: invalid quoting ({e})"
-            ) from e
-        if not template_parts:
-            raise ValueError("unsafe audio transcription command: empty command")
-
-        path_was_used = False
-        argv: list[str] = []
-        for part in template_parts:
-            if "{path}" in part:
-                path_was_used = True
-                part = part.replace("{path}", str(audio_path))
-            if "{language}" in part:
-                part = part.replace("{language}", language)
-            if part:
-                argv.append(part)
-        if not path_was_used:
-            argv.append(str(audio_path))
-        return argv
-
-    async def _transcribe_audio(
-        self,
-        path: str,
-        language: str = "",
-        timeout: int = 300,
-    ) -> dict[str, Any]:
-        try:
-            resolved, _root_kind = self._file_tools.resolve_tool_path(path)
-            if not resolved.exists():
-                return self._error(f"'{path}' does not exist", path=str(resolved))
-            if not resolved.is_file():
-                return self._error(f"'{path}' is not a regular file", path=str(resolved))
-            command_template = self._audio_transcription_command().strip()
-            if not command_template:
-                return self._error(
-                    "Audio transcription is not configured. Set audio.transcription_command "
-                    "in config.json or SIMPLE_AUDIO_TRANSCRIBE_COMMAND. Use {path} as the "
-                    "audio-file placeholder.",
-                    path=str(resolved),
-                )
-            language = str(language or "").strip()
-            argv = self._build_audio_transcription_argv(
-                command_template, resolved, language
-            )
-            timeout = max(1, min(int(timeout), 900))
-            proc = None
-            output_dir = self._process_output_dir()
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={
-                    **os.environ.copy(),
-                    "AGENT_OUTPUT_DIR": str(output_dir),
-                    "AGENT_WORKSPACE_ROOT": str(self._active_workspace_root()),
-                },
-                cwd=str(output_dir),
-                start_new_session=True,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            transcript = stdout.decode(errors="replace").strip()
-            err = stderr.decode(errors="replace").strip()
-            if proc.returncode != 0:
-                return self._error(
-                    f"Audio transcription failed with exit code {proc.returncode}",
-                    path=str(resolved),
-                    stderr=err[-4000:],
-                    exit_code=proc.returncode,
-                )
-            return self._ok(
-                path=str(resolved),
-                transcript=transcript,
-                stderr=err[-4000:] if err else "",
-                exit_code=proc.returncode,
-            )
-        except asyncio.TimeoutError:
-            await self._terminate_process(proc)
-            return self._error(
-                f"Audio transcription timed out after {timeout}s",
-                path=path,
-                timed_out=True,
-            )
-        except asyncio.CancelledError:
-            await self._terminate_process(proc)
-            raise
-        except ValueError as e:
-            return self._error(str(e))
-        except Exception as e:
-            return self._error(f"Error transcribing audio: {e}")
 
     async def _terminate_process(self, proc: Any) -> None:
         if proc is None:

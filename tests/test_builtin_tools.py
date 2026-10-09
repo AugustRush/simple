@@ -1339,7 +1339,7 @@ def test_transcribe_audio_rejects_shell_control_in_template(tmp_path):
         "python transcribe.py {path}; touch /tmp/pwned",
     )
 
-    result = asyncio.run(tools._transcribe_audio("sample.wav", timeout=1))
+    result = asyncio.run(tools._audio_tools.transcribe("sample.wav", timeout=1))
 
     assert result["ok"] is False
     assert "unsafe audio transcription command" in result["error"].lower()

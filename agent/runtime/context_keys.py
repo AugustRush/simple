@@ -252,7 +252,7 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="audio_transcription_command",
         writers=("agent/bootstrap.py",),
-        readers=("agent/tools/builtin_tools.py",),
+        readers=("agent/tools/audio_tools.py",),
     ),)
 
 BY_KEY: dict[str, ContextKey] = {entry.key: entry for entry in CONTEXT_KEYS}
