@@ -2632,6 +2632,54 @@ def _coordinator(
     return coordinator, fake_core
 
 
+def test_a_queued_message_answered_meanwhile_is_not_run_again() -> None:
+    """A resend that arrived while the session was busy is not a second task.
+
+    Measured on a real session: a message delivered twice -- once to start a
+    turn, once while that turn was running -- was queued, and then run again to
+    completion when the turn finished, so its whole tool loop was paid for
+    twice.  A *different* message queued beside it still gets its turn: that is
+    what the queue is for.
+    """
+    import asyncio
+
+    class _Store:
+        def message_has_answer(self, *, session_id, message_id):
+            return message_id == "msg-duplicate"
+
+    class _ContextManager:
+        store = _Store()
+
+    coordinator, core = _coordinator()
+    sink = _CoordinatorSink()
+    state = RuntimeSessionState(
+        ctx=object(), context_manager=_ContextManager()
+    )
+    state.restart_queue = [
+        coordinator._queue_entry(
+            TurnInput.from_text(
+                "同一条消息",
+                session_id="s-1",
+                metadata={"message_id": "msg-duplicate"},
+            ),
+            sink,
+        ),
+        coordinator._queue_entry(
+            TurnInput.from_text(
+                "另一条消息",
+                session_id="s-1",
+                metadata={"message_id": "msg-fresh"},
+            ),
+            sink,
+        ),
+    ]
+
+    asyncio.run(coordinator._run_restarts_if_idle(state, sink))
+
+    assert [call.metadata.get("message_id") for call in core.calls] == ["msg-fresh"]
+    assert state.restart_queue == []
+
+
 def test_coordinator_cleans_temporary_attachment_after_drain(tmp_path) -> None:
     class ConsumingSink(_CoordinatorSink):
         def __init__(self) -> None:

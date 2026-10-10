@@ -443,17 +443,29 @@ class CommandCoordinator:
     ) -> None:
         if state.operation_state != "idle" or not state.restart_queue:
             return
-        queued = state.restart_queue.pop(0)
-        turn_input = self._queued_turn_input(queued)
-        await self._run_operation(
-            turn_input,
-            state,
-            queued.get("sink") or fallback_sink,
-            classification=None,
-            forward_text=queued["text"],
-            accepts_interjections=True,
-            initial_ready=queued.get("ready"),
-        )
+        while state.restart_queue:
+            queued = state.restart_queue.pop(0)
+            if self._message_already_answered(state, queued):
+                # The same message arrived again while this session was busy --
+                # a resend, a replay after a reconnect -- and the turn that was
+                # running answered it in the meantime.  Running the queued copy
+                # repeats the whole tool loop for a reply the reader already has
+                # (measurably: one message ran two full passes, doubling its
+                # model and tool calls).  The queue itself is how a *second,
+                # different* message waits its turn, so only already-answered
+                # ones are dropped.
+                continue
+            turn_input = self._queued_turn_input(queued)
+            await self._run_operation(
+                turn_input,
+                state,
+                queued.get("sink") or fallback_sink,
+                classification=None,
+                forward_text=queued["text"],
+                accepts_interjections=True,
+                initial_ready=queued.get("ready"),
+            )
+            return
 
     async def _handle_now(
         self,
@@ -987,6 +999,32 @@ class CommandCoordinator:
         state.restart_queue.append(
             cls._queue_entry(turn_input, sink, urgency=urgency, ready=ready)
         )
+
+    @staticmethod
+    def _message_already_answered(state: Any, queued: Mapping[str, Any]) -> bool:
+        """Whether the queued message already has an answer on record."""
+        turn_input = CommandCoordinator._queued_turn_input(queued)
+        metadata = getattr(turn_input, "metadata", None) or {}
+        message_id = str(
+            metadata.get("turn_id")
+            or metadata.get("message_id")
+            or queued.get("message_id")
+            or ""
+        )
+        store = getattr(getattr(state, "context_manager", None), "store", None)
+        check = getattr(store, "message_has_answer", None)
+        if not message_id or not callable(check):
+            return False
+        try:
+            return bool(
+                check(
+                    session_id=str(getattr(turn_input, "session_id", "") or ""),
+                    message_id=message_id,
+                )
+            )
+        except Exception:
+            logger.exception("could not tell whether a queued message was answered")
+            return False
 
     @staticmethod
     def _queued_turn_input(entry: Mapping[str, Any]) -> TurnInput:

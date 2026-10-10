@@ -1423,6 +1423,30 @@ class LTMStore:
                 keys.append(key)
         return keys
 
+    def message_has_answer(self, *, session_id: str, message_id: str) -> bool:
+        """Whether this message already has an assistant answer on record.
+
+        The question a re-delivery has to answer before it becomes work again.
+        A message that has been answered is a resend, not a task: running it a
+        second time pays for the whole tool loop twice for a reply the reader
+        already has.
+        """
+        clean_session = str(session_id or "").strip()
+        clean_message = str(message_id or "").strip()
+        if not clean_session or not clean_message:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM conversation_turns
+                 WHERE session_id = ? AND role = 'assistant'
+                   AND (reply_to_id = ? OR message_id = ?)
+                 LIMIT 1
+                """,
+                (clean_session, clean_message, clean_message),
+            ).fetchone()
+        return row is not None
+
     def transcript_window(
         self,
         *,
