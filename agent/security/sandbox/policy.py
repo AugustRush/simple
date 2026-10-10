@@ -167,7 +167,9 @@ class ShellSandboxRequest:
     extra_read_paths: tuple[str, ...] = ()
     #: The agent's own home (``~/.agent`` or ``~/.agent-<name>``).  Denied for
     #: read and write because ``config.json`` holds provider API keys;
-    #: ``output_root`` and ``scratch_dir`` are reopened inside it.
+    #: ``output_root`` and ``scratch_dir`` are reopened inside it, and so is
+    #: ``plugins/`` read-only -- a plugin's skills ship scripts to run, and a
+    #: skill stored where the shell cannot read it is a skill that cannot work.
     agent_home: Path | None = None
 
 
@@ -361,6 +363,18 @@ def resolve_policy(request: ShellSandboxRequest) -> ResolvedSandboxPolicy:
             restrictions.append(PathRule(candidate, read=False, write=False))
         for reopened in (output, scratch):
             restrictions.append(PathRule(reopened, read=True, write=True))
+        # 3a-bis. Installed plugins and the skills they ship are content the
+        #     *user* chose to install, and "run my own script" is the normal
+        #     shape of one: a skill's SKILL.md says ``bash $SKILL_DIR/...``.
+        #     They live under the home we just denied, so denying by location
+        #     made every such skill unusable -- the shell could not read the
+        #     files, let alone execute them.  Read-only, and only this subtree:
+        #     what the home's deny protects is ``config.json`` (provider keys),
+        #     the memory and scheduler databases, and the session records, none
+        #     of which are here -- and a plugin's own files are not something a
+        #     shell command should be rewriting in place.
+        for candidate in _both_spellings([str(request.agent_home / "plugins")]):
+            restrictions.append(PathRule(candidate, read=True, write=False))
 
     # 3b. Internal bookkeeping (locks, profiles, scratch internals) stays
     #     hidden.  Must follow the output_root re-open above: it lives inside.

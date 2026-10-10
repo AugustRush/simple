@@ -50,6 +50,47 @@ def _request(
 # ── Profile generation ──────────────────────────────────────────────────────
 
 
+def test_a_plugins_own_files_are_readable_to_the_shell(tmp_path):
+    """A skill that runs its own script must be able to read it.
+
+    Plugins are installed under the agent home, and the home is denied to the
+    shell because ``config.json`` holds provider keys -- so denying by location
+    made every skill that ships a script unusable: the shell could not even read
+    the file (``py_compile`` on an installed route.py came back "Operation not
+    permitted").  The plugin tree is reopened read-only, and what the deny
+    protects stays denied.
+    """
+    from agent.security.sandbox.policy import ShellSandboxRequest, resolve_policy
+
+    home = tmp_path / "agent-home"
+    policy = resolve_policy(
+        ShellSandboxRequest(
+            workspace_root=tmp_path / "workspace",
+            output_root=home / "output",
+            workspace_read=True,
+            workspace_write=False,
+            write_scope=(),
+            scratch_dir=home / "output" / "sandbox",
+            mode="read_all",
+            agent_home=home,
+        )
+    )
+
+    assert policy.effective_rights(home / "plugins" / "demo" / "skills" / "x" / "route.py") == (
+        True,
+        False,
+    )
+    # Readable is not writable: a plugin's files are not the shell's to rewrite.
+    for protected in (
+        "config.json",
+        "memory/palace.db",
+        "context/palace.db",
+        "web/sessions/s-1/.session.json",
+    ):
+        readable, writable = policy.effective_rights(home / protected)
+        assert (readable, writable) == (False, False), protected
+
+
 def test_profile_hides_workspace_when_read_disabled(tmp_path):
     request = _request(tmp_path, workspace_read=False)
     profile = _macos_seatbelt_profile(request)
