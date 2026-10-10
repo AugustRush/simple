@@ -377,6 +377,68 @@ def test_an_interjection_is_journaled_between_the_request_and_the_answer(tmp_pat
     assert turns[1].metadata.get("urgency") == "now"
 
 
+def test_a_second_executions_answer_is_not_dropped(tmp_path):
+    """Idempotency is per execution, not per message.
+
+    Measured on a real session: one message was taken up twice, both answers
+    were delivered to the client, and the second was silently discarded because
+    it carried the same completion id as the first -- so the record kept *older*
+    text than the reader had already received, and a reload showed the wrong
+    reply.  A write this run already made still collapses; another run's answer
+    becomes a row of its own.
+    """
+    store = _interjection_store(tmp_path)
+    completion_id = "m1:completion:1"
+    same_run = {"run_id": "run-a"}
+
+    first = store.write_conversation_exchange(
+        session_id="web",
+        user_content="融合这两个技能",
+        assistant_content="Recon done",
+        message_id="m1",
+        assistant_message_id=completion_id,
+        metadata=same_run,
+    )
+    replay = store.write_conversation_exchange(
+        session_id="web",
+        user_content="融合这两个技能",
+        assistant_content="Recon done",
+        message_id="m1",
+        assistant_message_id=completion_id,
+        metadata=same_run,
+    )
+    # The same key written by *another* execution is a second answer, not a
+    # duplicate of the first: it was shown to the reader too.
+    other_run = store.write_conversation_exchange(
+        session_id="web",
+        user_content="融合这两个技能",
+        assistant_content="融合技能已经建好并装上了",
+        message_id="m1",
+        assistant_message_id=completion_id,
+        metadata={"run_id": "run-b"},
+    )
+    # ... and an execution of its own has an id of its own (see run_turn).
+    fresh_key = store.write_conversation_exchange(
+        session_id="web",
+        user_content="融合这两个技能",
+        assistant_content="那就是第三份答案",
+        message_id="m1",
+        assistant_message_id="m1:run:c:completion:1",
+        metadata={"run_id": "run-c"},
+    )
+
+    assert first.assistant_created is True
+    assert replay.assistant_created is False
+    assert other_run.assistant_created is True
+    assert fresh_key.assistant_created is True
+    turns = store.recent_conversation_turns(session_id="web")
+    assert [turn.content for turn in turns if turn.role == "assistant"] == [
+        "Recon done",
+        "融合技能已经建好并装上了",
+        "那就是第三份答案",
+    ]
+
+
 def test_replaying_the_same_turn_does_not_duplicate_an_interjection(tmp_path):
     """The write is idempotent on the message id, like the user row beside it."""
     store = _interjection_store(tmp_path)

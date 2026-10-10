@@ -875,6 +875,15 @@ class AgentCore:
             "turn_id",
             str(turn_metadata.get("message_id") or uuid.uuid4().hex),
         )
+        # What this run *writes* is identified by this run, not by the message.
+        # A message taken up twice produces two answers, and both were shown to
+        # the reader -- keying the assistant row by message plus iteration alone
+        # let the second answer collide with the first and be dropped, so the
+        # record kept *older* text than the client had already received.  Minted
+        # once here it is stable for every write this run makes, which is what
+        # keeps a retried write idempotent.
+        run_id = str(turn_metadata.get("run_id") or uuid.uuid4().hex[:12])
+        turn_metadata["run_id"] = run_id
         prompted_input = TurnInput(
             text=prompt,
             session_id=turn_input.session_id,
@@ -965,7 +974,8 @@ class AgentCore:
                     self._refresh_skill_prompt_if_needed(state)
                     iteration_metadata = dict(turn_metadata)
                     iteration_metadata["completion_id"] = (
-                        f"{turn_metadata['turn_id']}:completion:{iteration_index + 1}"
+                        f"{turn_metadata['turn_id']}:run:{run_id}"
+                        f":completion:{iteration_index + 1}"
                     )
                     current_input = TurnInput(
                         text=iteration_prompt,

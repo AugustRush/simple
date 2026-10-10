@@ -1128,6 +1128,16 @@ class LTMStore:
             ).fetchone()
         return self._row_to_conversation_turn(row) if row else None
 
+    @staticmethod
+    def _json_object(raw: Any) -> dict[str, Any]:
+        """The object a stored ``metadata_json`` holds, or an empty one."""
+        try:
+            value = json.loads(raw or "{}")
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+
     def write_conversation_exchange(
         self,
         *,
@@ -1260,7 +1270,7 @@ class LTMStore:
                 if clean_assistant_message_id:
                     existing_assistant = conn.execute(
                         """
-                        SELECT id FROM conversation_turns
+                        SELECT id, metadata_json FROM conversation_turns
                         WHERE session_id = ? AND role = 'assistant'
                           AND message_id = ?
                         LIMIT 1
@@ -1270,13 +1280,28 @@ class LTMStore:
                 elif clean_message_id:
                     existing_assistant = conn.execute(
                         """
-                        SELECT id FROM conversation_turns
+                        SELECT id, metadata_json FROM conversation_turns
                         WHERE session_id = ? AND role = 'assistant'
                           AND reply_to_id = ?
                         LIMIT 1
                         """,
                         (clean_session_id, clean_message_id),
                     ).fetchone()
+                if existing_assistant is not None:
+                    # Idempotency is per *execution*: a write this run already
+                    # made collapses into its own row, while another run's answer
+                    # is a row of its own.  Keying on the completion id alone made
+                    # a second execution's answer look like a duplicate of the
+                    # first and dropped it -- measurably, two delivered answers
+                    # were missing from the record while the rows held *older*
+                    # text.  Rows written before runs had ids keep the old
+                    # behaviour, so this only ever adds an answer.
+                    incoming_run = str(payload.get("run_id") or "")
+                    existing_run = str(
+                        self._json_object(existing_assistant["metadata_json"]).get("run_id") or ""
+                    )
+                    if incoming_run and existing_run and incoming_run != existing_run:
+                        existing_assistant = None
                 if existing_assistant is None:
                     prior_assistant = None
                     if clean_message_id:

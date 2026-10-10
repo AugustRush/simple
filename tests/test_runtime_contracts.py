@@ -960,9 +960,13 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
     assert state.turn_count == 2
     assert execution.result.text == "reply:follow up"
     assert execution.continuation_rounds == 2
+    # One execution's iterations share a run id and differ by iteration: the
+    # identity of an answer is *this run*, so a message taken up a second time
+    # cannot collide with the first answer and be dropped from the record.
+    first_run_id = turn_runner.completion_ids[0].split(":run:")[1].split(":completion:")[0]
     assert turn_runner.completion_ids == [
-        "msg-1:completion:1",
-        "msg-1:completion:2",
+        f"msg-1:run:{first_run_id}:completion:1",
+        f"msg-1:run:{first_run_id}:completion:2",
     ]
     assert not execution.blocked
     assert [event.name for event in execution.events] == [
@@ -973,6 +977,7 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
         "agent_result_ready",
         "turn_response_delivered",
     ]
+
     assert execution.events[0].name == "turn_started"
     assert execution.events[1].session_id == "session-1"
     assert execution.events[1].channel_name == "feishu"
@@ -994,6 +999,24 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
         )
     ]
 
+
+    # The same message, taken up again: a new run, so its answers are its own.
+    turn_runner.completion_ids = []
+    again = asyncio.run(
+        core.handle_turn(
+            TurnInput.from_text(
+                "hello",
+                session_id="session-1",
+                channel_name="feishu",
+                metadata={"message_id": "msg-1"},
+            ),
+            RuntimeSessionState(ctx=_Ctx()),
+            sink=sink,
+        )
+    )
+    second_run_id = turn_runner.completion_ids[0].split(":run:")[1].split(":completion:")[0]
+    assert second_run_id != first_run_id
+    assert not again.blocked
 
 def test_agent_core_prompt_submit_metadata_uses_canonical_turn_identity():
     class _Ctx:
