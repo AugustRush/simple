@@ -419,6 +419,13 @@ export function useConversations(deps: Deps) {
               // has to survive this mapping: without the flag the row reads as
               // a turn boundary, and the grouping would split that turn again.
               interjection: item.interjection === true ? true : undefined,
+              // The thinking the server kept for this assistant row.  It
+              // rendered live from reasoning_chunk, so dropping it here is
+              // what used to erase the strip on the post-turn re-read.
+              reasoning:
+                typeof item.reasoning === 'string' && item.reasoning
+                  ? item.reasoning
+                  : undefined,
             }
           },
         )
@@ -548,6 +555,10 @@ export function useConversations(deps: Deps) {
             toolState: item.toolState as ToolState | undefined,
             attachments: Array.isArray(item.attachments) ? item.attachments : undefined,
             interjection: item.interjection === true ? true : undefined,
+            reasoning:
+              typeof item.reasoning === 'string' && item.reasoning
+                ? item.reasoning
+                : undefined,
           }
         },
       )

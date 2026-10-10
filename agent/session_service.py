@@ -157,6 +157,13 @@ def _session_order(item: dict[str, Any]) -> tuple[int, int, float]:
 
 
 
+#: Where an assistant row's thinking is kept inside the turn metadata.  The
+#: store already round-trips that payload for both rows of an exchange, so
+#: this needs no column and no migration -- and the reader exposes it for
+#: assistant rows only.
+_REASONING_METADATA_KEY = "_assistant_reasoning"
+
+
 def _messages_from_turns(
     turns: Any,
 ) -> tuple[list[dict[str, Any]], set[str]]:
@@ -213,6 +220,15 @@ def _messages_from_turns(
                 previous["seq"] = max(
                     int(previous.get("seq") or 0), int(getattr(turn, "seq", 0) or 0)
                 )
+                incoming_reasoning = str(
+                    metadata.get(_REASONING_METADATA_KEY) or ""
+                ).strip()
+                if incoming_reasoning:
+                    earlier_reasoning = str(previous.get("reasoning") or "")
+                    if incoming_reasoning not in earlier_reasoning:
+                        previous["reasoning"] = (
+                            f"{earlier_reasoning}\n\n{incoming_reasoning}".strip()
+                        )
                 continue
             item = {
                 "role": role,
@@ -222,6 +238,13 @@ def _messages_from_turns(
                 "created_at": str(getattr(turn, "created_at", "") or ""),
                 "message_id": str(getattr(turn, "message_id", "") or ""),
             }
+            # The thinking that produced an assistant row, kept out of the text
+            # because a reader may collapse it.  Only assistant rows: the stored
+            # payload is shared with the user row of the same exchange.
+            if role == "assistant":
+                reasoning = str(metadata.get(_REASONING_METADATA_KEY) or "").strip()
+                if reasoning:
+                    item["reasoning"] = reasoning
             # A message the user sent *during* this turn.  The flag travels with
             # the row because the client has to render it as in-turn speech: an
             # ordinary user row is a turn boundary, and treating an interjection

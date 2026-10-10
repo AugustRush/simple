@@ -31,6 +31,7 @@ from agent.core.output import (
     RuntimeEvent,
     _active_event_collector,
     _active_sink,
+    recorded_text,
 )
 from agent.runtime.heartbeat import heartbeat_path_for_session
 from agent.skills.catalog import prepare_user_message_for_skills
@@ -505,12 +506,41 @@ class TurnRunner:
         if completion_id:
             record_kwargs["assistant_message_id"] = completion_id
 
+        # What the record holds for the assistant is what the client was shown.
+        # ``result.text`` is the turn's *final* message, but a turn that narrated
+        # before calling a tool streamed more than that -- and the web frontend
+        # re-reads this record the moment the turn ends, asserting that
+        # everything the socket showed is in it.  Record only the answer and the
+        # narration disappears at completion, which is exactly what was reported.
+        active_sink = _active_sink.get()
+        displayed_text = (
+            str(getattr(active_sink, "displayed_text", "") or "")
+            if active_sink is not None
+            else ""
+        )
+
+        # Thinking is shown on the same channel and belongs to the same record.
+        # It rides the turn's metadata rather than a new column: the store
+        # already round-trips ``metadata_json`` for these rows, so a reader gets
+        # it back with no schema change -- and the API exposes it for assistant
+        # rows only, since the payload is shared with the user row.
+        displayed_reasoning = (
+            str(getattr(active_sink, "displayed_reasoning", "") or "")
+            if active_sink is not None
+            else ""
+        )
+        if displayed_reasoning:
+            record_kwargs["metadata"] = {
+                **dict(record_kwargs.get("metadata") or {}),
+                "_assistant_reasoning": displayed_reasoning,
+            }
+
         maintenance(
             ctx_mgr=state.context_manager,
             agent=require_service(self._components, "agent"),
             ctx=state.ctx,
             user_content=turn_input.text,
-            assistant_content=result.text or "",
+            assistant_content=recorded_text(displayed_text, result.text or ""),
             channel=turn_input.channel_name,
             record_kwargs=record_kwargs,
             memory_worker=state.memory_worker,

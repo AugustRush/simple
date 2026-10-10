@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.core.output import OutputSink
+from agent.core.output import OutputSink, recorded_text
 
 logger = logging.getLogger(__name__)
 
@@ -224,9 +224,29 @@ class WebOutputSink(OutputSink):
         self.reasoning_text += chunk
         self._emit({"type": "reasoning_chunk", "chunk": chunk, **_turn_tag(self._turn_id)})
 
+    @property
+    def displayed_reasoning(self) -> str:
+        """What this sink showed as thinking (``reasoning_text``)."""
+        return self.reasoning_text
+
+    @property
+    def displayed_text(self) -> str:
+        """What this sink showed for the turn: the text it streamed.
+
+        It is what the client has already rendered, what the reconnect snapshot
+        replays, and -- through ``OutputSink.displayed_text`` -- what the durable
+        record is asked to hold.  The runtime's own text is the turn's *final*
+        message, so it is only a fallback (see ``on_turn_complete``).
+        """
+        return self.full_text
+
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
-        if full_text:
-            self.full_text = full_text
+        # Never shrink.  The frame sent below replaces the client's streaming
+        # message, so adopting a shorter text here is exactly how a turn that
+        # narrated before calling a tool lost that narration on completion.
+        # The runtime's ``full_text`` is the last message of the turn; it is the
+        # whole answer only when this sink streamed nothing.
+        self.full_text = recorded_text(self.full_text, full_text)
         self._turn_complete_emitted = True
         self._completion_event.set()
         self._emit(

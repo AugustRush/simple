@@ -668,6 +668,106 @@ def _run_shell_approval(decision_payload):
         shell_session_allowlist_clear()
 
 
+def test_the_transcript_gives_an_assistant_row_its_thinking_back():
+    """Thinking is part of what a reader saw, so the record carries it back.
+
+    It is stored in the turn's metadata -- which the store already round-trips,
+    so no column and no migration -- and that payload is shared with the *user*
+    row of the same exchange, so the reader must expose it for assistant rows
+    only.
+    """
+    from types import SimpleNamespace
+
+    from agent.session_service import _messages_from_turns
+
+    def turn(role, content, seq, reasoning):
+        return SimpleNamespace(
+            role=role,
+            content=content,
+            reply_to_id="",
+            seq=seq,
+            created_at="",
+            message_id=f"m{seq}",
+            metadata={"_assistant_reasoning": reasoning},
+        )
+
+    messages, _ = _messages_from_turns(
+        [
+            turn("user", "问", 1, "不该出现在用户行"),
+            turn("assistant", "答", 2, "我先想了一下要不要回答。"),
+        ]
+    )
+    by_role = {message["role"]: message for message in messages}
+
+    assert by_role["assistant"]["reasoning"] == "我先想了一下要不要回答。"
+    assert "reasoning" not in by_role["user"]
+
+
+def test_the_rule_that_decides_a_turns_text():
+    """One rule, because the sink and the record must not disagree.
+
+    ``answer`` being the tail of what was shown means the turn streamed more
+    than its final message (narration before a tool call), so the whole of it is
+    the turn's text.  Anything else is a correction, and the runtime's text is
+    authoritative.
+    """
+    from agent.core.output import recorded_text
+
+    assert recorded_text("叙述。答复。", "答复。") == "叙述。答复。"
+    assert recorded_text("答复。", "答复。") == "答复。"
+    # An answer the display does not contain was never shown: append it.
+    assert recorded_text("approved", "done") == "approved\n\ndone"
+    assert recorded_text("叙述。答复。", "答复。") == "叙述。答复。"  # already shown
+    assert recorded_text("", "done") == "done"               # nothing was shown
+    assert recorded_text("shown", "") == "shown"             # no final answer
+
+
+def test_a_completed_turn_keeps_what_it_streamed():
+    """The frame replaces the client's message, so it must not shrink.
+
+    The runtime's text is the turn's *final* message; the client has already
+    rendered the narration that came before a tool call.  Adopting the shorter
+    text here is exactly how that narration disappeared on completion.
+    """
+    from agent.channels.web_sink import WebOutputSink
+
+    sink = WebOutputSink(collect=True, turn_id="t-1")
+    sink.mark_turn_start()
+    sink.on_stream_chunk("先说明意图。")
+    sink.on_stream_chunk("这是答复。")
+    sink.on_turn_complete("这是答复。", [])
+
+    complete = [e for e in sink.events if e["type"] == "turn_complete"][0]
+    assert complete["text"] == "先说明意图。这是答复。"
+    # ... and it is what the record is asked to hold.
+    assert sink.displayed_text == "先说明意图。这是答复。"
+
+    # A final message that was never streamed is appended, not substituted.
+    appended = WebOutputSink(collect=True, turn_id="t-2")
+    appended.mark_turn_start()
+    appended.on_stream_chunk("approved")
+    appended.on_turn_complete("done", [])
+    assert (
+        [e for e in appended.events if e["type"] == "turn_complete"][0]["text"]
+        == "approved\n\ndone"
+    )
+    # ... but a final message the display already contains changes nothing.
+    contained = WebOutputSink(collect=True, turn_id="t-4")
+    contained.mark_turn_start()
+    contained.on_stream_chunk("同一个答复")
+    contained.on_turn_complete("同一个答复", [])
+    assert (
+        [e for e in contained.events if e["type"] == "turn_complete"][0]["text"]
+        == "同一个答复"
+    )
+
+    # A sink that streamed nothing still gets the answer.
+    silent = WebOutputSink(collect=True, turn_id="t-3")
+    silent.mark_turn_start()
+    silent.on_turn_complete("只有答复", [])
+    assert silent.displayed_text == "只有答复"
+
+
 def test_the_event_tags_name_their_key_and_omit_an_unknown_identity():
     """The tag is a client contract: the key spelling and the omission.
 
@@ -836,7 +936,10 @@ def test_web_non_shell_prompt_rejects_session_scope():
                 events.append(event)
                 if event["type"] == "turn_complete":
                     break
-    assert events[-1]["text"] == "done"
+    # Both markers survive: the streamed confirmation, and the completion text
+    # this handler never streamed.  A completed turn's text is what the client
+    # saw *plus* any final message that was not streamed -- see ``recorded_text``.
+    assert events[-1]["text"] == "approved\n\ndone"
     assert any(
         e.get("chunk") == "approved" for e in events if e["type"] == "stream_chunk"
     )

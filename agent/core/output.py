@@ -135,6 +135,32 @@ def _render_markdown_line(line: str) -> Text:
     return text
 
 
+def recorded_text(displayed: str, answer: str) -> str:
+    """The text a turn is shown and recorded as, given what was displayed.
+
+    A turn that narrates before calling a tool streams *more* than its final
+    message: the answer is the tail of what the client saw, so the whole of it
+    is the turn's text -- recording only the answer is how the narration
+    disappeared the moment the turn completed.
+
+    A final text the display does **not** already contain was never shown --
+    measurably, some turns produce their last message outside the stream -- so
+    the turn's text is what was shown *plus* that message.  Appending rather
+    than replacing is the whole point: the client has already rendered what it
+    streamed, and losing either half is the bug this exists to prevent.
+
+    Hence one rule, used by the sink when it completes a turn and by the runtime
+    when it writes the record, so the two cannot disagree.
+    """
+    shown = (displayed or "").strip()
+    final = (answer or "").strip()
+    if not shown:
+        return answer or ""
+    if not final or final in shown:
+        return displayed or ""
+    return f"{displayed.rstrip()}\n\n{answer.lstrip()}"
+
+
 class _StreamMarkdown:
     """Line-buffered streaming markdown renderer.
 
@@ -532,6 +558,33 @@ class OutputSink(ABC):
         """
 
         return False
+
+    @property
+    def displayed_text(self) -> str:
+        """What this sink showed for the turn, when that is not just the answer.
+
+        The durable record has to hold everything the client saw: the web
+        frontend re-reads it the moment a turn ends and states that as the
+        invariant ("everything the live socket showed for it exists there").  A
+        turn that narrated before calling a tool streamed *more* than its final
+        answer, so the runtime asks the sink that did the streaming instead of
+        assuming the answer is the whole of it.
+
+        ``""`` means "no opinion" and the answer is recorded, which is the right
+        default for a sink whose display is chrome around the answer rather than
+        the answer itself.
+        """
+        return ""
+
+    @property
+    def displayed_reasoning(self) -> str:
+        """The thinking this sink showed for the turn, or "" when it showed none.
+
+        Thinking is part of what a reader saw, so it is part of what the record
+        has to hold: the web client renders it, re-reads the record when the turn
+        ends, and would otherwise erase it in front of the reader.
+        """
+        return ""
 
     def sync_stream_cb(self, chunk: str) -> None:
         """Synchronous callback adapter for BaseAgent.send_message."""
