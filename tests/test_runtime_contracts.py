@@ -139,6 +139,101 @@ def test_turn_runner_delegates_to_agent_and_normalizes_result():
     )
 
 
+def test_a_message_that_already_has_an_answer_does_not_run_again():
+    """The third line of defence: a replay arriving down a path nothing saw.
+
+    Behind the in-flight guard (this message is already running) and the queue
+    guard (a resend that waited its turn) sits the signal the journal already
+    gives: ``begin_turn`` says whether *it* wrote the user row.  A message whose
+    row was written before and whose answer is on record is a replay; one whose
+    earlier attempt died before answering is a retry, and still runs.
+    """
+    ran: list[str] = []
+
+    class _Agent:
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return type(
+                "Result",
+                (),
+                {"agent_id": "a", "content": "reply", "tool_calls_made": [], "error": None},
+            )()
+
+    class _Runner:
+        async def run(self, turn_input, ctx, stream_callback=None):
+            ran.append(turn_input.text)
+            return TurnResult(text="reply")
+
+        async def complete_turn(self, turn_input, state, result):
+            return []
+
+    class _Sink:
+        def sync_stream_cb(self, chunk):
+            return None
+
+        def on_turn_complete(self, text, tool_calls):
+            return None
+
+        def on_error(self, error):
+            return None
+
+        async def drain(self):
+            return None
+
+    class _Store:
+        def __init__(self, answered):
+            self.answered = answered
+
+        def message_has_answer(self, *, session_id, message_id):
+            return self.answered
+
+    class _ContextManager:
+        def __init__(self, answered):
+            self.store = _Store(answered)
+
+        def begin_turn(self, *, user_content, channel="", message_id="", metadata=None):
+            return False  # journalled before: this message was taken up earlier
+
+        def mark_activity(self):
+            return None
+
+    class _Ctx:
+        system_prompt = "system"
+        metadata: dict = {}
+
+    def handle(answered):
+        components = RuntimeComponents(
+            {
+                "agent": _Agent(),
+                "agent_loop": _Runner(),
+                "system_prompt": "system",
+                "base_system_prompt": "system",
+            }
+        )
+        core = AgentCore(components)
+        state = RuntimeSessionState(
+            ctx=_Ctx(), context_manager=_ContextManager(answered)
+        )
+        return asyncio.run(
+            core.handle_turn(
+                TurnInput.from_text(
+                    "hello", session_id="s-1", metadata={"message_id": "msg-1"}
+                ),
+                state,
+                sink=_Sink(),
+            )
+        )
+
+    replayed = handle(True)
+    assert replayed.blocked is True
+    assert "already been answered" in replayed.block_reason
+    assert ran == []
+
+    # The earlier attempt died before answering: this is a retry, not a replay.
+    retried = handle(False)
+    assert retried.blocked is False
+    assert ran == ["hello"]
+
+
 def test_a_message_already_running_does_not_start_a_second_turn():
     """One message, one turn: a re-delivery must not double the work.
 

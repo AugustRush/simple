@@ -743,6 +743,26 @@ class AgentCore:
         state.set_session_prompt(prompt)
 
     @staticmethod
+    def _message_already_answered(
+        state: Any, session_id: str, message_id: str
+    ) -> bool:
+        """Whether this message already has an assistant answer on record."""
+        store = getattr(getattr(state, "context_manager", None), "store", None)
+        check = getattr(store, "message_has_answer", None)
+        if not message_id or not callable(check):
+            return False
+        from agent import shared as _shared
+
+        answered = False
+        with _shared._suppress_with_log(
+            "could not tell whether a message was already answered"
+        ):
+            answered = bool(
+                check(session_id=str(session_id or ""), message_id=str(message_id))
+            )
+        return answered
+
+    @staticmethod
     async def _drain_if_supported(sink: Any) -> None:
         drain = getattr(sink, "drain", None)
         if callable(drain):
@@ -914,12 +934,29 @@ class AgentCore:
         if state.context_manager is not None:
             begin_turn = getattr(state.context_manager, "begin_turn", None)
             if callable(begin_turn):
-                begin_turn(
+                # ``begin_turn`` writes the user row and says whether *it* wrote
+                # it: False means this message was journalled before.  That is
+                # the third line of defence, behind the in-flight and queue
+                # guards -- the one that catches a delivery arriving down a path
+                # neither of them saw.  Only an already *answered* message is
+                # refused: one whose earlier attempt died before answering is a
+                # legitimate retry and must run.
+                journalled_now = begin_turn(
                     user_content=turn_input.text,
                     channel=turn_input.channel_name,
                     message_id=str(turn_metadata["turn_id"]),
                     metadata=turn_metadata,
                 )
+                if journalled_now is False and self._message_already_answered(
+                    state, turn_input.session_id, turn_key
+                ):
+                    in_flight.discard(turn_key)
+                    return TurnExecution(
+                        result=TurnResult(text=""),
+                        continuation_rounds=0,
+                        blocked=True,
+                        block_reason="this message has already been answered",
+                    )
         blocked, prompt = await self._apply_prompt_submit_hooks(
             prompt,
             prompted_input,
