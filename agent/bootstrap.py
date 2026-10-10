@@ -207,7 +207,14 @@ async def _build_web_session_components(
     workspace_root = (
         Path(str(configured_workspace)).expanduser().resolve(strict=False)
         if configured_workspace
-        else Path(global_components.get("workspace_root") or Path.cwd()).resolve()
+        # Never a process cwd: a session's file boundary is something the user
+        # chose, and when nothing was chosen the agent's own workspace is the
+        # honest default.  A CLI process that *was* started inside a project
+        # passes its cwd in as the global workspace_root, so that deliberate
+        # act still works -- see ``_gateway_workspace_config`` for the server.
+        else Path(
+            global_components.get("workspace_root") or shared.DEFAULT_WORKSPACE_DIR
+        ).resolve()
     )
     session_cfg["output_dir"] = str(output_dir)
     session_cfg["workspace_root"] = str(workspace_root)

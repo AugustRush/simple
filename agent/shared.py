@@ -120,7 +120,7 @@ def _set_agent_home(home: Path) -> None:
     global AGENT_HOME, MEMORY_DIR, SKILLS_DIR, TOOLS_DIR, PACKAGE_ROOT
     global BUILTIN_SKILLS_DIR, PROMPTS_DIR, RL_DIR, SCHEDULER_DIR
     global SCHEDULER_DB_FILE, CONFIG_FILE, INDEX_FILE, SESSIONS_FILE
-    global DEFAULT_OUTPUT_DIR, PLUGINS_DIR, USER_PLUGINS_DIR, CONTEXT_DIR
+    global DEFAULT_OUTPUT_DIR, DEFAULT_WORKSPACE_DIR, PLUGINS_DIR, USER_PLUGINS_DIR, CONTEXT_DIR
     global STAGING_DIR, PALACE_DB_FILE
     resolved = Path(home).expanduser().resolve()
     os.environ["SIMPLE_AGENT_HOME"] = str(resolved)
@@ -138,6 +138,11 @@ def _set_agent_home(home: Path) -> None:
     INDEX_FILE = MEMORY_DIR / "INDEX.md"
     SESSIONS_FILE = RL_DIR / "sessions.jsonl"
     DEFAULT_OUTPUT_DIR = AGENT_HOME / "output"
+    # The workspace a *server* hands a conversation that has not chosen one.
+    # Home-scoped on purpose: ``--name prod`` then gets its own, and the agent's
+    # own working area never mixes with somebody's project.  Sibling of
+    # ``output`` because the file policy requires the two roots to be disjoint.
+    DEFAULT_WORKSPACE_DIR = AGENT_HOME / "workspace"
     PLUGINS_DIR = PACKAGE_ROOT / "_builtin" / "plugins"
     USER_PLUGINS_DIR = AGENT_HOME / "plugins"
     CONTEXT_DIR = AGENT_HOME / "context"
@@ -159,6 +164,7 @@ CONFIG_FILE = AGENT_HOME / "config.json"
 INDEX_FILE = MEMORY_DIR / "INDEX.md"
 SESSIONS_FILE = RL_DIR / "sessions.jsonl"
 DEFAULT_OUTPUT_DIR = AGENT_HOME / "output"
+DEFAULT_WORKSPACE_DIR = AGENT_HOME / "workspace"
 PLUGINS_DIR = PACKAGE_ROOT / "_builtin" / "plugins"
 USER_PLUGINS_DIR = AGENT_HOME / "plugins"
 

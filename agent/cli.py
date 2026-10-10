@@ -1059,6 +1059,34 @@ def main_callback(
             home_lock.release()
 
 
+def _gateway_workspace_config(cfg: dict) -> dict:
+    """The config the gateway runs with, carrying a workspace it can defend.
+
+    The gateway is not a process somebody started *inside* a project: its cwd is
+    wherever the shell happened to be, and every conversation that has not
+    chosen a folder would inherit that -- reading it, and (once a folder is
+    granted in the UI) writing it, with nothing on screen explaining why.  A
+    server hands out the agent's own workspace instead.
+
+    An explicit ``workspace_root`` in the config still wins, and a folder chosen
+    in the UI is per session.  The directory is created only when *we* are the
+    ones choosing it: a configured path that does not exist is somebody's typo,
+    and creating it silently would hide that.
+    """
+    if str(cfg.get("workspace_root") or "").strip():
+        return cfg
+    workspace = shared.DEFAULT_WORKSPACE_DIR
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        shared.CONSOLE.print(
+            f"[yellow]Could not create the default workspace {workspace}: {exc}.\n"
+            "Set workspace_root in your config, or pick a folder per session.[/yellow]"
+        )
+        return cfg
+    return {**cfg, "workspace_root": str(workspace)}
+
+
 def _gateway_channel_guidance(cfg: dict) -> str:
     """What to tell somebody whose gateway started no channels.
 
@@ -1132,9 +1160,12 @@ def gateway(
             raise typer.Exit(0)
         cfg, _ = agent_module.load_config()
 
+    # Chosen here rather than inherited from the shell: see the helper.
+    gateway_cfg = _gateway_workspace_config(cfg)
+
     async def _run():
         try:
-            components = await agent_module._build_components_async(cfg)
+            components = await agent_module._build_components_async(gateway_cfg)
         except RuntimeError as exc:
             shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1)
@@ -1149,9 +1180,9 @@ def gateway(
         scheduler_task: Optional[asyncio.Task] = None
         scheduler_store = None
         try:
-            channels = _build_gateway_channels(cfg)
+            channels = _build_gateway_channels(gateway_cfg)
             if not channels:
-                shared.CONSOLE.print(_gateway_channel_guidance(cfg))
+                shared.CONSOLE.print(_gateway_channel_guidance(gateway_cfg))
                 return
             shared.CONSOLE.print(
                 f"[dim]Gateway starting {len(channels)} channel(s). "
@@ -1172,7 +1203,7 @@ def gateway(
             catalog.mount(SchedulerPlugin())
             service = require_service(components, "scheduler")
             scheduler_task = asyncio.create_task(service.run_forever())
-            runner = ChannelRunner(channels, components, cfg)
+            runner = ChannelRunner(channels, components, gateway_cfg)
             await runner.run()
         finally:
             if scheduler_task is not None:

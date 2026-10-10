@@ -7525,6 +7525,58 @@ def test_evolve_uses_qualified_component_cleanup(monkeypatch):
     assert calls["closed"] == 1
 
 
+def test_a_gateway_without_a_configured_workspace_does_not_inherit_the_cwd(
+    tmp_path, monkeypatch
+):
+    """The gateway is not a process somebody started inside a project.
+
+    Its cwd is wherever the shell happened to be, and every conversation that
+    had not chosen a folder inherited it -- reading that directory, and (once a
+    folder was granted in the UI) writing it, with nothing on screen explaining
+    why.  The app's own workspace is the honest default.
+    """
+    import agent.cli as cli_module
+
+    workspace = tmp_path / "agent-workspace"
+    monkeypatch.setattr(cli_module.shared, "DEFAULT_WORKSPACE_DIR", workspace)
+
+    resolved = cli_module._gateway_workspace_config({})
+
+    assert resolved["workspace_root"] == str(workspace)
+    assert Path(resolved["workspace_root"]).resolve() != Path.cwd().resolve()
+    assert workspace.is_dir(), "the workspace we chose must exist for the file tools"
+
+
+def test_a_configured_workspace_is_left_alone(tmp_path, monkeypatch):
+    """An explicit choice wins, and a path that does not exist is not invented."""
+    import agent.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module.shared, "DEFAULT_WORKSPACE_DIR", tmp_path / "unused-default"
+    )
+    configured = {"workspace_root": str(tmp_path / "my-project")}
+
+    assert cli_module._gateway_workspace_config(configured) is configured
+    assert not (tmp_path / "my-project").exists()
+    assert not (tmp_path / "unused-default").exists()
+
+
+def test_the_default_workspace_is_home_scoped_and_disjoint_from_output(
+    tmp_path, monkeypatch
+):
+    """The two roots a session is given must not contain one another.
+
+    The file policy refuses to start when they do -- which is how running a
+    gateway from a directory that contained the agent home once failed.
+    """
+    from agent import shared
+
+    assert shared.DEFAULT_WORKSPACE_DIR.parent == shared.AGENT_HOME
+    assert shared.DEFAULT_WORKSPACE_DIR != shared.DEFAULT_OUTPUT_DIR
+    assert shared.DEFAULT_OUTPUT_DIR not in shared.DEFAULT_WORKSPACE_DIR.parents
+    assert shared.DEFAULT_WORKSPACE_DIR not in shared.DEFAULT_OUTPUT_DIR.parents
+
+
 def test_gateway_guidance_names_the_local_channel_and_the_real_situation():
     """An unhelpful message sends people down the harder path.
 

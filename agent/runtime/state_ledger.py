@@ -194,6 +194,9 @@ LEDGER: tuple[StateEntry, ...] = (
     StateEntry("INDEX_FILE", "agent/shared.py", 146, "REBOUND", "process", "service", 9),
     StateEntry("SESSIONS_FILE", "agent/shared.py", 147, "REBOUND", "process", "service", 9),
     StateEntry("DEFAULT_OUTPUT_DIR", "agent/shared.py", 148, "REBOUND", "process", "service", 9),
+    StateEntry("DEFAULT_WORKSPACE_DIR", "agent/shared.py", 123, "REBOUND", "process", "service", 9,
+               "The workspace a server hands a conversation that has not chosen one: "
+               "home-scoped so --name gets its own, and disjoint from the output root."),
     StateEntry("PLUGINS_DIR", "agent/shared.py", 149, "REBOUND", "process", "service", 9),
     StateEntry("USER_PLUGINS_DIR", "agent/shared.py", 150, "REBOUND", "process", "service", 9),
     StateEntry("CONTEXT_DIR", "agent/shared.py", 256, "REBOUND", "process", "service", 9),
