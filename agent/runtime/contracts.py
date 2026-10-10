@@ -884,6 +884,26 @@ class AgentCore:
         # keeps a retried write idempotent.
         run_id = str(turn_metadata.get("run_id") or uuid.uuid4().hex[:12])
         turn_metadata["run_id"] = run_id
+        # One message, one turn -- while it is running.  A re-delivery (a client
+        # resend, a replay after a reconnect) must not start a second tool loop
+        # for the same message: measurably, one message ran two *interleaved*
+        # loops under a single turn id (steps 1..42 and 1..56 alternating),
+        # doubling its model calls and tool calls, and the second answer could
+        # not be recorded under the first one's key.  Refusing the duplicate is
+        # what makes "at-least-once delivery" stop costing twice.
+        turn_key = str(turn_metadata["turn_id"])
+        in_flight = getattr(state, "turns_in_flight", None)
+        if in_flight is None:
+            in_flight = set()
+            state.turns_in_flight = in_flight
+        if turn_key in in_flight:
+            return TurnExecution(
+                result=TurnResult(text=""),
+                continuation_rounds=0,
+                blocked=True,
+                block_reason="this message is already being answered",
+            )
+        in_flight.add(turn_key)
         prompted_input = TurnInput(
             text=prompt,
             session_id=turn_input.session_id,
@@ -1124,6 +1144,7 @@ class AgentCore:
                 events=self._drain_collector(turn_input),
             )
         finally:
+            in_flight.discard(turn_key)
             if state.cancel_token is not None:
                 state.ctx.metadata.pop("cancel_token", None)
             if schedule_target_token is not None:

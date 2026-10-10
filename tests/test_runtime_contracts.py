@@ -139,6 +139,84 @@ def test_turn_runner_delegates_to_agent_and_normalizes_result():
     )
 
 
+def test_a_message_already_running_does_not_start_a_second_turn():
+    """One message, one turn: a re-delivery must not double the work.
+
+    Measured on a real session: one message ran two *interleaved* tool loops
+    under a single turn id (steps 1..42 and 1..56 alternating), so its model
+    calls and tool calls were paid for twice -- and the second answer could not
+    be recorded under the first one's completion key.
+    """
+    holder: dict = {}
+
+    class _Agent:
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return type(
+                "Result",
+                (),
+                {"agent_id": "a", "content": "reply", "tool_calls_made": [], "error": None},
+            )()
+
+    class _Runner:
+        async def run(self, turn_input, ctx, stream_callback=None):
+            # A re-delivery of the very message this turn is answering.
+            holder["nested"] = await holder["core"].handle_turn(
+                TurnInput.from_text(
+                    "hello", session_id="s-1", metadata={"message_id": "msg-1"}
+                ),
+                holder["state"],
+                sink=holder["sink"],
+            )
+            return TurnResult(text="reply")
+
+        async def complete_turn(self, turn_input, state, result):
+            return []
+
+    class _Sink:
+        def sync_stream_cb(self, chunk):
+            return None
+
+        def on_turn_complete(self, text, tool_calls):
+            return None
+
+        def on_error(self, error):
+            return None
+
+        async def drain(self):
+            return None
+
+    class _Ctx:
+        system_prompt = "system"
+        metadata: dict = {}
+
+    components = RuntimeComponents(
+        {
+            "agent": _Agent(),
+            "agent_loop": _Runner(),
+            "system_prompt": "system",
+            "base_system_prompt": "system",
+        }
+    )
+    core = AgentCore(components)
+    state = RuntimeSessionState(ctx=_Ctx())
+    sink = _Sink()
+    holder.update(core=core, state=state, sink=sink)
+
+    outer = asyncio.run(
+        core.handle_turn(
+            TurnInput.from_text(
+                "hello", session_id="s-1", metadata={"message_id": "msg-1"}
+            ),
+            state,
+            sink=sink,
+        )
+    )
+
+    assert outer.blocked is False
+    assert holder["nested"].blocked is True
+    assert "already being answered" in holder["nested"].block_reason
+
+
 def test_runtime_session_state_records_task_context_once_and_truncates():
     state = RuntimeSessionState(ctx=object())
 
