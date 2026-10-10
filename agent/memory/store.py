@@ -1382,6 +1382,22 @@ class LTMStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_conversation_turn(row) for row in reversed(rows)]
 
+    @staticmethod
+    def _turn_keys(rows: Any) -> list[str]:
+        """The distinct turns a run of positions belongs to, newest first.
+
+        A position with no turn of its own -- an older conversation row written
+        before ids were threaded through, a standalone command result -- is its
+        own unit, which keeps such a row from being silently merged into the
+        neighbouring turn's budget.
+        """
+        keys: list[str] = []
+        for row in rows:
+            key = str(row["turn_key"] or f"pos:{int(row['seq'])}")
+            if key not in keys:
+                keys.append(key)
+        return keys
+
     def transcript_window(
         self,
         *,
@@ -1396,42 +1412,81 @@ class LTMStore:
         than two lists it has to reconcile, and a tool call keeps its place
         between the request that caused it and the reply it fed.
 
-        ``limit`` bounds the *timeline*, not each table separately: the newest
-        ``limit`` positions are taken from the union, so a window can never come
-        back holding 2 x limit rows. ``before_seq`` pages backwards through it.
+        ``limit`` bounds **turns**, not positions.  A position is not what the
+        client consumes: a turn's tool calls take two positions each and are
+        displayed as one collapsed trace, so a position budget can be spent
+        inside a single turn -- the reader is handed that trace with no reply,
+        and the conversation it wanted sits behind the cursor until somebody
+        pages back through a hundred tool calls.  Measured: a session whose
+        ``conversation_turns`` held five rows answered ``limit=200`` with 101
+        tool rows and no assistant row at all, because one turn's events filled
+        the window on their own.
+
+        A turn is the unit writer and reader agree on: ``agent_events.turn_id``
+        names it, ``conversation_turns`` links its rows through
+        ``reply_to_id``/``message_id``, and a turn's positions are contiguous.
+        So the window walks positions newest-first and cuts at the boundary of
+        the next turn, which is what keeps a turn's tools and its reply in the
+        same window.  ``before_seq`` pages backwards through it.
         """
         clean_session_id = str(session_id or "").strip()
         if not clean_session_id:
             return [], [], False
-        limit = max(1, min(int(limit), 500))
+        turns_limit = max(1, min(int(limit), 500))
         window = before_seq if before_seq > 0 else (1 << 62)
+        # Read positions newest-first in chunks until the budget of *turns* is
+        # full: how many positions one turn owns is the turn's business, so the
+        # only way to count turns is to walk them.
+        withheld = False
+        collected: list[Any] = []
+        batch = max(turns_limit * 2, 200)
         with self._connect() as conn:
-            # One ordered pass over both tables, then cut the window: this is
-            # what makes the limit mean the same thing for both.
-            positions = conn.execute(
-                """
-                SELECT seq, 'turn' AS source FROM conversation_turns
-                WHERE session_id = ? AND seq < ?
-                UNION ALL
-                SELECT seq, 'event' AS source FROM agent_events
-                WHERE session_id = ? AND seq < ?
-                  AND event_type IN (
-                      'tool_started', 'tool_progress', 'tool_completed',
-                      'tool_failed', 'tool_blocked', 'attachment',
-                      'command_result'
-                  )
-                ORDER BY seq DESC LIMIT ?
-                """,
-                (clean_session_id, window, clean_session_id, window, limit),
-            ).fetchall()
-            seqs = [int(row["seq"]) for row in positions]
-            has_more = len(seqs) == limit and bool(seqs)
-            turn_seqs = [
-                int(row["seq"]) for row in positions if str(row["source"]) == "turn"
-            ]
-            event_seqs = [
-                int(row["seq"]) for row in positions if str(row["source"]) == "event"
-            ]
+            while True:
+                chunk = conn.execute(
+                    """
+                    SELECT seq, 'turn' AS source,
+                           COALESCE(NULLIF(reply_to_id, ''), message_id) AS turn_key
+                      FROM conversation_turns
+                     WHERE session_id = ? AND seq < ?
+                    UNION ALL
+                    SELECT seq, 'event' AS source, turn_id AS turn_key
+                      FROM agent_events
+                     WHERE session_id = ? AND seq < ?
+                       AND event_type IN (
+                           'tool_started', 'tool_progress', 'tool_completed',
+                           'tool_failed', 'tool_blocked', 'attachment',
+                           'command_result'
+                       )
+                     ORDER BY seq DESC
+                     LIMIT ?
+                    """,
+                    (clean_session_id, window, clean_session_id, window, batch),
+                ).fetchall()
+                collected.extend(chunk)
+                if len(chunk) < batch:
+                    break
+                if len(self._turn_keys(collected)) > turns_limit:
+                    withheld = True
+                    break
+                window = int(chunk[-1]["seq"])
+
+        positions: list[Any] = []
+        keys: list[str] = []
+        for row in collected:  # newest first
+            key = str(row["turn_key"] or f"pos:{int(row['seq'])}")
+            if key not in keys:
+                if len(keys) >= turns_limit:
+                    withheld = True
+                    break
+                keys.append(key)
+            positions.append(row)
+        has_more = withheld and bool(positions)
+        turn_seqs = [
+            int(row["seq"]) for row in positions if str(row["source"]) == "turn"
+        ]
+        event_seqs = [
+            int(row["seq"]) for row in positions if str(row["source"]) == "event"
+        ]
 
         # Resolved through each row's own sequence rather than by re-running a
         # range query: the window is a set of positions, and a second range

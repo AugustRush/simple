@@ -1949,12 +1949,52 @@ def test_one_session_never_reads_another_sessions_rows(tmp_path):
             )
 
 
-def test_a_transcript_pages_backwards_with_a_cursor(tmp_path):
-    """A long conversation is paged, not cut off.
+def test_a_window_is_whole_turns_not_positions(tmp_path):
+    """One turn's tool calls must not push the conversation out of the window.
 
-    The window is the newest slice; ``oldest_seq`` is what the next request
-    pages from and ``has_more`` says whether the conversation continues. Without
-    it a reader had no way to reach the beginning of a long session.
+    Measured on a real session: five conversation rows plus one turn that made a
+    hundred tool calls answered ``limit=200`` with 101 tool rows and *no*
+    assistant row at all -- the reply sat 1200 positions behind the cursor, so
+    the reader had to page back through every tool call to see the answer it was
+    replying to.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="融合这两个技能",
+        assistant_content="Recon done: 44 styles",
+        channel="web",
+        message_id="turn-1",
+        assistant_message_id="turn-1",
+    )
+    # The turn that is still working: two positions per tool call.
+    for index in range(160):
+        for event_type in ("tool_started", "tool_completed"):
+            store.append_agent_event(
+                session_id="web-session",
+                event_type=event_type,
+                payload={"operation_id": f"op-{index}", "tool_name": "shell"},
+                turn_id="turn-2",
+            )
+    service = SessionService(store=store)
+
+    window = service.get_messages("web-session", limit=50)
+
+    assert [
+        item["content"] for item in window["messages"] if item["role"] == "assistant"
+    ] == ["Recon done: 44 styles"]
+
+
+def test_a_transcript_pages_backwards_with_a_cursor(tmp_path):
+    """A long conversation is paged, not cut off -- in whole turns.
+
+    ``limit`` counts **turns**, not positions: a turn's tool calls take two
+    positions each and are displayed as one collapsed trace, so a position
+    budget gets spent inside a single turn and the reply the reader wants falls
+    behind the cursor.  ``oldest_seq`` is what the next request pages from and
+    ``has_more`` says whether the conversation continues.
     """
     from agent.memory.store import LTMStore
 
@@ -1969,10 +2009,8 @@ def test_a_transcript_pages_backwards_with_a_cursor(tmp_path):
         )
     service = SessionService(store=store)
 
-    newest = service.get_messages("web-session", limit=6)
+    newest = service.get_messages("web-session", limit=2)
     assert [item["content"] for item in newest["messages"]] == [
-        "请求 10",
-        "回答 10",
         "请求 11",
         "回答 11",
         "请求 12",
@@ -1981,15 +2019,13 @@ def test_a_transcript_pages_backwards_with_a_cursor(tmp_path):
     assert newest["has_more"] is True
 
     older = service.get_messages(
-        "web-session", limit=6, before_seq=newest["oldest_seq"]
+        "web-session", limit=2, before_seq=newest["oldest_seq"]
     )
     assert [item["content"] for item in older["messages"]] == [
-        "请求 7",
-        "回答 7",
-        "请求 8",
-        "回答 8",
         "请求 9",
         "回答 9",
+        "请求 10",
+        "回答 10",
     ]
     # The second page picks up where the first stopped: the cursor is the
     # oldest row of the previous page, not a count of pages.
@@ -2004,7 +2040,7 @@ def test_a_transcript_pages_backwards_with_a_cursor(tmp_path):
         newest_page.append(
             service.get_messages(
                 "web-session",
-                limit=6,
+                limit=2,
                 before_seq=newest_page[-1]["oldest_seq"],
             )
         )

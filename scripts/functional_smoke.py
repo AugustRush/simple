@@ -287,6 +287,54 @@ async def check_workspace_is_not_the_cwd(client: Any, base: str, results: Result
         await client.delete(f"{base}/api/sessions/{session_id}")
 
 
+async def check_window_is_whole_turns(client: Any, base: str, home: Path, results: Results) -> None:
+    """A turn's tool calls must not push the conversation out of its own window.
+
+    Measured on a real session: five conversation rows plus one turn making a
+    hundred tool calls answered ``limit=200`` with 101 tool rows and *no*
+    assistant row -- the reply sat 1200 positions behind the cursor, so a reader
+    had to page back through every tool call to see the answer.  The rows here
+    are written through the same store the gateway reads, so this is the real
+    read path with a real long turn in it.
+    """
+    from agent.memory.store import LTMStore
+
+    session_id = await new_session(client, base)
+    store = LTMStore(context_dir=home / "context", memory_dir=home / "memory")
+    reply = "Recon done: 44 styles"
+    store.write_conversation_exchange(
+        session_id=session_id,
+        user_content="融合这两个技能",
+        assistant_content=reply,
+        channel="web",
+        message_id="turn-1",
+        assistant_message_id="turn-1",
+    )
+    for index in range(120):
+        for event_type in ("tool_started", "tool_completed"):
+            store.append_agent_event(
+                session_id=session_id,
+                event_type=event_type,
+                payload={"operation_id": f"op-{index}", "tool_name": "shell"},
+                turn_id="turn-2",
+            )
+    rows = await records(client, base, session_id)
+    answers = [r for r in rows if r.get("role") == "assistant"]
+    problems = []
+    if not answers:
+        problems.append(
+            f"the first window holds {len(rows)} rows and no reply "
+            f"(roles: {sorted({r.get('role') for r in rows})})"
+        )
+    elif reply not in str(answers[-1].get("content") or ""):
+        problems.append(f"the reply came back as {str(answers[-1].get('content'))[:40]!r}")
+    results.add(
+        "window is whole turns",
+        FAIL if problems else OK,
+        "; ".join(problems) if problems else f"120 tool calls, reply still in the first window",
+    )
+
+
 async def check_turn_record_holds_the_stream(
     client: Any, base: str, results: Results
 ) -> None:
@@ -335,7 +383,9 @@ async def check_turn_record_holds_the_stream(
         await client.delete(f"{base}/api/sessions/{session_id}")
 
 
-async def run_checks(base: str, results: Results, has_provider: bool) -> None:
+async def run_checks(
+    base: str, results: Results, has_provider: bool, home: Path
+) -> None:
     import httpx
 
     async with httpx.AsyncClient(timeout=90) as client:
@@ -344,6 +394,7 @@ async def run_checks(base: str, results: Results, has_provider: bool) -> None:
         await check_session_lifecycle(client, base, results)
         await check_slash_command(client, base, results)
         await check_workspace_is_not_the_cwd(client, base, results)
+        await check_window_is_whole_turns(client, base, home, results)
         if has_provider:
             await check_turn_record_holds_the_stream(client, base, results)
         else:
@@ -376,7 +427,7 @@ def main() -> int:
     process = start_gateway(home, port)
     CURRENT_PROCESS = process
     try:
-        asyncio.run(run_checks(base, results, has_provider))
+        asyncio.run(run_checks(base, results, has_provider, home))
     except Exception as exc:  # noqa: BLE001 - the report is the point
         results.add("harness", FAIL, f"{type(exc).__name__}: {exc}")
     finally:
