@@ -224,6 +224,10 @@ class WebOutputSink(OutputSink):
         self.reasoning_text += chunk
         self._emit({"type": "reasoning_chunk", "chunk": chunk, **_turn_tag(self._turn_id)})
 
+    def on_command_result(self, text: str, *, level: str = "info") -> None:
+        """A command's answer: its own event, so the client can print it."""
+        self._emit({"type": "command_result", "text": text, "level": level})
+
     @property
     def displayed_reasoning(self) -> str:
         """What this sink showed as thinking (``reasoning_text``)."""

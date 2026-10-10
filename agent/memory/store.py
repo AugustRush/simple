@@ -1417,7 +1417,8 @@ class LTMStore:
                 WHERE session_id = ? AND seq < ?
                   AND event_type IN (
                       'tool_started', 'tool_progress', 'tool_completed',
-                      'tool_failed', 'tool_blocked', 'attachment'
+                      'tool_failed', 'tool_blocked', 'attachment',
+                      'command_result'
                   )
                 ORDER BY seq DESC LIMIT ?
                 """,

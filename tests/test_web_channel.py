@@ -668,6 +668,58 @@ def _run_shell_approval(decision_payload):
         shell_session_allowlist_clear()
 
 
+def test_a_command_result_is_a_reply_not_a_status():
+    """A command's answer must be visible, and must survive a reload.
+
+    It went out as a ``status`` -- the line that says what the agent is doing
+    right now -- and the frame that ended the command cleared it.  A reader
+    typing ``/help`` saw a flash and nothing else, while the server had run the
+    command and logged it.
+    """
+    from types import SimpleNamespace
+
+    from agent.channels.web_sink import WebOutputSink
+    from agent.commands import CommandResult
+    from agent.commands.coordinator import CommandCoordinator
+    from agent.session_service import _event_rows
+
+    sink = WebOutputSink(collect=True, turn_id="t-1")
+    sink.on_command_result("## 命令表", level="info")
+    assert [event["type"] for event in sink.events] == ["command_result"]
+
+    appended: list[tuple] = []
+
+    class _Log:
+        def append(self, name, fields, turn_id=""):
+            appended.append((name, fields, turn_id))
+
+    state = SimpleNamespace(context_manager=SimpleNamespace(session_log=_Log()))
+    CommandCoordinator._journal_command_result(
+        state,
+        SimpleNamespace(text="/help", metadata={"message_id": "m-1"}),
+        CommandResult(response_text="## 命令表"),
+    )
+    assert appended[0][0] == "command_result"
+    assert appended[0][1]["text"] == "## 命令表"
+
+    rows = _event_rows(
+        [
+            SimpleNamespace(
+                event_type="command_result",
+                payload={"text": "## 命令表"},
+                created_at="now",
+                seq=7,
+                turn_id="t-1",
+                id=1,
+            )
+        ],
+        persisted_attachment_paths=set(),
+        is_live=False,
+    )
+    assert rows and rows[0]["role"] == "command"
+    assert rows[0]["content"] == "## 命令表"
+
+
 def test_the_transcript_gives_an_assistant_row_its_thinking_back():
     """Thinking is part of what a reader saw, so the record carries it back.
 

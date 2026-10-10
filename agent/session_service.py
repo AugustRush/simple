@@ -313,6 +313,19 @@ def _event_rows(
                 }
             )
             continue
+        if event_type == "command_result":
+            text = str(payload.get("text") or "").strip()
+            if text:
+                rows.append(
+                    {
+                        "role": "command",
+                        "content": text,
+                        "created_at": str(getattr(event, "created_at", "") or ""),
+                        "seq": int(getattr(event, "seq", 0) or 0),
+                        "turn_id": str(getattr(event, "turn_id", "") or ""),
+                    }
+                )
+            continue
         if event_type not in {"tool_started", "tool_progress", "tool_completed", "tool_failed"}:
             continue
         operation_id = str(payload.get("operation_id") or "")

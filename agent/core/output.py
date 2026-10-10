@@ -559,6 +559,17 @@ class OutputSink(ABC):
 
         return False
 
+    def on_command_result(self, text: str, *, level: str = "info") -> None:
+        """Called with a command's answer, as opposed to what the agent is doing.
+
+        A status is transient by design -- the next one replaces it -- so a
+        command whose answer went out as a status was shown for as long as it
+        took the following frame to arrive.  A sink that can show a block does;
+        the default keeps the old behaviour for sinks that only have a status
+        line.
+        """
+        self.on_status(text, level=level)
+
     @property
     def displayed_text(self) -> str:
         """What this sink showed for the turn, when that is not just the answer.

@@ -143,7 +143,7 @@ class CommandCoordinator:
                 classification,
                 self._command_context(turn_input, state, sink),
             )
-            await self._render_result(result, sink)
+            await self._render_result(result, sink, state=state, turn_input=turn_input)
             self._emit(
                 "command_rejected",
                 turn_input,
@@ -386,7 +386,7 @@ class CommandCoordinator:
             classification,
             self._command_context(turn_input, state, sink),
         )
-        await self._render_result(result, sink)
+        await self._render_result(result, sink, state=state, turn_input=turn_input)
         command = self._command_name(classification)
         duration_ms = round((time.perf_counter() - started_at) * 1000, 1)
         if result.error:
@@ -614,11 +614,19 @@ class CommandCoordinator:
             reason="busy",
         )
 
-    async def _render_result(self, result: CommandResult, sink: OutputSink) -> None:
+    async def _render_result(
+        self,
+        result: CommandResult,
+        sink: OutputSink,
+        *,
+        state: Any = None,
+        turn_input: Any = None,
+    ) -> None:
         queued_attachments: list[tuple[Any, Any]] = []
         try:
             if result.response_text is not None:
-                self._safe_status(sink, result.response_text, level=result.level)
+                self._present_command_result(sink, result.response_text, level=result.level)
+                self._journal_command_result(state, turn_input, result)
             elif result.error:
                 self._safe_error(sink, result.error)
             for attachment in result.attachments:
@@ -636,6 +644,52 @@ class CommandCoordinator:
                 sink,
                 tuple(queued_attachments),
             )
+
+    @staticmethod
+    def _present_command_result(sink: Any, text: str, *, level: str) -> None:
+        """Show a command's answer where the channel can actually show it."""
+        present = getattr(sink, "on_command_result", None)
+        try:
+            if callable(present):
+                present(text, level=level)
+            else:
+                sink.on_status(text, level=level)
+        except Exception:
+            logger.exception("command output sink failed")
+
+    @staticmethod
+    def _journal_command_result(
+        state: Any, turn_input: Any, result: CommandResult
+    ) -> None:
+        """Put a command's answer in the session record, not only on screen.
+
+        It used to reach the client as a *status* -- the line that says what the
+        agent is doing right now -- and the frame that ended the command cleared
+        it, so somebody typing ``/help`` saw a flash and nothing else while the
+        server had run the command and logged it.  The session log is where a
+        session's record is kept, so a command's answer belongs there too.
+        """
+        if state is None or turn_input is None:
+            return
+        log = getattr(getattr(state, "context_manager", None), "session_log", None)
+        append = getattr(log, "append", None)
+        if not callable(append):
+            return
+        try:
+            metadata = getattr(turn_input, "metadata", None) or {}
+            append(
+                "command_result",
+                {
+                    "text": str(result.response_text or ""),
+                    "level": str(result.level or "info"),
+                    "command": str(getattr(turn_input, "text", "") or ""),
+                },
+                turn_id=str(
+                    metadata.get("turn_id") or metadata.get("message_id") or ""
+                ),
+            )
+        except Exception:
+            logger.exception("failed to journal command output")
 
     @staticmethod
     def _cleanup_temporary_attachments(

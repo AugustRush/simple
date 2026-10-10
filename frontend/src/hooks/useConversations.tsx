@@ -985,6 +985,22 @@ export function useConversations(deps: Deps) {
           return
         }
 
+        if (evt.type === 'command_result') {
+          // A command's answer, which is a reply rather than what the agent is
+          // doing: shown as a row of its own, and journalled by the server, so
+          // it is still there after a reload.  As a status it was overwritten by
+          // the very next frame and the reader saw a flash and nothing else.
+          const text = String(evt.text || '')
+          if (text.trim()) {
+            appendMessage({
+              id: makeId(),
+              role: evt.level === 'error' ? 'error' : 'command',
+              content: text,
+            })
+          }
+          return
+        }
+
         if (evt.type === 'status' || evt.type === 'info') {
           const text =
             evt.text ||
