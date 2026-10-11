@@ -226,8 +226,34 @@ ECOSYSTEM = {
 
 DSH_NOTE = (
     "no plugin format for this runtime: a DSH plugin is a Node/Cordis module. "
-    "Interop is MCP servers + SKILL.md, not the package"
+    "Interop is read-only -- its MCP declarations and skill roots (agent/plugins/dsh.py)"
 )
+
+
+def report_dsh_profile() -> None:
+    """What this runtime can take from a real DSH profile, measured.
+
+    Read-only and best-effort: the profile is the operator's, the file may use
+    YAML outside the subset reader, and both are reported rather than treated as
+    failures.  Without this section the DSH row above is a note; with it the
+    claim "MCP servers are the interop" has a number behind it.
+    """
+    from agent.plugins.dsh import read_dsh_profile
+
+    profiles = sorted((Path.home() / ".dsh" / "profiles").glob("*"))
+    if not profiles:
+        print("  (no ~/.dsh/profiles on this machine)")
+        return
+    for profile_dir in profiles:
+        if not profile_dir.is_dir():
+            continue
+        profile = read_dsh_profile(profile_dir)
+        servers = ", ".join(server["name"] for server in profile.mcp_servers) or "-"
+        print(f"  {profile_dir.name}: bundles={len(profile.bundles)} mcp={servers}")
+        for reason in profile.unsupported:
+            print(f"    not convertible: {reason}")
+        for warning in profile.warnings:
+            print(f"    unreadable: {warning}")
 
 
 #: Whether each fixture ships something its own ecosystem defines as executable
@@ -662,12 +688,18 @@ def main() -> int:
     except Exception as exc:  # pragma: no cover - environment dependent
         print(f"  {SKIP} gateway check: {type(exc).__name__}: {str(exc)[:80]}")
 
+    print("\n== DSH (read-only): what a real profile declares ==")
+    try:
+        report_dsh_profile()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        print(f"  {SKIP} DSH profile: {type(exc).__name__}: {str(exc)[:80]}")
+
     print("\ncaveats (not failures, but they bound the numbers above)")
     print("  - Codex has no agent or slash-command concept: those files are a")
     print("    Claude Code convention it does not read (Codex migrates commands/")
     print("    into skills at install time)")
-    print("  - a DSH plugin is an npm/Cordis package: only its skills and MCP")
-    print("    declarations have a counterpart here; the code cannot run")
+    print("  - a DSH plugin is an npm/Cordis package: only its MCP declarations")
+    print("    and skill roots have a counterpart here, read-only; the code cannot run")
     print("  - hook events with no dispatcher are reported as 'inert'")
 
     if not args.keep_home:
