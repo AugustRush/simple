@@ -43,12 +43,6 @@ ROOT_ASSEMBLED: dict[str, str] = {
         "decide which skills a turn may use. A plugin providing it would have to "
         "load before the plugins that inject it."
     ),
-    "agent_core": (
-        "Owns the turn runner, maintenance and session state; it is constructed "
-        "from the components those services live in. A plugin could provide it -- "
-        "the TurnRunner plugin already provides agent_loop -- and that is the "
-        "convergence target."
-    ),
 }
 
 
@@ -56,6 +50,15 @@ ROOT_ASSEMBLED: dict[str, str] = {
 #: floor is not debt: the loader is mounted *by* the container, so the container
 #: cannot get it from a plugin it has not loaded yet.
 FLOORS: dict[str, str] = {
+    "agent_core": (
+        "A facade over the composition itself: it resolves `agent_loop`, "
+        "`skill_catalog`, `plugin_catalog`, `post_turn_maintenance` and `output_dir` at "
+        "call time through the container, and it publishes the system prompt by handing "
+        "the whole mapping to the publisher. A plugin cannot be handed the container "
+        "without making \"which services does this plugin need\" unanswerable, which is "
+        "the property the plugin model rests on -- so this is a floor rather than a "
+        "service waiting to be moved."
+    ),
     "plugin_catalog": (
         "The loader cannot be provided by the thing it loads: the container mounts "
         "plugins through this service, so it has to exist before the first plugin "

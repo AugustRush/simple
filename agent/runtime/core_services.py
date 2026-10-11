@@ -198,7 +198,13 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/runtime/contracts.py",
             "agent/commands/builtin.py",
         ),
-        summary="The turn runner's owner: skill refresh, maintenance, session state.",
+        summary=(
+            "The turn runner's owner: skill refresh, maintenance, session state.  It "
+            "stays in the composition root because it *is* a view of the composition -- "
+            "it resolves five services at call time and publishes the system prompt "
+            "through the whole mapping, which a plugin cannot be handed without making "
+            "its dependencies unanswerable."
+        ),
     ),
     CoreService(
         name="agent_loop",
