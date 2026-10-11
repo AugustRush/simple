@@ -73,6 +73,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",  # writes the runtime context (sandbox, output dir)
             "agent/tools/plugin_tools.py",
         ),
+        contract="agent/tools/protocols.py:ToolRegistryService",
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",

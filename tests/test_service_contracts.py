@@ -45,6 +45,13 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "mcp_client",
     ),
     (
+        "agent.tools.runtime",
+        "ToolRegistry",
+        "agent.tools.protocols",
+        "ToolRegistryService",
+        "registry",
+    ),
+    (
         "agent.skills.catalog",
         "SkillCatalog",
         "agent.skills.protocols",
@@ -121,11 +128,15 @@ def test_every_declared_member_has_a_caller(row) -> None:
     protocol = _protocol(protocol_module, protocol_name)
     sources = _call_site_sources(module_name)
 
-    unused = [
-        name
-        for name in _protocol_members(protocol)
-        if not re.search(rf"\.{re.escape(name)}\s*\(", sources)
-    ]
+    def called(name: str) -> bool:
+        # ``service.name(...)`` or the kernel's duck-typed ``getattr(service, "name")``
+        # -- the latter is how the capability views are reached (``ctx.tools``).
+        return bool(
+            re.search(rf"\.{re.escape(name)}\s*\(", sources)
+            or re.search("getattr\\([^)]*[\"']" + re.escape(name) + "[\"']", sources)
+        )
+
+    unused = [name for name in _protocol_members(protocol) if not called(name)]
     assert not unused, (
         f"{protocol_name} declares members nothing calls: {unused}"
     )
