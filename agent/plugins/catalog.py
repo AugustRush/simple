@@ -465,15 +465,27 @@ def _merge_hooks_from_file(
     _merge_hooks_block(plugin_dir.name, source, into)
 
 
-def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dict]:
-    """Read ``.mcp.json`` at the plugin root and return MCP server configs.
+#: File names an MCP server block may live in at a plugin root.  ``.mcp.json``
+#: is Claude Code's and Codex's legacy location; ``mcp.json`` (no dot) is the
+#: same file in the portable Agent Plugins v1 layout, where it is the *default*
+#: component path rather than something the manifest names.
+MCP_MANIFEST_FILES: tuple[str, ...] = (".mcp.json", "mcp.json")
 
-    Claude Code's standard location for MCP servers bundled by a plugin.
-    Format is ``{"mcpServers": {"name": {...}, ...}}`` — a dict keyed by
-    server name.  Returns a flat list of configs each with ``"name"`` set.
+
+def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dict]:
+    """Read a plugin root's MCP server file and return its server configs.
+
+    Both spellings of the file are read (see :data:`MCP_MANIFEST_FILES`), and the
+    first one that exists wins -- a plugin that ships both is describing one set
+    of servers, not two.  Format is ``{"mcpServers": {"name": {...}, ...}}`` — a
+    dict keyed by server name.  Returns a flat list of configs each with
+    ``"name"`` set.
     """
-    mf = plugin_dir / ".mcp.json"
-    if not mf.exists():
+    mf = next(
+        (candidate for name in MCP_MANIFEST_FILES if (candidate := plugin_dir / name).exists()),
+        None,
+    )
+    if mf is None:
         return []
     try:
         data = json.loads(mf.read_text(encoding="utf-8"))
@@ -689,22 +701,33 @@ def _local_marketplace_source_path(entry: dict[str, Any]) -> str:
     return str(source.get("path", "") or "").strip()
 
 
+#: Where each ecosystem says a marketplace manifest lives, relative to the
+#: marketplace root.  Codex reads these four in order (``.agents/plugins/`` is
+#: its own, and ``.claude-plugin/`` is accepted for compatibility); Claude Code
+#: reads its one.  A root ``marketplace.json`` is this project's own older
+#: spelling and stays last so a real ecosystem file wins.
+MARKETPLACE_MANIFESTS: tuple[Path, ...] = (
+    Path(".agents") / "plugins" / "marketplace.json",
+    Path(".agents") / "plugins" / "api_marketplace.json",
+    Path(".claude-plugin") / "marketplace.json",
+    Path("marketplace.json"),
+)
+
+
 def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]]]:
     """Read a supported marketplace manifest if present.
 
     Supports Claude Code's ``.claude-plugin/marketplace.json`` and Codex's
-    root ``marketplace.json``.  Only local relative plugin sources are expanded;
-    remote marketplace entries belong to the installer, not the runtime loader.
+    ``.agents/plugins/marketplace.json`` (see :data:`MARKETPLACE_MANIFESTS`).
+    Only local relative plugin sources are expanded; remote marketplace entries
+    belong to the installer, not the runtime loader.
     """
     if _has_plugin_manifest(dir_path):
         return None
     mp = next(
         (
             candidate
-            for candidate in (
-                dir_path / ".claude-plugin" / "marketplace.json",
-                dir_path / "marketplace.json",
-            )
+            for candidate in (dir_path / rel for rel in MARKETPLACE_MANIFESTS)
             if candidate.exists()
         ),
         None,
@@ -738,11 +761,7 @@ def _is_plugin_container(dir_path: Path) -> bool:
     if _has_plugin_manifest(dir_path):
         return True
     return any(
-        candidate.exists()
-        for candidate in (
-            dir_path / ".claude-plugin" / "marketplace.json",
-            dir_path / "marketplace.json",
-        )
+        (dir_path / rel).exists() for rel in MARKETPLACE_MANIFESTS
     )
 
 
@@ -1018,12 +1037,25 @@ class _CatalogPlugin:
                     _add_bundled(catalog._bundled_skills, (self.name, skills_path))
                 )
 
+        # One server, one registration.  A manifest that names its MCP file
+        # (``"mcpServers": "./.mcp.json"`` -- Codex's documented form, and legal
+        # in Claude Code) used to register the file's contents *and* have the
+        # reader find the same file, so the same server was offered twice.  The
+        # manifest's own entry wins, on the same rule as hooks below.
+        declared_mcp: list[dict] = []
         for mcp_cfg in meta.mcp_servers:
             if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
-                ctx.on_unwind(_add_bundled(catalog._bundled_mcp, (self.name, mcp_cfg)))
+                declared_mcp.append(mcp_cfg)
+        seen_mcp = {str(cfg.get("name")) for cfg in declared_mcp}
         for mcp_cfg in _read_mcp_json(plugin_dir, self.name):
-            if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
-                ctx.on_unwind(_add_bundled(catalog._bundled_mcp, (self.name, mcp_cfg)))
+            if not isinstance(mcp_cfg, dict) or not mcp_cfg.get("name"):
+                continue
+            if str(mcp_cfg["name"]) in seen_mcp:
+                continue
+            seen_mcp.add(str(mcp_cfg["name"]))
+            declared_mcp.append(mcp_cfg)
+        for mcp_cfg in declared_mcp:
+            ctx.on_unwind(_add_bundled(catalog._bundled_mcp, (self.name, mcp_cfg)))
 
         for undo in catalog._load_command_files(
             plugin_dir, self.name, meta.commands
@@ -2096,6 +2128,13 @@ class PluginCatalog:
         env = dict(os.environ)
         if meta.path is not None:
             env["CLAUDE_PLUGIN_ROOT"] = str(meta.path)
+            # Codex runs a plugin's hook commands with these two names, and a
+            # Codex plugin's hook command says ``"$PLUGIN_ROOT/hooks/x.sh"``.
+            # Setting only the Claude Code spelling made every such hook fail
+            # with an empty variable -- silently, since a hook's exit status is
+            # its own business.
+            env["PLUGIN_ROOT"] = str(meta.path)
+            env["PLUGIN_DATA"] = str(_plugin_data_dir(meta.name))
         # Workspace = current cwd; matches what CC reports.
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
         tool_name = str(event_payload.get("tool_name", "") or "")

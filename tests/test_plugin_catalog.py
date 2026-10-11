@@ -1660,6 +1660,185 @@ def test_codex_plugin_root_with_marketplace_manifest_still_loads_root_plugin(tmp
     assert catalog.get_loaded_names_for_directory("root-plugin") == {"root-plugin"}
 
 
+def test_a_codex_marketplace_is_read_from_its_real_location(tmp_path):
+    """Codex puts its marketplace at ``.agents/plugins/marketplace.json``.
+
+    Reading only a root ``marketplace.json`` meant a real Codex marketplace was
+    not a marketplace at all: the directory yielded no plugins, because the
+    entries live under ``plugins/<name>/`` and the loader does not recurse two
+    levels looking for manifests.
+    """
+    from agent import PluginCatalog
+
+    market = tmp_path / "codex-market"
+    (market / ".agents" / "plugins").mkdir(parents=True)
+    (market / ".agents" / "plugins" / "marketplace.json").write_text(
+        '{"name": "market", "plugins": ['
+        '{"name": "beta", "source": {"source": "local", "path": "./plugins/beta"}, '
+        '"policy": {"installation": "AVAILABLE"}}]}',
+        encoding="utf-8",
+    )
+    (market / "plugins" / "beta" / ".codex-plugin").mkdir(parents=True)
+    (market / "plugins" / "beta" / ".codex-plugin" / "plugin.json").write_text(
+        '{"name": "beta"}', encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["beta"]
+    assert catalog.get_loaded_names_for_directory("codex-market") == {"beta"}
+
+
+def test_agent_plugins_v1_reads_its_default_mcp_file(tmp_path):
+    """The portable layout's MCP file is ``mcp.json``, not ``.mcp.json``.
+
+    Nothing in an Agent Plugins v1 manifest has to mention it: it is the
+    default component path, so a reader that only looks for the dotted name
+    loads the plugin and silently drops the servers it declares.
+    """
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "portable"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        '{"$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", '
+        '"name": "portable", "version": "1.0.0"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / "mcp.json").write_text(
+        '{"mcpServers": {"portable-mcp": {"command": "python3", "args": ["-c", "1"]}}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["portable-mcp"]
+
+
+def test_a_named_mcp_file_is_registered_once(tmp_path):
+    """A manifest that names its own MCP file must not register it twice.
+
+    ``"mcpServers": "./.mcp.json"`` is Codex's documented form and legal in
+    Claude Code; the manifest reader and the file reader then both found the
+    same servers, so the same process was offered twice.
+    """
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "dupe"
+    (plugin_dir / ".codex-plugin").mkdir(parents=True)
+    (plugin_dir / ".codex-plugin" / "plugin.json").write_text(
+        '{"name": "dupe", "mcpServers": "./.mcp.json"}', encoding="utf-8"
+    )
+    (plugin_dir / ".mcp.json").write_text(
+        '{"mcpServers": {"one": {"command": "python3"}}}', encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["one"]
+
+
+def test_hook_commands_get_the_codex_environment_names(tmp_path):
+    """Codex runs a plugin's hooks with ``PLUGIN_ROOT``, not only ``CLAUDE_*``.
+
+    A Codex hook command says ``"$PLUGIN_ROOT/hooks/x.sh"``; with only the
+    Claude Code spelling set, that expands to an empty path and the hook fails
+    without saying so.
+    """
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "hooked"
+    (plugin_dir / ".codex-plugin").mkdir(parents=True)
+    (plugin_dir / ".codex-plugin" / "plugin.json").write_text(
+        '{"name": "hooked"}', encoding="utf-8"
+    )
+    (plugin_dir / "hooks").mkdir()
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        '{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", '
+        '"command": "$PLUGIN_ROOT/hooks/guard.sh"}]}]}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    meta = next(m for m in catalog.list_plugins() if m.name == "hooked")
+
+    env = catalog._hook_env(meta, {})
+
+    assert env["PLUGIN_ROOT"] == str(plugin_dir)
+    assert env["PLUGIN_DATA"]
+    assert env["CLAUDE_PLUGIN_ROOT"] == str(plugin_dir)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "plugin.json",
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+        "marketplace.json",
+        ".agents/plugins/marketplace.json",
+        ".agents/plugins/api_marketplace.json",
+        "__init__.py",
+        "SKILL.md",
+    ],
+)
+def test_the_installer_accepts_every_layout_the_loader_does(tmp_path, marker):
+    """Being stricter than the loader is a compatibility bug with no upside.
+
+    A Codex plugin without a ``skills/`` directory, a marketplace, and a
+    single-skill package were all loadable and all refused by install.
+    """
+    from agent.tools.plugin_tools import _looks_like_plugin
+
+    target = tmp_path / "candidate"
+    target.mkdir()
+    path = target / marker
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
+
+    assert _looks_like_plugin(target) is True
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        # Claude Code's default hooks file needs no manifest entry
+        {"hooks/hooks.json": '{"hooks": {}}', "skills/x/SKILL.md": "---\nname: x\n---"},
+        # Agent Plugins v1's default MCP file
+        {"plugin.json": '{"name": "p"}', "mcp.json": '{"mcpServers": {}}'},
+        # Codex legacy: executable content declared in its own manifest dir
+        {".codex-plugin/plugin.json": '{"name": "p", "mcpServers": "./x.json"}'},
+        {".codex-plugin/plugin.json": '{"name": "p", "hooks": "./hooks/hooks.json"}'},
+        # the older spellings still count
+        {".mcp.json": '{"mcpServers": {}}'},
+        {"__init__.py": ""},
+    ],
+)
+def test_every_executable_location_asks_for_consent(tmp_path, layout):
+    """The consent gate has to know every place executable content can live.
+
+    It asked about ``.mcp.json`` and about a manifest's own fields, so a plugin
+    shipping a stdio MCP server as ``mcp.json`` -- or a hook at the *default*
+    ``hooks/hooks.json``, which its manifest need not mention -- installed with
+    no approval and ran arbitrary commands on being enabled.
+    """
+    from agent.tools.plugin_tools import _plugin_executable_content
+
+    target = tmp_path / "candidate"
+    target.mkdir()
+    for relative, body in layout.items():
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+    assert _plugin_executable_content(target) != ""
+
+
 def test_discover_accepts_plugin_directory_as_builtin_root(tmp_path):
     """builtin_dir may point directly at a plugin repository root."""
     from agent import PluginCatalog

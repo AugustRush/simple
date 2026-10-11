@@ -61,17 +61,35 @@ from .executor import report_tool_progress
 
 
 def _looks_like_plugin(dir_path: Path) -> bool:
-    """Return True if *dir_path* contains at least one recognisable plugin marker."""
-    cc_plugin = dir_path / ".claude-plugin"
-    if (dir_path / "plugin.json").exists() or (cc_plugin / "plugin.json").exists():
-        return True
-    if (cc_plugin / "marketplace.json").exists():
-        return True
-    if (dir_path / "__init__.py").exists():
-        return True
-    if (dir_path / "skills").is_dir() or (dir_path / "commands").is_dir():
-        return True
-    return False
+    """Return True if *dir_path* contains at least one recognisable plugin marker.
+
+    The list has to cover every layout the **loader** accepts.  A plugin the
+    runtime would happily load but the installer refuses is a compatibility bug
+    with no upside: it is the difference between "Codex plugins work" and "a
+    Codex plugin without a skills directory cannot be installed at all", and
+    between a marketplace being loadable and being installable.  Measured, that
+    was the case for ``.codex-plugin/plugin.json``, for both marketplaces'
+    manifest locations, and for a bare ``SKILL.md`` root (a single-skill
+    package, which ``_read_plugin_json`` already synthesises metadata for).
+    """
+    for marker in (
+        dir_path / "plugin.json",
+        dir_path / ".claude-plugin" / "plugin.json",
+        dir_path / ".codex-plugin" / "plugin.json",
+        dir_path / ".claude-plugin" / "marketplace.json",
+        dir_path / "marketplace.json",
+        dir_path / ".agents" / "plugins" / "marketplace.json",
+        dir_path / ".agents" / "plugins" / "api_marketplace.json",
+        dir_path / "__init__.py",
+        dir_path / "SKILL.md",
+    ):
+        if marker.exists():
+            return True
+    return (
+        (dir_path / "skills").is_dir()
+        or (dir_path / "commands").is_dir()
+        or (dir_path / "agents").is_dir()
+    )
 
 
 def _canonicalize_plugin_source(source: str) -> str:
@@ -94,14 +112,27 @@ def _plugin_executable_content(target: Path) -> str:
     Installations that run code (Python entry point, MCP server, hooks) are
     equivalent to executing arbitrary code and must pass human confirmation
     before activation.
+
+    Every location each ecosystem defines as executable is checked, not just the
+    one spelling this started with.  A gate that misses a location is worse than
+    no gate: measured against fixtures written the way the ecosystems document
+    them, ``mcp.json`` (Agent Plugins v1's default MCP file) and
+    ``hooks/hooks.json`` (the **default** hooks file for both Claude Code and
+    Codex -- a plugin need not mention it in its manifest) both installed with
+    no approval at all, and both run arbitrary commands the moment the plugin is
+    enabled.
     """
     if (target / "__init__.py").exists():
         return "Python 入口 (__init__.py)"
-    if (target / ".mcp.json").exists():
-        return "MCP server (.mcp.json)"
+    for mcp_name in (".mcp.json", "mcp.json"):
+        if (target / mcp_name).exists():
+            return f"MCP server ({mcp_name})"
+    if (target / "hooks" / "hooks.json").is_file():
+        return "hooks (hooks/hooks.json)"
     for manifest in (
         target / "plugin.json",
         target / ".claude-plugin" / "plugin.json",
+        target / ".codex-plugin" / "plugin.json",
     ):
         if not manifest.exists():
             continue
@@ -110,9 +141,9 @@ def _plugin_executable_content(target: Path) -> str:
         except Exception:
             data = {}
         if data.get("mcp_servers") or data.get("mcpServers"):
-            return "MCP server (plugin.json)"
+            return "MCP server (manifest)"
         if data.get("hooks"):
-            return "hooks (plugin.json)"
+            return "hooks (manifest)"
     hooks_dir = target / ".claude-plugin" / "hooks"
     if hooks_dir.is_dir() and any(hooks_dir.iterdir()):
         return "hooks (.claude-plugin/hooks)"
