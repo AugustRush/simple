@@ -1557,6 +1557,10 @@ _COMPONENT_KEYS: dict[str, str] = {
     "max_tokens": "the output ceiling the session was built with",
     "llm": "the model adapter service",
     # services
+    # Two writers, so *not* in `_PLUGIN_PROVIDED`: the `registry` plugin provides
+    # the process-wide one, and a web session forks its own into its mapping (a
+    # fork is what a session's tool boundary is).  The ledger's `owners` carries
+    # both.
     "registry": "the tool registry",
     "context_manager": "the session log",
     "skill_catalog": "the skill catalog",
@@ -1601,6 +1605,13 @@ _COMPONENT_KEYS: dict[str, str] = {
     "plugin_pending": "plugins waiting for a dependency the composition does not supply",
     "output_dir": "where output is written",
     "workspace_root": "the workspace",
+    # The paths the `registry` and `skill_catalog` plugins build their services from.
+    # They are values rather than services: the CLI's `--name`/`--resource` choose
+    # them, so a plugin must be told, not left to derive its own.
+    "resource_root": "where resource definitions (skills, tools, plugins) live",
+    "user_skills_dir": "the user's skills root",
+    "user_tools_dir": "the user's tools root",
+    "user_plugins_dir": "the user's plugins root",
     "config_revision": "bumped to force a session rebuild",
     "command_coordinator_factory": "builds a session's coordinator",
     "session_components_factory": "builds a session's components",
@@ -1626,6 +1637,7 @@ _PLUGIN_PROVIDED: dict[str, str] = {
     "mcp_client": "agent/tools/mcp_plugin.py",
     "mcp_server_configs": "agent/tools/mcp_plugin.py",
     "mcp_status": "agent/tools/mcp_plugin.py",
+    "skill_catalog": "agent/skills/plugin.py",
 }
 
 

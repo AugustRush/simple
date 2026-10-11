@@ -32,17 +32,6 @@ AGENT_ROOT = REPO_ROOT / "agent"
 #: Services the composition root still assembles, with the reason and what it
 #: would take to move each one behind a plugin.  Empty is the goal.
 ROOT_ASSEMBLED: dict[str, str] = {
-    "registry": (
-        "The tool registry is built before the catalog mounts -- plugins register "
-        "tools on it -- so it is the container's floor rather than a tenant. Moving "
-        "it needs a registry service that exists before any plugin, which is what "
-        "the container already is."
-    ),
-    "skill_catalog": (
-        "Same shape as the registry: the catalog is read while plugins load, to "
-        "decide which skills a turn may use. A plugin providing it would have to "
-        "load before the plugins that inject it."
-    ),
 }
 
 

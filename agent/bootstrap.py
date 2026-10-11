@@ -503,9 +503,7 @@ async def _build_components_async(
     decay_factor = shared.DECAY_FACTOR
     sleep_token_ratio = shared.SLEEP_TOKEN_RATIO
     chars_per_token = shared.CHARS_PER_TOKEN
-    registry_cls = agent_module.ToolRegistry
     builtin_tools_cls = agent_module.BuiltinTools
-    skill_catalog_cls = agent_module.SkillCatalog
     user_tool_catalog_cls = agent_module.UserToolCatalog
 
     if announce:
@@ -559,73 +557,6 @@ async def _build_components_async(
     )
     supports_vision = provider_supports_vision(cfg, active_provider)
 
-    registry = registry_cls(console=console)
-    # Resource definitions (skills, tools, plugins, prompts) are global for
-    # Web sessions, while state directories below the session home remain
-    # isolated.  Keep this explicit for tools that resolve paths at call time.
-    registry.set_context("resource_home", str(resource_root))
-    registry.set_context("workspace_root", str(workspace_root))
-    registry.set_context("user_skills_dir", str(user_skills_dir))
-    registry.set_context("user_tools_dir", str(user_tools_dir))
-    registry.set_context("user_plugins_dir", str(user_plugins_dir))
-
-    # Context Manager — build first so BuiltinTools can reference it
-    # Config is split into two sub-sections:
-    #   context.storage       — LTM store settings (what to keep)
-    #   context.consolidation — trigger settings (when/how to consolidate)
-    ctx_cfg = cfg.get("context", {})
-    storage_cfg = ctx_cfg.get("storage", ctx_cfg)  # fallback: flat cfg for compat
-    cons_cfg = ctx_cfg.get("consolidation", ctx_cfg)  # fallback: flat cfg for compat
-    if announce:
-        # A posture nobody can see is a posture nobody maintains.  Running
-        # unsandboxed is a deliberate, temporary choice that lives in a
-        # permanent file, so it has to announce itself on every start.
-        from agent.security.filesystem_sandbox import sandbox_posture_warning
-
-        posture = sandbox_posture_warning(
-            str(registry.get_context("shell_sandbox_mode") or "read_all"),
-            devices=bool(registry.get_context("shell_devices", True)),
-        )
-        if posture:
-            console.print(f"[bold yellow]⚠ {posture}[/bold yellow]")
-    audio_cfg = cfg.get("audio", {})
-    audio_transcription_command = ""
-    if isinstance(audio_cfg, dict):
-        audio_transcription_command = str(
-            audio_cfg.get("transcription_command", "") or ""
-        ).strip()
-    if audio_transcription_command:
-        registry.set_context(
-            "audio_transcription_command",
-            audio_transcription_command,
-        )
-    tavily_api_key = cfg.get("tavily_api_key", "")
-    if isinstance(tavily_api_key, str) and tavily_api_key.startswith("$"):
-        tavily_api_key = os.environ.get(tavily_api_key[1:], "")
-    if not tavily_api_key:
-        tavily_api_key = os.environ.get("TAVILY_API_KEY", "")
-    if tavily_api_key:
-        registry.set_context("tavily_api_key", tavily_api_key)
-
-    # web_fetch's egress proxy.  Unset means "read the standard environment
-    # variables"; a URL pins one; "none" forces direct connections.  This
-    # matters behind a fake-IP resolver (Clash's enhanced-mode: fake-ip), where
-    # every name answers with a reserved address that the direct path refuses.
-    web_proxy = cfg.get("web_proxy", "")
-    if isinstance(web_proxy, str) and web_proxy.strip():
-        registry.set_context("web_proxy", web_proxy.strip())
-
-    skill_catalog = skill_catalog_cls(
-        user_root=user_skills_dir,
-        # The switches from config.json, so a skill turned off before this
-        # process started is off when it starts.  The rest of the file is
-        # irrelevant to the catalog, and a non-dict section reads as "no
-        # switches" rather than raising: a hand-edited config must not stop
-        # the agent from loading.
-        skill_config=cfg.get("skills"),
-    )
-    skill_catalog.load_all()
-    skill_catalog.register_tools(registry)
     user_tool_catalog = user_tool_catalog_cls(root=user_tools_dir)
 
     # The model adapter -- the routing table that sends each per-call model
@@ -661,12 +592,17 @@ async def _build_components_async(
         "client_cache_key": client_cache_key,
         "model": model,
         "api_format": api_format,
-        "registry": registry,
         "max_tokens": max_tokens,
-        "skill_catalog": skill_catalog,
-        "user_tool_catalog": user_tool_catalog,
         "output_dir": output_dir,
         "workspace_root": workspace_root,
+        # The paths the ``registry`` and ``skill_catalog`` plugins build their
+        # services from.  They are composition decisions (the CLI's ``--name`` and
+        # ``--resource`` choose them), so they arrive here as values rather than
+        # being re-derived inside a plugin from ``shared``.
+        "resource_root": resource_root,
+        "user_skills_dir": user_skills_dir,
+        "user_tools_dir": user_tools_dir,
+        "user_plugins_dir": user_plugins_dir,
         "file_access_policy": file_policy,
         "file_service": file_service,
         "client_provider": client_provider,
@@ -680,25 +616,6 @@ async def _build_components_async(
         else False
     )
     _partial_components["user_tools_enabled"] = user_tools_enabled
-    # Two admission modes, never zero.  Enabling user_tools trusts the whole
-    # directory; leaving it off still loads the individual tools the user
-    # approved by hand, so a tool created and confirmed in an earlier session
-    # keeps working instead of silently vanishing on restart.
-    loaded_user_tools = user_tool_catalog.load_into_registry(
-        registry, require_approval=not user_tools_enabled
-    )
-    if announce:
-        if loaded_user_tools:
-            scope = "all" if user_tools_enabled else "approved"
-            console.print(
-                f"[green]User tools loaded ({scope}):[/green] "
-                + ", ".join(loaded_user_tools)
-            )
-        elif not user_tools_enabled:
-            console.print(
-                "[dim]No approved user tools; create one with create_tool, or set "
-                "user_tools.enabled=true to load every ~/.agent/tools/*.py[/dim]"
-            )
     base_system_prompt = system_prompt
 
     # No EvolutionEngine here any more.  The plugin builds the one it uses, reading the
@@ -765,6 +682,13 @@ async def _build_components_async(
                 )
             )
         )
+    # The registry and the skill catalog are provided by plugins now (``registry``,
+    # ``skill_catalog``, declared first for a reader; the kernel pends their
+    # dependents, so the order is documentation rather than a sequence).  Everything
+    # below that used to read the objects the composition built resolves them here.
+    registry = require_service(components, "registry")
+    skill_catalog = require_service(components, "skill_catalog")
+
     # The built-in tool set used to be constructed here directly, which made every tool it
     # registers permanent for the life of the process.
     # Resolved, not built: the agent is a plugin's now.  This call is the composition
@@ -812,8 +736,47 @@ async def _build_components_async(
             if str(entry).strip()
         ),
     )
+    if announce:
+        # A posture nobody can see is a posture nobody maintains.  Running unsandboxed
+        # is a deliberate, temporary choice that lives in a permanent file, so it has to
+        # announce itself on every start.
+        #
+        # Announced *here*, next to the context it reads, rather than in the block that
+        # used to sit above the plugin mounts: that one read `shell_sandbox_mode` before
+        # anything had written it, so it announced the default posture whatever the
+        # operator had configured.  Measured while moving the registry into a plugin.
+        from agent.security.filesystem_sandbox import sandbox_posture_warning
+
+        posture = sandbox_posture_warning(
+            str(registry.get_context("shell_sandbox_mode") or "read_all"),
+            devices=bool(registry.get_context("shell_devices", True)),
+        )
+        if posture:
+            console.print(f"[bold yellow]⚠ {posture}[/bold yellow]")
     if loaded_plugins and announce:
         console.print("[green]Plugins loaded:[/green] " + ", ".join(loaded_plugins))
+
+    # Two admission modes, never zero.  Enabling user_tools trusts the whole
+    # directory; leaving it off still loads the individual tools the user approved
+    # by hand, so a tool created and confirmed in an earlier session keeps working
+    # instead of silently vanishing on restart.
+    user_tool_catalog = user_tool_catalog_cls(root=user_tools_dir)
+    components["user_tool_catalog"] = user_tool_catalog
+    loaded_user_tools = user_tool_catalog.load_into_registry(
+        registry, require_approval=not user_tools_enabled
+    )
+    if announce:
+        if loaded_user_tools:
+            scope = "all" if user_tools_enabled else "approved"
+            console.print(
+                f"[green]User tools loaded ({scope}):[/green] "
+                + ", ".join(loaded_user_tools)
+            )
+        elif not user_tools_enabled:
+            console.print(
+                "[dim]No approved user tools; create one with create_tool, or set "
+                "user_tools.enabled=true to load every ~/.agent/tools/*.py[/dim]"
+            )
 
     # Load skills bundled by plugins into the skill catalog
     for _pname, _skills_root in plugin_catalog.get_bundled_skills():

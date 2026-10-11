@@ -25,6 +25,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 def test_the_declaration_names_every_core_plugin() -> None:
     """One list, and the composition root mounts from it rather than beside it."""
     assert core_plugin_names() == (
+        "registry",
+        "skill_catalog",
         "ralph",
         "model",
         "memory",

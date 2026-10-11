@@ -72,6 +72,18 @@ class CorePlugin:
         return self.factory(context)
 
 
+def _registry(_: CoreContext) -> Any:
+    from agent.tools.registry_plugin import RegistryPlugin
+
+    return RegistryPlugin()
+
+
+def _skill_catalog(_: CoreContext) -> Any:
+    from agent.skills.plugin import SkillCatalogPlugin
+
+    return SkillCatalogPlugin()
+
+
 def _ralph(_: CoreContext) -> Any:
     from agent.ralph.plugin import RalphPlugin
 
@@ -128,6 +140,24 @@ def _agent_loop(_: CoreContext) -> Any:
 
 #: Ordered for a reader; the kernel resolves the dependencies, in any order (measured).
 CORE_PLUGINS: tuple[CorePlugin, ...] = (
+    CorePlugin(
+        name="registry",
+        summary=(
+            "the tool registry; provides `registry` and the static context "
+            "(resource paths, secrets) the tool implementations read"
+        ),
+        factory=_registry,
+        provides=("registry",),
+    ),
+    CorePlugin(
+        name="skill_catalog",
+        summary=(
+            "the skill catalog; provides `skill_catalog` and registers the "
+            "skill-management tools on the registry"
+        ),
+        factory=_skill_catalog,
+        provides=("skill_catalog",),
+    ),
     CorePlugin(
         name="ralph",
         summary="the task loop; provides `ralph_service`",

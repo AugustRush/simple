@@ -69,7 +69,8 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="registry",
         owners=(
-            "agent/bootstrap.py",
+            "agent/tools/registry_plugin.py",
+            "agent/bootstrap.py",  # writes the runtime context (sandbox, output dir)
             "agent/tools/plugin_tools.py",
         ),
         consumers=(
@@ -83,6 +84,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/core/agent_plugin.py",  # the agent's tool registry
             "agent/scheduler/plugin.py",  # a scheduled run's tools come from it
             "agent/tools/mcp_plugin.py",  # the client registers its tools on it
+            "agent/skills/plugin.py",  # the skill-management tools register on it
             "agent/tools/plugin.py",  # the built-in tools register on it
         ),
         summary="The tool registry: definitions, capabilities, and the context keys below.",
@@ -90,7 +92,8 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="skill_catalog",
         owners=(
-            "agent/bootstrap.py",
+            "agent/skills/plugin.py",
+            "agent/bootstrap.py",  # loads the skills plugins bundled
             "agent/tools/plugin_tools.py",
         ),
         consumers=(

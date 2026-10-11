@@ -30,6 +30,8 @@ def test_a_default_composition_is_unchanged() -> None:
     names = [plugin.name for plugin in core_plugins()]
 
     assert names == [
+        "registry",
+        "skill_catalog",
         "ralph",
         "model",
         "memory",

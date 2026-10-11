@@ -73,7 +73,7 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     # ── paths: resolved at startup, read by tools at call time ──
     ContextKey(
         key="workspace_root",
-        writers=("agent/bootstrap.py", "agent/commands/builtin.py",),
+        writers=("agent/tools/registry_plugin.py", "agent/commands/builtin.py",),
         readers=("agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
     ),
     ContextKey(
@@ -83,22 +83,22 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ),
     ContextKey(
         key="resource_home",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/scheduler/build.py", "agent/tools/builtin_tools.py",),
     ),
     ContextKey(
         key="user_skills_dir",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/config.py",),
     ),
     ContextKey(
         key="user_tools_dir",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/config.py",),
     ),
     ContextKey(
         key="user_plugins_dir",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/tools/plugin_tools.py",),
     ),
 
@@ -241,17 +241,17 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     # ── per-session endpoints and credentials ──
     ContextKey(
         key="web_proxy",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/tools/web_tools.py",),
     ),
     ContextKey(
         key="tavily_api_key",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/tools/web_tools.py",),
     ),
     ContextKey(
         key="audio_transcription_command",
-        writers=("agent/bootstrap.py",),
+        writers=("agent/tools/registry_plugin.py",),
         readers=("agent/tools/audio_tools.py",),
     ),)
 
