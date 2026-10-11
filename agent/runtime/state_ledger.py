@@ -170,6 +170,13 @@ LEDGER: tuple[StateEntry, ...] = (
                "Per-scope shell permission level."),
     StateEntry("_session_sandbox_modes", "agent/security/shell.py", 240, "CONTAINER", "session", "service", 9,
                "Per-scope sandbox mode."),
+    StateEntry("PLUGIN_FORMATS", "agent/plugins/formats.py", 251, "CONTAINER", "process", "service", 4,
+               "The plugin-format adapters: which ecosystem keeps its manifest, "
+               "marketplaces, hook vocabulary and executable-content rules where. "
+               "Process-scoped on purpose -- a format is not per session -- and the "
+               "convergence target is a service in the container, so an embedder's "
+               "format can be provided and unwound like any other registration "
+               "instead of being appended to a module list."),
     StateEntry("_PENDING", "agent/security/plugin_approval.py", 20, "CONTAINER", "session", "service", 5,
                "Plugin installs awaiting human approval, TTL 5 minutes."),
     StateEntry("_APPROVED", "agent/security/plugin_approval.py", 21, "CONTAINER", "session", "service", 5,

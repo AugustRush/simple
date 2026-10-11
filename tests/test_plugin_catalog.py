@@ -1839,6 +1839,108 @@ def test_every_executable_location_asks_for_consent(tmp_path, layout):
     assert _plugin_executable_content(target) != ""
 
 
+# ─── format adapters ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def acme_format():
+    """A fourth ecosystem, defined entirely in a test.
+
+    This is the acceptance test for the adapter seam: if adding an ecosystem
+    means editing ``catalog.py`` or ``plugin_tools.py``, this fixture cannot
+    work -- and it does not touch either.
+    """
+    from agent.plugins import formats as plugin_formats
+
+    acme = plugin_formats.PluginFormat(
+        key="acme",
+        label="Acme plugin",
+        manifests=(".acme-plugin/plugin.json",),
+        marketplaces=(".acme/marketplace.json",),
+        hooks_files=("acme-hooks.json",),
+        mcp_files=("acme-mcp.json",),
+        markers=("skills",),
+        executable_files=("acme-run.py", "acme-mcp.json"),
+        executable_keys=("tools",),
+        hook_events={"BeforeTool": "on_pre_tool"},
+        root_environment=("ACME_ROOT",),
+        data_environment=("ACME_DATA",),
+        project_environment=("ACME_PROJECT",),
+    )
+    snapshot = list(plugin_formats.PLUGIN_FORMATS)
+    plugin_formats.register_format(acme)
+    try:
+        yield acme
+    finally:
+        plugin_formats.PLUGIN_FORMATS[:] = snapshot
+
+
+def test_a_new_ecosystem_is_one_adapter(tmp_path, acme_format):
+    """Registering a format is the whole job: loader, marketplace and env."""
+    from agent import PluginCatalog
+
+    market = tmp_path / "acme-market"
+    (market / ".acme").mkdir(parents=True)
+    (market / ".acme" / "marketplace.json").write_text(
+        '{"name": "acme", "plugins": ['
+        '{"name": "widget", "source": {"source": "local", "path": "./plugins/widget"}}]}',
+        encoding="utf-8",
+    )
+    plugin_dir = market / "plugins" / "widget"
+    (plugin_dir / ".acme-plugin").mkdir(parents=True)
+    (plugin_dir / ".acme-plugin" / "plugin.json").write_text(
+        '{"name": "widget"}', encoding="utf-8"
+    )
+    skill = plugin_dir / "skills" / "widgetry"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: widgetry\ndescription: an acme skill\n---\nUse it.",
+        encoding="utf-8",
+    )
+    (plugin_dir / "acme-hooks.json").write_text(
+        '{"hooks": {"BeforeTool": [{"hooks": [{"type": "command", '
+        '"command": "$ACME_ROOT/x.sh"}]}]}}',
+        encoding="utf-8",
+    )
+    (plugin_dir / "acme-mcp.json").write_text(
+        '{"mcpServers": {"acme-mcp": {"command": "python3"}}}', encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["widget"], "the marketplace path came from the adapter"
+    assert catalog.get_loaded_names_for_directory("acme-market") == {"widget"}
+    assert [name for name, _ in catalog.get_bundled_skills()] == ["widget"]
+    assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["acme-mcp"]
+    meta = next(m for m in catalog.list_plugins() if m.name == "widget")
+    assert "on_pre_tool" in meta.hooks_config, "the adapter's event name was translated"
+
+    env = catalog._hook_env(meta, {})
+    assert env["ACME_ROOT"] == str(plugin_dir)
+    assert env["ACME_DATA"] and env["ACME_PROJECT"]
+
+
+def test_the_installer_knows_the_new_ecosystem_too(tmp_path, acme_format):
+    """One adapter answers the installer as well as the loader."""
+    from agent.tools.plugin_tools import (
+        _looks_like_plugin,
+        _plugin_executable_content,
+    )
+
+    plugin_dir = tmp_path / "widget"
+    (plugin_dir / ".acme-plugin").mkdir(parents=True)
+    (plugin_dir / ".acme-plugin" / "plugin.json").write_text(
+        '{"name": "widget"}', encoding="utf-8"
+    )
+
+    assert _looks_like_plugin(plugin_dir) is True
+    assert _plugin_executable_content(plugin_dir) == ""
+
+    (plugin_dir / "acme-run.py").write_text("print('hi')\n", encoding="utf-8")
+    assert _plugin_executable_content(plugin_dir) == "acme-run.py"
+
+
 def test_discover_accepts_plugin_directory_as_builtin_root(tmp_path):
     """builtin_dir may point directly at a plugin repository root."""
     from agent import PluginCatalog

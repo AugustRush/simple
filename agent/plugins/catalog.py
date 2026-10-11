@@ -19,6 +19,7 @@ from agent.commands.registry import CommandRegistry
 from agent.core.agent_registry import AgentRegistry, role_key
 from agent.core.output import _active_event_collector
 from agent.kernel.plugin import PluginHost
+from agent.plugins import formats as plugin_formats
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
 from agent.core.event_domains import SessionFinished
@@ -214,49 +215,6 @@ class PluginMeta:
 # table's last edit introduced, and `tests/test_plugin_hook_dispatch.py` now records
 # which names are wired and why the others are not.  Add a name here and that test tells
 # you it needs a decision.
-_CC_EVENT_MAP = {
-    # Lifecycle
-    "SessionStart": "on_session_start",
-    "SessionEnd": "on_session_end",
-    "Setup": "on_setup",
-    # Prompt flow
-    "UserPromptSubmit": "on_prompt_submit",
-    "UserPromptExpansion": "on_prompt_expansion",
-    # Tool lifecycle
-    "PreToolUse": "on_pre_tool",
-    "PostToolUse": "on_post_tool",
-    "PostToolUseFailure": "on_post_tool_failure",
-    "PostToolBatch": "on_post_tool_batch",
-    "PermissionRequest": "on_permission_request",
-    "PermissionDenied": "on_permission_denied",
-    # Turn lifecycle
-    "Stop": "on_turn_end",
-    "StopFailure": "on_turn_failure",
-    "PreCompact": "on_pre_compact",
-    "PostCompact": "on_post_compact",
-    # Notifications & display
-    "Notification": "on_notification",
-    "MessageDisplay": "on_message_display",
-    # Sub-agents
-    "SubagentStart": "on_subagent_start",
-    "SubagentStop": "on_subagent_stop",
-    # Tasks
-    "TaskCreated": "on_task_created",
-    "TaskCompleted": "on_task_completed",
-    # Reactive events
-    "ConfigChange": "on_config_change",
-    "CwdChanged": "on_cwd_changed",
-    "FileChanged": "on_file_changed",
-    "InstructionsLoaded": "on_instructions_loaded",
-    # Worktree lifecycle
-    "WorktreeCreate": "on_worktree_create",
-    "WorktreeRemove": "on_worktree_remove",
-    # Agent teams
-    "TeammateIdle": "on_teammate_idle",
-    # MCP elicitation
-    "Elicitation": "on_elicitation",
-    "ElicitationResult": "on_elicitation_result",
-}
 
 # Tool name translation: our tool name → Claude Code tool name.
 # Used when matching a Claude Code matcher pattern against our tools.
@@ -327,14 +285,10 @@ def _plugin_data_dir(plugin_name: str) -> Path:
 
 
 def _plugin_substitution_env(plugin_dir: Path, plugin_name: str) -> dict[str, str]:
-    return {
-        "CLAUDE_PLUGIN_ROOT": str(plugin_dir),
-        "CLAUDE_PLUGIN_DATA": str(_plugin_data_dir(plugin_name)),
-        "CLAUDE_PROJECT_DIR": str(Path.cwd()),
-        "CODEX_PLUGIN_ROOT": str(plugin_dir),
-        "CODEX_PLUGIN_DATA": str(_plugin_data_dir(plugin_name)),
-        "CODEX_PROJECT_DIR": str(Path.cwd()),
-    }
+    """``${...}`` values for a manifest or MCP config, by every format's spelling."""
+    return plugin_formats.placeholder_environment(
+        plugin_dir, _plugin_data_dir(plugin_name), Path.cwd()
+    )
 
 
 _PLUGIN_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -366,7 +320,11 @@ def _normalize_claude_hook_entries(
     entries: Any,
 ) -> tuple[str, list[dict]]:
     """Translate Claude Code hook matcher groups to internal flat entries."""
-    internal_event = _CC_EVENT_MAP.get(event_name, event_name)
+    # Asked live, not snapshotted at import: a format registered later (an
+    # embedder's, or a test's) brings its event vocabulary with it.  A name this
+    # project has no counterpart for passes through unchanged, so "this hook does
+    # nothing yet" stays distinguishable from "this hook is not recognised".
+    internal_event = plugin_formats.all_hook_events().get(event_name, event_name)
     if not isinstance(entries, list):
         return internal_event, []
     flat: list[dict] = []
@@ -415,30 +373,41 @@ def _merge_hooks_block(
             into.setdefault(internal_event, []).extend(flat)
 
 
-def _read_claude_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
-    """Read ``hooks/hooks.json`` and translate to the internal hook shape.
+def _read_default_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
+    """Read each format's default hooks file and translate it.
 
-    Claude Code's structure nests once more than ours:
-        {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", ...}]}]}
-    Our internal shape is flat:
-        {"on_pre_tool": [{"matcher": "Bash", "type": "command", "command": ..., "timeout": ...}]}
-    Event names are translated via _CC_EVENT_MAP; ignored events emit a warning.
+    ``hooks/hooks.json`` is where both Claude Code and Codex keep hooks that the
+    manifest never mentions, so a reader that only looked at the manifest's
+    ``hooks`` key let a plugin run shell nobody was asked about.  The file list
+    comes from the adapters; a format that keeps hooks elsewhere adds its path
+    there rather than here.
+
+    The structure nests once more than ours::
+
+        {"hooks": {"PreToolUse": [{"matcher": "Bash",
+                                   "hooks": [{"type": "command", ...}]}]}}
+
+    and ours is flat::
+
+        {"on_pre_tool": [{"matcher": "Bash", "type": "command",
+                          "command": ..., "timeout": ...}]}
     """
-    hf = plugin_dir / "hooks" / "hooks.json"
-    if not hf.exists():
-        return {}
-    try:
-        data = json.loads(hf.read_text(encoding="utf-8"))
-    except Exception as exc:
-        shared.CONSOLE.print(
-            f"[yellow]Plugin '{plugin_dir.name}': hooks.json unreadable: {exc}[/yellow]"
-        )
-        return {}
-    cc_hooks = data.get("hooks", {})
-    if not isinstance(cc_hooks, dict):
-        return {}
     out: dict[str, list[dict]] = {}
-    _merge_hooks_block(plugin_dir.name, cc_hooks, out)
+    for relative in plugin_formats.merged_paths("hooks_files"):
+        hooks_file = plugin_dir / relative
+        if not hooks_file.exists():
+            continue
+        try:
+            data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            shared.CONSOLE.print(
+                f"[yellow]Plugin '{plugin_dir.name}': {relative} unreadable: {exc}[/yellow]"
+            )
+            continue
+        block = data.get("hooks", {})
+        if not isinstance(block, dict):
+            continue
+        _merge_hooks_block(plugin_dir.name, block, out)
     return out
 
 
@@ -465,13 +434,6 @@ def _merge_hooks_from_file(
     _merge_hooks_block(plugin_dir.name, source, into)
 
 
-#: File names an MCP server block may live in at a plugin root.  ``.mcp.json``
-#: is Claude Code's and Codex's legacy location; ``mcp.json`` (no dot) is the
-#: same file in the portable Agent Plugins v1 layout, where it is the *default*
-#: component path rather than something the manifest names.
-MCP_MANIFEST_FILES: tuple[str, ...] = (".mcp.json", "mcp.json")
-
-
 def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dict]:
     """Read a plugin root's MCP server file and return its server configs.
 
@@ -482,7 +444,11 @@ def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dic
     ``"name"`` set.
     """
     mf = next(
-        (candidate for name in MCP_MANIFEST_FILES if (candidate := plugin_dir / name).exists()),
+        (
+            candidate
+            for name in plugin_formats.merged_paths("mcp_files")
+            if (candidate := plugin_dir / name).exists()
+        ),
         None,
     )
     if mf is None:
@@ -491,7 +457,7 @@ def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dic
         data = json.loads(mf.read_text(encoding="utf-8"))
     except Exception as exc:
         shared.CONSOLE.print(
-            f"[yellow]Plugin '{plugin_dir.name}': .mcp.json unreadable: {exc}[/yellow]"
+            f"[yellow]Plugin '{plugin_dir.name}': {mf.name} unreadable: {exc}[/yellow]"
         )
         return []
     servers = data.get("mcpServers", data)
@@ -601,23 +567,21 @@ def _normalize_mcp_servers(plugin_dir: Path, data: dict, plugin_env: dict) -> li
         substituted_mcp.append(normalized)
     return substituted_mcp
 def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
-    """Read plugin.json from a plugin directory.  Returns None if absent.
+    """Read a plugin manifest.  Returns None when no format has one here.
 
-    Detects either layout:
-      - ``<plugin>/plugin.json``                 (this project's original format)
-      - ``<plugin>/.claude-plugin/plugin.json``  (Claude Code format)
-      - ``<plugin>/.codex-plugin/plugin.json``   (Codex format)
+    *Where* a manifest lives is the format adapters' business
+    (``agent/plugins/formats.py``): this reads whichever candidate they name
+    first, so a new ecosystem is a registration rather than a branch here.
 
-    Accepts both ``mcp_servers`` (snake_case) and ``mcpServers`` (camelCase).
-    Skills default to the ``skills`` subdirectory when it exists, so a
-    Claude Code plugin needs no manifest entry to expose its skills.
+    Accepts both ``mcp_servers`` (snake_case) and ``mcpServers`` (camelCase) --
+    the field names are shared even where the locations are not.  Skills default
+    to the ``skills`` subdirectory when it exists, so a plugin needs no manifest
+    entry to expose its skills.
     """
-    manifest_candidates = [
-        plugin_dir / ".codex-plugin" / "plugin.json",
-        plugin_dir / ".claude-plugin" / "plugin.json",
-        plugin_dir / "plugin.json",
-    ]
-    pj = next((candidate for candidate in manifest_candidates if candidate.exists()), None)
+    pj = next(
+        (candidate for candidate in plugin_formats.manifest_candidates(plugin_dir) if candidate.exists()),
+        None,
+    )
     if pj is None:
         # No manifest at all — synthesise minimal meta if any standard
         # subdir exists (so claude-plugin packages without a plugin.json
@@ -679,13 +643,10 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
 
 
 def _has_plugin_manifest(dir_path: Path) -> bool:
+    """Whether a supported format keeps a manifest here -- asked of the adapters."""
     return any(
         candidate.exists()
-        for candidate in (
-            dir_path / ".codex-plugin" / "plugin.json",
-            dir_path / ".claude-plugin" / "plugin.json",
-            dir_path / "plugin.json",
-        )
+        for candidate in plugin_formats.manifest_candidates(dir_path)
     )
 
 
@@ -701,33 +662,19 @@ def _local_marketplace_source_path(entry: dict[str, Any]) -> str:
     return str(source.get("path", "") or "").strip()
 
 
-#: Where each ecosystem says a marketplace manifest lives, relative to the
-#: marketplace root.  Codex reads these four in order (``.agents/plugins/`` is
-#: its own, and ``.claude-plugin/`` is accepted for compatibility); Claude Code
-#: reads its one.  A root ``marketplace.json`` is this project's own older
-#: spelling and stays last so a real ecosystem file wins.
-MARKETPLACE_MANIFESTS: tuple[Path, ...] = (
-    Path(".agents") / "plugins" / "marketplace.json",
-    Path(".agents") / "plugins" / "api_marketplace.json",
-    Path(".claude-plugin") / "marketplace.json",
-    Path("marketplace.json"),
-)
-
-
 def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]]]:
     """Read a supported marketplace manifest if present.
 
-    Supports Claude Code's ``.claude-plugin/marketplace.json`` and Codex's
-    ``.agents/plugins/marketplace.json`` (see :data:`MARKETPLACE_MANIFESTS`).
-    Only local relative plugin sources are expanded; remote marketplace entries
-    belong to the installer, not the runtime loader.
+    The candidate paths come from the format adapters, in their precedence
+    order.  Only local relative plugin sources are expanded; remote marketplace
+    entries belong to the installer, not the runtime loader.
     """
     if _has_plugin_manifest(dir_path):
         return None
     mp = next(
         (
             candidate
-            for candidate in (dir_path / rel for rel in MARKETPLACE_MANIFESTS)
+            for candidate in plugin_formats.marketplace_candidates(dir_path)
             if candidate.exists()
         ),
         None,
@@ -761,7 +708,8 @@ def _is_plugin_container(dir_path: Path) -> bool:
     if _has_plugin_manifest(dir_path):
         return True
     return any(
-        (dir_path / rel).exists() for rel in MARKETPLACE_MANIFESTS
+        candidate.exists()
+        for candidate in plugin_formats.marketplace_candidates(dir_path)
     )
 
 
@@ -1068,7 +1016,7 @@ class _CatalogPlugin:
         # config, with a plugin.json entry winning on the same event key.  Merged
         # here because the config is the plugin's; left un-undone because nothing
         # reads a removed plugin's hooks -- the catalog looks them up by name.
-        for event_name, entries in _read_claude_hooks_json(plugin_dir).items():
+        for event_name, entries in _read_default_hooks_json(plugin_dir).items():
             meta.hooks_config.setdefault(event_name, []).extend(entries)
         if meta.hooks_config:
             # The only thing the tool bridge is for.  See `_ensure_event_bridge`.
@@ -1370,14 +1318,12 @@ class PluginCatalog:
     def discover_and_load(self) -> list[str]:
         """Scan plugin directories and load all valid plugins.
 
-        Supports three on-disk layouts:
-        1. Native: ``<dir>/plugin.json`` + ``__init__.py`` with ``register()``.
-        2. Claude Code: ``<dir>/.claude-plugin/plugin.json`` + standard
-           subdirectories (skills/ commands/ agents/ hooks/).  No Python
-           required — declarative-only plugins are fully supported.
-        3. Marketplace: ``<dir>/.claude-plugin/marketplace.json`` listing
-           multiple plugins via ``plugins[].source``.  Each entry is expanded
-           into its own plugin load.
+        What counts as a plugin, a marketplace and a manifest is the format
+        adapters' business (``agent/plugins/formats.py``): native
+        ``plugin.json`` with ``__init__.py``, Claude Code's ``.claude-plugin``
+        layout with its convention subdirectories, Codex's two manifest
+        locations, and whichever marketplace files those formats declare -- each
+        expanded into its own plugin load.
 
         Failures in individual plugins are reported but do not abort startup.
 
@@ -2127,16 +2073,15 @@ class PluginCatalog:
         """Build Claude Code-compatible environment variables for hook exec."""
         env = dict(os.environ)
         if meta.path is not None:
-            env["CLAUDE_PLUGIN_ROOT"] = str(meta.path)
-            # Codex runs a plugin's hook commands with these two names, and a
-            # Codex plugin's hook command says ``"$PLUGIN_ROOT/hooks/x.sh"``.
-            # Setting only the Claude Code spelling made every such hook fail
-            # with an empty variable -- silently, since a hook's exit status is
-            # its own business.
-            env["PLUGIN_ROOT"] = str(meta.path)
-            env["PLUGIN_DATA"] = str(_plugin_data_dir(meta.name))
-        # Workspace = current cwd; matches what CC reports.
-        env["CLAUDE_PROJECT_DIR"] = os.getcwd()
+            # Every format's spelling of "where this plugin lives" and "where it
+            # may write", from the adapters: a Codex hook command says
+            # ``"$PLUGIN_ROOT/hooks/x.sh"`` and a Claude Code one says
+            # ``${CLAUDE_PLUGIN_ROOT}/...``, and both have to resolve.
+            env.update(
+                plugin_formats.hook_environment(
+                    meta.path, _plugin_data_dir(meta.name), Path.cwd()
+                )
+            )
         tool_name = str(event_payload.get("tool_name", "") or "")
         if tool_name:
             env["TOOL_NAME"] = _OUR_TO_CC_TOOL_NAME.get(tool_name, tool_name)

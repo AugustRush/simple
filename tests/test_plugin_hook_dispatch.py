@@ -57,17 +57,35 @@ _NOT_DISPATCHED: dict[str, str] = {
 
 
 def _cc_event_map() -> dict[str, str]:
-    tree = ast.parse((REPO_ROOT / "agent/plugins/catalog.py").read_text(encoding="utf-8"))
+    """The Claude Code vocabulary, read from the format adapter that owns it.
+
+    It used to be a dict literal in ``catalog.py``; the loader no longer knows any
+    ecosystem's event names, so the guard follows the table to
+    ``agent/plugins/formats.py``.  Reading it as source rather than importing it keeps
+    the check independent of the module's own import side effects.
+    """
+    tree = ast.parse(
+        (REPO_ROOT / "agent/plugins/formats.py").read_text(encoding="utf-8")
+    )
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_CC_EVENT_MAP" for t in node.targets
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign)
+            else []
+        )
+        if any(
+            isinstance(t, ast.Name) and t.id == "CLAUDE_CODE_HOOK_EVENTS"
+            for t in targets
         ):
+            value = node.value
+            if not isinstance(value, ast.Dict):
+                raise AssertionError("CLAUDE_CODE_HOOK_EVENTS is no longer a literal")
             return {
                 k.value: v.value
-                for k, v in zip(node.value.keys, node.value.values)
+                for k, v in zip(value.keys, value.values)
                 if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
             }
-    raise AssertionError("_CC_EVENT_MAP not found")
+    raise AssertionError("CLAUDE_CODE_HOOK_EVENTS not found")
 
 
 def test_every_translated_event_is_dispatched_or_recorded() -> None:

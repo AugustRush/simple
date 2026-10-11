@@ -61,35 +61,39 @@ from .executor import report_tool_progress
 
 
 def _looks_like_plugin(dir_path: Path) -> bool:
-    """Return True if *dir_path* contains at least one recognisable plugin marker.
+    """Return True if *dir_path* holds anything the loader would recognise.
 
-    The list has to cover every layout the **loader** accepts.  A plugin the
-    runtime would happily load but the installer refuses is a compatibility bug
-    with no upside: it is the difference between "Codex plugins work" and "a
-    Codex plugin without a skills directory cannot be installed at all", and
-    between a marketplace being loadable and being installable.  Measured, that
-    was the case for ``.codex-plugin/plugin.json``, for both marketplaces'
-    manifest locations, and for a bare ``SKILL.md`` root (a single-skill
-    package, which ``_read_plugin_json`` already synthesises metadata for).
+    The answer comes from the format adapters (``agent/plugins/formats.py``),
+    because the installer and the loader asking two different questions is how a
+    plugin the runtime loads became one the installer refuses.  Being stricter
+    than the loader has no upside: it is the difference between "Codex plugins
+    work" and "a Codex plugin without a skills directory cannot be installed".
     """
-    for marker in (
-        dir_path / "plugin.json",
-        dir_path / ".claude-plugin" / "plugin.json",
-        dir_path / ".codex-plugin" / "plugin.json",
-        dir_path / ".claude-plugin" / "marketplace.json",
-        dir_path / "marketplace.json",
-        dir_path / ".agents" / "plugins" / "marketplace.json",
-        dir_path / ".agents" / "plugins" / "api_marketplace.json",
-        dir_path / "__init__.py",
-        dir_path / "SKILL.md",
-    ):
-        if marker.exists():
-            return True
-    return (
-        (dir_path / "skills").is_dir()
-        or (dir_path / "commands").is_dir()
-        or (dir_path / "agents").is_dir()
-    )
+    from agent.plugins import formats as plugin_formats
+
+    return plugin_formats.looks_like_plugin(dir_path)
+
+
+def _expected_plugin_markers(limit: int = 8) -> str:
+    """The markers the installer accepts, named from the format adapters.
+
+    Generated rather than written out: a hand-written list is how the message
+    came to name three layouts while the loader accepted five.
+    """
+    from agent.plugins import formats as plugin_formats
+
+    names: list[str] = []
+    for fmt in plugin_formats.PLUGIN_FORMATS:
+        for relative in fmt.manifests + fmt.marketplaces + fmt.markers:
+            if relative not in names:
+                names.append(relative)
+    names.extend(plugin_formats.STANDALONE_SKILL_FILES)
+    for directories in plugin_formats.CONVENTION_DIRS.values():
+        for directory in directories:
+            if directory not in names:
+                names.append(directory)
+    shown = ", ".join(names[:limit])
+    return f"{shown}, ..." if len(names) > limit else shown
 
 
 def _canonicalize_plugin_source(source: str) -> str:
@@ -109,45 +113,33 @@ def _canonicalize_plugin_source(source: str) -> str:
 def _plugin_executable_content(target: Path) -> str:
     """Describe executable content a plugin ships ("" = declarative only).
 
-    Installations that run code (Python entry point, MCP server, hooks) are
-    equivalent to executing arbitrary code and must pass human confirmation
-    before activation.
+    Installations that run code (a Python entry point, an MCP server, a hook
+    command) are equivalent to executing arbitrary code and must pass human
+    confirmation before activation.
 
-    Every location each ecosystem defines as executable is checked, not just the
-    one spelling this started with.  A gate that misses a location is worse than
-    no gate: measured against fixtures written the way the ecosystems document
-    them, ``mcp.json`` (Agent Plugins v1's default MCP file) and
-    ``hooks/hooks.json`` (the **default** hooks file for both Claude Code and
-    Codex -- a plugin need not mention it in its manifest) both installed with
-    no approval at all, and both run arbitrary commands the moment the plugin is
-    enabled.
+    What counts as code is the *ecosystem's* answer, so it comes from the format
+    adapters: ``.mcp.json`` and ``mcp.json``, ``hooks/hooks.json`` -- the default
+    hooks file for both Claude Code and Codex, which a manifest need not mention
+    -- and the ``mcpServers``/``hooks`` keys of whichever manifest the plugin
+    ships.  Measured against fixtures written to each ecosystem's documentation,
+    the locations this used to miss were exactly the ones that install with no
+    approval and run arbitrary commands on being enabled.
     """
-    if (target / "__init__.py").exists():
-        return "Python 入口 (__init__.py)"
-    for mcp_name in (".mcp.json", "mcp.json"):
-        if (target / mcp_name).exists():
-            return f"MCP server ({mcp_name})"
-    if (target / "hooks" / "hooks.json").is_file():
-        return "hooks (hooks/hooks.json)"
-    for manifest in (
-        target / "plugin.json",
-        target / ".claude-plugin" / "plugin.json",
-        target / ".codex-plugin" / "plugin.json",
-    ):
-        if not manifest.exists():
-            continue
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        if data.get("mcp_servers") or data.get("mcpServers"):
+    from agent.plugins import formats as plugin_formats
+
+    def describe(marker: str) -> str:
+        name = marker.rsplit(":", 1)[-1] if ":" in marker else marker
+        if marker == "__init__.py":
+            return "Python 入口 (__init__.py)"
+        if name.endswith("mcp.json"):
+            return f"MCP server ({name})"
+        if "mcpServers" in marker or "mcp_servers" in marker:
             return "MCP server (manifest)"
-        if data.get("hooks"):
-            return "hooks (manifest)"
-    hooks_dir = target / ".claude-plugin" / "hooks"
-    if hooks_dir.is_dir() and any(hooks_dir.iterdir()):
-        return "hooks (.claude-plugin/hooks)"
-    return ""
+        if name.startswith("hooks") or "hooks" in marker:
+            return f"hooks ({name})" if name != "hooks" else "hooks"
+        return marker
+
+    return plugin_formats.executable_content(target, describe=describe)
 
 
 _PLUGIN_INSTALL_LOCK: Optional[asyncio.Lock] = None
@@ -348,8 +340,7 @@ class PluginTools:
                         "ok": False,
                         "error": (
                             f"Installed directory does not appear to be a valid plugin. "
-                            f"Expected one of: plugin.json, .claude-plugin/plugin.json, "
-                            f"__init__.py, skills/, or commands/."
+                            f"Expected one of: {_expected_plugin_markers()}."
                         ),
                     }
                 )
