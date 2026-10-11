@@ -58,6 +58,11 @@ class CoreService:
     owners: tuple[str, ...]
     consumers: tuple[str, ...]
     summary: str
+    #: Where the *contract* for this service is written down, when one is.
+    #: A name with an owner says who fills it; a contract says what a different
+    #: implementation has to satisfy to fill it instead.  Empty for services whose
+    #: interface is still implicit -- which is a fact worth being able to see.
+    contract: str = ""
 
 
 CORE_SERVICES: tuple[CoreService, ...] = (
@@ -161,6 +166,23 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/tools/plugin.py",  # the built-in tools read and write session context
         ),
         summary="The memory system: staging, retrieval, consolidation, per session.",
+        contract="agent/memory/contracts.py:ContextService",
+    ),
+    CoreService(
+        name="ltm_store",
+        owners=(
+            "agent/memory/plugin.py",
+        ),
+        consumers=(
+            "agent/bootstrap.py",
+            "agent/memory/session_plugin.py",
+        ),
+        summary=(
+            "The long-term store the palace and the context manager share.  "
+            "Replacing it alone swaps storage while keeping this project's "
+            "retrieval, consolidation and compaction."
+        ),
+        contract="agent/memory/contracts.py:MemoryStore",
     ),
     CoreService(
         name="agent_core",
@@ -223,6 +245,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/tools/plugin.py",  # the memory tools
         ),
         summary="The long-term store behind the context manager.",
+        contract="agent/memory/contracts.py:MemoryStore",
     ),
     CoreService(
         name="mcp_client",

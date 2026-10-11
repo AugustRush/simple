@@ -534,11 +534,18 @@ def test_the_scan_detects_the_shared_resolve_helper() -> None:
 
 
 def test_declared_names_match_the_documented_set() -> None:
-    """The eight names this step covers, so an accidental removal is caught."""
+    """The names the vocabulary covers, so an accidental removal is caught.
+
+    ``ltm_store`` joined when the memory contracts were written down: it was
+    already a service (``agent/memory/plugin.py`` provides it, the session plugin
+    and the composition root resolve it) and being *undeclared* was the reason it
+    had no written interface to replace.
+    """
     assert set(core_service_names()) == {
         "agent",
         "agent_core",
         "context_manager",
+        "ltm_store",
         "mcp_client",
         "memory",
         "plugin_catalog",
@@ -547,6 +554,35 @@ def test_declared_names_match_the_documented_set() -> None:
         "agent_loop",
         "llm",
     }
+
+
+def test_the_declared_contracts_exist() -> None:
+    """A contract pointer has to name a real symbol, or it is decoration.
+
+    Checked by reading the file rather than importing it: the pointer is written
+    the way the owner and consumer lists are (a source path), and importing every
+    contract module to check one name would make this test depend on the import
+    graph it is supposed to describe.
+    """
+    for entry in CORE_SERVICES:
+        if not entry.contract:
+            continue
+        relative, _, symbol = entry.contract.partition(":")
+        source = REPO_ROOT / relative
+        assert source.is_file(), f"{entry.name} points at a missing file: {relative}"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        found = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        } | {
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        }
+        assert symbol in found, f"{entry.name} points at a missing {symbol} in {relative}"
 
 
 def test_an_entry_is_frozen() -> None:
