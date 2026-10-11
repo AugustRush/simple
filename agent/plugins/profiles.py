@@ -149,14 +149,33 @@ class PluginProfile:
         }
 
 
-#: The named compositions.  One row today, because the point of this change is
-#: the mechanism: a profile is data, and adding the second one is a table edit.
+#: The profile that swaps the built-in memory store for the SQLite FTS5 backend.
+#: Its key is the plugin's name, so the declaration reads as "the service comes
+#: from that plugin" without a second vocabulary.
+SQLITE_FTS_PROFILE_NAME = "sqlite-fts-memory"
+
+#: The named compositions.  Two rows now, and the second one is the evidence the
+#: first comment asked for: a profile is data, so a different memory backend is a
+#: table edit plus the plugin it names.
 PROFILES: dict[str, PluginProfile] = {
     DEFAULT_PROFILE_NAME: PluginProfile(
         key=DEFAULT_PROFILE_NAME,
         label="默认",
         summary="加载所有未被配置禁用的插件。",
         entries=(),
+    ),
+    SQLITE_FTS_PROFILE_NAME: PluginProfile(
+        key=SQLITE_FTS_PROFILE_NAME,
+        label="SQLite FTS5 记忆",
+        summary=(
+            "用 sqlite-fts-memory 插件提供的存储替换内置 memory/ltm_store；"
+            "检索、整理、压缩仍由本项目提供，跑的是同一份契约测试。"
+        ),
+        entries=(),
+        service_replacements={
+            "ltm_store": SQLITE_FTS_PROFILE_NAME,
+            "memory": SQLITE_FTS_PROFILE_NAME,
+        },
     ),
 }
 

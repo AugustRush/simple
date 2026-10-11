@@ -27,6 +27,7 @@ def test_the_declaration_names_every_core_plugin() -> None:
     assert core_plugin_names() == (
         "ralph",
         "memory",
+        "sqlite-fts-memory",
         "session",
         "agent",
         "tools",
@@ -46,9 +47,18 @@ def test_a_selection_narrows_the_set_and_says_so() -> None:
 
 
 def test_no_selection_means_all_of_them() -> None:
-    """The safe default: a deployment that says nothing keeps what it had."""
-    assert core_plugins() == CORE_PLUGINS
-    assert core_plugins(enabled=None) == CORE_PLUGINS
+    """The safe default: a deployment that says nothing keeps what it had.
+
+    "All of them" is every plugin that is **on by default**.  A plugin marked
+    ``opt_in`` exists to replace a default one -- mounting both would be two
+    providers of one name, which the kernel refuses -- so the default set is the
+    declaration minus the opt-ins, and that is what this compares.
+    """
+    default = [plugin for plugin in CORE_PLUGINS if not plugin.opt_in]
+    assert list(core_plugins()) == default
+    assert list(core_plugins(enabled=None)) == default
+    assert "sqlite-fts-memory" in core_plugin_names(), "declared"
+    assert "sqlite-fts-memory" not in [plugin.name for plugin in core_plugins()], "not mounted"
 
 
 def test_an_unknown_name_is_refused_rather_than_ignored() -> None:

@@ -51,6 +51,21 @@ def _is_metadata_receiver(node: ast.AST) -> bool:
     return "metadata" in ast.unparse(node)
 
 
+def _is_config_receiver(node: ast.AST) -> bool:
+    """Whether *node* is the configuration mapping rather than a service container.
+
+    ``cfg.get("memory")`` reads the ``memory`` *section* of the config, and the
+    scanner cannot tell it from a read of the ``memory`` service without knowing
+    the receiver.  Configuration receivers are named ``cfg``/``config`` by
+    convention throughout this tree; services are read from ``components``,
+    ``ctx``, ``registry`` or a service attribute.
+    """
+    if isinstance(node, ast.Call):
+        node = node.func.value if isinstance(node.func, ast.Attribute) else node.func
+    text = ast.unparse(node)
+    return text in {"cfg", "config", "self._cfg", "self._config", "self.cfg", "self.config"}
+
+
 def _string_key(node: ast.Call | ast.Subscript) -> str | None:
     """The literal string key of a ``.get("k")`` / ``["k"]`` expression."""
     if isinstance(node, ast.Call):
@@ -158,6 +173,13 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     names = set(core_service_names())
     writers: dict[str, set[str]] = {}
     readers: dict[str, set[str]] = {}
+    #: Dict literals that *declare* which plugin provides a service rather than
+    #: providing it (``PluginProfile(service_replacements={"ltm_store": "..."})``).
+    #: A declaration names the same service the composition writes, so counting it
+    #: as a writer made the ledger claim a profile constructs the store -- and a
+    #: ledger that names a writer which only declares tells the next reader not to
+    #: replace it.
+    declarations: set[int] = set()
 
     def note(bucket: dict[str, set[str]], key: str | None, rel: str) -> None:
         if key in names:
@@ -168,6 +190,15 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             continue
         rel = str(path.relative_to(REPO_ROOT))
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        # Collected from the *same* tree the loop below walks: the exclusion is by
+        # node identity, and a second ``ast.parse`` produces different objects.
+        declarations = {
+            id(keyword.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+            if keyword.arg in {"service_replacements", "service_replacement"}
+        }
         assignment_targets = _is_assignment_target(tree)
         for node in ast.walk(tree):
             # **Every** dict literal, anywhere -- not only ones bound by an
@@ -176,6 +207,8 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             # missed ``memory`` entirely while reporting the ledger as correct,
             # because the guard and the ledger shared the same blind spot.
             if isinstance(node, ast.Dict):
+                if id(node) in declarations:
+                    continue
                 # A *provider* is not "any dict that mentions a service name".  A helper
                 # that pulls names out of a mapping is a reader, and counting it made the
                 # ledger claim cli.py constructs the memory service -- a ledger that names
@@ -212,10 +245,14 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                 elif attr in ("get", "pop", "require", "lookup", "resolve"):
                     # ``lookup``/``resolve`` tolerate absence, ``require`` does
                     # not; all are container-mediated reads, which is the property
-                    # being checked.  A metadata mapping is excluded because it
-                    # carries some of the same names without being a component
-                    # mapping -- see :func:`_is_metadata_receiver`.
-                    if not _is_metadata_receiver(func.value):
+                    # being checked.  Two receivers are excluded because they carry
+                    # some of the same names without being component mappings:
+                    # per-turn metadata (:func:`_is_metadata_receiver`) and the
+                    # configuration, whose ``memory``/``sandbox`` keys are
+                    # *sections* (:func:`_is_config_receiver`).
+                    if not _is_metadata_receiver(func.value) and not _is_config_receiver(
+                        func.value
+                    ):
                         note(readers, _string_key(node), rel)
                 elif attr == "_core":
                     # ``self._core("x")`` on the plugin catalog: an attribute

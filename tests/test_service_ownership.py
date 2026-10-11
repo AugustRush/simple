@@ -103,7 +103,12 @@ def test_the_scan_finds_the_plugin_providers() -> None:
     providers = _plugin_providers()
 
     assert "ltm_store" in providers, "memory plugin provides it"
-    assert providers["ltm_store"] == {"agent/memory/plugin.py"}
+    assert providers["ltm_store"] == {
+        "agent/memory/plugin.py",
+        # The opt-in alternative backend provides the same service; naming it as a
+        # replacement is what mounts it.
+        "agent/memory/backends/sqlite_fts.py",
+    }
     assert "context_manager" in providers
     assert "agent_loop" in providers, "the turn runner provides itself"
 

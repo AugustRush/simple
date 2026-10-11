@@ -32,8 +32,13 @@ def test_a_replacement_drops_the_core_plugin_that_would_have_provided_it() -> No
 
 
 def test_a_replacement_of_an_unrelated_service_changes_nothing() -> None:
-    """Control: a service no core plugin provides displaces nothing."""
-    assert core_plugins(replacements={"something_else": "acme.thing"}) == CORE_PLUGINS
+    """Control: a service no core plugin provides displaces nothing.
+
+    Compared against the *default* set rather than ``CORE_PLUGINS``: the
+    declaration also holds opt-in plugins (an alternative memory backend), which
+    nothing mounts until something asks for them.
+    """
+    assert core_plugins(replacements={"something_else": "acme.thing"}) == core_plugins()
 
 
 def test_every_core_plugin_that_provides_the_service_is_dropped() -> None:

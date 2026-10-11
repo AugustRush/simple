@@ -172,6 +172,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="ltm_store",
         owners=(
             "agent/memory/plugin.py",
+            "agent/memory/backends/sqlite_fts.py",  # the opt-in alternative backend
         ),
         consumers=(
             "agent/bootstrap.py",
@@ -232,15 +233,13 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="memory",
         owners=(
             "agent/memory/plugin.py",
+            "agent/memory/backends/sqlite_fts.py",  # the opt-in alternative backend
             "agent/config.py",
         ),
         consumers=(
-            "agent/bootstrap.py",
-            "agent/channels/base.py",
+            "agent/_builtin/plugins/evolution/__init__.py",  # experience is scored against stored memory
             "agent/cli.py",
             "agent/commands/builtin.py",
-            "agent/_builtin/plugins/evolution/__init__.py",  # experience is scored against stored memory
-            "agent/memory/plugin.py",  # the palace is built over the store this reads
             "agent/scheduler/plugin.py",  # a scheduled run consolidates into it
             "agent/tools/plugin.py",  # the memory tools
         ),

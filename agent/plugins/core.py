@@ -62,6 +62,11 @@ class CorePlugin:
     factory: Callable[[CoreContext], Any]
     #: The services it provides, for a composition that wants to report what it has.
     provides: tuple[str, ...] = ()
+    #: Mounted only when a composition asks for it -- by naming it in ``core`` or by
+    #: naming it as the replacement for a service it provides.  A plugin that would
+    #: collide with a default one has to be opt-in, and saying so here is better than
+    #: a special case in the selection code.
+    opt_in: bool = False
 
     def build(self, context: CoreContext) -> Any:
         return self.factory(context)
@@ -77,6 +82,12 @@ def _memory(_: CoreContext) -> Any:
     from agent.memory.plugin import MemoryPlugin
 
     return MemoryPlugin()
+
+
+def _sqlite_fts_memory(_: CoreContext) -> Any:
+    from agent.memory.backends.sqlite_fts import SqliteFtsMemoryPlugin
+
+    return SqliteFtsMemoryPlugin()
 
 
 def _session(_: CoreContext) -> Any:
@@ -118,6 +129,17 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         provides=("ltm_store", "memory"),
     ),
     CorePlugin(
+        name="sqlite-fts-memory",
+        summary=(
+            "an alternative store (one SQLite file, FTS5 search) providing "
+            "`ltm_store` and `memory`; opt-in, because by default the built-in "
+            "memory plugin provides those"
+        ),
+        factory=_sqlite_fts_memory,
+        provides=("ltm_store", "memory"),
+        opt_in=True,
+    ),
+    CorePlugin(
         name="session",
         summary="the session log; provides `context_manager`",
         factory=_session,
@@ -157,9 +179,11 @@ def core_plugins(
 ) -> tuple[CorePlugin, ...]:
     """The core plugins to mount, in declaration order.
 
-    *enabled* ``None`` means all of them, which is the only safe default: every existing
-    composition mounts all six, and a default that silently dropped one would be a behaviour
-    change nobody asked for.
+    *enabled* ``None`` means every plugin that is on by default, which is the only safe
+    default: every existing composition mounts all six, and a default that silently dropped
+    one would be a behaviour change nobody asked for.  A plugin marked ``opt_in`` is not
+    part of that default -- it exists to *replace* one of them, so mounting both would be
+    two providers of one name.
 
     *replacements* maps a **service name** to the **plugin** that provides it instead.  A core
     plugin whose ``provides`` intersects that set is left out, because mounting both would be
@@ -170,19 +194,27 @@ def core_plugins(
     The caller is expected to *check* the replacement afterwards: this decides what not to
     mount, and cannot know whether the named plugin actually came up.
     """
-    chosen = list(CORE_PLUGINS)
-    if enabled is not None:
+    if enabled is None:
+        chosen = [plugin for plugin in CORE_PLUGINS if not plugin.opt_in]
+    else:
         unknown = sorted(set(enabled) - set(_BY_NAME))
         if unknown:
             raise KeyError(f"no such core plugin: {unknown}")
-        chosen = [plugin for plugin in chosen if plugin.name in set(enabled)]
+        chosen = [plugin for plugin in CORE_PLUGINS if plugin.name in set(enabled)]
 
     if replacements:
         replaced = set(replacements)
-        displaced = sorted(
+        displaced = {
             plugin.name for plugin in chosen if set(plugin.provides) & replaced
-        )
-        if displaced:
-            chosen = [plugin for plugin in chosen if plugin.name not in set(displaced)]
+        }
+        chosen = [plugin for plugin in chosen if plugin.name not in displaced]
+        # Naming a plugin as the replacement for a service *is* asking for it, so a
+        # core plugin that is otherwise opt-in joins the composition here.  A name
+        # that is not one of ours is a discovered plugin, mounted by the loader.
+        for plugin_name in dict.fromkeys(replacements.values()):
+            entry = _BY_NAME.get(plugin_name)
+            if entry is None or any(p.name == entry.name for p in chosen):
+                continue
+            chosen.append(entry)
 
     return tuple(chosen)

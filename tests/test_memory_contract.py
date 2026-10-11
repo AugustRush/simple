@@ -42,6 +42,25 @@ def _protocol_members(protocol: Any) -> dict[str, Any]:
     }
 
 
+def _protocol_attributes(protocol: Any) -> dict[str, Any]:
+    """Public data members: declared properties, plus bare annotations.
+
+    Methods are one half of an interface and data is the other; a store handed to
+    ``MemoryPalace`` has to expose ``memory_dir`` or the palace cannot find its
+    export directory, and nothing about "the method signatures match" would catch
+    that.
+    """
+    declared = {
+        name: member
+        for name, member in vars(protocol).items()
+        if not name.startswith("_") and isinstance(member, property)
+    }
+    for name, hint in getattr(protocol, "__annotations__", {}).items():
+        if not name.startswith("_"):
+            declared.setdefault(name, hint)
+    return declared
+
+
 def _signature_shape(func: Any) -> list[tuple[str, str, bool]]:
     """Parameter names, kinds and whether each has a default.
 
@@ -100,6 +119,14 @@ def _assert_conforms(protocol: Any, implementation: Any, label: str) -> None:
         assert inspect.iscoroutinefunction(actual) == inspect.iscoroutinefunction(member), (
             f"{label}.{name} async-ness differs from the contract"
         )
+    for name, declared in _protocol_attributes(protocol).items():
+        assert hasattr(implementation, name), f"{label} is missing the {name} attribute"
+        value = getattr(implementation, name)
+        assert value is not None, f"{label}.{name} is None"
+        if declared is int or declared == "int":
+            assert isinstance(value, int), f"{label}.{name} should be an int"
+        if "Path" in str(declared):
+            assert isinstance(value, Path), f"{label}.{name} should be a Path"
 
 
 def _make_store(tmp_path: Path) -> Any:
@@ -111,10 +138,16 @@ def _make_store(tmp_path: Path) -> Any:
     )
 
 
-def test_the_builtin_store_satisfies_the_store_contract(tmp_path):
+def test_every_backend_satisfies_the_store_contract(backend, tmp_path):
+    """Signature-and-attribute conformance, for every implementation.
+
+    Parametrized like the behaviour suite: a second backend that satisfies the
+    semantics but renames a parameter would break a caller that passes it by
+    keyword, and nothing about the behavioural run would notice.
+    """
     from agent.memory.contracts import MemoryStore
 
-    _assert_conforms(MemoryStore, _make_store(tmp_path), "LTMStore")
+    _assert_conforms(MemoryStore, backend(tmp_path), backend.__name__)
 
 
 def test_the_builtin_services_satisfy_their_contracts(tmp_path):
@@ -320,6 +353,39 @@ def run_store_contract(store: Any, *, session_id: str = "contract-session") -> N
     found = store.search_conversation_turns("tea", session_id=session_id)
     assert found and any("tea" in turn.content for turn in found)
 
+    # A second *execution* of the same message is a second answer, and it must be
+    # a row of its own: folding it into the first is how a delivered answer
+    # disappeared from the record.
+    second = store.write_conversation_exchange(
+        session_id=session_id,
+        user_content="what do I like?",
+        assistant_content="tea (second run)",
+        channel="test",
+        message_id="msg-1",
+        assistant_message_id="msg-1:run:def:completion:1",
+    )
+    assert second.user_created is False and second.assistant_created is True
+    answers = [
+        turn.content
+        for turn in store.recent_conversation_turns(session_id=session_id)
+        if turn.role == "assistant"
+    ]
+    assert "tea, apparently" in answers and "tea (second run)" in answers
+
+    # ...while a retry of the *same* execution is a no-op.
+    retry = store.write_conversation_exchange(
+        session_id=session_id,
+        user_content="what do I like?",
+        assistant_content="tea (second run)",
+        channel="test",
+        message_id="msg-1",
+        assistant_message_id="msg-1:run:def:completion:1",
+    )
+    assert retry.assistant_created is False
+    assert len(
+        [t for t in store.recent_conversation_turns(session_id=session_id) if t.role == "assistant"]
+    ) == 2
+
     window, events, has_more = store.transcript_window(session_id=session_id, limit=10)
     assert {turn.content for turn in window} >= {"what do I like?", "tea, apparently"}
     assert isinstance(events, list) and has_more is False
@@ -365,8 +431,30 @@ def run_store_contract(store: Any, *, session_id: str = "contract-session") -> N
     store.close()  # idempotent: a caller that closes twice must not crash
 
 
-def test_the_builtin_store_meets_the_behaviour_contract(tmp_path):
-    run_store_contract(_make_store(tmp_path))
+def _make_sqlite_fts_store(tmp_path: Path) -> Any:
+    from agent.memory.backends.sqlite_fts import SqliteFtsStore
+
+    return SqliteFtsStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+
+
+#: Every implementation of ``MemoryStore``.  Adding one here is the whole cost of
+#: claiming a second backend: the same suite runs against it unchanged.
+BACKENDS: dict[str, Callable[[Path], Any]] = {
+    "builtin": _make_store,
+    "sqlite-fts": _make_sqlite_fts_store,
+}
+
+
+@pytest.fixture(params=sorted(BACKENDS))
+def backend(request: pytest.FixtureRequest) -> Callable[[Path], Any]:
+    return BACKENDS[request.param]
+
+
+def test_every_backend_meets_the_behaviour_contract(backend, tmp_path):
+    run_store_contract(backend(tmp_path))
 
 
 def test_a_replacement_store_is_the_one_the_context_manager_gets(tmp_path, monkeypatch):

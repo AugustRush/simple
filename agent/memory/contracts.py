@@ -52,6 +52,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Sequence, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - types only
+    from pathlib import Path
+
     from agent.core.transport import ModelEndpoint
     from agent.memory.models import (
         AgentRuntimeEvent,
@@ -76,6 +78,16 @@ class MemoryStore(Protocol):
     a re-implementation gets written: the first group is "remember this", the
     third is "what did we say", and so on.
     """
+
+    # ── data the callers read ───────────────────────────────────────────────
+    @property
+    def memory_dir(self) -> "Path":
+        """Where the palace keeps what it exports (``MemoryPalace`` reads it)."""
+
+    @property
+    def max_categories(self) -> int:
+        """The category ceiling consolidation reports against (read by
+        ``ContextManager``)."""
 
     # ── long-term entries ───────────────────────────────────────────────────
     def add_entry(self, entry: "LTMEntry") -> None:
