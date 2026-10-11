@@ -154,15 +154,32 @@ class PluginProfile:
 #: from that plugin" without a second vocabulary.
 SQLITE_FTS_PROFILE_NAME = "sqlite-fts-memory"
 
-#: The named compositions.  Two rows now, and the second one is the evidence the
-#: first comment asked for: a profile is data, so a different memory backend is a
-#: table edit plus the plugin it names.
+#: The profile that swaps the whole session service: a `ContextService` that records
+#: and retrieves but never consolidates.  The store stays the built-in one, which is
+#: the point -- the two layers are replaceable independently.
+RECORD_ONLY_CONTEXT_PROFILE_NAME = "record-only-context"
+
+#: The named compositions.  Three rows, and each one is the evidence the first
+#: comment asked for: a profile is data, so a different backend (store *or* service)
+#: is a table edit plus the plugin it names.
 PROFILES: dict[str, PluginProfile] = {
     DEFAULT_PROFILE_NAME: PluginProfile(
         key=DEFAULT_PROFILE_NAME,
         label="默认",
         summary="加载所有未被配置禁用的插件。",
         entries=(),
+    ),
+    RECORD_ONLY_CONTEXT_PROFILE_NAME: PluginProfile(
+        key=RECORD_ONLY_CONTEXT_PROFILE_NAME,
+        label="只记录不整理的记忆",
+        summary=(
+            "用 record-only-context 插件提供的会话服务替换 context_manager："
+            "对话与检索照常，整理与压缩不做（同一份契约测试）。"
+        ),
+        entries=(),
+        service_replacements={
+            "context_manager": RECORD_ONLY_CONTEXT_PROFILE_NAME,
+        },
     ),
     SQLITE_FTS_PROFILE_NAME: PluginProfile(
         key=SQLITE_FTS_PROFILE_NAME,

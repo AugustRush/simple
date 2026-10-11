@@ -32,6 +32,7 @@ def test_the_declaration_names_every_core_plugin() -> None:
         "memory",
         "sqlite-fts-memory",
         "mcp",
+        "record-only-context",
         "session",
         "agent",
         "tools",

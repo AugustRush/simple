@@ -1203,7 +1203,7 @@ def observe_provider_usage(
             return
         session_id = str(
             ctx.metadata.get("session_id")
-            or getattr(getattr(context_manager, "staging", None), "session_id", "")
+            or getattr(context_manager, "session_id", "")
             or ctx.agent_id
         )
         step = max(1, int(ctx.metadata.get("_provider_step", 1) or 1))

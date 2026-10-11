@@ -293,6 +293,13 @@ class ContextService(Protocol):
     def remember(self, entry: "LTMEntry") -> None:
         """Store one durable entry, for writers that know what they learned."""
 
+    def has_answer(self, *, session_id: str, message_id: str) -> bool:
+        """Whether a message already has an assistant answer on record.
+
+        Soft by design, the same way ``MemoryStore.message_has_answer`` is: an
+        implementation without the underlying query answers ``False``.
+        """
+
     def recover_orphan_staging(self) -> int:
         """Queue consolidation for turns stranded by sessions that never finished.
 
@@ -301,6 +308,18 @@ class ContextService(Protocol):
 
     def close(self) -> None:
         """Release what this service owns.  Safe to call twice."""
+
+    def spawn_session(
+        self, session_id: "Optional[str]" = None, *, project_scope: str = ""
+    ) -> "ContextService":
+        """A session-scoped service sharing durable memory, not staging or timers.
+
+        Channel transports multiplex many chats through one process, so this is how
+        one chat gets its own history and idle policy.  Three callers depend on it
+        (both channels, the CLI's ``cli`` session, a scheduled run's
+        ``scheduler:<id>``) and all three bind it with ``getattr`` first, which is
+        why the method scan did not see it: the name they call is a local one.
+        """
 
     def mark_activity(self) -> None:
         """Note that the session did something, for idle/sleep accounting."""

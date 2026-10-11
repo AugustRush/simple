@@ -190,6 +190,12 @@ def test_a_message_that_already_has_an_answer_does_not_run_again():
         def __init__(self, answered):
             self.store = _Store(answered)
 
+        def has_answer(self, *, session_id, message_id):
+            """The manager answers it now; the store's query stays its business."""
+            return self.store.message_has_answer(
+                session_id=session_id, message_id=message_id
+            )
+
         def begin_turn(self, *, user_content, channel="", message_id="", metadata=None):
             return False  # journalled before: this message was taken up earlier
 

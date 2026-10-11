@@ -843,6 +843,8 @@ def test_channel_runner_evicts_oldest_idle_session_at_capacity():
         min_messages = 2
         def __init__(self, session_id): self.staging = _Staging(session_id)
         def mark_activity(self): pass
+        def close(self):
+            self.staging.close()
         def record_turn(self, **_kwargs): return True
         def should_enqueue_consolidation(self): return False
         def should_compact_messages(self, _messages, input_token_budget): return False

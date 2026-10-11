@@ -122,8 +122,7 @@ class ChannelRunner:
         base_ctx_mgr = resolve(components, "context_manager")
         if base_ctx_mgr is None:
             return None
-        staging = getattr(base_ctx_mgr, "staging", None)
-        if str(getattr(staging, "session_id", "") or "") == str(session_id):
+        if str(getattr(base_ctx_mgr, "session_id", "") or "") == str(session_id):
             return base_ctx_mgr
         spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
         if callable(spawn_session):
@@ -421,10 +420,9 @@ class ChannelRunner:
                         f"[dim]Plugin session_end error: {exc}[/dim]"
                     )
             for session in sessions.values():
-                staging = getattr(session.context_manager, "staging", None)
-                close = getattr(staging, "close", None)
-                if callable(close):
-                    close()
+                close_manager = getattr(session.context_manager, "close", None)
+                if callable(close_manager):
+                    close_manager()
             if memory_pool is not None:
                 memory_pool.stop()
                 await memory_pool.wait()
@@ -510,11 +508,10 @@ class ChannelRunner:
                     worker.stop()
                 with shared._suppress_with_log("session worker wait failed"):
                     await worker.wait()
-            staging = getattr(state.context_manager, "staging", None)
-            close = getattr(staging, "close", None)
-            if callable(close):
-                with shared._suppress_with_log("session staging close failed"):
-                    close()
+            close_manager = getattr(state.context_manager, "close", None)
+            if callable(close_manager):
+                with shared._suppress_with_log("session memory close failed"):
+                    close_manager()
             await _cleanup_session_runtime(session_id)
 
         async def _evict_idle_sessions(protected_session_id: str) -> None:

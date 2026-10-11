@@ -747,8 +747,7 @@ class AgentCore:
         state: Any, session_id: str, message_id: str
     ) -> bool:
         """Whether this message already has an assistant answer on record."""
-        store = getattr(getattr(state, "context_manager", None), "store", None)
-        check = getattr(store, "message_has_answer", None)
+        check = getattr(getattr(state, "context_manager", None), "has_answer", None)
         if not message_id or not callable(check):
             return False
         from agent import shared as _shared

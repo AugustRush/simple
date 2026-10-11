@@ -1011,8 +1011,7 @@ class CommandCoordinator:
             or queued.get("message_id")
             or ""
         )
-        store = getattr(getattr(state, "context_manager", None), "store", None)
-        check = getattr(store, "message_has_answer", None)
+        check = getattr(getattr(state, "context_manager", None), "has_answer", None)
         if not message_id or not callable(check):
             return False
         try:

@@ -201,6 +201,20 @@ class ContextManager:
         """
         self.store.add_entry(entry)
 
+    def has_answer(self, *, session_id: str, message_id: str) -> bool:
+        """Whether this session already has an assistant answer for a message.
+
+        The store's ``message_has_answer`` is deliberately optional (see
+        ``contracts.py``), so the feature-detection lives here rather than in the
+        runtime layer, which used to reach ``context_manager.store`` by name to
+        ask.  A store without it answers "no", which is the same behaviour as
+        before -- but now the dependency is a declared member.
+        """
+        check = getattr(self.store, "message_has_answer", None)
+        if not callable(check) or not message_id:
+            return False
+        return bool(check(session_id=str(session_id or ""), message_id=str(message_id)))
+
     def recover_orphan_staging(self) -> int:
         """Queue consolidation for turns stranded by sessions that never finished."""
         return enqueue_orphan_staging_recovery(self)

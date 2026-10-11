@@ -918,8 +918,7 @@ class SessionService:
                     pass
         manager = getattr(live, "context_manager", None)
         if manager is not None:
-            staging = getattr(manager, "staging", None)
-            close = getattr(staging, "close", None)
+            close = getattr(manager, "close", None)
             if callable(close):
                 try:
                     close()

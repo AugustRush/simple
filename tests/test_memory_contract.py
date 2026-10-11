@@ -29,6 +29,44 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: Attribute peeks that remain, each a decision rather than a blanket exclusion.
+#:
+#: The rule the guard enforces is "an out-of-package reader must not depend on a
+#: member the contract does not declare".  These four do, and each is *soft*: the
+#: caller feature-detects, so an implementation without the member loses a feature
+#: rather than breaking.  Recording them keeps the guard's teeth for the hard ones
+#: -- and the next round's queue is exactly this list.
+_ATTRIBUTE_PEEK_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("agent/channels/base.py", "session_log"): (
+        "soft: the durable session log is a separate collaborator; the site logs a "
+        "debug line when a manager has none"
+    ),
+    ("agent/commands/coordinator.py", "session_log"): (
+        "soft: same collaborator, feature-detected through getattr(..., 'append')"
+    ),
+    ("agent/channels/web.py", "store"): (
+        "soft: the web session service takes the store it is given and degrades "
+        "without one; contracting it is a separate decision about SessionService"
+    ),
+    ("agent/commands/builtin.py", "store"): (
+        "soft: reads session turns through the store's optional get_turns_for_session"
+    ),
+    ("agent/core/turn_loop.py", "consolidation"): (
+        "soft: reads the manager's consolidation engine to decide whether a "
+        "provider-level consolidation model is configured"
+    ),
+    ("agent/core/token_budget.py", "consolidation"): (
+        "soft: the same read for the token budget's consolidation estimate"
+    ),
+    ("agent/core/turn_loop.py", "store"): (
+        "soft: reads the store's optional append_usage_event for token accounting"
+    ),
+    ("agent/session_service.py", "dir"): (
+        "not the memory store: this receiver is the *session* store, whose name "
+        "collides with LTMStore.dir (a name-based scan cannot tell them apart)"
+    ),
+}
+
 #: Public members of the concrete classes that are deliberately *outside* the
 #: contracts, with the reason.  Empty is the goal; an entry here is a decision.
 OUTSIDE_THE_CONTRACT: dict[str, str] = {}
@@ -334,19 +372,162 @@ def test_no_reader_reaches_past_the_contract_through_attributes(
             continue
         tree = ast.parse(source.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                if node.attr in members and ast.unparse(node.value) != "self":
+                    if (str(relative), node.attr) not in _ATTRIBUTE_PEEK_ALLOWLIST:
+                        offenders.append(
+                            f"{relative}:{node.lineno} {ast.unparse(node.value)}.{node.attr}"
+                        )
                 continue
-            if node.attr not in members:
-                continue
-            receiver = ast.unparse(node.value)
-            if receiver == "self":
-                continue
-            offenders.append(f"{relative}:{node.lineno} {receiver}.{node.attr}")
+            # ``getattr(x, "staging", None)`` is the same dependency with the name in
+            # a string, and it is how three call sites hid from the first version of
+            # this scan (``spawn_session``, ``store``) -- so it is checked too.
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                and node.args[1].value in members
+                and (str(relative), node.args[1].value) not in _ATTRIBUTE_PEEK_ALLOWLIST
+            ):
+                offenders.append(
+                    f"{relative}:{node.lineno} getattr({ast.unparse(node.args[0])}, "
+                    f"{node.args[1].value!r})"
+                )
     assert not offenders, (
         f"these read a {class_name} member the {protocol_name} contract does not "
         "declare, so a replacement is not obliged to have it:\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ── the behaviour every context service must have ────────────────────────────
+
+
+def run_context_contract(service: Any, *, store: Any) -> None:
+    """Assert the semantics a :class:`ContextService` must have.
+
+    Written as **relationships between the members**, not as a fixed sequence,
+    because the second implementation exists to have a different *policy*: it never
+    consolidates and never compacts.  So the suite asks "if you say there is work,
+    can it be done and does the count follow" rather than "consolidate now".
+
+    Importable, like :func:`run_store_contract`: another implementation's test calls
+    it with its own service.
+    """
+    import asyncio
+
+    from agent.core.transport import ModelEndpoint
+    from agent.memory.models import LTMEntry
+
+    endpoint = ModelEndpoint(client=None, api_format="openai")
+    session_id = service.session_id
+    assert session_id, "a service journals under a session id"
+
+    # Safely callable at any time, on any implementation.
+    service.mark_activity()
+    service.on_memory_cleared()
+
+    # Recording is idempotent per message id, and readable back through the store.
+    assert service.begin_turn(user_content="hello", message_id="m-1") is True
+    assert service.begin_turn(user_content="hello", message_id="m-1") is False
+    assert (
+        service.record_turn(
+            user_content="hello",
+            assistant_content="hi",
+            message_id="m-1",
+            assistant_message_id="m-1:run:1",
+        )
+        is True
+    )
+    assert (
+        service.record_turn(
+            user_content="hello",
+            assistant_content="hi",
+            message_id="m-1",
+            assistant_message_id="m-1:run:1",
+        )
+        is False
+    )
+    turns = store.recent_conversation_turns(session_id=session_id)
+    assert [(turn.role, turn.content) for turn in turns][:2] == [
+        ("user", "hello"),
+        ("assistant", "hi"),
+    ]
+
+    # What is remembered is reachable through retrieval.
+    service.remember(
+        LTMEntry(
+            id="ctx-1",
+            content="Prefers concise answers about widgets",
+            importance=0.9,
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            source_session=session_id,
+            created_at="2026-01-01",
+            updated_at="2026-01-01",
+        )
+    )
+    assert "widgets" in service.retrieve_context("widgets")
+    assert isinstance(service.retrieve_implicit_context("widgets"), str)
+
+    # Staging is a policy, but its answers must be consistent with the contract.
+    service.stage_turn("user", "a staged turn")
+    assert isinstance(service.has_enough_staged(), bool)
+
+    # Consolidation: enqueue → pending → consumed → empty.
+    service.enqueue_consolidation("contract")
+    assert service.pending_jobs() >= 1, "an enqueued job is pending"
+    consumed = asyncio.run(
+        service.process_one_job(endpoint, "contract-model", extractor=lambda *_: [])
+    )
+    assert consumed is True
+    assert service.pending_jobs() == 0
+    assert (
+        asyncio.run(
+            service.process_one_job(endpoint, "contract-model", extractor=lambda *_: [])
+        )
+        is False
+    )
+    assert isinstance(service.should_enqueue_consolidation(), bool)
+    assert isinstance(service.should_session_end_sleep(), bool)
+
+    # Compaction: trimming to budget is a promise; summarizing is not.
+    messages = [{"role": "user", "content": "x" * 200} for _ in range(10)]
+
+    def estimate(items: list[dict]) -> int:
+        return sum(len(str(item.get("content", ""))) for item in items)
+
+    budget = 300
+    fitted = service.fit_to_budget(
+        [dict(m) for m in messages], input_token_budget=budget, estimate_tokens=estimate
+    )
+    assert estimate(fitted) <= budget, "fit_to_budget must fit the budget it is given"
+    compacted = service.compact_messages(
+        [dict(m) for m in messages], input_token_budget=budget
+    )
+    assert isinstance(compacted, list)
+    assert all("role" in item for item in compacted)
+    assert isinstance(service.should_compact_messages(messages, budget), bool)
+
+    # Sleep is the one member that needs a model.  A stub endpoint may make it fail;
+    # what the contract requires is the shape.
+    kept = asyncio.run(
+        service.sleep([dict(m) for m in messages], endpoint, "contract-model")
+    )
+    assert isinstance(kept, list) and kept
+
+    # Session fan-out, recovery and teardown.
+    spawned = service.spawn_session("contract-child")
+    assert spawned.session_id == "contract-child"
+    assert spawned is not service
+    assert isinstance(service.recover_orphan_staging(), int)
+    assert isinstance(service.has_answer(session_id=session_id, message_id="m-1"), bool)
+    service.close()
+    service.close()  # idempotent
 
 
 # ── the behaviour every store must have ──────────────────────────────────────
@@ -547,6 +728,54 @@ def backend(request: pytest.FixtureRequest) -> Callable[[Path], Any]:
 
 def test_every_backend_meets_the_behaviour_contract(backend, tmp_path):
     run_store_contract(backend(tmp_path))
+
+
+#: Every implementation of ``ContextService``: the built-in manager, and the
+#: record-only one whose *policy* differs (no consolidation, no compaction).
+def _make_context_manager(tmp_path: Path) -> Any:
+    from agent import ConsolidationEngine, ContextManager, LocalRetriever, StagingBuffer
+
+    store = _make_store(tmp_path)
+    return (
+        ContextManager(
+            store=store,
+            retriever=LocalRetriever(),
+            consolidation=ConsolidationEngine(store=store),
+            staging=StagingBuffer(context_dir=tmp_path / "context", session_id="builtin"),
+        ),
+        store,
+    )
+
+
+def _make_record_only_context(tmp_path: Path) -> Any:
+    from agent.memory.backends.record_only import RecordOnlyContextService
+
+    store = _make_store(tmp_path)
+    return RecordOnlyContextService(store, "record-only"), store
+
+
+CONTEXT_BACKENDS: dict[str, Callable[[Path], Any]] = {
+    "builtin": _make_context_manager,
+    "record-only": _make_record_only_context,
+}
+
+
+@pytest.fixture(params=sorted(CONTEXT_BACKENDS))
+def context_backend(request: pytest.FixtureRequest) -> Callable[[Path], Any]:
+    return CONTEXT_BACKENDS[request.param]
+
+
+def test_every_context_service_meets_the_behaviour_contract(context_backend, tmp_path):
+    service, store = context_backend(tmp_path)
+    run_context_contract(service, store=store)
+
+
+def test_every_context_service_satisfies_the_protocol(context_backend, tmp_path):
+    """Signature-and-attribute conformance, for every implementation."""
+    from agent.memory.contracts import ContextService
+
+    service, _store = context_backend(tmp_path)
+    _assert_conforms(ContextService, service, context_backend.__name__)
 
 
 def test_a_replacement_store_is_the_one_the_context_manager_gets(tmp_path, monkeypatch):

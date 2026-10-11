@@ -2650,6 +2650,12 @@ def test_a_queued_message_answered_meanwhile_is_not_run_again() -> None:
     class _ContextManager:
         store = _Store()
 
+        def has_answer(self, *, session_id, message_id):
+            """The manager answers it now; the store's query stays its business."""
+            return self.store.message_has_answer(
+                session_id=session_id, message_id=message_id
+            )
+
     coordinator, core = _coordinator()
     sink = _CoordinatorSink()
     state = RuntimeSessionState(

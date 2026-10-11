@@ -114,6 +114,12 @@ def _mcp(_: CoreContext) -> Any:
     return MCPPlugin()
 
 
+def _record_only_context(_: CoreContext) -> Any:
+    from agent.memory.backends.record_only import RecordOnlyContextPlugin
+
+    return RecordOnlyContextPlugin()
+
+
 def _session(_: CoreContext) -> Any:
     from agent.memory.session_plugin import SessionPlugin
 
@@ -198,6 +204,17 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         ),
         factory=_mcp,
         provides=("mcp_client", "mcp_server_configs", "mcp_status"),
+    ),
+    CorePlugin(
+        name="record-only-context",
+        summary=(
+            "an alternative session service (record + retrieve, no consolidation) "
+            "providing `context_manager`; opt-in, because by default the session "
+            "plugin provides that"
+        ),
+        factory=_record_only_context,
+        provides=("context_manager",),
+        opt_in=True,
     ),
     CorePlugin(
         name="session",

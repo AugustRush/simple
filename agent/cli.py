@@ -600,8 +600,7 @@ def _build_cli_context_manager(components: dict) -> Optional[ContextManager]:
     base_ctx_mgr: Optional[ContextManager] = components.get("context_manager")
     if base_ctx_mgr is None:
         return base_ctx_mgr
-    staging = getattr(base_ctx_mgr, "staging", None)
-    if getattr(staging, "session_id", None) == "cli":
+    if getattr(base_ctx_mgr, "session_id", None) == "cli":
         return base_ctx_mgr
     spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
     return spawn_session("cli") if callable(spawn_session) else base_ctx_mgr

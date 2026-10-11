@@ -15,12 +15,19 @@ implementation can *satisfy* the contract; this one proves it can be *selected*
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from agent.plugins.core import core_plugin_names, core_plugins
-from agent.plugins.profiles import PROFILES, SQLITE_FTS_PROFILE_NAME
+from agent.plugins.profiles import (
+    PROFILES,
+    RECORD_ONLY_CONTEXT_PROFILE_NAME,
+    SQLITE_FTS_PROFILE_NAME,
+)
+
+RECORD_ONLY_PROFILE = RECORD_ONLY_CONTEXT_PROFILE_NAME
 
 REPLACEMENT = {"ltm_store": SQLITE_FTS_PROFILE_NAME, "memory": SQLITE_FTS_PROFILE_NAME}
 
@@ -78,6 +85,12 @@ def memory_home(tmp_path, monkeypatch):
     (tmp_path / "context").mkdir()
     (tmp_path / "memory").mkdir()
     return tmp_path
+
+
+def _minimal_cfg() -> dict:
+    from test_agent_integration import _minimal_cfg as factory
+
+    return factory()
 
 
 def _mount_replacement(mapping: dict) -> None:
@@ -156,6 +169,55 @@ def test_the_profile_swaps_the_store_in_the_real_composition(monkeypatch, tmp_pa
     assert components["memory"].store is store
     # And the session plugin took it, which is what "the application uses it" means.
     assert components["context_manager"].store is store
+
+
+def test_a_profile_can_name_another_context_service() -> None:
+    """The upper layer is replaceable too, and by the same mechanism."""
+    names = [
+        plugin.name
+        for plugin in core_plugins(replacements={"context_manager": RECORD_ONLY_PROFILE})
+    ]
+
+    assert RECORD_ONLY_PROFILE in names, "naming it mounts it"
+    assert "session" not in names, "and drops the plugin whose service it replaced"
+    assert "memory" in names, "the store's plugin stays: the layers are independent"
+
+
+def test_the_record_only_profile_declares_the_replacement() -> None:
+    profile = PROFILES[RECORD_ONLY_PROFILE]
+
+    assert profile.service_replacements == {"context_manager": RECORD_ONLY_PROFILE}
+
+
+def test_the_real_composition_can_use_the_second_context_service(
+    monkeypatch, tmp_path
+) -> None:
+    """Same profile mechanism, the other layer, and the same contract suite."""
+    import agent as agent_module
+
+    from test_memory_contract import run_context_contract
+
+    cfg = _minimal_cfg()
+    cfg["plugins"] = {"_profile": RECORD_ONLY_PROFILE}
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg, announce=True: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = asyncio.run(agent_module._build_components_async(cfg, announce=False))
+
+    manager = components["context_manager"]
+    assert components["plugin_catalog"].who_provides("context_manager") == RECORD_ONLY_PROFILE
+    assert type(manager).__name__ == "RecordOnlyContextService"
+    # The whole point: the contract, run against the service the composition chose.
+    run_context_contract(manager, store=components["ltm_store"])
+    components["plugin_catalog"].close()
 
 
 def test_the_replacement_survives_a_turn_shaped_write(memory_home) -> None:

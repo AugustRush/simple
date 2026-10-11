@@ -157,6 +157,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="context_manager",
         owners=(
             "agent/memory/session_plugin.py",
+            "agent/memory/backends/record_only.py",  # the opt-in second implementation
         ),
         consumers=(
             "agent/bootstrap.py",
@@ -182,6 +183,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         consumers=(
             "agent/bootstrap.py",
             "agent/memory/session_plugin.py",
+            "agent/memory/backends/record_only.py",  # the record-only context service
             "agent/_builtin/plugins/evolution/__init__.py",  # writes learned strategies
         ),
         summary=(
