@@ -40,6 +40,21 @@ from .retrieval import LocalRetriever
 from .staging import StagingBuffer
 from .store import LTMStore
 
+#: The events that end a turn, and so are the only ones whose ``error``
+#: describes how the *task* stands.  ``turn_finished`` carries the successful
+#: ending (and the assistant's content) as well as a cancellation, so leaving it
+#: out would lose 「已取消」; everything else that happens to carry an ``error``
+#: key is talking about itself, not about the task.
+TURN_OUTCOME_EVENTS = frozenset(
+    {
+        "turn_finished",
+        "turn_failed",
+        "turn_error_reported",
+        "turn_interrupted",
+    }
+)
+
+
 def enqueue_orphan_staging_recovery(ctx_mgr: Any) -> int:
     """Queue consolidation for turns stranded by sessions that never finished.
 
@@ -1878,7 +1893,21 @@ class ContextManager:
         payload = payload if isinstance(payload, dict) else {}
         user_content = str(payload.get("user_content", "") or "")
         assistant_content = str(payload.get("assistant_content", "") or "")
-        error = str(payload.get("error", "") or "")
+        # How the task stands is how its **turn** ended, and only a described
+        # error may say so.  Both halves matter, because an ``error`` key on a
+        # recorded event is not a task-level fact:
+        #
+        # * ``agent_result_ready`` reports a *boolean* -- did this one model call
+        #   fail -- and a failed call inside a turn that then continued is not the
+        #   task's outcome.  Stringified, it also landed in the durable
+        #   ``last_error`` as the word "True", which is what the model then read
+        #   as the task's last error.
+        # * consolidation runs in the background and reports its own failures
+        #   under the same key; a memory-maintenance failure is not the task's.
+        error = ""
+        raw_error = payload.get("error")
+        if event_type in TURN_OUTCOME_EVENTS and isinstance(raw_error, str):
+            error = raw_error
         clean_user = self._clip_working_state_text(user_content, 1000)
         clean_assistant = self._clip_working_state_text(assistant_content, 1000)
         clean_error = self._clip_working_state_text(error, 1000)

@@ -463,6 +463,81 @@ def test_agent_runtime_event_persists_and_projects_working_state(tmp_path):
     assert snapshot.state["artifacts"] == ["/tmp/生态环境"]
 
 
+def test_a_task_status_comes_from_its_turn_not_from_telemetry(tmp_path):
+    """An ``error`` key on a recorded event is not a task-level fact.
+
+    ``agent_result_ready`` reports a *boolean* -- did this one model call fail --
+    so a failed call inside a turn that then continued stamped the whole task
+    ``failed``, and the boolean, stringified, was written into the durable
+    ``last_error`` as the word "True": the projection is model-readable, so that
+    is what the agent then read as "the task's last error".  Background
+    consolidation reports under the same key for the same reason.  What the
+    status records is how the task's **turn** ended.
+    """
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+
+    def status_and_error():
+        snapshot = store.load_session_working_state("session-1")
+        assert snapshot is not None
+        return snapshot.state["status"], snapshot.state["last_error"]
+
+    # One model call failed, and the turn it belongs to is still running.
+    ctx_mgr.record_runtime_event(
+        "agent_result_ready",
+        {"tool_calls": 3, "error": True, "content_len": 0, "content_preview": ""},
+    )
+    assert status_and_error() == ("in_progress", "")
+
+    # Maintenance failed in the background: not the task's outcome either.
+    ctx_mgr.record_runtime_event(
+        "consolidation_failed", {"reason": "exception", "error": "boom"}
+    )
+    assert status_and_error() == ("in_progress", "")
+
+    # The turn's own ending is what says how the task stands.
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "做一个故事类型的",
+            "assistant_content": "",
+            "error": "Model response remained truncated after 6 auto-continue attempts",
+        },
+    )
+    assert status_and_error() == (
+        "failed",
+        "Model response remained truncated after 6 auto-continue attempts",
+    )
+
+    # A turn the user stopped is 「已取消」, which rides the same event.
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {"user_content": "停一下", "assistant_content": "", "error": "cancelled_by_user"},
+    )
+    assert status_and_error() == ("cancelled", "cancelled_by_user")
+
+    # A turn that ended with an answer completed the work it was doing.
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {"user_content": "写完了吗", "assistant_content": "写完了"},
+    )
+    assert status_and_error() == ("completed", "")
+
+
 def test_session_working_state_store_api_persists_and_reloads(tmp_path):
     from agent import LTMStore
 
