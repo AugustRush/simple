@@ -145,8 +145,15 @@ def _assert_conforms(protocol: Any, implementation: Any, label: str) -> None:
     function would report every member as different.  Class-level access also
     resolves ``staticmethod``/``classmethod`` the way a caller sees them.
     """
-    assert isinstance(implementation, protocol), f"{label} does not satisfy {protocol.__name__}"
-    cls = type(implementation)
+    # An instance or a class: some services are awkward to construct in a test, and
+    # the class-level check is the same one (every member present, same signature),
+    # while ``isinstance`` against a runtime-checkable Protocol on a *class object*
+    # would inspect ``type``'s attributes and fail for the wrong reason.
+    cls = implementation if isinstance(implementation, type) else type(implementation)
+    if not isinstance(implementation, type):
+        assert isinstance(implementation, protocol), (
+            f"{label} does not satisfy {protocol.__name__}"
+        )
     for name, member in _protocol_members(protocol).items():
         assert hasattr(cls, name), f"{label} is missing {name}"
         actual = getattr(cls, name)

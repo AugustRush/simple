@@ -292,7 +292,11 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/config.py",
             "agent/plugins/catalog.py",
         ),
-        summary="The MCP client, when a composition connected any servers.",
+        contract="agent/tools/protocols.py:MCPClientService",
+        summary=(
+            "The MCP client, when a composition connected any servers.  Its contract is "
+            "the three members a caller uses: connect, read the status, close."
+        ),
     ),
 )
 
