@@ -173,12 +173,24 @@
  * area reads as unavailable rather than offering a box that is not the thing
  * to answer.
  *
- * The cover is a SIBLING of the composer, absolutely laid over it, and that is
+ * The two are one grid cell, so the footer is as tall as the taller of them and
+ * the transcript above ends where the footer begins.  They used to be laid on
+ * top of each other instead: the cover was absolutely positioned with
+ * `inset: 0`, so a bar taller than the composer -- a head, a reason, a command
+ * block and three buttons are -- overflowed *upward* out of the footer and
+ * painted over the last rows of the conversation.  Measured at 1280x720 before
+ * this rule: bar top 533, transcript viewport ends 610, so 77px of the live
+ * reply, its 「思考过程 思考中」 strip and its typing dots sat under the bar.  A
+ * grid track is sized by the taller child's margin box, which is the same cover
+ * with the space taken out of the page instead of off the transcript.
+ *
+ * The cover is a SIBLING of the composer, never a child of it, and that is
  * load-bearing rather than tidy: with the bar inside the composer, taking the
  * covered composer out of the pointer path and the tab order also reached the
- * bar's own buttons -- 允许本次 stopped being clickable, and no unit test or
- * type check can see that. As a sibling, the cover intercepts every click on
- * its own and the composer underneath can be hidden with one declaration.
+ * bar's own buttons, and 允许本次 stopped being clickable (a real page probe
+ * caught it; the unit tests and the type checker cannot see that). As a
+ * sibling, the cover intercepts every click on its own and the composer
+ * underneath can be hidden with one declaration.
  *
  * `visibility: hidden` on the composer keeps its layout box, so the stage does
  * not change height when the bar arrives, and it drops the covered input out
@@ -193,11 +205,19 @@
   position: relative;
   width: min(820px, 100%);
   margin: 0 auto;
+  display: grid;
+  /* The composer keeps its own height and sits at the bottom of the cell; the
+   * cover is the one that fills it. */
+  align-items: end;
+}
+
+.composer-stage > * {
+  grid-area: 1 / 1;
 }
 
 .approval-cover {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  align-self: stretch;
   z-index: 40;
   display: flex;
   flex-direction: column;
