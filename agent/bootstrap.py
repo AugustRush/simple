@@ -125,16 +125,15 @@ def build_gateway_channels(cfg: dict) -> list[Channel]:
 
 
 def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
-    """One client for a non-active provider (used by RoutingTransport).
+    """One client for a non-active provider (used by the session transports).
 
-    Delegates to the provider registry, which is now the single place a client
-    is constructed.  This function previously carried its own copy, and the
-    copy had drifted: an unrecognised format silently became an OpenAI client
-    here while ``ModelClientFactory.from_config`` raised for the same input.
+    A thin alias for :func:`agent.core.providers.provider_client_factory`, kept
+    under this name because the web session path resolves it *through this
+    module* and a test substitutes it there.
     """
-    from agent.core.providers import build_client
+    from agent.core.providers import provider_client_factory
 
-    return build_client(provider_cfg, api_format)
+    return provider_client_factory(provider_cfg, api_format)
 
 
 def _web_session_home(session_id: str) -> Path:
@@ -649,39 +648,14 @@ async def _build_components_async(
             f"{len(mcp_server_configs)} configured server(s)[/dim]"
         )
 
-    # Route per-call model overrides to the provider that owns the model, so
-    # the UI's model dropdown can offer every configured provider's models.
-    # The active provider stays the default; unknown model ids keep today's
-    # behavior (sent to the active client).  The transport is handed to the
-    # constructor rather than assigned afterwards so everything the agent
-    # derives — sub-agents above all — sees the routing table from the start.
-    from agent.core.transport import (
-        build_routing_transport,
-        provider_client_cache_key,
-    )
+    # The model adapter -- the routing table that sends each per-call model
+    # override to the provider that owns it -- is a **plugin** now (``model``,
+    # mounted with the rest below).  It was built here, which made "replace the
+    # model adapter" a patch to this function; it provides ``llm`` and the
+    # process-lifetime client cache the web session rebuilds resolve, so every
+    # participant that declared the ``llm`` seam gets it from the composition.
+    from agent.core.transport import provider_client_cache_key
 
-    # Process-lifetime SDK client cache shared with every web session's
-    # routing transport, so per-session rebuilds do not leak one connection
-    # pool per session per provider.
-    provider_client_cache: dict = {}
-    routing_transport = build_routing_transport(
-        cfg,
-        api_format,
-        client,
-        client_factory=_provider_client_factory,
-        client_cache=provider_client_cache,
-    )
-    # Say which providers could not be built, at the one moment the user is looking at
-    # startup output.  The composition proceeds without them (a provider it merely routes
-    # to must not be a startup prerequisite -- see ``build_routing_transport``), so without
-    # this the first sign would be a call that fails, or a model that answers from the
-    # wrong endpoint.  Printed next to the "Provider:" line by putting it here.
-    if announce:
-        for _name, _reason in sorted(routing_transport.unavailable.items()):
-            console.print(
-                f"[yellow]Provider '{_name}' unavailable: {_reason}[/yellow] "
-                "[dim]— its models stay unroutable until this is fixed[/dim]"
-            )
     client_cache_key = provider_client_cache_key(
         (providers or {}).get(client_provider, {}), api_format
     )
@@ -716,7 +690,6 @@ async def _build_components_async(
         "file_access_policy": file_policy,
         "file_service": file_service,
         "client_provider": client_provider,
-        "llm": routing_transport,
         "cfg": cfg,
     }
     components = _partial_components
@@ -939,7 +912,7 @@ async def _build_components_async(
             session_id,
             global_cfg or cfg,
             components,
-            provider_client_cache=provider_client_cache,
+            provider_client_cache=require_service(components, "provider_client_cache"),
         )
 
     components["session_components_factory"] = _session_components_factory

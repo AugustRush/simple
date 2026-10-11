@@ -216,12 +216,14 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="llm",
         owners=(
-            "agent/bootstrap.py",
+            "agent/core/model_plugin.py",  # the process-wide routing transport
+            "agent/bootstrap.py",  # the session-scoped transport of a web session
         ),
         consumers=(
             "agent/core/agent.py",
             "agent/core/agent_plugin.py",  # the agent's transport
         ),
+        contract="agent/core/transport.py:ModelTransport",
         summary=(
             "The model adapter: the one place provider dispatch happens.  An ABC "
             "with three implementations, so the seam existed before the container "

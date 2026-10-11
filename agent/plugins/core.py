@@ -78,6 +78,12 @@ def _ralph(_: CoreContext) -> Any:
     return RalphPlugin()
 
 
+def _model(_: CoreContext) -> Any:
+    from agent.core.model_plugin import ModelPlugin
+
+    return ModelPlugin()
+
+
 def _memory(_: CoreContext) -> Any:
     from agent.memory.plugin import MemoryPlugin
 
@@ -121,6 +127,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         summary="the task loop; provides `ralph_service`",
         factory=_ralph,
         provides=("ralph_service",),
+    ),
+    CorePlugin(
+        name="model",
+        summary=(
+            "the model adapter; provides `llm` and the process-lifetime "
+            "provider client cache behind it"
+        ),
+        factory=_model,
+        provides=("llm", "provider_client_cache"),
     ),
     CorePlugin(
         name="memory",

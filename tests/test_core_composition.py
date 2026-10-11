@@ -26,6 +26,7 @@ def test_the_declaration_names_every_core_plugin() -> None:
     """One list, and the composition root mounts from it rather than beside it."""
     assert core_plugin_names() == (
         "ralph",
+        "model",
         "memory",
         "sqlite-fts-memory",
         "session",

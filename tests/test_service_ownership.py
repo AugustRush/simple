@@ -49,11 +49,6 @@ ROOT_ASSEMBLED: dict[str, str] = {
         "the TurnRunner plugin already provides agent_loop -- and that is the "
         "convergence target."
     ),
-    "llm": (
-        "An ABC with three implementations, so the seam exists; the composition "
-        "root still chooses one. Moving the choice into a plugin is what would make "
-        "a fourth provider a plugin instead of a patch to bootstrap."
-    ),
     "mcp_client": (
         "Built before the catalog so plugin-declared MCP servers can connect during "
         "load, and written again by the plugin tools when one is installed. It wants "

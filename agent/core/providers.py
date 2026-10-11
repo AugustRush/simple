@@ -49,6 +49,7 @@ __all__ = [
     "build_client",
     "build_transport",
     "missing_credential",
+    "provider_client_factory",
     "register_provider",
     "registered_formats",
     "resolve_api_key",
@@ -316,3 +317,15 @@ def build_transport(
 def build_client(provider_cfg: dict, api_format: str) -> Any:
     """Build the SDK client for *api_format*."""
     return SHARED.build_client(provider_cfg, api_format)
+
+
+def provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
+    """One client for a provider that is not the active one.
+
+    Used by ``RoutingTransport`` for every model override that routes to another
+    provider.  It lives here, next to :func:`build_client`, because it *is*
+    ``build_client``: it used to be copied per call site, and one copy had
+    drifted -- an unrecognised format silently became an OpenAI client there
+    while ``ModelClientFactory.from_config`` raised for the same input.
+    """
+    return build_client(provider_cfg, api_format)
