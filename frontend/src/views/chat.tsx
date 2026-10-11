@@ -3,7 +3,7 @@
 import type { AppCtx } from '../app/AppCtx'
 import { ApprovalBar } from '../components/ApprovalBar'
 import { MessageList } from '../components/MessageList'
-import { TASK_INTERRUPTED_STATUSES, TASK_STATUS_LABELS } from '../constants'
+import { TASK_STATUS_LABELS } from '../constants'
 import { compactWorkspacePath, truncate } from '../lib/format'
 import { fileHref } from '../lib/media'
 import {
@@ -27,7 +27,7 @@ import React from 'react'
 const { TextArea } = Input
 
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
   return (
@@ -235,48 +235,48 @@ export function renderChat(ctx: AppCtx) {
             </ul>
           </div>
         )}
-        {sessionState?.task?.active_goal &&
-          !isStreaming &&
-          resumingTaskId !== (sessionState.task.task_id || sessionState.task.active_goal || '') &&
-          TASK_INTERRUPTED_STATUSES.has(
-            String(sessionState.task.status || '').toLowerCase(),
-          ) && (
-            <div className="task-guidance-card">
-              <div className="task-guidance-head">
-                <span className="task-guidance-label">当前任务</span>
-                {sessionState.task.status && (
-                  <span className="task-guidance-status">
-                    {TASK_STATUS_LABELS[String(sessionState.task.status).toLowerCase()]
-                      || sessionState.task.status}
-                  </span>
-                )}
-              </div>
-              <strong>{truncate(sessionState.task.active_goal, 140)}</strong>
-              {sessionState.task.progress && (
-                <span>{truncate(sessionState.task.progress, 180)}</span>
+        {taskGuidanceVisible && sessionState?.task?.active_goal && (
+          // The rule itself -- recorded status, the server's snapshot, the
+          // frames narrated since, this prompt already answered -- lives in the
+          // hook, next to the state it reads. Rendering it here as a second
+          // condition is how the card came to offer 继续任务 over a session the
+          // agent was still working in.
+          <div className="task-guidance-card">
+            <div className="task-guidance-head">
+              <span className="task-guidance-label">当前任务</span>
+              {sessionState.task.status && (
+                <span className="task-guidance-status">
+                  {TASK_STATUS_LABELS[String(sessionState.task.status).toLowerCase()]
+                    || sessionState.task.status}
+                </span>
               )}
-              <div className="task-guidance-next">
-                <span>{sessionState.task.next_action ? `下一步：${truncate(sessionState.task.next_action, 180)}` : '任务已中断，可选择继续或放弃'}</span>
-                <div className="task-guidance-actions">
-                  <Button
-                    type="text"
-                    size="small"
-                    onClick={continueTask}
-                  >
-                    继续任务
-                  </Button>
-                  <Button
-                    type="text"
-                    size="small"
-                    danger
-                    onClick={dismissTaskGuidance}
-                  >
-                    放弃任务
-                  </Button>
-                </div>
+            </div>
+            <strong>{truncate(sessionState.task.active_goal, 140)}</strong>
+            {sessionState.task.progress && (
+              <span>{truncate(sessionState.task.progress, 180)}</span>
+            )}
+            <div className="task-guidance-next">
+              <span>{sessionState.task.next_action ? `下一步：${truncate(sessionState.task.next_action, 180)}` : '任务已中断，可选择继续或放弃'}</span>
+              <div className="task-guidance-actions">
+                <Button
+                  type="text"
+                  size="small"
+                  onClick={continueTask}
+                >
+                  继续任务
+                </Button>
+                <Button
+                  type="text"
+                  size="small"
+                  danger
+                  onClick={dismissTaskGuidance}
+                >
+                  放弃任务
+                </Button>
               </div>
             </div>
-          )}
+          </div>
+        )}
         {activity && (
           <div
             className={`composer-activity ${interrupting ? 'is-interrupting' : ''}`}

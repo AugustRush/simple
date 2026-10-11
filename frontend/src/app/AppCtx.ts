@@ -66,6 +66,13 @@ export interface AppCtx {
   withdrawQueuedMessages: (messageIds: string[]) => Promise<void>
   sessionState: SessionState | null
   resumingTaskId: string | null
+  /**
+   * Whether the task-guidance card may be shown. The whole rule lives with the
+   * state it reads -- the recorded task status, the server's snapshot, the
+   * frames narrated since, and whether this same prompt was already answered --
+   * so the view cannot render a second, drifting copy of it.
+   */
+  taskGuidanceVisible: boolean
   continueTask: () => Promise<void>
   dismissTaskGuidance: () => Promise<void>
   activity: string

@@ -6,7 +6,14 @@ import {
   SESSION_STATUS_LABELS,
   TRACE_SEVERITY,
 } from '../constants'
-import type { ConfirmRisk, Message, SessionInfo, ToolDotSummary, ToolState } from '../types'
+import type {
+  ConfirmRisk,
+  Message,
+  SessionInfo,
+  SessionState,
+  ToolDotSummary,
+  ToolState,
+} from '../types'
 
 
 export function toolStateLabel(state?: ToolState): string {
@@ -81,6 +88,25 @@ export const sessionStatusOf = (item: SessionInfo): string =>
 
 /** Running, stopping or holding queued work -- the states that get a badge. */
 export const isSessionBusy = (item: SessionInfo): boolean => Boolean(sessionStatusOf(item))
+
+
+/**
+ * Whether a ``/state`` snapshot says the session still has work in it.
+ *
+ * The server's own word, from the same snapshot the task guidance is read
+ * from, so it is the only thing that can say whether the agent is still
+ * working on that task.  ``isStreaming`` cannot say it: that flag tracks a live
+ * *text* stream, and a turn that is running tool calls -- or that reported an
+ * error it is still recovering from -- has none, so the flag reads "stopped"
+ * for the whole stretch.  A queue count counts too: the coordinator runs
+ * queued work itself, so nothing is waiting for the reader while it is
+ * non-empty.
+ */
+export const sessionStateBusy = (
+  state?: Pick<SessionState, 'operation_state' | 'queue'> | null,
+): boolean =>
+  String(state?.operation_state || 'idle') !== 'idle' ||
+  Number(state?.queue?.pending || 0) > 0
 
 
 const activityTime = (item: SessionInfo): number => {

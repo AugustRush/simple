@@ -3,7 +3,7 @@ import { CONVERSATION_SUMMARY_HALF_HEIGHT, INTERRUPT_RETRY_MS, INTERRUPT_STUCK_M
 import { truncate } from '../lib/format'
 import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
-import { compareSessions, isInTurnUserMessage, isSessionBusy } from '../lib/tools'
+import { compareSessions, isInTurnUserMessage, isSessionBusy, sessionStateBusy } from '../lib/tools'
 import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState } from '../types'
 import { Modal } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
@@ -12,6 +12,21 @@ import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
 
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useApiClient> & ReturnType<typeof useConfirm>
+
+/**
+ * Frame types that can arrive over an *idle* session: a keep-alive, a notice,
+ * or a workspace change.  Every other frame on the session socket is the server
+ * narrating a turn -- a tool call starting, a progress line, a chunk.
+ *
+ * The list is deliberately a deny-list.  A frame type nobody has taught this
+ * list about is treated as work, which costs at most one extra state reading;
+ * the other default would let a new frame type reintroduce the bug this exists
+ * to prevent -- a card offering to continue a task the agent is executing.
+ */
+const IDLE_FRAMES = new Set(['heartbeat', 'notification', 'workspace_changed'])
+
+const narratesTurnWork = (type: string): boolean =>
+  Boolean(type) && !IDLE_FRAMES.has(type)
 
 export function useConversations(deps: Deps) {
   const { api, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, confirmDeadlineRef, makeId, messageApi, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setConfirmDetailOpen, setConfirmRemaining, setConfirmReq, setPaletteQuery, setView, token, wsRef } = deps
@@ -148,6 +163,21 @@ export function useConversations(deps: Deps) {
   const [connecting, setConnecting] = useState(false)
 
   const [isStreaming, setIsStreaming] = useState(false)
+
+  // Whether this session has narrated turn work that no idle reading of
+  // ``/state`` has accounted for yet.  `isStreaming` cannot stand in for it: it
+  // narrates a *text* stream, and a turn that is running tool calls after a
+  // response failed emits none, so it reads "stopped" for the whole stretch
+  // while frames keep arriving.  This flag is what that silence is measured
+  // against -- it is set by the frames themselves, so it cannot be stale by
+  // more than the frame in flight, and a reading that lands with nothing newer
+  // behind it retires it.
+  const [serverWorking, setServerWorking] = useState(false)
+
+  //: How many work frames have arrived.  A reading can only retire the work it
+  //: was asked after: if this moved while the request was in flight, the answer
+  //: describes a moment before the work that has arrived since.
+  const narrationSeqRef = useRef(0)
 
   // True between the user asking to stop and the turn actually unwinding.
   // The abort is cooperative, so this cannot be derived from `isStreaming`.
@@ -597,11 +627,17 @@ export function useConversations(deps: Deps) {
 
   const loadSessionState = useCallback(async (sid: string) => {
     const sendSeq = messageSendSeqRef.current
+    const narrationAtRequest = narrationSeqRef.current
     try {
       const resp = await api(`/api/sessions/${encodeURIComponent(sid)}/state`)
       const data = (await resp.json()) as SessionState
       if (activeSessionRef.current === sid) {
         setSessionState(data)
+        if (narrationSeqRef.current === narrationAtRequest) {
+          // Nothing was narrated while this was in flight, so the answer is the
+          // newest word on the session: busy keeps the flag, idle retires it.
+          setServerWorking(sessionStateBusy(data))
+        }
         setResumingTaskId(previous => {
           if (!previous) return null
           const task = data.task
@@ -632,6 +668,10 @@ export function useConversations(deps: Deps) {
         setResumingTaskId(null)
         idleSnapshotSeenRef.current = false
         setIsStreaming(false)
+        // A reading that never arrived is not evidence of work, and keeping the
+        // flag would keep polling a server that is not answering. Nothing is
+        // lost if it comes back: the frames it narrates set the flag again.
+        setServerWorking(false)
       }
     }
   }, [api, applyStreamingSnapshot])
@@ -747,6 +787,14 @@ export function useConversations(deps: Deps) {
           evt = JSON.parse(event.data)
         } catch {
           return
+        }
+
+        // The server is doing turn work in this session, whatever the last
+        // snapshot said.  Recorded before the frame is handled, so a frame that
+        // fails to match any branch below still counts as the work it narrated.
+        if (narratesTurnWork(String(evt.type || ''))) {
+          narrationSeqRef.current += 1
+          setServerWorking(true)
         }
 
         // Thinking arrives before the first answer token, so this is often what
@@ -1146,6 +1194,11 @@ export function useConversations(deps: Deps) {
       streamIdRef.current = null
       streamTurnRef.current = null
       setIsStreaming(false)
+      // Both describe the session that was open, not the one being opened: the
+      // frames that set the flag came from the old session's socket, and the
+      // next reading is what re-establishes the truth for this one.
+      narrationSeqRef.current = 0
+      setServerWorking(false)
       setActivity('')
       // Restore the previous conversation instantly from the local cache, then
       // let the server reconcile in the background so the view never blanks out.
@@ -1227,14 +1280,46 @@ export function useConversations(deps: Deps) {
   // turn is running. Polling this lightweight endpoint keeps task guidance and
   // queue counts useful during long tool runs, including messages submitted
   // from another browser tab.
+  //
+  // It polls while *any* of the three signs of work is up: the client's stream
+  // flag, the server's own word in the snapshot, and the frames that have
+  // arrived since that snapshot. The last two are why it keeps going where the
+  // stream flag stops: a turn running tool calls emits no chunks, and a turn
+  // that reported a failed response clears the flag while the server may still
+  // hold the work. A poll that stopped with the flag is what left the client
+  // holding a "nothing is running" snapshot over a running session -- the card
+  // offering 继续任务 over work the agent was doing.
+  const sessionBusy = sessionStateBusy(sessionState)
   useEffect(() => {
     if (!activeSession) return
     const refresh = () => loadSessionState(activeSession)
     refresh()
-    if (!isStreaming) return
+    if (!isStreaming && !sessionBusy && !serverWorking) return
     const timer = window.setInterval(refresh, 1200)
     return () => window.clearInterval(timer)
-  }, [activeSession, isStreaming, loadSessionState])
+  }, [activeSession, isStreaming, sessionBusy, serverWorking, loadSessionState])
+
+  /**
+   * Whether the task-guidance card may be shown.
+   *
+   * The card's premise is "this task has stopped, and only you can restart
+   * it". Every part of that premise is a claim about work, so it takes all of
+   * them agreeing -- the stream flag, the server's snapshot, and the frames
+   * narrated since -- plus a task the record calls interrupted, and no answer
+   * to this same prompt already given. Any disagreement hides the card: a card
+   * over a working session is the one failure this prompt cannot afford, while
+   * a card shown a second late costs nothing.
+   */
+  const taskGuidanceVisible = Boolean(
+    sessionState?.task?.active_goal &&
+      TASK_INTERRUPTED_STATUSES.has(
+        String(sessionState.task.status || '').toLowerCase(),
+      ) &&
+      !isStreaming &&
+      !sessionBusy &&
+      !serverWorking &&
+      resumingTaskId !== (sessionState.task.task_id || sessionState.task.active_goal || ''),
+  )
 
   // The list's busy badges only changed on this tab's own events -- a send, a
   // ``done`` on the open socket. Switch away from a running session and its
@@ -2091,5 +2176,5 @@ export function useConversations(deps: Deps) {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
   }
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }
