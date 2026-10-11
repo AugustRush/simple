@@ -18,6 +18,17 @@ a directory name itself.  A new ecosystem is one :class:`PluginFormat` literal
 in this module plus the tests for it -- and, for an embedder, one
 :func:`register_format` call.
 
+User-level skill roots
+---------------------
+``user_skill_roots`` is why the skill catalog does not hard-code one directory.
+It is *not* symmetric across ecosystems, and pretending it were would be the
+invention this module exists to avoid: Codex's user root is ``~/.codex/skills``
+(its own home), Claude Code's is not listed here because this project has no
+evidence for it, and ``~/.agents/skills`` is the vendor-neutral one DSH reads
+alongside its ``~/.dsh/skills``.  The neutral pair lives in
+:data:`SHARED_SKILL_ROOTS` rather than on a format, because no *plugin directory*
+format owns it.
+
 What is *not* per-format
 ------------------------
 The asset conventions (``skills/``, ``commands/``, ``agents/``) and the manifest
@@ -37,6 +48,7 @@ this module existed.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -56,6 +68,10 @@ __all__ = [
     "CONVENTION_DIRS",
     "STANDALONE_SKILL_FILES",
     "merged_paths",
+    "SkillRoot",
+    "user_skill_roots",
+    "shared_skill_roots",
+    "SHARED_SKILL_ROOTS",
     "CLAUDE_CODE_HOOK_EVENTS",
     "CODEX_HOOK_EVENTS",
 ]
@@ -71,6 +87,25 @@ CONVENTION_DIRS: Mapping[str, tuple[str, ...]] = {
 #: A directory holding one of these at its root *is* a skill, without a
 #: ``skills/`` directory.  This project reads SKILL.md; so does everyone else.
 STANDALONE_SKILL_FILES: tuple[str, ...] = ("SKILL.md",)
+
+
+@dataclass(frozen=True)
+class SkillRoot:
+    """One user-level skill root an ecosystem reads.
+
+    ``system_dir`` names the subtree that holds the **ecosystem's own** bundled
+    skills rather than the user's, and is skipped when the root is scanned.  Both
+    ecosystems that have one call it ``.system``, and both were checked in their
+    own source rather than guessed: Codex installs its embedded skills into
+    ``CODEX_HOME/skills/.system`` and *rewrites that directory on startup*, and
+    DSH marks its own home root ``skipSystem: true``.  Loading those into this
+    agent's prompt would be adopting another product's instructions, which is not
+    what "the user has these skills" means.
+    """
+
+    label: str
+    path: str
+    system_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,6 +146,15 @@ class PluginFormat:
     root_environment: tuple[str, ...] = ()
     data_environment: tuple[str, ...] = ()
     project_environment: tuple[str, ...] = ()
+    #: Where this ecosystem keeps **user-level** skills.  Read by the skill catalog
+    #: through :func:`user_skill_roots`: a skill the user installed for another
+    #: agent is a skill the user has, and *which directory that is* is the
+    #: ecosystem's convention -- the same reason manifests and hook events live here
+    #: instead of in the loader.
+    #:
+    #: Plugin-*bundled* skills are a different thing and are not listed here: those
+    #: arrive with a plugin directory and the loader already loads them.
+    user_skill_roots: tuple["SkillRoot", ...] = ()
 
 
 #: Claude Code's hook event vocabulary, as published.  Names this project has no
@@ -176,10 +220,25 @@ NATIVE = PluginFormat(
     marketplaces=("marketplace.json",),
     markers=("__init__.py",),
     executable_files=("__init__.py",),
+    # No user skill root: this project's own is ``<resource_root>/skills``, which
+    # the catalog scans as its primary root (see agent/skills/catalog.py).  Listing
+    # it here would scan it twice under a second name.
     executable_keys=_MCP_KEYS + _HOOK_KEYS,
     root_environment=("CLAUDE_PLUGIN_ROOT",),
     data_environment=("CLAUDE_PLUGIN_DATA",),
     project_environment=("CLAUDE_PROJECT_DIR",),
+)
+
+#: The vendor-neutral skill roots: no *plugin directory* format owns these, and
+#: more than one ecosystem reads them.  ``~/.agents/skills`` is the one DSH calls
+#: ``user-agents`` (its ``agentsHome`` is ``$DSH_AGENTS_HOME`` or ``~/.agents``,
+#: read from its own source); ``~/.dsh/skills`` is DSH's own user root.  Codex
+#: reads ``.agents/skills`` at the *project* level, which is a different root and
+#: is not scanned here.
+SHARED_SKILL_ROOTS: tuple[SkillRoot, ...] = (
+    # No ``system_dir``: DSH reads this one without ``skipSystem``.
+    SkillRoot(label="agents", path="~/.agents/skills"),
+    SkillRoot(label="dsh", path="~/.dsh/skills", system_dir=".system"),
 )
 
 CLAUDE_CODE = PluginFormat(
@@ -198,6 +257,9 @@ CLAUDE_CODE = PluginFormat(
     root_environment=("CLAUDE_PLUGIN_ROOT",),
     data_environment=("CLAUDE_PLUGIN_DATA",),
     project_environment=("CLAUDE_PROJECT_DIR",),
+    # No ``user_skill_roots``: this project has no evidence for Claude Code's
+    # user-level skills directory, and inventing one would make the catalog scan a
+    # path nobody verified.  Add it here (one tuple) when there is evidence.
 )
 
 CODEX = PluginFormat(
@@ -212,6 +274,12 @@ CODEX = PluginFormat(
     # both.  ``mcp_files``/``hooks_files`` are read by location, not by which
     # manifest won, so no component is lost either way.
     manifests=(".codex-plugin/plugin.json", "plugin.json"),
+    # ``<codex_home>/skills``, with ``codex_home`` defaulting to ``~/.codex``
+    # (read from the Codex source this loader was written against).  ``.system``
+    # is Codex's own embedded-skill cache -- see :class:`SkillRoot`.
+    user_skill_roots=(
+        SkillRoot(label="codex", path="~/.codex/skills", system_dir=".system"),
+    ),
     marketplaces=(
         ".agents/plugins/marketplace.json",
         ".agents/plugins/api_marketplace.json",
@@ -263,6 +331,54 @@ def _relative_paths(attribute: str) -> tuple[str, ...]:
             if relative not in seen:
                 seen.append(relative)
     return tuple(seen)
+
+
+def user_skill_roots() -> tuple[SkillRoot, ...]:
+    """Every user-level skill root the known ecosystems read, path expanded.
+
+    Read by the skill catalog, which otherwise has to know that Codex keeps skills
+    in ``~/.codex`` and DSH in ``~/.agents``.  Order is the declaration order of
+    :data:`PLUGIN_FORMATS`, then :data:`SHARED_SKILL_ROOTS`, and the **first**
+    occurrence of a path wins: ``~/.agents/skills`` is the vendor-neutral one and
+    scanning it once is the point, not once per ecosystem that reads it.  A format
+    that names it again contributes nothing (its ``system_dir`` is not merged in,
+    because the first declaration is the one with evidence behind it).
+
+    Paths are expanded here rather than at import time, so a test (or a
+    ``--name`` home switch) changes what they resolve to.  ``DSH_AGENTS_HOME`` is
+    honoured for the agents root, because DSH honours it.
+    """
+    seen: dict[str, SkillRoot] = {}
+    for fmt in PLUGIN_FORMATS:
+        for root in fmt.user_skill_roots:
+            seen.setdefault(root.path, root)
+    for root in SHARED_SKILL_ROOTS:
+        seen.setdefault(root.path, root)
+    resolved: list[SkillRoot] = []
+    for template, root in seen.items():
+        path = template
+        if template == "~/.agents/skills":
+            agents_home = os.environ.get("DSH_AGENTS_HOME", "").strip()
+            if agents_home:
+                path = str(Path(agents_home).expanduser() / "skills")
+        resolved.append(
+            SkillRoot(
+                label=root.label,
+                path=str(Path(path).expanduser()),
+                system_dir=root.system_dir,
+            )
+        )
+    return tuple(resolved)
+
+
+def shared_skill_roots() -> tuple[SkillRoot, ...]:
+    """The subset of :func:`user_skill_roots` that exists on this machine.
+
+    Existence is checked here because the catalog's ``_load_root`` tolerates a
+    missing directory silently, and a caller that wants to *report* what it read
+    cannot tell "absent" from "empty" after the fact.
+    """
+    return tuple(root for root in user_skill_roots() if Path(root.path).is_dir())
 
 
 def manifest_candidates(root: Path) -> tuple[Path, ...]:

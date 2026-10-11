@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from agent.plugins.formats import SHARED_SKILL_ROOTS
+
 __all__ = [
     "DshProfile",
     "JsExpression",
@@ -45,9 +47,11 @@ __all__ = [
 #: The Cordis plugin name a profile uses to declare an MCP server.
 DSH_MCP_PLUGIN = "@deepseek-ai/dsh-mcp-client"
 
-#: Skill roots DSH scans that this runtime can also read.  ``~/.agents/skills`` is
-#: the vendor-neutral one; the others are DSH's own.
-DSH_SKILL_ROOTS = ("~/.agents/skills", "~/.dsh/skills")
+#: Skill roots DSH scans that this runtime can also read.  Taken from the format
+#: adapters rather than copied: the conventions belong there (see
+#: :data:`agent.plugins.formats.SHARED_SKILL_ROOTS`), and a second copy here is a
+#: second thing to keep in step.
+DSH_SKILL_ROOTS = tuple(root.path for root in SHARED_SKILL_ROOTS)
 
 
 class YamlSubsetError(ValueError):

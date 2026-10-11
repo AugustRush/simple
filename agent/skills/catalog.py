@@ -257,12 +257,35 @@ class SkillCatalog:
         self.invalidate()
         return True
 
-    def _load_root(self, root: Path, *, source: str) -> None:
+    def _load_root(
+        self,
+        root: Path,
+        *,
+        source: str,
+        keep_existing: bool = False,
+        skip_dirs: tuple[str, ...] = (),
+    ) -> None:
+        """Read one root's skills.
+
+        ``keep_existing`` makes the root a **fallback layer**: a skill id that is
+        already loaded (the user's own, a plugin's) is not shadowed by this root.
+        The skill roots other ecosystems keep are read that way -- a skill the user
+        installed here outranks one this agent found in another tool's directory.
+
+        ``skip_dirs`` names subtrees to leave alone, for the roots that keep the
+        ecosystem's *own* bundled skills in one (Codex's ``.system``, which it
+        rewrites from its embedded assets on every startup).
+        """
         if not root.exists():
             return
         for skill_file in sorted(root.rglob("SKILL.md")):
+            relative = skill_file.relative_to(root)
+            if skip_dirs and any(part in skip_dirs for part in relative.parts[:-1]):
+                continue
             bundle = self._read_bundle(skill_file, root=root, source=source)
             if bundle is None:
+                continue
+            if keep_existing and bundle.id in self._skills:
                 continue
             self._skills[bundle.id] = bundle
         self._rebuild_aliases()

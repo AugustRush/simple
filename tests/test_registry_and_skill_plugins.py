@@ -93,7 +93,14 @@ def test_the_registry_class_is_read_at_setup_time(monkeypatch) -> None:
     assert made and "console" in made[0]
 
 
-def test_the_skill_plugin_loads_skills_and_registers_their_tools(tmp_path) -> None:
+def test_the_skill_plugin_loads_skills_and_registers_their_tools(
+    tmp_path, monkeypatch
+) -> None:
+    # A home of its own: the plugin also reads the *shared* roots other ecosystems
+    # keep, so a test that used the real home would depend on what is installed on
+    # the machine running it.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DSH_AGENTS_HOME", raising=False)
     root = tmp_path / "skills"
     skill_dir = root / "deploy"
     skill_dir.mkdir(parents=True)
