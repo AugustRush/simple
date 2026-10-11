@@ -485,9 +485,11 @@ class PluginTools:
     ) -> tuple[bool, bool]:
         """Ask the human before activating executable plugin content.
 
-        Returns ``(approved, needs_pending)``.  Interactive sinks decide
-        immediately; a decline is final.  Non-interactive sinks leave a
-        pending record so the coordinator can redeem a later "同意" reply.
+        Returns ``(approved, needs_pending)``.  A sink that can ask decides
+        immediately; ``None`` back from it means nobody could be asked (no
+        dialog, no connected browser), which leaves a pending record so the
+        coordinator can redeem a later "同意" reply.  A human who was asked and
+        declined is terminal.
         """
         from agent.core.output import _APPROVAL_LOCK, _active_sink
         from agent.security.plugin_approval import (
@@ -501,7 +503,6 @@ class PluginTools:
             sink = _active_sink.get()
             if sink is None:
                 return False, False
-            interactive = bool(getattr(sink, "interactive_confirmation", False))
             approved = await sink.on_tool_confirmation(
                 "install_plugin",
                 command=source,
@@ -513,7 +514,7 @@ class PluginTools:
             if approved:
                 plugin_install_mark_approved(scope, source)
                 return True, False
-            return False, not interactive
+            return False, approved is None
 
     async def uninstall_plugin(self, name: str, intent: str = "") -> dict:
         import shutil

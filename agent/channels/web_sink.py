@@ -649,6 +649,34 @@ class WebOutputSink(OutputSink):
         )
         return False
 
+    @property
+    def interactive_confirmation(self) -> bool:
+        """A connected browser is a person who can be asked, right now.
+
+        The base sink answers ``False`` -- "no dialog here, leave a pending
+        record and ask by chat reply instead" -- and that answer is what the
+        consent callers branch on.  Reporting it here was wrong in both
+        directions:
+
+        * ``memory_clear`` refuses outright unless a person can be asked, so
+          clearing memory from the browser failed with "requires interactive
+          human approval" while the bar it needs was one call away;
+        * ``install_plugin`` and user-tool activation skipped the prompt and
+          left a pending record for a later 「同意」 reply;
+        * and the coordinator's phrase matching runs *only* where no menu
+          exists, because a bare "yes" is ambiguous and the weakest consent
+          channel must not become the operative one.  With this sink claiming
+          no menu, a message that normalizes to ``ok`` / ``yes`` / ``y`` could
+          redeem the sole pending high-risk shell command without the card
+          being read at all.
+
+        A tab that is not connected is still handled the other way:
+        ``on_tool_confirmation`` answers ``None`` -- "nobody could be asked" --
+        which is not a refusal, so the pending record survives for the
+        reconnect, when the prompt is re-offered, or for a later ``/confirm``.
+        """
+        return not self._collect
+
     async def on_tool_confirmation(
         self,
         name: str,

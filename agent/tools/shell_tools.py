@@ -74,12 +74,13 @@ from agent.tools.files import _normalize_write_scope
 _SHELL_CONFIRMATION_GUIDANCE = (
     "Only high-risk commands (disk/system destruction, destructive options, "
     "shell operators, pipe-to-shell patterns) require human approval; "
-    "medium-risk commands run without asking. An interactive terminal shows "
-    "an approval menu automatically; in non-terminal channels "
-    "(Feishu/gateway), show the exact command to the user and ask them to "
-    "reply “同意” (or run /confirm <token>). After approval, retry the "
-    "byte-identical command within 5 minutes — do not modify it and do not "
-    "route around the shell tool."
+    "medium-risk commands run without asking. An interactive client — a "
+    "terminal, or a connected browser — shows an approval prompt by itself. "
+    "Where no prompt can appear (a chat channel such as Feishu, or a browser "
+    "that has disconnected), show the exact command to the user and ask them to "
+    "reply “同意”, or give them the /confirm <token> to run themselves. After "
+    "approval, retry the byte-identical command within 5 minutes — do not "
+    "modify it and do not route around the shell tool."
 )
 
 

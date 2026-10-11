@@ -57,9 +57,9 @@ async def confirm_tool_activation(
 ) -> tuple[bool, bool]:
     """Ask the human before a generated tool becomes callable.
 
-    Returns ``(approved, needs_pending)``.  An interactive sink decides now and
-    a decline is final; a non-interactive sink leaves a pending record so a
-    later approval reply can redeem it.
+    Returns ``(approved, needs_pending)``.  A sink that can ask decides now and
+    a decline is final; ``None`` back from it means nobody could be asked, which
+    leaves a pending record so a later approval reply can redeem it.
     """
     from agent.core.output import _APPROVAL_LOCK, _active_sink
     from agent.security.plugin_approval import (
@@ -76,7 +76,6 @@ async def confirm_tool_activation(
         sink = _active_sink.get()
         if sink is None:
             return False, False
-        interactive = bool(getattr(sink, "interactive_confirmation", False))
         approved = await sink.on_tool_confirmation(
             "create_tool",
             command=f"activate user tool '{tool_id}'",
@@ -88,7 +87,7 @@ async def confirm_tool_activation(
         if approved:
             plugin_install_mark_approved(consent_scope, source)
             return True, False
-        return False, not interactive
+        return False, approved is None
 
 
 __all__ = [

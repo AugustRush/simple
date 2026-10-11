@@ -2384,7 +2384,17 @@ def _install_plugin_harness(tmp_path, monkeypatch):
 
 
 class _FakeConfirmationSink:
-    def __init__(self, answer: bool, interactive: bool = True):
+    """A sink that answers the three-valued consent contract.
+
+    ``answer=None`` is "nobody could be asked" (no dialog, no connected
+    browser) and ``answer=False`` is a human declining -- see
+    ``OutputSink.on_tool_confirmation``.  The callers act differently on the
+    two: the first leaves a pending record a later 「同意」 can redeem, the
+    second is final.  Returning ``False`` for both is what made a declined
+    install stay redeemable.
+    """
+
+    def __init__(self, answer: bool | None, interactive: bool = True):
         self.answer = answer
         self.interactive = interactive
         self.asked: list[dict] = []
@@ -2402,7 +2412,7 @@ class _FakeConfirmationSink:
         reason: str,
         confirmation_token: str,
         scope,
-    ) -> bool:
+    ) -> bool | None:
         self.asked.append(
             {"name": name, "command": command, "reason": reason}
         )
@@ -2626,6 +2636,67 @@ def test_install_plugin_requires_confirmation_for_executable_content(
         plugin_install_clear_all()
 
 
+@pytest.mark.parametrize(
+    ("answer", "interactive", "expected_pending"),
+    [
+        # asked and approved: decided now, nothing left over
+        (True, True, False),
+        # asked and declined: final
+        (False, True, False),
+        # nobody could be asked (no dialog, no connected browser): the record
+        # is the only way the human can still answer, so it has to survive
+        (None, False, True),
+        # a dialog exists that still could not reach anybody
+        (None, True, True),
+        # a sink that never approves, by policy -- also final
+        (False, False, False),
+    ],
+)
+def test_an_install_stays_pending_only_when_nobody_was_asked(
+    tmp_path, monkeypatch, answer, interactive, expected_pending
+):
+    """The three-valued consent answer decides, not the menu flag.
+
+    ``on_tool_confirmation`` documents ``None`` as "nobody could be asked" and
+    ``False`` as a refusal (the human's, or the sink's own policy).  Deriving
+    "leave a record behind" from the *flag* instead made two of the five
+    combinations wrong: a policy refusal left the plugin redeemable by a later
+    「同意」, and a dialog that reached nobody retired the record the human
+    needed.  Only the first is fixed by ``answer is None``; both are pinned
+    here.
+    """
+    from agent.security.plugin_approval import (
+        plugin_install_clear_all,
+        plugin_install_pending_for_scope,
+    )
+    from agent.security.shell import ShellAuthorizationScope
+
+    scope = ShellAuthorizationScope("cli", "cli", "")
+    plugin_install_clear_all()
+    try:
+        tools, _, _, _ = _install_plugin_harness(tmp_path, monkeypatch)
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "plugin.json").write_text("{}", encoding="utf-8")
+        (source / "__init__.py").write_text("", encoding="utf-8")
+
+        result = _run_install_with_sink(
+            tools, str(source), _FakeConfirmationSink(answer=answer, interactive=interactive)
+        )
+
+        if answer is True:
+            assert result["ok"] is True
+            assert plugin_install_pending_for_scope(scope) == []
+            return
+        assert result["ok"] is False
+        assert result["cancelled"] is True
+        assert (result.get("requires_confirmation") is True) is expected_pending
+        pending = plugin_install_pending_for_scope(scope)
+        assert (pending == [str(source)]) is expected_pending
+    finally:
+        plugin_install_clear_all()
+
+
 def test_install_plugin_declarative_skips_confirmation(tmp_path, monkeypatch):
     from agent.security.plugin_approval import plugin_install_clear_all
 
@@ -2663,7 +2734,7 @@ def test_install_plugin_pending_confirmation_for_gateway(tmp_path, monkeypatch):
         (source / "__init__.py").write_text("", encoding="utf-8")
 
         scope = ShellAuthorizationScope("cli", "cli", "")
-        sink = _FakeConfirmationSink(answer=False, interactive=False)
+        sink = _FakeConfirmationSink(answer=None, interactive=False)
 
         first = _run_install_with_sink(tools, str(source), sink)
         assert first["ok"] is False

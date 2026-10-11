@@ -997,6 +997,41 @@ def test_web_non_shell_prompt_rejects_session_scope():
     )
 
 
+def test_a_connected_browser_says_it_can_be_asked():
+    """The consent callers branch on this flag, so it has to be the truth.
+
+    Three flows read it: ``memory_clear`` refuses outright unless a person can
+    be asked; plugin installs and user-tool activation decide "prompt now" vs
+    "leave a pending record for a later 「同意」"; and the coordinator's phrase
+    matching runs *only* where no menu exists, because a bare "yes" is
+    ambiguous.  This sink is the menu -- it sends the prompt on the socket,
+    waits for the answer, and re-offers it after a reconnect -- so a connected
+    tab is a person who can be asked.
+    """
+    import asyncio
+
+    from agent.channels.web_sink import WebOutputSink
+
+    class _Socket:
+        async def send_json(self, _payload):
+            return None
+
+    async def connected() -> bool:
+        sink = WebOutputSink(websocket=_Socket())
+        try:
+            return bool(sink.interactive_confirmation)
+        finally:
+            await sink.close()
+
+    assert asyncio.run(connected()) is True
+
+    # Nothing to ask: the plain-HTTP/collection path, and a turn whose browser
+    # has gone away.  Both hand the caller ``None`` from the prompt and keep
+    # the pending record alive for a reconnect or a later /confirm.
+    assert WebOutputSink(collect=True).interactive_confirmation is False
+    assert WebOutputSink().interactive_confirmation is False
+
+
 def test_web_session_approvals_can_be_revoked():
     from starlette.testclient import TestClient
     from agent.security.shell import (

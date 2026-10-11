@@ -242,11 +242,17 @@ def _approve_everything(monkeypatch):
     monkeypatch.setattr(tool_approval, "confirm_tool_activation", _approve)
 
 
-def _decline_everything(monkeypatch, *, interactive: bool):
+def _decline_everything(monkeypatch, *, asked: bool):
+    """Stub the activation gate's *answer*: ``(approved, needs_pending)``.
+
+    ``asked=True`` is a human who was asked and refused (nothing left over);
+    ``asked=False`` is nobody to ask, so the caller has to leave a pending
+    record the human can redeem later.
+    """
     from agent.security import tool_approval
 
     async def _decline(**kwargs):
-        return False, not interactive
+        return False, not asked
 
     monkeypatch.setattr(tool_approval, "confirm_tool_activation", _decline)
 
@@ -274,7 +280,7 @@ def test_declined_tool_leaves_nothing_behind(tools_root, monkeypatch):
     from agent.tools import user_tools
     from agent.tools.runtime import ToolRegistry
 
-    _decline_everything(monkeypatch, interactive=True)
+    _decline_everything(monkeypatch, asked=True)
     registry = ToolRegistry()
 
     result = asyncio.run(
@@ -295,7 +301,7 @@ def test_non_interactive_decline_asks_for_confirmation_instead(
     from agent.tools import user_tools
     from agent.tools.runtime import ToolRegistry
 
-    _decline_everything(monkeypatch, interactive=False)
+    _decline_everything(monkeypatch, asked=False)
 
     result = asyncio.run(
         user_tools.author_tool("echo", _GOOD_SOURCE, registry=ToolRegistry())
@@ -304,6 +310,52 @@ def test_non_interactive_decline_asks_for_confirmation_instead(
     assert result["requires_confirmation"] is True
     assert "echo" in result["confirmation_guidance"]
     assert result["would_register"] == ["echo"]
+
+
+def test_activation_honours_the_three_valued_consent_answer(monkeypatch):
+    """``None`` is "nobody could be asked"; ``False`` is a refusal.
+
+    The gate derived "leave a pending record" from whether the sink *had* a
+    menu instead of from the answer it gave, so a sink that never approves by
+    policy still left the activation redeemable by a later 「同意」, while a
+    dialog that could not reach anybody retired the record the human needed.
+    """
+    from agent.core.output import _active_sink
+    from agent.security import tool_approval
+    from agent.security.plugin_approval import plugin_install_clear_all
+    from agent.security.shell import ShellAuthorizationScope
+
+    class _Sink:
+        def __init__(self, answer: bool | None) -> None:
+            self.answer = answer
+            self.asked = 0
+
+        async def on_tool_confirmation(self, *_args, **_kwargs):
+            self.asked += 1
+            return self.answer
+
+    scope = ShellAuthorizationScope("web-1", "web", "")
+    plugin_install_clear_all()
+    try:
+        for answer, expected in ((True, False), (False, False), (None, True)):
+            sink = _Sink(answer)
+            token = _active_sink.set(sink)
+            try:
+                approved, needs_pending = asyncio.run(
+                    tool_approval.confirm_tool_activation(
+                        tool_id="echo",
+                        digest="digest",
+                        reason="runs code",
+                        scope=scope,
+                    )
+                )
+            finally:
+                _active_sink.reset(token)
+                plugin_install_clear_all()
+            assert (approved, needs_pending) == (answer is True, expected), answer
+            assert sink.asked == 1
+    finally:
+        plugin_install_clear_all()
 
 
 def test_a_broken_tool_never_reaches_the_tools_directory(tools_root, monkeypatch):

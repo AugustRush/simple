@@ -4217,7 +4217,7 @@ def test_unknown_explicit_skill_reference_still_reports_an_error():
     assert classification.skill_error == "unknown"
 
 
-def _phrase_approval_outcome(*, menu_available: bool):
+def _phrase_approval_outcome(*, menu_available: bool, sink: object = None):
     """Run the chat-approval path against a sink with/without a menu."""
     from dataclasses import dataclass, field, replace as dc_replace
     from agent.commands.coordinator import CommandCoordinator
@@ -4253,7 +4253,7 @@ def _phrase_approval_outcome(*, menu_available: bool):
     coordinator = CommandCoordinator.__new__(CommandCoordinator)
     turn_input = _TurnInput()
     result = coordinator._maybe_redeem_chat_approval(
-        turn_input, _Classification(), _Sink()
+        turn_input, _Classification(), sink if sink is not None else _Sink()
     )
     redeemed = shell_session_allowlist_contains(dangerous, scope=scope)
     shell_session_allowlist_clear()
@@ -4270,6 +4270,33 @@ def test_phrase_approval_is_inert_when_an_interactive_menu_exists():
     redeemed, rewritten = _phrase_approval_outcome(menu_available=True)
     assert redeemed is False
     assert rewritten is False
+
+
+def test_a_connected_browser_cannot_approve_a_command_by_saying_yes():
+    """The browser has a menu, so its messages must not be an approval channel.
+
+    Measured on the shipped code: the web sink reported no menu, so ``yes``
+    redeemed the sole pending high-risk command -- and the card asking about
+    that same command was on screen at the time.  A person who is being shown
+    the exact command, its risk and a countdown has already been asked; a
+    second door means the weakest channel decides.
+    """
+    import asyncio
+
+    from agent.channels.web_sink import WebOutputSink
+
+    class _Socket:
+        async def send_json(self, _payload):
+            return None
+
+    async def outcome() -> tuple[bool, bool]:
+        sink = WebOutputSink(websocket=_Socket())
+        try:
+            return _phrase_approval_outcome(menu_available=True, sink=sink)
+        finally:
+            await sink.close()
+
+    assert asyncio.run(outcome()) == (False, False)
 
 
 def test_phrase_approval_still_works_where_no_menu_is_possible():
