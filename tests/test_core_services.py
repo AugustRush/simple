@@ -1542,6 +1542,10 @@ _COMPONENT_KEYS: dict[str, str] = {
     "client": "the provider client",
     "client_cache_key": "keys the shared client cache",
     "client_provider": "the active provider's name; read back off a web session",
+    "provider_client_cache": (
+        "one SDK client per provider configuration for the process; provided by the "
+        "`model` plugin and resolved by every web session's transport rebuild"
+    ),
     "model": "the model name in effect",
     # Written for every composition and, as of this table's writing, **not read back off
     # a mapping**: the provider format is read from config dicts (``provider_cfg``) and
@@ -1557,6 +1561,11 @@ _COMPONENT_KEYS: dict[str, str] = {
     "context_manager": "the session log",
     "skill_catalog": "the skill catalog",
     "plugin_catalog": "the plugin catalog",
+    # The client and its status come from ``agent/tools/mcp_plugin.py`` now (see
+    # `_PLUGIN_PROVIDED`); they stay in this table for the same reason ``evolution``
+    # does -- it documents what a composition can *contain*, and the entry moving
+    # from "bootstrap writes it" to "a plugin provides it" is the change this table
+    # exists to make visible.
     "mcp_client": "the MCP client",
     "mcp_status": "what the MCP connection attempts did",
     "mcp_task": "the background MCP connect task",
@@ -1610,6 +1619,13 @@ _PLUGIN_PROVIDED: dict[str, str] = {
     "memory": "agent/memory/plugin.py",
     "ltm_store": "agent/memory/plugin.py",
     "context_manager": "agent/memory/session_plugin.py",
+    # ``llm``/``model`` are *not* here: bootstrap still writes both -- the model name
+    # into the mapping, and a web session's own routing transport under ``llm``.  The
+    # plugin provides the process-wide transport; the key has two writers.
+    "provider_client_cache": "agent/core/model_plugin.py",
+    "mcp_client": "agent/tools/mcp_plugin.py",
+    "mcp_server_configs": "agent/tools/mcp_plugin.py",
+    "mcp_status": "agent/tools/mcp_plugin.py",
 }
 
 

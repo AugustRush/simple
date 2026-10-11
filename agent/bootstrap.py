@@ -391,15 +391,6 @@ async def _build_web_session_components(
     return session_components
 
 
-def _empty_mcp_status(configured_servers: int = 0) -> dict[str, int]:
-    return {
-        "configured_servers": configured_servers,
-        "connected_servers": 0,
-        "failed_servers": 0,
-        "registered_tools": 0,
-    }
-
-
 def _refresh_components_system_prompt(components: dict) -> str:
     """Recompose the prompt and publish it.
 
@@ -516,7 +507,6 @@ async def _build_components_async(
     builtin_tools_cls = agent_module.BuiltinTools
     skill_catalog_cls = agent_module.SkillCatalog
     user_tool_catalog_cls = agent_module.UserToolCatalog
-    mcp_client_cls = agent_module.MCPClient
 
     if announce:
         client, model, max_tokens = ModelClientFactory.from_config(cfg)
@@ -637,16 +627,6 @@ async def _build_components_async(
     skill_catalog.load_all()
     skill_catalog.register_tools(registry)
     user_tool_catalog = user_tool_catalog_cls(root=user_tools_dir)
-
-    mcp_client = None
-    mcp_server_configs = list(cfg.get("mcp_servers", []) or [])
-    mcp_status = _empty_mcp_status(len(mcp_server_configs))
-    if mcp_server_configs:
-        mcp_client = mcp_client_cls(registry)
-        console.print(
-            "[dim]MCP connecting in background: "
-            f"{len(mcp_server_configs)} configured server(s)[/dim]"
-        )
 
     # The model adapter -- the routing table that sends each per-call model
     # override to the provider that owns it -- is a **plugin** now (``model``,
@@ -840,15 +820,6 @@ async def _build_components_async(
         skill_catalog._load_root(_skills_root, source=f"plugin:{_pname}")
     skill_catalog._rebuild_aliases()
 
-    # Connect MCP servers bundled by plugins
-    bundled_mcp = plugin_catalog.get_bundled_mcp()
-    if bundled_mcp:
-        mcp_server_configs.extend(server_cfg for _, server_cfg in bundled_mcp)
-        mcp_status = _empty_mcp_status(len(mcp_server_configs))
-    if bundled_mcp and mcp_client is None:
-        mcp_client = mcp_client_cls(registry)
-
-
     # Compose system prompt now that plugins are loaded (they may append rules).
     system_prompt = _compose_system_prompt(
         system_prompt,
@@ -869,8 +840,9 @@ async def _build_components_async(
         "base_system_prompt": base_system_prompt,
         "system_prompt": system_prompt,
         "plugin_catalog": plugin_catalog,
-        "mcp_client": mcp_client,
-        "mcp_status": mcp_status,
+        # The ``mcp`` plugin provides ``mcp_client``/``mcp_status``; what is left
+        # here is the handle to the task the composition starts below, which is the
+        # composition's own state.
         "mcp_task": None,
         "config_revision": 0,
     })
@@ -955,6 +927,11 @@ async def _build_components_async(
     registry.set_context("command_router", command_router)
     registry.set_context("skill_catalog", skill_catalog)
     registry.set_context("registry", registry)
+    # The client and the merged server list come from the ``mcp`` plugin; *when* to
+    # connect stays here, because the background connect refreshes the system prompt
+    # and must not run before the composition has published one.
+    mcp_client = components.get("mcp_client")
+    mcp_server_configs = list(components.get("mcp_server_configs") or ())
     if mcp_client is not None:
         registry.set_context("mcp_client", mcp_client)
     if mcp_client is not None and mcp_server_configs:

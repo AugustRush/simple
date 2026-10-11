@@ -82,6 +82,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/runtime/system_prompt.py",
             "agent/core/agent_plugin.py",  # the agent's tool registry
             "agent/scheduler/plugin.py",  # a scheduled run's tools come from it
+            "agent/tools/mcp_plugin.py",  # the client registers its tools on it
             "agent/tools/plugin.py",  # the built-in tools register on it
         ),
         summary="The tool registry: definitions, capabilities, and the context keys below.",
@@ -125,6 +126,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
             "agent/core/agent_plugin.py",  # the agent reaches the composition through it
+            "agent/tools/mcp_plugin.py",  # reads the servers other plugins bundled
         ),
         summary="Loaded plugins and everything they contributed.",
     ),
@@ -251,8 +253,9 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="mcp_client",
         owners=(
-            "agent/bootstrap.py",
-            "agent/tools/plugin_tools.py",
+            "agent/tools/mcp_plugin.py",
+            "agent/tools/plugin_tools.py",  # installs into the catalog's client
+            "agent/bootstrap.py",  # publishes it into the tool registry's context
         ),
         consumers=(
             "agent/bootstrap.py",

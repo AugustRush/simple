@@ -96,6 +96,12 @@ def _sqlite_fts_memory(_: CoreContext) -> Any:
     return SqliteFtsMemoryPlugin()
 
 
+def _mcp(_: CoreContext) -> Any:
+    from agent.tools.mcp_plugin import MCPPlugin
+
+    return MCPPlugin()
+
+
 def _session(_: CoreContext) -> Any:
     from agent.memory.session_plugin import SessionPlugin
 
@@ -153,6 +159,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         factory=_sqlite_fts_memory,
         provides=("ltm_store", "memory"),
         opt_in=True,
+    ),
+    CorePlugin(
+        name="mcp",
+        summary=(
+            "the MCP client; provides `mcp_client`, the merged server list the "
+            "composition connects, and the status it reports"
+        ),
+        factory=_mcp,
+        provides=("mcp_client", "mcp_server_configs", "mcp_status"),
     ),
     CorePlugin(
         name="session",

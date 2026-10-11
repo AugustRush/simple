@@ -49,12 +49,6 @@ ROOT_ASSEMBLED: dict[str, str] = {
         "the TurnRunner plugin already provides agent_loop -- and that is the "
         "convergence target."
     ),
-    "mcp_client": (
-        "Built before the catalog so plugin-declared MCP servers can connect during "
-        "load, and written again by the plugin tools when one is installed. It wants "
-        "to be a service a plugin provides, with the tools resolving it instead of "
-        "reaching into the mapping."
-    ),
 }
 
 
