@@ -83,3 +83,43 @@ implementation selected by profile, and point the four CLI sites at the service.
 * **Claude Code's user-level skill root.** Not declared, because no evidence for
   its path exists in this tree or in the sources it was written against. One
   `SkillRoot` tuple adds it when there is evidence.
+
+## Round 2 — the two divergences this document's review found, closed
+
+A review against the model ("every module is a plugin; a plugin is an implementation of
+a declared interface; third parties are adapted") turned up two things this document
+had not recorded, and both are now done:
+
+1. **A second plugin tree.** ``build_gateway_channels`` built a ``PluginHost`` of its
+   own, provided ``cfg`` + ``channels`` on it, and mounted the web and Feishu plugins
+   there: the main catalog could not answer ``who_provides("channels")``, no profile
+   could disable or replace a channel, the channel plugins could inject nothing else,
+   and nothing disposed that host.  ``agent/channels/registry_plugin.py`` provides
+   ``channels`` now, the two built-ins are core plugins, the gateway reads the service,
+   and ``build_gateway_channels`` survives only as the *no-composition* path that
+   composes the same declarations.  ``8f20f16``.
+2. **The interface was implicit for 8 of 12 services.**  The ledger's ``contract``
+   column is **12/12** now: ``mcp_client`` (3 members), ``skill_catalog`` (9),
+   ``agent`` (5 methods + 4 data), ``registry`` (13), ``channels`` (2 protocols: the
+   registry and the contribution view), ``plugin_catalog`` (15), ``agent_core`` and
+   ``agent_loop``.  Each has a protocol module beside its service and a row in
+   ``tests/test_service_contracts.py``, which runs the same three guards the memory
+   services get — signature conformance (an instance *or* a class, and data members
+   count, including instance attributes), attribute closure, and "no member declared
+   without a caller" — plus a meta-guard that every pointer in the ledger is checked by
+   some file.  Six commits, ``781085c`` … ``1a957f1``.
+
+Two things the protocols caught, both worth keeping as method:
+
+* a name-based scan had attributed ``registry.all()`` and ``set_enabled``/``list_plugins``
+  to services they do not belong to (``all`` is the *channel* registry's; ``set_enabled``
+  is the scheduler store's).  Every member in every protocol above was verified by
+  reading the call site;
+* ``AgentCore`` and ``TurnRunner`` live in one module and **one is the other's caller**,
+  which is a real consumer relationship between two services — so the "has a caller"
+  scan reads the whole tree, implementation module included.
+
+Still open from the review: the two capability services the **loader itself** provides
+(``commands``, ``agents``) are not in the ledger at all, and the *declarative*
+third-party path (Claude Code / Codex plugins, which contribute assets rather than
+implementing the plugin protocol) still needs its interface decided.
