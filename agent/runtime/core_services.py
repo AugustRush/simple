@@ -120,6 +120,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",
             "agent/cli.py",
         ),
+        contract="agent/plugins/protocols.py:PluginCatalogService",
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",
