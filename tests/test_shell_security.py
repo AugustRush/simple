@@ -352,6 +352,67 @@ def test_shell_security_operators_and_patterns_require_confirmation_at_default()
         assert auto.allowed is True
 
 
+def test_a_newline_separates_commands_exactly_as_a_semicolon_does():
+    """The tool runs the string through ``/bin/sh -c``, where a newline ends a
+    command as surely as ``;`` does.
+
+    Treating it as whitespace made the *same* compound command free when its
+    lines were separated by a newline: `echo a; echo b` asked, `echo a<newline>
+    echo b` ran unchallenged, at the default level.
+    """
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_uses_shell_features,
+    )
+
+    scope = ShellAuthorizationScope("newline", "web", "user-1")
+    for command in ("echo a; echo b", "echo a\necho b"):
+        result = shell_command_check(command, scope=scope)
+
+        assert result.allowed is False
+        assert result.risk_level == "high"
+        assert result.requires_confirmation is True
+
+        auto = shell_command_check(command, scope=scope, permission_level="high")
+        assert auto.allowed is True
+
+    assert shell_command_uses_shell_features("echo a\necho b") is True
+
+
+def test_a_newline_cannot_smuggle_an_inline_cwd_change():
+    """The structural guard read only the first command on a line.
+
+    `cd /tmp; echo ok` was refused while `echo ok<newline>cd /tmp` was allowed
+    at every level -- and the ``cd`` really does move the cwd for the lines
+    after it, inside the one ``sh -c`` the tool launches.
+    """
+    from agent.security.shell import shell_command_check
+
+    for command in (
+        "cd /tmp && echo ok",
+        "pushd /tmp; echo ok",
+        "cd /tmp\necho ok",
+        "echo ok\ncd /tmp",
+        "set -e\ncd /tmp\ncat passwd",
+    ):
+        result = shell_command_check(command)
+
+        assert result.allowed is False, command
+        assert result.risk_level == "high"
+        # Structural, not merely risky: never confirmable, at any level.
+        assert result.requires_confirmation is False, command
+
+
+def test_a_quoted_newline_is_still_just_text():
+    """Only an unquoted newline separates commands, and the check follows."""
+    from agent.security.shell import shell_command_check, _find_shell_operator
+
+    for command in ('echo "a\nb"', "printf '%s\\n' cd"):
+        assert _find_shell_operator(command) is None, command
+        assert shell_command_check(command).allowed is True, command
+
+
 def test_shell_security_absolute_paths_run_automatically():
     from agent.security.shell import shell_command_check
 

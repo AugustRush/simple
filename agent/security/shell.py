@@ -185,6 +185,12 @@ HIGH_RISK_SHELL_OPERATORS: frozenset[str] = frozenset(
         ">>",
         "<",
         "<<",
+        # A newline separates commands exactly as `;` does -- the tool runs the
+        # string through ``/bin/sh -c`` -- so it is a control operator and not
+        # whitespace.  Leaving it out made the *same* compound command free
+        # when its lines were separated by a newline instead of a semicolon,
+        # and it hid an inline ``cd`` from the structural guard below.
+        "\n",
     }
 )
 
@@ -763,7 +769,15 @@ def _parse_shell_tokens(command: str) -> list[str]:
         # and caught by _find_shell_operator.  shlex's default punctuation
         # ("();<>|&") leaves backticks glued to the surrounding word, so a
         # backtick pair never matched the lone "`" in HIGH_RISK_SHELL_OPERATORS.
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&`")
+        #
+        # The newline is punctuation for the same kind of reason: shlex treats
+        # it as whitespace, which is exactly what a shell does *not* do with it,
+        # so it is moved out of ``whitespace`` and into the punctuation set to
+        # come back as a token.  A newline inside quotes stays part of its word,
+        # because a quoted character is never punctuation -- which is right: it
+        # separates nothing there.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&`\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         return list(lexer)
     except ValueError as exc:
@@ -1029,6 +1043,14 @@ def _shell_operator_guard(command: str) -> Optional[tuple[str, str]]:
             "confirm",
             "shell redirection requires confirmation "
             "(use file tools for workspace writes)",
+        )
+    if operator == "\n":
+        # Naming it beats quoting it: an interpolated newline in the middle of
+        # this sentence reads as a broken message in the consent card.
+        return (
+            "confirm",
+            "a multi-line command runs each line as its own command, "
+            "so it requires confirmation",
         )
     return ("confirm", f"shell control operator '{operator}' requires confirmation")
 
