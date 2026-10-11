@@ -257,6 +257,98 @@ def test_no_member_is_declared_without_a_caller(protocol_name: str):
     assert not unused, f"{protocol_name} declares members nobody calls: {unused}"
 
 
+def _concrete_data_members(path: Path, class_name: str) -> set[str]:
+    """Public *data* a class exposes: properties, class annotations, ``self.x = …``.
+
+    The method scan cannot see any of this, which is how ``.staging``/``.store``
+    stayed invisible while six files depended on them.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not (isinstance(node, ast.ClassDef) and node.name == class_name):
+            continue
+        names: set[str] = set()
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any("property" in ast.unparse(d) for d in item.decorator_list):
+                    names.add(item.name)
+                for sub in ast.walk(item):
+                    if isinstance(sub, ast.Assign):
+                        targets = sub.targets
+                    elif isinstance(sub, ast.AnnAssign):
+                        targets = [sub.target]
+                    else:
+                        continue
+                    for target in targets:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "self"
+                        ):
+                            names.add(target.attr)
+            elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                names.add(item.target.id)
+        return {name for name in names if not name.startswith("_")}
+    raise AssertionError(f"{class_name} not found in {path.name}")
+
+
+@pytest.mark.parametrize(
+    ("path", "class_name", "protocol_name"),
+    [
+        ("agent/memory/store.py", "LTMStore", "MemoryStore"),
+        ("agent/memory/context.py", "ContextManager", "ContextService"),
+        ("agent/memory/palace.py", "MemoryPalace", "MemoryService"),
+    ],
+)
+def test_no_reader_reaches_past_the_contract_through_attributes(
+    path: str, class_name: str, protocol_name: str
+):
+    """The half of the seam the method scan could not see.
+
+    It was green while six files read ``.staging`` and ``.store`` -- attributes no
+    contract declared -- so a replacement could satisfy every method and still raise
+    ``AttributeError`` on the first turn, or silently lose orphan-staging recovery
+    (that one used ``getattr`` and merely returned 0).  A protocol a second
+    implementation has to satisfy is closed under attribute access too.
+
+    Reads whose receiver is ``self`` are not counted: outside this package ``self``
+    belongs to some other class, and its own attributes are its own business.  The
+    scan is otherwise name-based, which is the same limitation the method scan has --
+    distinctive member names make it sufficient, and a false positive is fixed by
+    renaming the other object's attribute or by declaring the member here.
+    """
+    import ast
+
+    from agent.memory import contracts
+
+    protocol = getattr(contracts, protocol_name)
+    declared = set(_protocol_attributes(protocol)) | set(_protocol_members(protocol))
+    members = _concrete_data_members(REPO_ROOT / path, class_name) - declared
+
+    offenders: list[str] = []
+    for source in sorted((REPO_ROOT / "agent").rglob("*.py")):
+        relative = source.relative_to(REPO_ROOT)
+        if str(relative).startswith("agent/memory/") or "__pycache__" in str(relative):
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+                continue
+            if node.attr not in members:
+                continue
+            receiver = ast.unparse(node.value)
+            if receiver == "self":
+                continue
+            offenders.append(f"{relative}:{node.lineno} {receiver}.{node.attr}")
+    assert not offenders, (
+        f"these read a {class_name} member the {protocol_name} contract does not "
+        "declare, so a replacement is not obliged to have it:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
 # ── the behaviour every store must have ──────────────────────────────────────
 
 

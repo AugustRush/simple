@@ -9768,6 +9768,12 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
         class staging:
             session_id = "session-1"
 
+        session_id = "session-1"
+
+        def recover_orphan_staging(self):
+            """A ``ContextService`` member now, so the double supplies it."""
+            return 0
+
         def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
             return None
 
@@ -9893,8 +9899,22 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
             return 0
 
     class _FakeContextManager:
+        session_id = "session-1"
+        min_messages = 2
+
         def __init__(self):
             self.staging = _FakeStaging()
+
+        def recover_orphan_staging(self):
+            """The manager owns recovery now; nothing is stranded in this test."""
+            return 0
+
+        def stage_turn(self, role, content):
+            self.staging.append(role, content)
+
+        def has_enough_staged(self):
+            """Nothing is staged in this fake (``count()`` is 0), so never."""
+            return self.staging.count() >= self.min_messages
 
         def mark_activity(self):
             pass
@@ -9978,6 +9998,7 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
         "output_dir": tmp_path / "output",
         "context_manager": _FakeContextManager(),
         "client": object(),
+        "ltm_store": object(),
         "model": "fake-model",
     }
 
@@ -10028,9 +10049,17 @@ def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_
             return 0
 
     class _FakeContextManager:
+        session_id = "current-session"
+
         def __init__(self):
             self.staging = _FakeStaging()
             self.queued = []
+
+        def recover_orphan_staging(self):
+            """What the real manager does: ask the shared sweep to queue them."""
+            from agent import enqueue_orphan_staging_recovery
+
+            return enqueue_orphan_staging_recovery(self)
 
         def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
             return None

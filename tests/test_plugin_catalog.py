@@ -31,6 +31,11 @@ def _evolution_components(*, enabled: bool = False):
         "agent": object(),
         "model": "a-model",
         "memory": object(),
+        # The plugin writes learned entries to the *store's* service, so a
+        # composition that expects it to activate has to provide it -- which is
+        # the point of declaring it in ``inject`` rather than reaching through
+        # the palace.
+        "ltm_store": object(),
     }
 
 def _write_plugin(plugin_dir: Path, code: str) -> None:
@@ -3877,6 +3882,7 @@ def test_the_plugin_builds_the_engine_it_uses() -> None:
         ("agent", _Agent()),
         ("model", "a-model"),
         ("memory", object()),
+        ("ltm_store", object()),
     ):
         host.services.provide(name, value)
 
@@ -3903,6 +3909,7 @@ def test_the_config_decides_not_the_mounting() -> None:
         ("agent", object()),
         ("model", "a-model"),
         ("memory", object()),
+        ("ltm_store", object()),
     ):
         host.services.provide(name, value)
 
@@ -3925,7 +3932,12 @@ def test_a_composition_without_the_services_leaves_it_pending() -> None:
     host.load(EvolutionPlugin())
 
     assert host.pending() == ("evolution",)
-    assert set(host.waiting_for()["evolution"]) == {"agent", "model", "memory"}
+    assert set(host.waiting_for()["evolution"]) == {
+        "agent",
+        "model",
+        "memory",
+        "ltm_store",
+    }
 
 
 def test_a_missing_provider_is_not_a_failure() -> None:
@@ -3943,6 +3955,7 @@ def test_a_missing_provider_is_not_a_failure() -> None:
         ("agent", object()),  # no `endpoint_for`
         ("model", "a-model"),
         ("memory", object()),
+        ("ltm_store", object()),
     ):
         host.services.provide(name, value)
 

@@ -326,12 +326,12 @@ class RalphService:
         if manager is None or not summaries:
             return
         try:
-            manager.staging.append(
+            manager.stage_turn(
                 "user",
                 f"[Ralph/{task.id}] goal: {task.goal} | status: {task.status.value} "
                 f"| iters: {task.current_iteration}/{task.max_iterations}",
             )
-            manager.staging.append("assistant", "\n".join(summaries[-5:]))
+            manager.stage_turn("assistant", "\n".join(summaries[-5:]))
             manager.mark_activity()
             if manager.should_enqueue_consolidation():
                 manager.enqueue_consolidation("ralph_task_end")

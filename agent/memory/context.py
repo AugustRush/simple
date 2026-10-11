@@ -164,6 +164,60 @@ class ContextManager:
         self._suppress_next_turn_persistence = False
         self.last_working_state_recovery_trace: dict[str, Any] = {}
 
+    @property
+    def session_id(self) -> str:
+        """The session this manager journals.
+
+        A contract member because four callers needed it and used to reach for
+        ``staging.session_id``: the two sub-agent writers (which stamp the session
+        on what they store) and both channels (which register and log by session).
+        """
+        return str(getattr(self.staging, "session_id", "") or "")
+
+    def stage_turn(self, role: str, content: str) -> None:
+        """Stage one turn for later consolidation.
+
+        The *act* the turn loop and Ralph need.  ``StagingBuffer`` is how this
+        implementation keeps staged turns; naming the act rather than the buffer is
+        what lets a replacement keep them wherever it likes.
+        """
+        self.staging.append(role, content)
+
+    def has_enough_staged(self) -> bool:
+        """Whether enough is staged that waking a background worker is worth it.
+
+        The threshold (``min_messages``) is this implementation's policy; the caller
+        used to compare against the attribute, which made the policy part of the
+        interface.
+        """
+        return self.staging.count() >= self.min_messages
+
+    def remember(self, entry: LTMEntry) -> None:
+        """Store one durable entry.
+
+        For the writers that know *what* they learned and not how it is kept: the
+        spawn planner's promoted summaries and the sub-agent finale.  Retrieval and
+        consolidation stay behind ``retrieve_context`` and ``process_one_job``.
+        """
+        self.store.add_entry(entry)
+
+    def recover_orphan_staging(self) -> int:
+        """Queue consolidation for turns stranded by sessions that never finished."""
+        return enqueue_orphan_staging_recovery(self)
+
+    def close(self) -> None:
+        """Release what this manager owns.  Safe to call twice.
+
+        Replaces two call sites that closed its *parts* (``staging.close()`` then
+        ``store.close()``), which is knowledge of this implementation's internals.
+        """
+        close_staging = getattr(self.staging, "close", None)
+        if callable(close_staging):
+            close_staging()
+        close_store = getattr(self.store, "close", None)
+        if callable(close_store):
+            close_store()
+
     def on_memory_cleared(self) -> None:
         """Drop queued extraction work and keep the clearing turn forgotten."""
         with self._lock:

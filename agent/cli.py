@@ -860,7 +860,7 @@ async def _interactive_loop_body(
     # them, for background recovery.  Doing this synchronously would block
     # startup on a network model call before the user even sees the prompt.
     if ctx_mgr:
-        recovered = enqueue_orphan_staging_recovery(ctx_mgr)
+        recovered = ctx_mgr.recover_orphan_staging()
         if recovered:
             shared.CONSOLE.print(
                 f"[dim]Recovering {recovered} interrupted session(s)…[/dim]"
@@ -1003,9 +1003,9 @@ async def _interactive_loop_body(
             except Exception as exc:
                 shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
         if ctx_mgr is not None:
-            close_staging = getattr(ctx_mgr.staging, "close", None)
-            if callable(close_staging):
-                close_staging()
+            close_manager = getattr(ctx_mgr, "close", None)
+            if callable(close_manager):
+                close_manager()
 
     shared.CONSOLE.print("\n[dim]Session closed.[/dim]")
 

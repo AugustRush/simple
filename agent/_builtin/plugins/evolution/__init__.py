@@ -76,12 +76,15 @@ class EvolutionPlugin:
     #: the config instead is the shape the channel plugins use, and it removes the reason
     #: the composition had to build an engine above the catalog -- which is what blocked
     #: ``memory`` from becoming a plugin.
-    inject = ("cfg", "agent", "model", "memory")
+    # ``ltm_store`` rather than reaching through the palace: the store is the service
+    # that owns entries, and ``memory.store`` was an attribute no contract declared.
+    inject = ("cfg", "agent", "model", "memory", "ltm_store")
 
     def __init__(self) -> None:
         # Heavy resources are populated in setup(), once the composition says
         # whether there is an engine at all.
         self._engine: Any = None
+        self._store: Any = None
         self._prev_response: str = ""
         self._rule_store: Any = None  # built lazily in setup
         self._pending_failures: list[dict] = []
@@ -128,6 +131,10 @@ class EvolutionPlugin:
         """
         cfg = ctx.get("cfg", None) or {}
         section = cfg.get("evolution", {}) or {}
+        #: The store this plugin writes learned entries to.  Injected: entries are its
+        #: service's job, and reaching through ``memory.store`` was an undeclared
+        #: dependency on the palace's internals.
+        self._store = ctx.get("ltm_store", None)
         # Use what the composition gave, if it gave anything: a test injecting a fake
         # engine, or a composition substituting its own, is a decision this plugin does
         # not get to overrule.  Build one only when nobody did **and** the config says so
@@ -439,7 +446,12 @@ class EvolutionPlugin:
         score = score_result.get("score", 5)
         import agent as _agent_mod
 
-        store = self._engine.memory.store
+        store = self._store
+        if store is None:
+            # Injected, not discovered: the plugin declares ``ltm_store``, so a
+            # composition without one is a composition where nothing is written --
+            # reaching through the palace for it was the undeclared dependency.
+            return
         now = _agent_mod._now() if hasattr(_agent_mod, "_now") else _now()
         entry_id = _agent_mod._new_id() if hasattr(_agent_mod, "_new_id") else _new_id()
 

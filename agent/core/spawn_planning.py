@@ -358,7 +358,7 @@ def promote_orchestration_runs(
     """
     if not context_manager:
         return 0
-    session_id = context_manager.staging.session_id
+    session_id = context_manager.session_id
     written = 0
     for run in runs:
         run_id = str(run.get("run_id") or "")
@@ -369,7 +369,7 @@ def promote_orchestration_runs(
             if not summary:
                 continue
             summary = summary[:MAX_PROMOTED_SUMMARY_CHARS]
-            context_manager.store.add_entry(
+            context_manager.remember(
                 entry_type(
                     id=new_id(),
                     content=(

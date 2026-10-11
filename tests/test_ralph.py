@@ -1068,6 +1068,9 @@ def test_ralph_service_stages_memory_once_after_run():
 
     manager = SimpleNamespace(
         staging=Staging(),
+        # The protocol names the act now, so the double supplies it (and delegates
+        # to the same staging the assertion below reads).
+        stage_turn=lambda role, content: manager.staging.append(role, content),
         mark_activity=lambda: None,
         should_enqueue_consolidation=lambda: True,
         enqueue_consolidation=lambda reason: manager.jobs.append(reason),

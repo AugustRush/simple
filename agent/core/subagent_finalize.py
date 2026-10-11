@@ -135,7 +135,7 @@ async def finalize_sub_agent(
         # `memory_entry_id` and `artifact_ref` pointing at an entry that was
         # never stored, which a caller would then fail to retrieve.
         candidate_id = new_id()
-        context_manager.store.add_entry(
+        context_manager.remember(
             entry_type(
                 id=candidate_id,
                 content=(
@@ -149,7 +149,7 @@ async def finalize_sub_agent(
                 memory_type="sub_agent_observation",
                 scope=(f"run:{run_id}" if run_id else _UNTRACKED_SCOPE),
                 status="active",
-                source_session=(context_manager.staging.session_id or ""),
+                source_session=(context_manager.session_id or ""),
                 confidence=_OBSERVATION_CONFIDENCE,
                 created_at=now,
                 updated_at=now,

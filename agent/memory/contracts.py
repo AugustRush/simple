@@ -60,8 +60,8 @@ if TYPE_CHECKING:  # pragma: no cover - types only
         ConversationTurn,
         ConversationWriteResult,
         FactAssertion,
-        LTMEntry,
         LTMCategory,
+        LTMEntry,
         ResolvedFact,
         SessionWorkingState,
     )
@@ -278,6 +278,29 @@ class ContextService(Protocol):
     that reach through it (``core/spawn_planning``, ``core/subagent_finalize``)
     are the exception the contract test records.
     """
+
+    @property
+    def session_id(self) -> str:
+        """The session this service journals (read by both channels and the two
+        sub-agent writers, which used to reach into ``staging`` for it)."""
+
+    def stage_turn(self, role: str, content: str) -> None:
+        """Stage one turn for later consolidation (the turn loop and Ralph)."""
+
+    def has_enough_staged(self) -> bool:
+        """Whether enough is staged to be worth waking a background worker."""
+
+    def remember(self, entry: "LTMEntry") -> None:
+        """Store one durable entry, for writers that know what they learned."""
+
+    def recover_orphan_staging(self) -> int:
+        """Queue consolidation for turns stranded by sessions that never finished.
+
+        Returns how many interrupted sessions were queued.
+        """
+
+    def close(self) -> None:
+        """Release what this service owns.  Safe to call twice."""
 
     def mark_activity(self) -> None:
         """Note that the session did something, for idle/sleep accounting."""

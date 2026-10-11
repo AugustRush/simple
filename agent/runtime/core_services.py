@@ -182,6 +182,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         consumers=(
             "agent/bootstrap.py",
             "agent/memory/session_plugin.py",
+            "agent/_builtin/plugins/evolution/__init__.py",  # writes learned strategies
         ),
         summary=(
             "The long-term store the palace and the context manager share.  "

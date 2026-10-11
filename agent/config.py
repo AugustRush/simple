@@ -1464,11 +1464,9 @@ async def _close_components(components: dict) -> None:
         await mcp_client.close()
     ctx_mgr = resolve(components, "context_manager")
     if ctx_mgr is not None:
-        staging = getattr(ctx_mgr, "staging", None)
-        if staging is not None and hasattr(staging, "close"):
-            staging.close()
-        if hasattr(ctx_mgr, "store"):
-            ctx_mgr.store.close()
+        close_manager = getattr(ctx_mgr, "close", None)
+        if callable(close_manager):
+            close_manager()
     plugin_catalog = resolve(components, "plugin_catalog")
     if plugin_catalog is not None and hasattr(plugin_catalog, "close"):
         plugin_catalog.close()

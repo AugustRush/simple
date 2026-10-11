@@ -655,6 +655,10 @@ def test_post_turn_maintenance_records_runtime_event_turn_id():
 
         staging = _Staging()
 
+        def stage_turn(self, role, content):
+            """``ContextService`` names the act; the double supplies it."""
+            self.staging.append(role, content)
+
         def record_turn(self, **kwargs):
             pass
 

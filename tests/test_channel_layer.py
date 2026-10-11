@@ -713,11 +713,22 @@ def test_channel_runner_scopes_context_manager_per_chat():
             return len(self.entries)
 
     class _SessionContextManager:
+        #: The protocol's members a double has to supply too -- ``ContextService``
+        #: names the *acts* now, so a fake manager cannot get away with exposing
+        #: ``staging`` alone.
+        min_messages = 2
+
         def __init__(self, session_id: str):
             self.session_id = session_id
             self.staging = _RecordingStaging(session_id)
             self.mark_calls = 0
             self.recorded_turns: list[tuple[str, str, str]] = []
+
+        def stage_turn(self, role, content):
+            self.staging.append(role, content)
+
+        def has_enough_staged(self):
+            return self.staging.count() >= self.min_messages
 
         def mark_activity(self):
             self.mark_calls += 1
@@ -1470,9 +1481,16 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         min_messages = 2
 
         def __init__(self, session_id: str):
+            self.session_id = session_id
             self.staging = _RecordingStaging(session_id)
             self.enqueued: list[str] = []
             self.min_messages = 2
+
+        def stage_turn(self, role, content):
+            self.staging.append(role, content)
+
+        def has_enough_staged(self):
+            return self.staging.count() >= self.min_messages
 
         def mark_activity(self):
             return None
@@ -1637,6 +1655,7 @@ def test_channel_runner_exit_timeout_retains_session_staging(caplog):
             return OutputSink()
 
     class _Manager:
+        session_id = "chat-1"
         staging = SimpleNamespace(session_id="chat-1", entries=["user", "assistant"])
 
         def __init__(self):
@@ -1970,10 +1989,9 @@ def test_gateway_recovery_registers_and_wakes_the_base_manager(monkeypatch):
     ``should_process_jobs`` gates on ``idle_elapsed() >= idle_seconds``, so an
     unregistered, un-woken manager holds the jobs forever.
     """
-    monkeypatch.setattr(
-        agent_module, "enqueue_orphan_staging_recovery", lambda _mgr: 3
+    ctx_mgr = SimpleNamespace(
+        session_id="base-session", recover_orphan_staging=lambda: 3
     )
-    ctx_mgr = SimpleNamespace(staging=SimpleNamespace(session_id="base-session"))
     pool = _PoolSpy()
     runner = _recovery_runner(
         {"context_manager": ctx_mgr, "agent": _RecoveryAgent(), "cfg": {}}
@@ -2009,9 +2027,6 @@ def test_gateway_recovery_skips_the_pool_when_nothing_was_stranded(monkeypatch):
 
 def test_gateway_recovery_falls_back_to_a_standalone_worker(monkeypatch):
     """Channels without a pool still need someone to drain the jobs."""
-    monkeypatch.setattr(
-        agent_module, "enqueue_orphan_staging_recovery", lambda _mgr: 2
-    )
     started: list[str] = []
 
     class _Worker:
@@ -2027,7 +2042,7 @@ def test_gateway_recovery_falls_back_to_a_standalone_worker(monkeypatch):
     monkeypatch.setattr(agent_module, "BackgroundMemoryWorker", _Worker)
     components = {
         "context_manager": SimpleNamespace(
-            staging=SimpleNamespace(session_id="base-session")
+            session_id="base-session", recover_orphan_staging=lambda: 2
         ),
         "agent": _RecoveryAgent(),
         "cfg": {},
@@ -2042,15 +2057,14 @@ def test_gateway_recovery_falls_back_to_a_standalone_worker(monkeypatch):
 
 def test_gateway_recovery_never_blocks_startup(monkeypatch):
     """A gateway must come up even when recovery cannot run at all."""
-    def _boom(_mgr):
+    def _boom():
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(agent_module, "enqueue_orphan_staging_recovery", _boom)
     pool = _PoolSpy()
     runner = _recovery_runner(
         {
             "context_manager": SimpleNamespace(
-                staging=SimpleNamespace(session_id="base-session")
+                session_id="base-session", recover_orphan_staging=_boom
             ),
             "agent": _RecoveryAgent(),
             "cfg": {},

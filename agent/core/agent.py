@@ -1988,15 +1988,15 @@ class BaseAgent:
                 )
             if new_turn:
                 if stage_user:
-                    ctx_mgr.staging.append("user", user_content)
+                    ctx_mgr.stage_turn("user", user_content)
                 # Interjections are the user's own words, spoken during this
                 # turn: the staging buffer is what consolidation reads, so
                 # leaving them out would make the memory a record of only the
                 # sentences a turn happened to *start* with.
                 for text in stage_interjections:
-                    ctx_mgr.staging.append("user", text)
+                    ctx_mgr.stage_turn("user", text)
                 if stage_assistant:
-                    ctx_mgr.staging.append("assistant", assistant_content)
+                    ctx_mgr.stage_turn("assistant", assistant_content)
                 if ctx_mgr.should_enqueue_consolidation():
                     ctx_mgr.enqueue_consolidation("staged_turns")
         # Post-turn compaction serves two purposes:
@@ -2038,7 +2038,7 @@ class BaseAgent:
                 )
             if (
                 memory_worker is not None
-                and ctx_mgr.staging.count() >= ctx_mgr.min_messages
+                and ctx_mgr.has_enough_staged()
             ):
                 ctx_mgr.enqueue_consolidation("compact_triggered")
                 memory_worker.wake()

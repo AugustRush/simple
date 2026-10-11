@@ -40,9 +40,21 @@ class _Store:
 
 
 class _Manager:
+    """A double of ``ContextService``: the members the writers call, not the
+    internals -- which is what the protocol is for."""
+
     def __init__(self, session_id: str = "s-1") -> None:
         self.staging = type("S", (), {"session_id": session_id})()
         self.store = _Store()
+
+    @property
+    def session_id(self) -> str:
+        return self.staging.session_id
+
+    def remember(self, entry) -> None:
+        self.store.add_entry(entry)
+
+
 
 
 def _ok_validator(content, **kwargs):

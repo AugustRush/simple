@@ -144,7 +144,7 @@ class ChannelRunner:
         cfg = components.get("cfg") or {}
         model = agent.consolidation_model(cfg)
         endpoint = agent.consolidation_endpoint(cfg)
-        session_id = getattr(session_ctx_mgr.staging, "session_id", "")
+        session_id = str(getattr(session_ctx_mgr, "session_id", "") or "")
         pool = components.get("memory_worker_pool")
         if pool is not None:
             pool.register(session_id, session_ctx_mgr, model, endpoint)
@@ -180,7 +180,7 @@ class ChannelRunner:
         if ctx_mgr is None:
             return 0
         try:
-            recovered = agent_module.enqueue_orphan_staging_recovery(ctx_mgr)
+            recovered = ctx_mgr.recover_orphan_staging()
         except Exception:
             logger.exception("orphan staging recovery failed to enqueue")
             return 0
@@ -188,7 +188,7 @@ class ChannelRunner:
             return 0
         agent = resolve(components, "agent")
         cfg = components.get("cfg") or {}
-        session_id = str(getattr(ctx_mgr.staging, "session_id", "") or "")
+        session_id = str(getattr(ctx_mgr, "session_id", "") or "")
         try:
             model = agent.consolidation_model(cfg)
             endpoint = agent.consolidation_endpoint(cfg)
@@ -394,12 +394,12 @@ class ChannelRunner:
                 except TimeoutError:
                     logging.getLogger(__name__).warning(
                         "Session-end consolidation timed out; staging retained",
-                        extra={"session_id": manager.staging.session_id},
+                        extra={"session_id": manager.session_id},
                     )
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "Session-end consolidation failed; staging retained",
-                        extra={"session_id": manager.staging.session_id},
+                        extra={"session_id": manager.session_id},
                     )
             if plugin_catalog:
                 try:
