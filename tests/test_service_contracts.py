@@ -45,6 +45,20 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "mcp_client",
     ),
     (
+        "agent.runtime.contracts",
+        "TurnRunner",
+        "agent.runtime.protocols",
+        "AgentLoopService",
+        "agent_loop",
+    ),
+    (
+        "agent.runtime.contracts",
+        "AgentCore",
+        "agent.runtime.protocols",
+        "AgentCoreService",
+        "agent_core",
+    ),
+    (
         "agent.plugins.catalog",
         "PluginCatalog",
         "agent.plugins.protocols",
@@ -104,20 +118,18 @@ def _implementation(module_name: str, class_name: str) -> type:
 def _call_site_sources(implementation_module: str) -> str:
     """Every module that could call the service, except the implementation itself.
 
-    The whole tree rather than the ledger's consumer list: that list is built from
-    *container reads* (``resolve``/``ctx.get``/...), so a module that receives the
-    service as a **parameter** -- ``agent/config.py`` taking ``skill_catalog`` -- is
-    invisible to it.  Scanning for callers is the weaker claim (a same-named method on
-    another object counts), which is the safe direction for "does this member have a
-    caller at all"; the ledger keeps the stronger, narrower claim about *who reads the
-    service*.
+    The whole tree, including the implementation's own module: ``AgentCore`` and
+    ``TurnRunner`` live in one file and *one is the other's caller*, which is a real
+    consumer relationship between two services.  The weaker claim this makes (a
+    same-named method anywhere counts) is the safe direction for "does this member have
+    a caller at all"; the ledger keeps the stronger, narrower claim about *who reads the
+    service*, and that list is built from container reads -- so a module that receives
+    the service as a **parameter** (``agent/config.py`` taking ``skill_catalog``) is
+    invisible to it and would have made this check fail for a member that is used.
     """
     chunks: list[str] = []
     for path in sorted((REPO_ROOT / "agent").rglob("*.py")):
-        relative = path.relative_to(REPO_ROOT)
-        if "__pycache__" in str(relative):
-            continue
-        if str(relative) == f"{implementation_module.replace('.', '/')}.py":
+        if "__pycache__" in str(path):
             continue
         chunks.append(path.read_text(encoding="utf-8"))
     return "\n".join(chunks)

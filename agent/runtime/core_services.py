@@ -203,6 +203,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         owners=(
             "agent/bootstrap.py",
         ),
+        contract="agent/runtime/protocols.py:AgentCoreService",
         consumers=(
             "agent/bootstrap.py",
             "agent/channels/base.py",
@@ -222,6 +223,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         owners=(
             "agent/runtime/contracts.py",
         ),
+        contract="agent/runtime/protocols.py:AgentLoopService",
         consumers=(
             "agent/runtime/contracts.py",
         ),
