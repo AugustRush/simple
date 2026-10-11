@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from agent import shared
 from agent.core.events import ToolPostExecute, ToolPreExecute, bus_name
@@ -566,6 +566,75 @@ def _normalize_mcp_servers(plugin_dir: Path, data: dict, plugin_env: dict) -> li
         normalized["env"] = {**plugin_env, **server_env}
         substituted_mcp.append(normalized)
     return substituted_mcp
+#: The command-hook events this runtime can actually run.  Each one is the internal
+#: event name a ``fire_*`` dispatcher passes to ``_run_command_hooks``; nothing else
+#: executes a command hook, so this tuple *is* the capability.
+#:
+#: ``tests/test_plugin_hook_dispatch.py`` reads the dispatched set back out of this
+#: module's source and compares it with this tuple, so adding a dispatcher without
+#: updating the list -- or listing one that does not dispatch -- fails there rather
+#: than at the first plugin whose hook silently never ran.
+COMMAND_HOOK_EVENTS: tuple[str, ...] = (
+    "on_prompt_submit",
+    "on_turn_end",
+    "on_pre_tool",
+    "on_post_tool",
+)
+
+
+def inert_command_hooks(
+    hooks_config: Optional[Mapping[str, list[dict]]],
+) -> tuple[str, ...]:
+    """Declared command-hook events that no dispatcher will ever run, sorted.
+
+    An ecosystem defines the event, this runtime translates and stores it, and
+    nothing fires it: the plugin installs, the manifest validates, and the command
+    never runs.  That is the silent kind of unsupported -- so the names are
+    produced here, where a caller can report them, instead of only being known to a
+    test.
+    """
+    return tuple(
+        sorted(
+            str(event)
+            for event, entries in (hooks_config or {}).items()
+            if str(event) not in COMMAND_HOOK_EVENTS
+            and any(
+                str((entry or {}).get("command") or "").strip()
+                for entry in (entries or ())
+            )
+        )
+    )
+
+
+def _plugin_hook_config(
+    plugin_dir: Path, meta: Optional[PluginMeta] = None
+) -> dict[str, list[dict]]:
+    """Every command hook a plugin declares: the manifest's, plus each default hooks file.
+
+    One function because two readers need the same answer -- the activation report
+    and the installer's approval message -- and a ``hooks/hooks.json`` that only one
+    of them read would be the silent promise this exists to surface.
+    """
+    config: dict[str, list[dict]] = {}
+    for event, entries in ((meta.hooks_config if meta is not None else None) or {}).items():
+        config.setdefault(str(event), []).extend(entries)
+    for event, entries in _read_default_hooks_json(plugin_dir).items():
+        config.setdefault(str(event), []).extend(entries)
+    return config
+
+
+def plugin_inert_hooks(plugin_dir: Path) -> tuple[str, ...]:
+    """Command-hook events this plugin *directory* declares that nothing will run.
+
+    Read from the directory rather than from a mounted plugin: the installer needs
+    the answer before anything is loaded, and for a plugin that may never be.  It
+    reads the same two sources the loader does -- the manifest and the format's
+    default hooks file -- because a plugin whose hooks live in the file is exactly
+    the case the installer used to miss.
+    """
+    return inert_command_hooks(_plugin_hook_config(plugin_dir, _read_plugin_json(plugin_dir)))
+
+
 def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
     """Read a plugin manifest.  Returns None when no format has one here.
 
@@ -1018,6 +1087,17 @@ class _CatalogPlugin:
         # reads a removed plugin's hooks -- the catalog looks them up by name.
         for event_name, entries in _read_default_hooks_json(plugin_dir).items():
             meta.hooks_config.setdefault(event_name, []).extend(entries)
+        # Reported *after* the merge above, because a plugin's hooks live in two
+        # places and the file is the one the manifest never mentions -- reporting
+        # before it would have said "nothing dead" for exactly the plugins whose
+        # hooks are all in ``hooks/hooks.json`` (measured while writing this test).
+        inert = inert_command_hooks(meta.hooks_config)
+        if inert:
+            shown = ", ".join(inert[:4]) + ("…" if len(inert) > 4 else "")
+            shared.CONSOLE.print(
+                f"[dim]Plugin '{self.name}': {len(inert)} hook event(s) have no "
+                f"dispatcher in this runtime and will not run: {shown}[/dim]"
+            )
         if meta.hooks_config:
             # The only thing the tool bridge is for.  See `_ensure_event_bridge`.
             self._catalog._ensure_event_bridge()

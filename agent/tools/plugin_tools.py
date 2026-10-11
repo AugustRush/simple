@@ -110,6 +110,17 @@ def _canonicalize_plugin_source(source: str) -> str:
     return source
 
 
+def _inert_hooks_note(events: tuple[str, ...]) -> str:
+    """How to say "these declared hooks will never run" in one clause."""
+    if not events:
+        return ""
+    shown = ", ".join(events[:4]) + ("…" if len(events) > 4 else "")
+    return (
+        f"{len(events)} declared hook event(s) have no dispatcher in this runtime "
+        f"and will not run ({shown})"
+    )
+
+
 def _plugin_executable_content(target: Path) -> str:
     """Describe executable content a plugin ships ("" = declarative only).
 
@@ -345,8 +356,20 @@ class PluginTools:
                     }
                 )
 
+            # Hooks this runtime has no dispatcher for are *not* a reason to refuse an
+            # install -- nothing runs -- but they are a reason not to let the operator
+            # believe they will work.  Asked of the installed directory, before it is
+            # loaded, because that is the moment somebody is deciding.
+            from agent.plugins.catalog import plugin_inert_hooks
+
+            inert_hooks = plugin_inert_hooks(target)
+
             # Executable plugins are arbitrary code: ask the human first.
             executable_reason = _plugin_executable_content(target)
+            if executable_reason:
+                inert_note = _inert_hooks_note(inert_hooks)
+                if inert_note:
+                    executable_reason = f"{executable_reason}; {inert_note}"
             if executable_reason:
                 scope = self.authorization_scope()
                 approved, needs_pending = await self.confirm_plugin_install(
@@ -418,11 +441,16 @@ class PluginTools:
             "name": name,
             "replaced": backup is not None,
             "reload": reload_result,
+            # Reported on the success path too: a plugin that needed no approval
+            # because it ships no code can still declare hooks nothing will run, and
+            # the caller has no other way to learn that.
+            "inert_hooks": list(inert_hooks),
             "summary_text": (
                 f"{'Replaced' if backup is not None else 'Installed'} plugin "
                 f"'{name}' from {source}. "
                 f"Added: {', '.join(reload_result.get('added_plugins', [])) or 'none'}; "
                 f"connected MCP: {', '.join(reload_result.get('newly_connected_mcp', [])) or 'none'}."
+                + (f" Note: {_inert_hooks_note(inert_hooks)}." if inert_hooks else "")
             ),
         }
 
