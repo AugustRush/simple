@@ -271,6 +271,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         owners=(
             "agent/channels/registry_plugin.py",
         ),
+        contract="agent/channels/protocols.py:ChannelRegistryService",
         consumers=(
             "agent/channels/plugin.py",  # the built-in channels contribute to it
             "agent/bootstrap.py",  # the no-composition builder reads what they added

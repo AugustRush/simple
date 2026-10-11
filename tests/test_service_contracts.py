@@ -45,6 +45,13 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "mcp_client",
     ),
     (
+        "agent.channels.registry",
+        "ChannelRegistry",
+        "agent.channels.protocols",
+        "ChannelRegistryService",
+        "channels",
+    ),
+    (
         "agent.tools.runtime",
         "ToolRegistry",
         "agent.tools.protocols",
