@@ -44,6 +44,20 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "MCPClientService",
         "mcp_client",
     ),
+    (
+        "agent.skills.catalog",
+        "SkillCatalog",
+        "agent.skills.protocols",
+        "SkillCatalogService",
+        "skill_catalog",
+    ),
+    (
+        "agent.core.agent",
+        "BaseAgent",
+        "agent.core.protocols",
+        "AgentService",
+        "agent",
+    ),
 )
 
 #: Contracts checked by another file, so the map below can still insist that every
@@ -66,15 +80,25 @@ def _implementation(module_name: str, class_name: str) -> type:
     return getattr(importlib.import_module(module_name), class_name)
 
 
-def _consumer_sources(service: str) -> str:
-    """The text of every module the ledger names as a consumer of *service*."""
-    from agent.runtime.core_services import entry_for
+def _call_site_sources(implementation_module: str) -> str:
+    """Every module that could call the service, except the implementation itself.
 
+    The whole tree rather than the ledger's consumer list: that list is built from
+    *container reads* (``resolve``/``ctx.get``/...), so a module that receives the
+    service as a **parameter** -- ``agent/config.py`` taking ``skill_catalog`` -- is
+    invisible to it.  Scanning for callers is the weaker claim (a same-named method on
+    another object counts), which is the safe direction for "does this member have a
+    caller at all"; the ledger keeps the stronger, narrower claim about *who reads the
+    service*.
+    """
     chunks: list[str] = []
-    for relative in entry_for(service).consumers:
-        path = REPO_ROOT / relative
-        if path.is_file():
-            chunks.append(path.read_text(encoding="utf-8"))
+    for path in sorted((REPO_ROOT / "agent").rglob("*.py")):
+        relative = path.relative_to(REPO_ROOT)
+        if "__pycache__" in str(relative):
+            continue
+        if str(relative) == f"{implementation_module.replace('.', '/')}.py":
+            continue
+        chunks.append(path.read_text(encoding="utf-8"))
     return "\n".join(chunks)
 
 
@@ -91,15 +115,11 @@ def test_every_declared_member_has_a_caller(row) -> None:
     """A member nobody calls is a guess, and the ledger names the callers.
 
     A protocol derived from call sites must not grow a member "for completeness": the
-    surface this exercise exists to shrink is exactly that.  Reading the *declared
-    consumers* rather than the whole tree also keeps the two tables honest about each
-    other -- a protocol member the ledger's consumers never touch means one of the two
-    is describing something that is not there.
+    surface this exercise exists to shrink is exactly that.
     """
-    _module, _class, protocol_module, protocol_name, service = row
+    module_name, _class, protocol_module, protocol_name, _service = row
     protocol = _protocol(protocol_module, protocol_name)
-    sources = _consumer_sources(service)
-    assert sources, f"the ledger names no consumer files for {service}"
+    sources = _call_site_sources(module_name)
 
     unused = [
         name
@@ -107,8 +127,7 @@ def test_every_declared_member_has_a_caller(row) -> None:
         if not re.search(rf"\.{re.escape(name)}\s*\(", sources)
     ]
     assert not unused, (
-        f"{protocol_name} declares members none of {service}'s declared consumers "
-        f"call: {unused}"
+        f"{protocol_name} declares members nothing calls: {unused}"
     )
     attributed = [
         name
@@ -116,7 +135,7 @@ def test_every_declared_member_has_a_caller(row) -> None:
         if not re.search(rf"\.{re.escape(name)}\b", sources)
     ]
     assert not attributed, (
-        f"{protocol_name} declares data no declared consumer reads: {attributed}"
+        f"{protocol_name} declares data nothing reads: {attributed}"
     )
 
 

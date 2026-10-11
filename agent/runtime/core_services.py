@@ -96,6 +96,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",  # loads the skills plugins bundled
             "agent/tools/plugin_tools.py",
         ),
+        contract="agent/skills/protocols.py:SkillCatalogService",
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",
@@ -142,6 +143,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             # rebuild is for -- so `bootstrap` writes this name too.
             "agent/bootstrap.py",
         ),
+        contract="agent/core/protocols.py:AgentService",
         consumers=(
             "agent/bootstrap.py",
             "agent/channels/base.py",

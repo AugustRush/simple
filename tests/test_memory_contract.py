@@ -164,9 +164,15 @@ def _assert_conforms(protocol: Any, implementation: Any, label: str) -> None:
         assert inspect.iscoroutinefunction(actual) == inspect.iscoroutinefunction(member), (
             f"{label}.{name} async-ness differs from the contract"
         )
+    # Data members may be instance attributes (``self.api_format = ...``), which a
+    # class does not carry: read them off the class *and* off its ``__init__``.
+    instance_data = _class_instance_data(cls)
     for name, declared in _protocol_attributes(protocol).items():
-        assert hasattr(implementation, name), f"{label} is missing the {name} attribute"
-        value = getattr(implementation, name)
+        present = hasattr(cls, name) or name in instance_data
+        assert present, f"{label} is missing the {name} attribute"
+        if not hasattr(cls, name):
+            continue
+        value = getattr(cls, name)
         assert value is not None, f"{label}.{name} is None"
         if declared is int or declared == "int":
             assert isinstance(value, int), f"{label}.{name} should be an int"
@@ -300,6 +306,20 @@ def test_no_member_is_declared_without_a_caller(protocol_name: str):
         and not re.search(rf"def {re.escape(name)}\s*\(", text)
     ]
     assert not unused, f"{protocol_name} declares members nobody calls: {unused}"
+
+
+def _class_instance_data(cls: type) -> set[str]:
+    """Data a class's methods assign to ``self`` -- its instance attributes."""
+    import inspect
+
+    try:
+        source_path = Path(inspect.getfile(cls))
+    except (TypeError, OSError):  # pragma: no cover - builtins and C extensions
+        return set()
+    try:
+        return _concrete_data_members(source_path, cls.__name__)
+    except AssertionError:  # pragma: no cover - not defined in that file
+        return set()
 
 
 def _concrete_data_members(path: Path, class_name: str) -> set[str]:
