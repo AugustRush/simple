@@ -131,8 +131,14 @@ def test_gateway_name_wires_agent_home(tmp_path, switched_home, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(cli_module.agent_module, "load_config", lambda: ({}, False))
 
+    class _Channels:
+        def all(self):
+            return []
+
     async def fake_build_components_async(cfg):
-        return {}
+        # The channels come from the composition now (the channel plugins are mounted
+        # with everything else), so a fake composition carries the service.
+        return {"channels": _Channels()}
 
     async def fake_close_components(components):
         return None
@@ -143,7 +149,6 @@ def test_gateway_name_wires_agent_home(tmp_path, switched_home, monkeypatch):
     monkeypatch.setattr(
         cli_module.agent_module, "_close_components", fake_close_components
     )
-    monkeypatch.setattr(cli_module, "_build_gateway_channels", lambda cfg: [])
 
     cli_module.gateway(name="prod")
 

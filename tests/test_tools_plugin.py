@@ -139,10 +139,14 @@ def test_bootstrap_hands_it_its_own_module_level_name() -> None:
         and node.func.id == "CoreContext"
     ]
     assert contexts, "the composition root must build a CoreContext for the declaration"
-    passed = {
-        kw.arg: kw.value
-        for kw in contexts[0].keywords
-        if isinstance(kw.value, ast.Name)
-    }
-    assert passed.get("tools_class") is not None
-    assert passed["tools_class"].id == "builtin_tools_cls"
+    # Every CoreContext the root builds, not the first: the no-composition channel
+    # builder builds one too, and its plugins need nothing.
+    handovers = [
+        {kw.arg: kw.value for kw in node.keywords if isinstance(kw.value, ast.Name)}
+        for node in contexts
+    ]
+    tool_handovers = [
+        call.get("tools_class") for call in handovers if call.get("tools_class")
+    ]
+    assert tool_handovers, "the tool class must be handed over"
+    assert all(handover.id == "builtin_tools_cls" for handover in tool_handovers)

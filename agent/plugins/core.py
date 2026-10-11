@@ -72,6 +72,24 @@ class CorePlugin:
         return self.factory(context)
 
 
+def _channels(_: CoreContext) -> Any:
+    from agent.channels.registry_plugin import ChannelsPlugin
+
+    return ChannelsPlugin()
+
+
+def _web_channel(_: CoreContext) -> Any:
+    from agent.channels.plugin import WebChannelPlugin
+
+    return WebChannelPlugin()
+
+
+def _feishu_channel(_: CoreContext) -> Any:
+    from agent.channels.plugin import FeishuChannelPlugin
+
+    return FeishuChannelPlugin()
+
+
 def _registry(_: CoreContext) -> Any:
     from agent.tools.registry_plugin import RegistryPlugin
 
@@ -146,6 +164,25 @@ def _agent_loop(_: CoreContext) -> Any:
 
 #: Ordered for a reader; the kernel resolves the dependencies, in any order (measured).
 CORE_PLUGINS: tuple[CorePlugin, ...] = (
+    CorePlugin(
+        name="channels",
+        summary=(
+            "the channel registry; provides `channels`, which the web and Feishu "
+            "plugins (and a third party's) contribute to"
+        ),
+        factory=_channels,
+        provides=("channels",),
+    ),
+    CorePlugin(
+        name="channel.web",
+        summary="the web channel; contributes when `channels.web.enabled` is set",
+        factory=_web_channel,
+    ),
+    CorePlugin(
+        name="channel.feishu",
+        summary="the Feishu channel; contributes when `channels.feishu.enabled` is set",
+        factory=_feishu_channel,
+    ),
     CorePlugin(
         name="registry",
         summary=(

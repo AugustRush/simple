@@ -32,7 +32,6 @@ from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.core import CoreContext, core_plugins
 from agent.plugins.catalog import PluginCatalog
-from agent.channels.registry import ChannelRegistry
 from agent.memory.plugin import MemoryPlugin
 from agent.core.agent_plugin import AgentPlugin
 from agent.tools.plugin import ToolsPlugin
@@ -92,36 +91,31 @@ def _reserve_input_context(
 
 
 def build_gateway_channels(cfg: dict) -> list[Channel]:
-    """Every channel a configuration enables, collected from the channel plugins.
+    """The channels a config runs, for a caller that has **no composition**.
 
-    This used to hold a branch per channel -- read the section, import the class, filter
-    the config against its dataclass, construct, repeat.  Two channels meant two
-    branches, and the reason that mattered is not the line count: **a plugin could not
-    contribute a channel at all**, so a third party's transport had to be added here.
+    The runtime path is the ``channels`` service: ``cli.gateway`` builds the
+    composition and reads what the channel plugins contributed to it, which is what
+    puts them in the same tree as everything else (a profile can disable or replace
+    one, and the catalog can answer ``who_provides("channels")``).
 
-    Now every channel is a plugin registering on the ``channels`` service, the built-ins
-    included, and this is the composition that mounts them.  A channel whose dependency
-    is missing reports and is skipped rather than aborting startup, which is the one
-    behaviour of the old branches that was worth keeping -- see
-    :mod:`agent.channels.plugin`.
-
-    The host is local to this call: the gateway's channels are built once, per process,
-    and a registry that outlived the call would keep transports the process is not
-    running.
+    This function exists for callers that want the channels *without* a runtime --
+    tests, and anything that only needs the transports -- and it mounts the very same
+    plugins on a host of its own, named by :func:`core_plugins` rather than listed
+    again here.  A second tree with its own list is what this used to be; a second
+    tree that composes the same declarations is a convenience, and the docstring says
+    so rather than leaving a reader to discover it.
     """
-    from agent.channels.plugin import FeishuChannelPlugin, WebChannelPlugin
-    from agent.channels.registry import ChannelRegistry
     from agent.kernel.plugin import PluginHost
+    from agent.plugins.core import CoreContext, core_plugins
 
-    registry = ChannelRegistry()
     host = PluginHost()
     host.services.provide("cfg", cfg)
-    host.services.provide("channels", registry)
-    # Unconditionally: each contributes nothing unless its section says `enabled`, so the
-    # switch stays in the config rather than moving back into this function.
-    for plugin in (WebChannelPlugin(), FeishuChannelPlugin()):
-        host.load(plugin)
-    return list(registry.all())
+    for entry in core_plugins(enabled=("channels", "channel.web", "channel.feishu")):
+        host.load(entry.build(CoreContext()))
+    # The registry the ``channels`` plugin provided, not one built here: building it
+    # here is exactly the duplication this function used to be.
+    registry = host.services.get("channels")
+    return list(registry.all()) if registry is not None else []
 
 
 def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
@@ -629,11 +623,10 @@ async def _build_components_async(
     # That ordering was also what blocked `memory` from becoming a plugin: this line used
     # the memory object, and it sits above the catalog.  See the status document.
 
-    # The channels a composition runs.  Provided so a plugin can contribute one -- a
-    # tool, a command, a role, an MCP config and a skill root were all contributable and
-    # a channel was not, because the gateway's set was a branch per built-in in this
-    # file.  See `agent/channels/registry.py`.
-    _partial_components["channels"] = ChannelRegistry()
+    # The channels a composition runs are provided by the ``channels`` plugin now, so
+    # that a channel is an ordinary contribution *in the main tree*: the registry used to
+    # be built here, which put the channel plugins in a tree of their own where no profile
+    # could reach them.  See `agent/channels/registry_plugin.py`.
 
     # The named way to build a runtime, for anything inside a composition that needs one.
     # Six call sites already reach ``agent._build_components_async``; five of them are

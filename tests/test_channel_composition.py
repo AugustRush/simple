@@ -38,6 +38,10 @@ _BUILDER_MODULE = "agent/channels/plugin.py"
 #: The composition point, which the builder above is reached through.
 _COMPOSITION_MODULE = "agent/bootstrap.py"
 
+#: Where a composition says what it mounts.  The channel plugins are named here now,
+#: beside every other plugin, rather than imported by the composition root.
+_DECLARATION_MODULE = "agent/plugins/core.py"
+
 
 def _call_sites(source: str) -> list[str]:
     """Names constructed via ``ClassName(...)`` in *source*, ignoring strings."""
@@ -104,20 +108,110 @@ def test_the_composition_mounts_a_channel_plugin() -> None:
 
     A guard that only forbids construction elsewhere passes just as well when nothing
     constructs a channel at all, which is why the two are asserted together.
+
+    The channel plugins are named by the **core-plugin declaration** now, not by the
+    composition root: they are plugins like every other one, so the list of what a
+    composition mounts is one table (``agent/plugins/core.py``) and
+    ``build_gateway_channels`` composes *that* rather than importing the classes.  This
+    check follows the knowledge to its new home instead of being relaxed.
     """
-    source = (REPO_ROOT / _COMPOSITION_MODULE).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    mounted = {
+    declarations = (REPO_ROOT / _DECLARATION_MODULE).read_text(encoding="utf-8")
+    declared = {
         alias.name
-        for node in ast.walk(tree)
+        for node in ast.walk(ast.parse(declarations))
         if isinstance(node, ast.ImportFrom) and node.module == "agent.channels.plugin"
         for alias in node.names
     }
-    assert {"WebChannelPlugin", "FeishuChannelPlugin"} <= mounted, (
-        "build_gateway_channels must mount the channel plugins; found "
-        f"{sorted(mounted)}"
+    assert {"WebChannelPlugin", "FeishuChannelPlugin"} <= declared, (
+        "the core-plugin declaration must name the channel plugins; found "
+        f"{sorted(declared)}"
     )
-    assert "ChannelRegistry" in source, "and read the registry they contribute to"
+
+    source = (REPO_ROOT / _COMPOSITION_MODULE).read_text(encoding="utf-8")
+    assert "core_plugins(" in source, "the builder composes the declaration"
+    assert "ChannelsPlugin" not in source, (
+        "and does not name the registry plugin itself: providing `channels` is the "
+        "declaration's job too"
+    )
+
+
+def test_a_third_party_channel_is_an_ordinary_plugin(tmp_path) -> None:
+    """The claim the registry exists for, now true in the *main* tree.
+
+    A channel contributed by a plugin the catalog discovered, mounted into the same
+    composition as everything else: it can ``inject`` the capability service, and its
+    registration unwinds with it.  On the old local host the registration could not
+    unwind at all -- nothing disposed that host.
+    """
+    import textwrap
+
+    from agent import PluginCatalog
+    from agent.channels.registry_plugin import ChannelsPlugin
+
+    plugin_dir = tmp_path / "acme-channel"
+    plugin_dir.mkdir()
+    # A manifest, because a directory with only ``__init__.py`` is treated as a
+    # *container* of plugins rather than one -- the loader's rule, not this test's.
+    (plugin_dir / "plugin.json").write_text(
+        '{"name": "acme-channel"}', encoding="utf-8"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        textwrap.dedent(
+            """
+            class Channel:
+                name = "acme"
+
+                async def start(self, handler):
+                    return None
+
+                async def stop(self):
+                    return None
+
+                def create_sink(self, msg):
+                    return None
+
+
+            def register():
+                class AcmeChannel:
+                    name = "acme-channel"
+                    inject = ("channels",)
+
+                    def setup(self, ctx):
+                        # The scoped view owns attribution and the undo; this is the
+                        # whole contribution a channel plugin makes.
+                        ctx.channels.add(Channel())
+
+                return AcmeChannel()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=plugin_dir)
+    catalog.mount(ChannelsPlugin())
+    loaded = catalog.discover_and_load()
+    assert loaded == ["acme-channel"]
+
+    registry = catalog.resolve_service("channels")
+    assert [channel.name for channel in registry.all()] == ["acme"]
+
+    catalog.unload_plugin("acme-channel")
+    assert list(registry.all()) == [], "an unwound contribution takes its channel back"
+
+
+def test_a_profile_can_drop_or_replace_the_channels() -> None:
+    """Which channels run is composition, so a profile decides it."""
+    from agent.plugins.core import core_plugins
+
+    only_registry = [plugin.name for plugin in core_plugins(enabled=("channels",))]
+    assert only_registry == ["channels"], "the built-in channels are selectable"
+
+    replaced = [
+        plugin.name
+        for plugin in core_plugins(replacements={"channels": "acme.channels"})
+    ]
+    assert "channels" not in replaced, "the registry plugin it displaces goes"
+    assert "channel.web" in replaced, "the contributors stay; they pend on the provider"
 
 
 def test_the_switch_reads_the_config_section() -> None:

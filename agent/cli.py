@@ -82,7 +82,6 @@ SkillCatalog = agent_module.SkillCatalog
 StagingBuffer = agent_module.StagingBuffer
 TriggerSpec = agent_module.TriggerSpec
 enqueue_orphan_staging_recovery = agent_module.enqueue_orphan_staging_recovery
-_build_gateway_channels = agent_module._build_gateway_channels
 
 app = typer.Typer(
     name="agent",
@@ -1179,7 +1178,10 @@ def gateway(
         scheduler_task: Optional[asyncio.Task] = None
         scheduler_store = None
         try:
-            channels = _build_gateway_channels(gateway_cfg)
+            # From the composition, not from a tree of its own: the channel plugins
+            # are mounted with everything else now, so a profile can disable or
+            # replace one and a plugin can inject `channels`.
+            channels = list(require_service(components, "channels").all())
             if not channels:
                 shared.CONSOLE.print(_gateway_channel_guidance(gateway_cfg))
                 return

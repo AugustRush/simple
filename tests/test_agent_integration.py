@@ -7643,6 +7643,21 @@ def test_chat_sends_the_line_through_the_command_coordinator(monkeypatch):
     assert handled == ["/demo:thing"]
 
 
+def _install_fake_channels(components: dict, channels=("feishu",)) -> None:
+    """Give a hand-built composition the `channels` service the gateway reads."""
+    components["channels"] = _FakeChannelService(channels)
+
+
+class _FakeChannelService:
+    """The `channels` service the gateway reads from the composition."""
+
+    def __init__(self, channels=("feishu",)):
+        self._channels = list(channels)
+
+    def all(self):
+        return list(self._channels)
+
+
 def test_gateway_starts_background_scheduler(monkeypatch):
     import agent.cli as cli_module
     import agent.scheduler.build as scheduler_build
@@ -7674,6 +7689,7 @@ def test_gateway_starts_background_scheduler(monkeypatch):
 
     async def fake_build_components_async(cfg):
         components = {"agent": object()}
+        components["channels"] = _FakeChannelService()
         components["plugin_catalog"] = _MountingCatalog(components, _FakeService())
         return components
 
@@ -7705,7 +7721,8 @@ def test_gateway_starts_background_scheduler(monkeypatch):
     monkeypatch.setattr(cli_module.agent_module, "_build_components_async", fake_build_components_async)
     monkeypatch.setattr(cli_module.agent_module, "_close_components", fake_close_components)
     monkeypatch.setattr(cli_module, "_build_scheduler_service", fake_build_scheduler_service)
-    monkeypatch.setattr(cli_module, "_build_gateway_channels", lambda cfg: ["feishu"])
+    # No channel monkeypatch: the fake composition above carries the `channels`
+    # service the gateway reads from it now.
     monkeypatch.setattr(cli_module, "ChannelRunner", _FakeRunner)
 
     cli_module.gateway()
@@ -7808,7 +7825,9 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
     )
     monkeypatch.setattr(cli_module.agent_module, "_close_components", fake_close_components)
     monkeypatch.setattr(cli_module, "_build_scheduler_service", fake_build_scheduler_service)
-    monkeypatch.setattr(cli_module, "_build_gateway_channels", lambda cfg: ["feishu"])
+    # The channels come from the composition now; the monkeypatched builder went
+    # with the second tree.
+    _install_fake_channels(primary_components)
     monkeypatch.setattr(cli_module, "ChannelRunner", _FakeRunner)
 
     cli_module.gateway()

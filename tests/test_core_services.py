@@ -271,6 +271,17 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                     # implying it through the choice of dict accessor.  Each takes
                     # the container first, so the key is the argument after it.
                     note(readers, _component_key(node), rel)
+            elif (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in {"ctx", "context"}
+            ):
+                # ``ctx.channels`` -- the kernel resolves an *injected* service by
+                # attribute (``Context.__getattr__``), and for a capability service
+                # that is the idiomatic read: `ctx.tools`, `ctx.channels`.  Without
+                # this rule the ledger could not name a single consumer of one.
+                note(readers, node.attr, rel)
             elif isinstance(node, ast.Subscript):
                 # Two exclusions, both learned from false positives:
                 #
@@ -581,6 +592,7 @@ def test_declared_names_match_the_documented_set() -> None:
     assert set(core_service_names()) == {
         "agent",
         "agent_core",
+        "channels",
         "context_manager",
         "ltm_store",
         "mcp_client",
@@ -1638,6 +1650,7 @@ _PLUGIN_PROVIDED: dict[str, str] = {
     "mcp_server_configs": "agent/tools/mcp_plugin.py",
     "mcp_status": "agent/tools/mcp_plugin.py",
     "skill_catalog": "agent/skills/plugin.py",
+    "channels": "agent/channels/registry_plugin.py",
 }
 
 

@@ -107,6 +107,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/plugins/catalog.py",
             "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
+            "agent/scheduler/editing.py",  # reads a bundle to edit one (ctx.skill_catalog)
             "agent/ralph/plugin.py",  # a task may be driven by a skill
         ),
         summary="Loaded skills, and the dirty flag that decides when the prompt is stale.",
@@ -261,6 +262,23 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         ),
         summary="The long-term store behind the context manager.",
         contract="agent/memory/contracts.py:MemoryStore",
+    ),
+    CoreService(
+        name="channels",
+        owners=(
+            "agent/channels/registry_plugin.py",
+        ),
+        consumers=(
+            "agent/channels/plugin.py",  # the built-in channels contribute to it
+            "agent/bootstrap.py",  # the no-composition builder reads what they added
+            "agent/cli.py",  # the gateway runs what it holds
+        ),
+        summary=(
+            "The channel registry: the capability a channel plugin contributes to.  It "
+            "used to be provided on a host of its own (a second plugin tree, which no "
+            "profile could touch); providing it from a plugin is what makes a channel "
+            "an ordinary contribution."
+        ),
     ),
     CoreService(
         name="mcp_client",
