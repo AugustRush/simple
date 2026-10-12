@@ -1,11 +1,12 @@
 # Permissions: from per-command approval to capability grants
 
 **Status:** the gate is rewritten and measured (steps 1-3); one consent store holds all
-four consent kinds with three explicit lifetimes, and the shell gate now reads and writes
-it (step 4).  Two of three surfaces offer "always", and chat can answer several questions
-by number.  What remains is making a shell answer generalise (`program:`/`path:` rules),
-`/trust`, the write boundary, and the `why` line on every card — itemised at the end of
-this document with what each one is worth.
+four consent kinds with three explicit lifetimes, and the shell gate reads and writes it
+(step 4); and a "yes" now remembers the **capability** the question proposed rather than the
+command line (step 5) — measured, answering each of the corpus's questions once for the
+project turns 7 prompts into 0, with no leak into another project.  What remains is `/trust`
+to show and revoke what was granted, the sandbox half of the write boundary, the browser's
+fourth button, and the `why` line on every card — itemised at the end of this document.
 
 Everything in "What I measured" was produced by a probe against the code in this repo
 ([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
@@ -333,15 +334,26 @@ two questions from different kinds in one store do not get counted as each other
 ambiguity).  The store's own state is instance state — five containers on one object rather
 than five module names — which is recorded in `agent/runtime/state_ledger.py` as a decision.
 
-`always` is the part that removes the long tail, and it is now *reachable* for installs and
-activations, which could not say "always" at all before.  Precedent for the on-disk half
-exists in both places it matters: `user_tools.APPROVALS_FILENAME` (`.approved.json`, a
-digest of what was approved) and the config-level `shell_allowed_commands`.  What is still
-*mine to finish* is the generalisation: the rule a shell answer records is currently the
-exact command, so `program:npm` and `path:/Users/me/code` — the two rules that would make a
-shell answer cover the next spelling — are expressible and not yet written.  That is the
-next step's job, because it is also what the card's third answer needs in order to mean
-"this project" rather than "this line".
+`always` is the part that removes the long tail, and it is now reachable *and general*: an
+`always` answer remembers the rule the gate proposed when it asked, which is the narrowest
+rule that would have prevented the question.  The rule differs by reason, because the reason
+is what makes one rule right and another too broad:
+
+| why it asked | what "always, for this project" remembers |
+|---|---|
+| a write outside the workspace | `path:<the resolved target>` — the question was *this place* |
+| an environment mutation (`pip install …`) | `program:<argv0>` — the next install is a different line of the same intent |
+| anything else (unreadable code, an irreversible git command, a pipe into an interpreter, a named destructive command) | `command:<the exact line>` — broader would grant code that was never read |
+
+The gate decides this (`ShellCheckResult.approval_rule`) because it is the only place that
+knows *why*; the pending record carries the rule and the workspace, so no surface has to know
+either in order to offer the answer; and a prompt asked without a workspace cannot offer it at
+all, because "this project" with no project would be a grant in the global bucket — a
+different and much wider promise.
+
+Measured: the 58-command corpus raises 7 questions at the default level, those answers need
+**6 distinct rules**, and re-running the corpus afterwards asks **0** times — while another
+project still asks the same 7 (`scripts/permission_prompt_probe.py`).
 
 Revocation is one command — `/trust` lists rules and revokes one — which is what
 "consent that can be granted but never taken back is not consent" demands, and what today
@@ -449,11 +461,11 @@ Measured where the work is done; predicted where it is not.
 |---|---|---|---|
 | prompts on the corpus at the default | 11 (19%) | **7 (12%)** | — |
 | hazards unasked at the default | 11 of 19 | **1 of 19** | — |
-| prompts after one `always` per program | 11 | 7 | ~0 (the `program:` rule + the card) |
+| prompts after answering each once for the project | 11 | **0** (6 rules) | — |
 | levels a user must understand | 4 (1 real) | **4 (3 real)** | — (collapse withdrawn) |
 | slash commands for consent | 5 | 5 | 2 (`/trust`) |
 | consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** (the store, plus `user_tools`' digest ledger and the config allowlist, both documented) | — |
-| surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser) | chat has numbered replies but no "always" |
+| surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser backend) | the browser's fourth button; chat has numbered replies but no "always" |
 | consent lifetime | 5 min, RAM | **once / session / always** | — |
 
 ## Decisions taken
@@ -501,24 +513,23 @@ Measured where the work is done; predicted where it is not.
    (installs and activations previously could not answer it at all).  30 tests in
    `tests/test_consent_store.py` pin the lifetimes, the persistence, the ambiguity policy,
    the kind isolation and the two resets that must *not* touch a workspace's grants.
-5. ⏳ **Make a shell answer generalise**, then **collapse the write boundary to the
-   workspace** with grants feeding `write_scope`.  The store can already hold
-   `program:`/`path:` rules; what is missing is that the gate reads them and that the card
-   offers them.  This is the one remaining item that removes *prompts* rather than
-   duplication: one answer is what turns "asked again on the next spelling" into "asked
-   once for this project".  The boundary half is the same change seen from the sandbox's
-   side — the gate already asks about out-of-boundary writes, so today the prompt is the
-   enforcement rather than a rule behind it.
-6. ⏳ **One card.**  Two of three surfaces done: the browser always had three answers, the
-   terminal gained the third, chat gained a numbered reply plus a refusal.  Still missing:
-   `why` on every card (the browser shows a reason string, the terminal a risk level), the
-   project-wide answer, and `memory_clear` minting a pending record so it is answerable
-   off-terminal.
-7. ⏳ **`/trust`**, and the old commands as aliases.  Not started; it is what makes a
-   remembered answer visible and revocable from one place, and the reason `always` should
-   not ship on the shell side without it — consent that can be granted but not taken back
-   is not consent.  `revoke_scope` and the store's `revoke` already give it everything it
-   needs.
+5. ✅ **Make a shell answer generalise** (`ShellCheckResult.approval_rule`, `_project_grant`,
+   the `workspace` parameter, the store's `always_rule`/`workspace` on a pending record).
+   Answering once for the project now covers the next spelling, the next install of the same
+   program and the next file under a granted place, and it stays inside that project.
+   ⏳ Remaining beside it: **collapse the sandbox's write boundary to the workspace** and feed
+   remembered `path:` grants into `write_scope`.  The gate already asks about out-of-boundary
+   writes, so the behaviour is right; what is missing is that the sandbox still permits them,
+   which leaves the prompt as the enforcement rather than a rule behind it.
+6. ⏳ **One card.**  The terminal has four answers, the browser backend advertises and honours
+   `allow_project`, and chat gained a numbered reply plus a refusal.  Still missing: the
+   browser's fourth *button* (a frontend change plus a rebuild; the backend needs nothing
+   more), `why` on every card, and `memory_clear` minting a pending record so it is
+   answerable off-terminal.
+7. ⏳ **`/trust`**, and the old commands as aliases.  Not started, and now the most valuable
+   remaining item: `always` is reachable and persistent, so the surface that shows and revokes
+   what was granted is the thing that makes it honest — consent that can be granted but not
+   taken back is not consent.  `revoke_scope`, `revoke` and `remembered(workspace=…)` already
+   give it everything it needs.
 
-Steps 1-4 are done.  Step 5 is the next highest-value item, because it is the one that
-converts the answers that are still given into grants that are not asked again.
+Steps 1-5 are done.  `/trust` is next, then the sandbox half of the write boundary.
