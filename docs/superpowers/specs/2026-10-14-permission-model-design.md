@@ -6,11 +6,12 @@ four consent kinds with three explicit lifetimes, and the shell gate reads and w
 command line (step 5) — measured, answering each of the corpus's questions once for the
 project turns 7 prompts into 0, with no leak into another project; `/trust` shows and
 revokes what was granted, including the config-level list that no card ever mentioned
-(step 7); and every card names the grant it offers and why it is asking, while
-`memory_clear` is answerable from a chat channel instead of impossible there (step 6).
-What remains is the browser's fourth button and the sandbox half of the write boundary,
-plus aliasing the old consent commands — itemised at the end of this document, with the one
-item this host cannot verify called out.
+(step 7); and all three surfaces offer the same answers, name the grant they offer and say
+why they are asking, while `memory_clear` is answerable from a chat channel instead of
+impossible there (step 6).  Steps 1-7 are done.  Two things remain, and both are
+judgements rather than omissions: the sandbox half of the write boundary, which this host
+cannot verify, and folding the legacy `/allow` config list into the store, whose
+*visibility* problem `/trust` has already fixed.  Both are itemised at the end.
 
 Everything in "What I measured" was produced by a probe against the code in this repo
 ([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
@@ -469,7 +470,8 @@ Measured where the work is done; predicted where it is not.
 | levels a user must understand | 4 (1 real) | **4 (3 real)** | — (collapse withdrawn) |
 | slash commands for consent | 5 | **6** (`/trust` added; the 4 old ones still work) | aliasing the old four onto the store |
 | consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** (the store, plus `user_tools`' digest ledger and the config allowlist, both documented) | — |
-| surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser backend) | the browser's fourth button; chat has numbered replies but no "always" |
+| surfaces that can grant "always" | 1 of 3 | **2 of 3** (terminal, browser) | chat deliberately cannot — a bare phrase is the weakest channel and "always" is durable |
+| surfaces that can answer every consent kind | 2 of 4 kinds | **4 of 4 kinds on all three** | — |
 | consent kinds answerable off-terminal | 3 of 4 | **4 of 4** (`memory_clear` gained a pending record) | — |
 | cards that say *why* they are asking | 2 of 3 | **3 of 3** (the reason travels on the record) | — |
 | places a standing permission could hide | 4 | **1** (`/trust`, which lists the config allowlist too) | — |
@@ -528,28 +530,38 @@ Measured where the work is done; predicted where it is not.
    remembered `path:` grants into `write_scope`.  The gate already asks about out-of-boundary
    writes, so the behaviour is right; what is missing is that the sandbox still permits them,
    which leaves the prompt as the enforcement rather than a rule behind it.
-6. ⏳ **One card.**  The terminal has four answers and prints the rule each wider answer
-   would remember ("本项目总是允许（记住：这个程序的所有调用：pip）"); the browser backend
-   advertises and honours `allow_project`, carrying `project_rule` and its rendered label;
-   chat gained a numbered reply, a refusal, and memory clears; and every question now
-   carries its **reason** on the record, so the chat list — the only card a chat user ever
-   sees — says why each one is being asked rather than just what would run.  Still missing:
-   the browser's fourth *button* (a frontend change plus a rebuild; the backend needs
-   nothing more).
+6. ✅ **One card.**  All three surfaces now offer the same answers.  The terminal has four
+   answers and prints the rule each wider answer would remember ("本项目总是允许（记住：这个
+   程序的所有调用：pip）"); the browser has the fourth **button** (shipped in the built
+   bundle, with the rule as its tooltip and deliberately *no* keyboard chord — a mistyped
+   modifier should not grant something durable and project-wide); chat gained a numbered
+   reply, a refusal, and memory clears; and every question carries its **reason** on the
+   record, so the chat list — the only card a chat user ever sees — says why each one is
+   being asked rather than just what would run.
 7. ✅ **`/trust`**, and the old commands as aliases.  `/trust` lists both lifetimes, names
    the *kind* of each grant, revokes by number or wholesale, honours both scope and
    workspace so revoking "pip here" cannot drop it for another project or user, and also
    lists the **config-level** `shell_allowed_commands` as a separate, unnumbered section —
    that list pre-approves commands outside any consent record and nothing in the UI used to
    mention it.  The old commands still work and are now the legacy spelling of the same
-   intent; aliasing them onto the store is the small remaining cleanup, not a capability
-   gap.
+   intent; folding them into the store is the remaining cleanup below, not a capability gap.
 
-Steps 1-5 and 7 are done, and 6 is done on every surface whose change is backend-only.  The
-next item is the sandbox half of the write boundary — with one honest caveat, recorded here
-so the decision is visible rather than implied: **it cannot be verified on this host.**
-`sandbox-exec` is unavailable, so all thirteen `tests/test_sandbox_conformance.py` cases
-(and `test_shell_allows_output_dir_writes`) are pre-existing failures on this machine —
-which means a change to the boundary would land with its enforcement untested.  It should be
-done on a host that can run the sandbox, and the tool-state list audited first, so that
-"writes are confined to the workspace" does not break a tool whose cache lives elsewhere.
+Steps 1-7 are done.  Two items remain, both recorded as decisions rather than deferred
+work:
+
+* **The sandbox half of the write boundary.**  The gate already asks about writes outside
+  the workspace, so the *behaviour* is right; what is missing is that the sandbox still
+  permits them, which leaves the prompt as the enforcement rather than a rule behind it.
+  This **cannot be verified on this host**: `sandbox-exec` is unavailable, so all thirteen
+  `tests/test_sandbox_conformance.py` cases (and `test_shell_allows_output_dir_writes`) are
+  pre-existing failures here.  The policy layer is pure Python and would test fine, but the
+  thing that would actually break — a missing write grant making `git` or `pytest` fail on
+  a real machine — is exactly what those thirteen cases exist to catch.  It should be done
+  where the sandbox runs, with the tool-state list audited first so that "writes are
+  confined to the workspace" does not break a tool whose cache lives elsewhere.
+* **Folding `/allow`'s config list into the store.**  `/allow` and `/deny` still write
+  `shell_allowed_commands` in the config file, and the gate's pre-approval bypass reads it.
+  Moving it means the gate consults the store's *global* bucket, migrating existing entries
+  — a change to the one path that bypasses the gate entirely, including at high risk.  Its
+  user-visible defect (a standing permission nobody could see) is already fixed: `/trust`
+  lists it.
