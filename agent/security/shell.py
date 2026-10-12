@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+from agent.security import consent
 
 # ── Risk-level classification ────────────────────────────────────────────────
 #
@@ -429,14 +430,16 @@ def _write_roots(
     return tuple(roots)
 
 # ── Session allowlist ───────────────────────────────────────────────────────
+#
+# The allowlist and the pending confirmations used to live here as two module
+# dictionaries keyed by their own copy of the authorization scope.  Both are now
+# records in ``agent.security.consent``, the one store every consent kind writes
+# to, and the functions below are the shell-facing view of it.  What "until the
+# session goes away" used to be spelled as -- a ``NEVER_EXPIRES`` timestamp in a
+# far-future sentinel -- is a *lifetime* there (``consent.SESSION``), which is
+# also why "always for this workspace" became expressible at all.
 
 CONFIRMATION_TTL = timedelta(minutes=5)
-
-# Sentinel expiry for "always allow this command" approvals.  The allowlist
-# itself is process state keyed by authorization scope, so a far-future
-# timestamp is exactly "until the session goes away" without a second
-# container to keep in sync.
-NEVER_EXPIRES = datetime.max.replace(tzinfo=timezone.utc)
 
 # Permission levels, from most restrictive to least.  ``ask`` is the default:
 # low- and medium-risk commands run without confirmation; only high-risk
@@ -466,15 +469,30 @@ class PendingShellConfirmation:
 
 
 _DEFAULT_SCOPE = ShellAuthorizationScope("default", "cli", "")
-_session_allowlist: dict[tuple[ShellAuthorizationScope, str], datetime] = {}
-_pending_tokens: dict[str, PendingShellConfirmation] = {}
-# Tokens the human approved with "always allow this command".  Redeeming such
-# a token widens the allowlist entry from the pending token's TTL to the whole
-# scope, so the mark has to travel with the token rather than with the reply.
-_pending_session_scope: set[str] = set()
+#: The kind shell questions are registered under in the consent store.  It is
+#: what keeps a shell question out of the install list once both kinds live in
+#: the same store, rather than which module a caller happened to reach for.
+_SHELL_KIND = "shell"
 _session_auto_approve: set[ShellAuthorizationScope] = set()
 _session_permission_levels: dict[ShellAuthorizationScope, str] = {}
 _session_sandbox_modes: dict[ShellAuthorizationScope, str] = {}
+
+
+def _shell_rule(command: str) -> str:
+    """The rule a shell answer is remembered as: the exact normalized command."""
+    return consent.make_rule(consent.COMMAND, _normalize_command(command))
+
+
+def _epoch(now: Optional[datetime]) -> Optional[float]:
+    """A wall-clock stamp for the store, or ``None`` to let it use its own."""
+    if now is None:
+        return None
+    return _authorization_time(now).timestamp()
+
+
+def _stamp(epoch: float) -> datetime:
+    """The inverse of :func:`_epoch`, for the shell-facing pending record."""
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc)
 
 
 def _authorization_scope(
@@ -526,12 +544,24 @@ def shell_session_allowlist_add(
     now: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> None:
-    """Allow one normalized command in one authorization scope until expiry."""
+    """Allow one normalized command in one authorization scope until expiry.
+
+    The entry is written to the shared consent store as a ``once`` answer.  Its
+    expiry is the *question's* own deadline when the caller passes one, so a
+    human who took four minutes to decide gets one minute of approval rather
+    than five.
+    """
     current = _authorization_time(now)
-    expiry = _authorization_time(expires_at) if expires_at else current + CONFIRMATION_TTL
-    _session_allowlist[
-        (_authorization_scope(scope), _normalize_command(command_base))
-    ] = expiry
+    expiry = (
+        _authorization_time(expires_at) if expires_at else current + CONFIRMATION_TTL
+    )
+    consent.SHELL.remember(
+        _shell_rule(command_base),
+        consent.ONCE,
+        scope=_authorization_scope(scope),
+        expires_at=_epoch(expiry),
+        at=_epoch(now),
+    )
 
 
 def shell_session_allowlist_add_persistent(
@@ -546,20 +576,21 @@ def shell_session_allowlist_add_persistent(
     command" instead of the one-off consent that ``shell_command_confirm``
     grants.  Scope, not the command, is what the entry is keyed by, so this
     never leaks across sessions or channels.
+
+    A *session* answer rather than a ``once`` one, which is exactly what the
+    old ``NEVER_EXPIRES`` sentinel meant: the store spells "until this process
+    goes away" as a lifetime instead of as a far-future timestamp.
     """
-    shell_session_allowlist_add(
-        command_base,
-        scope=scope,
-        now=now,
-        expires_at=NEVER_EXPIRES,
+    consent.SHELL.remember(
+        _shell_rule(command_base),
+        consent.SESSION,
+        scope=_authorization_scope(scope),
     )
 
 
 def shell_session_allowlist_clear() -> None:
-    """Clear all entries from the session allowlist."""
-    _session_allowlist.clear()
-    _pending_tokens.clear()
-    _pending_session_scope.clear()
+    """Clear every session answer and open question, in every scope."""
+    consent.SHELL.clear_transient()
     _session_auto_approve.clear()
     _session_permission_levels.clear()
     _session_sandbox_modes.clear()
@@ -649,14 +680,11 @@ def shell_session_allowlist_contains(
     now: datetime | None = None,
 ) -> bool:
     """Check for an unexpired exact command approval in one scope."""
-    key = (_authorization_scope(scope), _normalize_command(command_base))
-    expiry = _session_allowlist.get(key)
-    if expiry is None:
-        return False
-    if expiry <= _authorization_time(now):
-        _session_allowlist.pop(key, None)
-        return False
-    return True
+    return consent.SHELL.approved(
+        _shell_rule(command_base),
+        scope=_authorization_scope(scope),
+        at=_epoch(now),
+    )
 
 
 def shell_session_allowlist_commands(
@@ -669,18 +697,10 @@ def shell_session_allowlist_commands(
     Expired entries are pruned on the way out so the caller never reports an
     approval the next check would reject anyway.
     """
-    resolved = _authorization_scope(scope)
-    current = _authorization_time(now)
-    result: list[tuple[datetime, str]] = []
-    for (entry_scope, command), expiry in list(_session_allowlist.items()):
-        if entry_scope != resolved:
-            continue
-        if expiry <= current:
-            _session_allowlist.pop((entry_scope, command), None)
-            continue
-        result.append((expiry, command))
-    result.sort(key=lambda pair: (pair[0], pair[1]))
-    return [command for _expiry, command in result]
+    rows = consent.SHELL.remembered(
+        scope=_authorization_scope(scope), at=_epoch(now)
+    )
+    return [consent.rule_value(row.rule) for row in rows]
 
 
 def shell_session_allowlist_clear_scope(
@@ -693,12 +713,7 @@ def shell_session_allowlist_clear_scope(
     alone — they are live questions, and revoking past answers must not silently
     answer them.
     """
-    resolved = _authorization_scope(scope)
-    removed = 0
-    for key in [key for key in _session_allowlist if key[0] == resolved]:
-        _session_allowlist.pop(key, None)
-        removed += 1
-    return removed
+    return consent.SHELL.revoke_scope(_authorization_scope(scope))
 
 
 def shell_command_uses_shell_features(command: str) -> bool:
@@ -748,6 +763,17 @@ class ShellCheckResult:
         return not self.allowed
 
 
+def _pending_records(
+    scope: ShellAuthorizationScope, now: datetime | None = None
+) -> list[Any]:
+    """The store's outstanding shell questions for one scope, oldest first."""
+    return [
+        record
+        for record in consent.SHELL.pending(scope, at=_epoch(now))
+        if record.kind == _SHELL_KIND
+    ]
+
+
 def shell_pending_mark_session_scope(
     token: str,
     *,
@@ -761,11 +787,9 @@ def shell_pending_mark_session_scope(
     it the "always allow" answer would decay into the same five-minute
     allowlist entry as a plain approval.
     """
-    stored = _pending_tokens.get(str(token))
-    if stored is None or stored.scope != scope:
+    if consent.SHELL.get(token, scope=scope) is None:
         return False
-    _pending_session_scope.add(str(token))
-    return True
+    return consent.SHELL.note_lifetime(token, consent.SESSION)
 
 
 def shell_command_confirm(
@@ -774,33 +798,14 @@ def shell_command_confirm(
     scope: ShellAuthorizationScope,
     now: datetime | None = None,
 ) -> bool:
-    """Redeem one pending token using trusted request identity."""
-    current = _authorization_time(now)
-    key = str(token)
-    stored = _pending_tokens.get(key)
-    if stored is None or stored.scope != scope or stored.expires_at <= current:
-        if stored is not None and stored.expires_at <= current:
-            _pending_tokens.pop(key, None)
-        _pending_session_scope.discard(key)
-        return False
-    _pending_tokens.pop(key, None)
-    if key in _pending_session_scope:
-        # "Always allow this command": outlive the token that carried the
-        # approval instead of inheriting its five-minute window.
-        _pending_session_scope.discard(key)
-        shell_session_allowlist_add_persistent(
-            stored.command,
-            scope=stored.scope,
-            now=current,
-        )
-        return True
-    shell_session_allowlist_add(
-        stored.command,
-        scope=stored.scope,
-        now=current,
-        expires_at=stored.expires_at,
-    )
-    return True
+    """Redeem one pending token using trusted request identity.
+
+    The answer is recorded at whatever lifetime the human chose -- the store
+    writes it from the record's own ``lifetime`` -- and a plain approval is
+    bounded by the *question's* deadline rather than by this moment.
+    """
+    approved = consent.SHELL.approve(token, scope=scope, at=_epoch(now))
+    return approved is not None
 
 
 def shell_pending_reject(
@@ -811,27 +816,31 @@ def shell_pending_reject(
     """Retire one pending token because the human refused it.
 
     A refusal has to be a terminal state.  Without this the record simply stays
-    pending until its TTL lapses, so a later unrelated approval reply ("yes",
-    "批准") can redeem the very command the human just declined.
+    pending until its TTL lapses, so a later unrelated approval reply ("批准")
+    can redeem the very command the human just declined.
     """
-    stored = _pending_tokens.get(str(token))
-    if stored is None or stored.scope != scope:
-        return False
-    _pending_tokens.pop(str(token), None)
-    _pending_session_scope.discard(str(token))
-    return True
+    return consent.SHELL.reject(token, scope=scope)
 
 
 def shell_pending_for_scope(
     scope: ShellAuthorizationScope,
     now: datetime | None = None,
 ) -> list[PendingShellConfirmation]:
-    """Return unexpired pending confirmations for one authorization scope."""
-    current = _authorization_time(now)
+    """Return unexpired pending confirmations for one authorization scope.
+
+    The store's record is translated into this module's own type because that
+    is what the shell-facing callers hold: ``shell_approve_single_pending``
+    returns ``record.command`` and the web sink keys its waiter on
+    ``confirmation_token``.
+    """
     return [
-        record
-        for token, record in list(_pending_tokens.items())
-        if record.scope == scope and record.expires_at > current
+        PendingShellConfirmation(
+            token=record.token,
+            command=record.what,
+            scope=scope,
+            expires_at=_stamp(record.expires_at),
+        )
+        for record in _pending_records(scope, now)
     ]
 
 
@@ -847,13 +856,13 @@ def shell_approve_single_pending(
     pending, several pending records exist (ambiguous), or redemption
     failed.  Callers must never treat ``None`` as approval.
     """
-    pending = shell_pending_for_scope(scope, now=now)
-    if len(pending) != 1:
+    records = _pending_records(scope, now)
+    if len(records) != 1:
         return None
-    record = pending[0]
-    if shell_command_confirm(record.token, scope=scope, now=now):
-        return record.command
-    return None
+    approved = consent.SHELL.approve(
+        records[0].token, scope=scope, at=_epoch(now)
+    )
+    return approved.what if approved is not None else None
 
 
 def _pending_confirmation(
@@ -863,22 +872,17 @@ def _pending_confirmation(
     now: datetime,
 ) -> str:
     normalized_command = _normalize_command(command)
-    for stale_token, record in list(_pending_tokens.items()):
-        if record.expires_at <= now:
-            _pending_tokens.pop(stale_token, None)
-        elif record.scope == scope and record.command == normalized_command:
-            # Reuse the outstanding approval instead of minting a fresh token
-            # on every retry; otherwise the human's approval could never be
-            # matched to the next identical attempt.
-            return record.token
-    token = str(uuid.uuid4())
-    _pending_tokens[token] = PendingShellConfirmation(
-        token=token,
-        command=normalized_command,
+    return consent.SHELL.ask(
+        kind=_SHELL_KIND,
+        summary=normalized_command,
+        rule=_shell_rule(normalized_command),
         scope=scope,
-        expires_at=now + CONFIRMATION_TTL,
+        at=_epoch(now),
+        # The store's own TTL is the same five minutes; passing the deadline
+        # keeps the shell gate's clock authoritative, which is what its tests
+        # drive.
+        expires_at=_epoch(now + CONFIRMATION_TTL),
     )
-    return token
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────

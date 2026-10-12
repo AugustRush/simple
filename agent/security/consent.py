@@ -139,6 +139,8 @@ class Remembered:
     lifetime: str
     scope_key: str = ""
     workspace: str = ""
+    #: When a ``once`` answer lapses; ``0.0`` for the lifetimes that do not.
+    expires_at: float = 0.0
 
 
 @dataclass
@@ -240,25 +242,42 @@ class ConsentStore:
         *,
         scope: Any = None,
         workspace: Any = None,
+        expires_at: Optional[float] = None,
+        at: Optional[float] = None,
     ) -> None:
-        """Record that *rule* may proceed, at *lifetime*."""
+        """Record that *rule* may proceed, at *lifetime*.
+
+        ``expires_at`` overrides when a ``once`` answer lapses.  The shell gate
+        needs it because its entry is bounded by the *question's* own deadline
+        rather than by the moment of the answer: a human who takes four minutes
+        to decide gets one minute of a once approval, not five.
+        """
         rule = str(rule)
         if lifetime not in LIFETIMES:
             lifetime = ONCE
         if lifetime == ALWAYS:
             key = str(workspace or "")
             self._load(key)
-            self._always[(key, rule)] = self.now()
+            self._always[(key, rule)] = self._now(at)
             self._flush(key)
             return
         key = scope_key(scope)
         if lifetime == SESSION:
             self._session.add((key, rule))
         else:
-            self._once[(key, rule)] = self.now() + PROMPT_TTL_SECONDS
+            self._once[(key, rule)] = (
+                expires_at
+                if expires_at is not None
+                else self._now(at) + PROMPT_TTL_SECONDS
+            )
 
     def lifetime_of(
-        self, rule: str, *, scope: Any = None, workspace: Any = None
+        self,
+        rule: str,
+        *,
+        scope: Any = None,
+        workspace: Any = None,
+        at: Optional[float] = None,
     ) -> str:
         """The longest lifetime currently in force for *rule*, or ``""``.
 
@@ -267,7 +286,7 @@ class ConsentStore:
         weaker one would make an answer look like it lapses when it does not.
         """
         rule = str(rule)
-        self._forget_expired()
+        self._forget_expired(at)
         if workspace is not None:
             stored = str(workspace or "")
             self._load(stored)
@@ -281,11 +300,16 @@ class ConsentStore:
         return ""
 
     def approved(
-        self, rule: str, *, scope: Any = None, workspace: Any = None
+        self,
+        rule: str,
+        *,
+        scope: Any = None,
+        workspace: Any = None,
+        at: Optional[float] = None,
     ) -> bool:
         """True when *rule* may proceed without asking."""
         return bool(
-            self.lifetime_of(rule, scope=scope, workspace=workspace)
+            self.lifetime_of(rule, scope=scope, workspace=workspace, at=at)
         )
 
     def revoke(
@@ -312,33 +336,102 @@ class ConsentStore:
                 self._flush(stored)
         return removed
 
-    def remembered(
-        self, *, scope: Any = None, workspace: Any = None
-    ) -> list[Remembered]:
-        """Everything currently in force, longest-lived first."""
-        self._forget_expired()
-        rows: list[Remembered] = []
+    def revoke_scope(self, scope: Any = None, *, at: Optional[float] = None) -> int:
+        """Drop every expiring/session answer for one scope; return how many.
+
+        This is the escape hatch a "never ask me again" answer needs, and what
+        the web session-revoke endpoint calls.  ``always`` answers are *not*
+        included: they are keyed by workspace rather than by scope, and revoking
+        them belongs to the surface that shows them (``/trust``), not to a
+        session reset that would silently drop the project's whole history of
+        answers.
+        """
+        self._forget_expired(at)
         key = scope_key(scope)
-        for stored, rule in self._always:
+        removed = 0
+        for store in (self._once,):
+            for entry in [entry for entry in store if entry[0] == key]:
+                store.pop(entry, None)
+                removed += 1
+        for entry in [entry for entry in self._session if entry[0] == key]:
+            self._session.discard(entry)
+            removed += 1
+        return removed
+
+    def clear_transient(self) -> None:
+        """Forget every ``once``/``session`` answer and every open question.
+
+        The shell gate's global reset: its answers and its questions, at every
+        scope, without touching what a workspace has been granted.
+        """
+        self._once.clear()
+        self._session.clear()
+        self._pending.clear()
+
+    def remembered(
+        self,
+        *,
+        scope: Any = None,
+        workspace: Any = None,
+        at: Optional[float] = None,
+    ) -> list[Remembered]:
+        """Everything currently in force, shortest-lived first.
+
+        ``always`` rows come last and only when a *workspace* is named: they are
+        not a fact about a scope, and listing one workspace's grants under every
+        session would make a per-project listing wrong everywhere.
+        """
+        self._forget_expired(at)
+        key = scope_key(scope)
+        rows: list[Remembered] = []
+        once = sorted(
+            (
+                (expires_at, rule)
+                for (stored, rule), expires_at in self._once.items()
+                if stored == key
+            ),
+            key=lambda pair: pair,
+        )
+        for expires_at, rule in once:
             rows.append(
-                Remembered(rule=rule, lifetime=ALWAYS, workspace=stored)
+                Remembered(
+                    rule=rule,
+                    lifetime=ONCE,
+                    scope_key=key,
+                    expires_at=expires_at,
+                )
             )
         for stored, rule in sorted(self._session):
             if stored == key:
                 rows.append(
                     Remembered(rule=rule, lifetime=SESSION, scope_key=stored)
                 )
-        for (stored, rule) in sorted(self._once):
-            if stored == key:
-                rows.append(
-                    Remembered(rule=rule, lifetime=ONCE, scope_key=stored)
-                )
+        if workspace is not None:
+            stored = str(workspace or "")
+            self._load(stored)
+            for (entry_workspace, rule) in sorted(self._always):
+                if entry_workspace == stored:
+                    rows.append(
+                        Remembered(
+                            rule=rule, lifetime=ALWAYS, workspace=stored
+                        )
+                    )
         return rows
 
     # ── questions ───────────────────────────────────────────────────────
 
-    def _forget_expired(self) -> None:
-        now = self.now()
+    def _now(self, at: Optional[float] = None) -> float:
+        """The clock for one call.
+
+        ``at`` exists because the shell gate's own tests drive time: every one
+        of its entry points takes a ``now`` datetime, and threading it here is
+        what let the gate keep its seams while its records moved into this
+        store.  ``None`` means "the real clock".
+        """
+        return self.now() if at is None else float(at)
+
+    def _forget_expired(self, at: Optional[float] = None) -> None:
+        now = self._now(at)
         for key, expires_at in list(self._once.items()):
             if expires_at <= now:
                 self._once.pop(key, None)
@@ -351,6 +444,8 @@ class ConsentStore:
         rule: str,
         scope: Any = None,
         lifetime: str = ONCE,
+        at: Optional[float] = None,
+        expires_at: Optional[float] = None,
     ) -> str:
         """Record a question and return its token.
 
@@ -359,11 +454,12 @@ class ConsentStore:
         request that prompted it, and a retry that minted a fresh token each
         time could never be answered at all.
         """
-        self._forget_expired()
+        self._forget_expired(at)
         key = scope_key(scope)
         rule = str(rule)
+        now = self._now(at)
         for token, record in list(self._pending.items()):
-            if record.expires_at <= self.now():
+            if record.expires_at <= now:
                 self._pending.pop(token, None)
             elif (
                 record.scope_key == key
@@ -378,19 +474,26 @@ class ConsentStore:
             summary=str(summary),
             rule=rule,
             scope_key=key,
-            expires_at=self.now() + PROMPT_TTL_SECONDS,
+            expires_at=(
+                expires_at
+                if expires_at is not None
+                else now + PROMPT_TTL_SECONDS
+            ),
             lifetime=lifetime if lifetime in LIFETIMES else ONCE,
         )
         return token
 
-    def pending(self, scope: Any = None) -> list[Pending]:
+    def pending(
+        self, scope: Any = None, *, at: Optional[float] = None
+    ) -> list[Pending]:
         """Outstanding questions for one scope, oldest first."""
-        self._forget_expired()
+        self._forget_expired(at)
         key = scope_key(scope)
+        now = self._now(at)
         rows = [
             record
             for record in self._pending.values()
-            if record.scope_key == key and record.expires_at > self.now()
+            if record.scope_key == key and record.expires_at > now
         ]
         return sorted(rows, key=lambda record: record.expires_at)
 
@@ -415,6 +518,22 @@ class ConsentStore:
         )
         return True
 
+    def get(self, token: str, *, scope: Any = None) -> Optional[Pending]:
+        """One outstanding question by token, *without* asking whether it expired.
+
+        The expiry question belongs to redemption, not to every reader: a
+        surface that wants to record the lifetime the human chose is asking
+        "is this the record I was shown", and answering that with a clock --
+        especially a different one than the caller used to mint it -- turns a
+        valid intent into a silent refusal.
+        """
+        record = self._pending.get(str(token))
+        if record is None:
+            return None
+        if scope is not None and record.scope_key != scope_key(scope):
+            return None
+        return record
+
     def approve(
         self,
         token: str,
@@ -422,18 +541,20 @@ class ConsentStore:
         scope: Any = None,
         workspace: Any = None,
         lifetime: Optional[str] = None,
+        at: Optional[float] = None,
+        expires_at: Optional[float] = None,
     ) -> Optional[Pending]:
         """Redeem one token; return the question it answered, or ``None``.
 
         The scope is re-checked here rather than trusted from the token, so an
         answer can never cross a session, channel or user boundary.
         """
-        self._forget_expired()
+        self._forget_expired(at)
         token = str(token)
         record = self._pending.get(token)
         if record is None:
             return None
-        if record.expires_at <= self.now():
+        if record.expires_at <= self._now(at):
             self._pending.pop(token, None)
             return None
         if scope is not None and record.scope_key != scope_key(scope):
@@ -444,10 +565,16 @@ class ConsentStore:
             lifetime or record.lifetime,
             scope=scope,
             workspace=workspace,
+            expires_at=(
+                expires_at if expires_at is not None else record.expires_at
+            ),
+            at=at,
         )
         return record
 
-    def reject(self, token: str, *, scope: Any = None) -> bool:
+    def reject(
+        self, token: str, *, scope: Any = None, at: Optional[float] = None
+    ) -> bool:
         """Retire one token because the human refused it.
 
         A refusal has to be terminal: leaving the record pending means a later,
@@ -462,35 +589,43 @@ class ConsentStore:
         self._pending.pop(token, None)
         return True
 
-    def answer_single(self, scope: Any = None) -> Optional[Pending]:
+    def answer_single(
+        self, scope: Any = None, *, at: Optional[float] = None
+    ) -> Optional[Pending]:
         """Redeem the *sole* outstanding question for a scope, else ``None``.
 
         Ambiguity is not guessed at: with zero or several outstanding questions
         a short reply like "yes" has no determinate referent, and the caller
         says so instead of picking one.
         """
-        rows = self.pending(scope)
+        rows = self.pending(scope, at=at)
         if len(rows) != 1:
             return None
-        return self.approve(rows[0].token, scope=scope)
+        return self.approve(rows[0].token, scope=scope, at=at)
 
-    def answer_at(self, index: int, scope: Any = None) -> Optional[Pending]:
+    def answer_at(
+        self, index: int, scope: Any = None, *, at: Optional[float] = None
+    ) -> Optional[Pending]:
         """Redeem the *index*-th outstanding question (1-based) for a scope.
 
         This is what replaces "go and copy a token": the same ambiguity that
         made a bare "yes" unusable is resolvable by number, so several pending
         questions are answerable in one reply.
         """
-        rows = self.pending(scope)
+        rows = self.pending(scope, at=at)
         if not 1 <= index <= len(rows):
             return None
-        return self.approve(rows[index - 1].token, scope=scope)
+        return self.approve(rows[index - 1].token, scope=scope, at=at)
 
-    def summary(self, scope: Any = None) -> list[str]:
+    def summary(
+        self, scope: Any = None, *, at: Optional[float] = None
+    ) -> list[str]:
         """One line per outstanding question, numbered, for a chat reply."""
         return [
             f"{position}. {record.summary}"
-            for position, record in enumerate(self.pending(scope), start=1)
+            for position, record in enumerate(
+                self.pending(scope, at=at), start=1
+            )
         ]
 
     def clear(self) -> None:

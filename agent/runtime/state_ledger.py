@@ -67,16 +67,19 @@ them would make the guard test assert something it never verified:
   has the complete list to reason about rather than the list the scanner could
   reach.
 - **One store, whose state is instance state.**  ``agent/security/consent.py``
-  replaces two module-level dicts here (``_PENDING``/``_APPROVED``, formerly
-  entries in this ledger) plus the shell allowlist and the user-tool digest
-  file with a single ``ConsentStore``: ``CONSENT.SHELL`` is the documented
-  process singleton of the shape above, and its five containers are attributes
-  of that instance rather than module names, so the scanner cannot reach them.
-  That is the *point* of the move -- state that used to be reachable from
-  anywhere and owned by nobody is now owned by one object with three explicit
-  lifetimes (``once``/``session``/``always``), and a store nobody configured
-  stays in memory.  Recorded here so the omission is a decision, not a blind
-  spot.
+  replaces five module-level containers that used to be entries in this ledger
+  -- ``plugin_approval._PENDING``/``_APPROVED`` and ``shell._session_allowlist``
+  / ``_pending_tokens``/``_pending_session_scope`` -- with a single
+  ``ConsentStore``: ``consent.SHELL`` is the documented process singleton of the
+  shape above, and its five containers are attributes of that instance rather
+  than module names, so the scanner cannot reach them.  That is the *point* of
+  the move -- state that used to be reachable from anywhere and owned by nobody
+  is now owned by one object with three explicit lifetimes
+  (``once``/``session``/``always``), and a store nobody configured stays in
+  memory.  Two consent records remain elsewhere on purpose and are listed as
+  their own entries below: ``user_tools``' content-digest approvals (a fact
+  about a *file*, not about a scope) and the config-level shell allowlist.
+  Recorded here so the omission is a decision, not a blind spot.
 
 Scope vocabulary
 ----------------
@@ -169,12 +172,10 @@ LEDGER: tuple[StateEntry, ...] = (
                "Feeds the provider {session} header. Session identity belongs to the "
                "session service, not to a ContextVar."),
     # ── Session-keyed tables (session scope, process storage) ────────────────
-    StateEntry("_session_allowlist", "agent/security/shell.py", 231, "CONTAINER", "session", "service", 9,
-               "Shell approval allowlist, keyed by (scope, command)."),
-    StateEntry("_pending_tokens", "agent/security/shell.py", 232, "CONTAINER", "session", "service", 9,
-               "Shell confirmation tokens awaiting a human reply."),
-    StateEntry("_pending_session_scope", "agent/security/shell.py", 237, "CONTAINER", "session", "service", 9,
-               "'Always allow this command' marks travelling with their token."),
+    # The shell allowlist, its pending tokens and the "always allow" marks that
+    # used to sit here are gone: they are records in the one ConsentStore in
+    # agent/security/consent.py now, keyed by a lifetime instead of by a
+    # far-future sentinel.  See the "Deliberately not scanned" note above.
     StateEntry("_session_auto_approve", "agent/security/shell.py", 238, "CONTAINER", "session", "service", 9,
                "Scopes a human opted into auto-approval."),
     StateEntry("_session_permission_levels", "agent/security/shell.py", 239, "CONTAINER", "session", "service", 9,

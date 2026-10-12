@@ -427,9 +427,11 @@ def test_an_install_approval_is_global_rather_than_per_workspace(
     )
 
     # Any scope, and it was recorded in the global bucket rather than under a
-    # workspace the install does not have.
+    # workspace the install does not have.  Listing that bucket has to name it:
+    # "this project's grants" and "this machine's grants" are different lists.
     assert plugin_approval.plugin_install_was_approved(_scope("s-9", "web", "u"), source)
-    assert [row.workspace for row in installs.remembered()] == [""]
+    assert [row.workspace for row in installs.remembered(workspace="")] == [""]
+    assert installs.remembered(workspace="/some/project") == []
 
 
 def test_an_install_record_is_a_question_that_can_be_answered_by_number(
@@ -545,5 +547,138 @@ def test_the_composition_root_points_the_store_at_the_home_it_was_given(
 
     assert consent.SHELL.ledger_root is not None
     assert consent.SHELL.ledger_root.resolve() == (home / "trust").resolve()
+
+
+# ── the shell gate on the same store ────────────────────────────────────────
+#
+# The gate kept its own two dictionaries and its own copy of the scope key
+# until these tests could be written against the shared store.  They drive it
+# through its own public functions -- the same ones the shell tool and the
+# coordinator call -- because what matters is that *behaviour* did not move,
+# only where the record lives.
+
+
+def _shell_state():
+    from agent.security import shell
+
+    shell.shell_session_allowlist_clear()
+    return shell
+
+
+def test_a_shell_question_is_not_an_install_question() -> None:
+    """One store, two kinds: each listing answers only its own question.
+
+    Without the kind on the record, a store shared by both would make the
+    install list and the command list two views of the same pile -- and the
+    coordinator's "is this reply ambiguous", which counts one kind, would start
+    counting the other's questions too.
+    """
+    from agent.security import plugin_approval
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_pending_for_scope,
+    )
+
+    shell = _shell_state()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    plugin_approval.plugin_install_record_pending(scope, "source-a")
+
+    assert [record.command for record in shell_pending_for_scope(scope)] == [
+        "mkfs /dev/disk0"
+    ]
+    assert plugin_approval.plugin_install_pending_for_scope(scope) == ["source-a"]
+    shell.shell_session_allowlist_clear()
+    plugin_approval.plugin_install_clear_all()
+
+
+def test_a_once_approval_is_bounded_by_the_question_not_by_the_answer() -> None:
+    """Four minutes of deciding leaves one minute of approval, not five.
+
+    The entry's expiry is the pending token's own deadline.  That is what the
+    gate has always done, and it is the conservative reading: an approval
+    answers the question that was asked, with the window that question had.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+        shell_session_allowlist_contains,
+    )
+
+    shell = _shell_state()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    asked_at = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    safety = shell_command_check("mkfs /dev/disk0", scope=scope, now=asked_at)
+
+    answered_at = asked_at + timedelta(minutes=4)
+    assert shell_command_confirm(
+        safety.confirmation_token, scope=scope, now=answered_at
+    )
+    assert shell_session_allowlist_contains(
+        "mkfs /dev/disk0",
+        scope=scope,
+        now=answered_at + timedelta(seconds=30),
+    )
+    assert not shell_session_allowlist_contains(
+        "mkfs /dev/disk0",
+        scope=scope,
+        now=asked_at + timedelta(minutes=5, seconds=1),
+    )
+    shell.shell_session_allowlist_clear()
+
+
+def test_revoking_a_scope_leaves_the_workspaces_grants_alone() -> None:
+    """A session reset is not a project reset.
+
+    ``always`` answers are keyed by workspace rather than by scope, so clearing
+    one scope's approvals must not silently drop what the project has been
+    granted -- that revocation belongs to the surface that shows them.
+    """
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_clear_scope,
+    )
+
+    shell = _shell_state()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    rule = consent.make_rule(consent.PROGRAM, "npm")
+    consent.SHELL.remember(rule, consent.ONCE, scope=scope)
+    consent.SHELL.remember(rule, consent.SESSION, scope=scope)
+    consent.SHELL.remember(rule, consent.ALWAYS, scope=scope, workspace="/w")
+
+    assert shell_session_allowlist_clear_scope(scope) == 2
+    assert consent.SHELL.lifetime_of(rule, scope=scope, workspace="/w") == (
+        consent.ALWAYS
+    )
+    shell.shell_session_allowlist_clear()
+    consent.SHELL.revoke(rule, workspace="/w")
+
+
+def test_the_global_shell_reset_leaves_the_workspaces_grants_alone() -> None:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_pending_for_scope,
+        shell_session_allowlist_commands,
+    )
+
+    shell = _shell_state()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    rule = consent.make_rule(consent.PROGRAM, "npm")
+    consent.SHELL.remember(rule, consent.ALWAYS, scope=scope, workspace="/w")
+
+    shell.shell_session_allowlist_clear()
+
+    assert shell_pending_for_scope(scope) == []
+    assert shell_session_allowlist_commands(scope=scope) == []
+    assert consent.SHELL.lifetime_of(rule, scope=scope, workspace="/w") == (
+        consent.ALWAYS
+    )
+    consent.SHELL.revoke(rule, workspace="/w")
 
 
