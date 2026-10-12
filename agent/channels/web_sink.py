@@ -777,13 +777,13 @@ class WebOutputSink(OutputSink):
         Only shell approvals carry a redeemable pending record plus an
         authorization scope, which is exactly the pair a session-wide entry is
         keyed by.  Plugin installs and memory clears are one-shot by design and
-        must never advertise the option.
+        must never advertise the option.  The answer lives in
+        :func:`agent.security.shell.shell_session_scope_supported` because the
+        terminal asks the same question and the two must not diverge.
         """
-        if str(name or "") != "shell" or not str(confirmation_token or ""):
-            return False
-        from agent.security.shell import ShellAuthorizationScope
+        from agent.security.shell import shell_session_scope_supported
 
-        return isinstance(scope, ShellAuthorizationScope)
+        return shell_session_scope_supported(name, confirmation_token, scope)
 
     # -- collection helpers ----------------------------------------------------
 

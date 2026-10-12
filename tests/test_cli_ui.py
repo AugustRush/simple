@@ -505,6 +505,223 @@ def test_approval_menu_validator_rejects_unknown_choices(answer):
         _APPROVAL_VALIDATOR.validate(Document(answer))
 
 
+@pytest.mark.parametrize("answer", ["3", "always", "总是", "本会话总是允许"])
+def test_the_always_answer_is_accepted_only_where_it_is_offered(answer):
+    """The menu vocabulary grows by one entry, and only for a shell approval.
+
+    ``_APPROVAL_VALIDATOR`` stays two-answer on purpose: it is the validator for
+    prompts that cannot honour "always", and the test above pins that it keeps
+    rejecting ``3``.
+    """
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.validation import ValidationError
+
+    from agent.core.output import _approval_validator
+
+    _approval_validator(True).validate(Document(answer))
+    with pytest.raises(ValidationError):
+        _approval_validator(False).validate(Document(answer))
+
+
+def test_the_always_answer_maps_to_always_and_never_to_a_plain_yes():
+    from agent.core.output import _approval_choice
+
+    assert _approval_choice("3", allow_always=True) == "always"
+    assert _approval_choice("总是", allow_always=True) == "always"
+    # Where it is not offered it is not an answer at all: the caller re-asks
+    # rather than reading an unrecognized keystroke as consent.
+    assert _approval_choice("3", allow_always=False) == ""
+    assert _approval_choice("1", allow_always=True) == "once"
+    assert _approval_choice("y", allow_always=True) == "once"
+    assert _approval_choice("2", allow_always=True) == "deny"
+    assert _approval_choice("", allow_always=True) == ""
+
+
+class _TerminalConsole:
+    """The least a console needs to be, for the consent menu to appear."""
+
+    is_terminal = True
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def print(self, *args, **kwargs) -> None:
+        self.lines.append(" ".join(str(arg) for arg in args))
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def _drive_terminal_consent(answer: str):
+    """Put one shell approval through the terminal menu; return what happened."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from agent.core.output import CliOutputSink
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+        shell_session_allowlist_clear,
+        shell_session_allowlist_contains,
+        shell_pending_for_scope,
+    )
+
+    scope = ShellAuthorizationScope("cli", "cli", "")
+    shell_session_allowlist_clear()
+    command = "mkfs /dev/disk0"
+    safety = shell_command_check(command, scope=scope)
+    console = _TerminalConsole()
+    sink = CliOutputSink(
+        console,
+        live_status=False,
+        can_prompt=True,
+        confirmation_prompt=_answer(answer),
+    )
+
+    async def drive() -> object:
+        return await sink.on_tool_confirmation(
+            "shell",
+            command=command,
+            risk_level=safety.risk_level,
+            reason=safety.reason,
+            confirmation_token=safety.confirmation_token,
+            scope=scope,
+        )
+
+    approved = asyncio.run(drive())
+    # The caller's redeem step, which is what turns the answer into a record.
+    redeemed = False
+    if approved:
+        redeemed = shell_command_confirm(
+            safety.confirmation_token, scope=scope
+        )
+    # An "always" answer is the one that outlives the token's own five minutes.
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    return {
+        "console": console,
+        "approved": approved,
+        "redeemed": redeemed,
+        "still_allowed_in_an_hour": shell_session_allowlist_contains(
+            command, scope=scope, now=later
+        ),
+        "pending": shell_pending_for_scope(scope),
+    }
+
+
+def _answer(text: str):
+    async def prompt() -> str:
+        return text
+
+    return prompt
+
+
+def test_the_terminal_offers_the_same_three_answers_the_browser_does():
+    """The measured asymmetry: "always" existed on one surface and not the other.
+
+    The browser bar has had a third button since it was written; the terminal
+    menu showed ``1) 批准执行 / 2) 拒绝`` and nothing else, so the surface most
+    people use was the one that could not say "stop asking me about this
+    command" -- and every later spelling of the same command asked again.
+    """
+    outcome = _drive_terminal_consent("3")
+
+    assert outcome["approved"] is True
+    assert outcome["redeemed"] is True
+    text = outcome["console"].text
+    assert "3)" in text
+    assert "本会话总是允许" in text
+
+
+def test_an_always_answer_outlives_the_token_and_a_plain_yes_does_not():
+    """The two answers differ in exactly one observable way, so pin it.
+
+    A plain approval writes an entry bounded by the pending token's own
+    five-minute deadline; "always" widens that to the whole scope.  An hour
+    later only the second is still in force.
+    """
+    always = _drive_terminal_consent("3")
+    once = _drive_terminal_consent("1")
+
+    assert always["approved"] is True and once["approved"] is True
+    assert once["still_allowed_in_an_hour"] is False
+    assert always["still_allowed_in_an_hour"] is True
+
+
+def test_a_decline_offers_no_third_answer_and_approves_nothing():
+    outcome = _drive_terminal_consent("2")
+
+    assert outcome["approved"] is False
+    assert outcome["redeemed"] is False
+    assert outcome["still_allowed_in_an_hour"] is False
+
+
+def test_a_non_shell_prompt_never_shows_the_always_answer():
+    """An install or a memory wipe is one-shot; offering it would be a lie."""
+    import asyncio
+
+    from agent.core.output import CliOutputSink
+
+    console = _TerminalConsole()
+    sink = CliOutputSink(
+        console,
+        live_status=False,
+        can_prompt=True,
+        confirmation_prompt=_answer("1"),
+    )
+
+    approved = asyncio.run(
+        sink.on_tool_confirmation(
+            "install_plugin",
+            command="https://example.invalid/p",
+            risk_level="high",
+            reason="executable content",
+            confirmation_token="",
+            scope=None,
+        )
+    )
+
+    assert approved is True
+    assert "3)" not in console.text
+    assert "本会话总是允许" not in console.text
+
+
+def test_a_prompt_that_never_answers_usablely_refuses_instead_of_spinning():
+    """A caller-supplied prompt is not trusted to terminate.
+
+    The terminal's own ``PromptSession`` re-asks through its validator, but the
+    full-screen TUI supplies an input queue and the sink cannot see into it.  A
+    callable that keeps returning something unusable has to end in a refusal --
+    the same answer Ctrl+C gives, for the same reason.
+    """
+    import asyncio
+
+    from agent.core.output import CliOutputSink
+
+    console = _TerminalConsole()
+    sink = CliOutputSink(
+        console,
+        live_status=False,
+        can_prompt=True,
+        confirmation_prompt=_answer("banana"),
+    )
+
+    approved = asyncio.run(
+        sink.on_tool_confirmation(
+            "install_plugin",
+            command="https://example.invalid/p",
+            risk_level="high",
+            reason="executable content",
+            confirmation_token="",
+            scope=None,
+        )
+    )
+
+    assert approved is False
+    assert console.text.count("请输入") >= 1
+
+
 def test_consent_prompt_buffers_parallel_tool_rendering(tmp_path):
     from agent.core.output import CliOutputSink
 

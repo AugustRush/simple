@@ -709,6 +709,26 @@ def shell_command_uses_shell_features(command: str) -> bool:
         return True
 
 
+def shell_session_scope_supported(
+    name: str, confirmation_token: str, scope: Any
+) -> bool:
+    """Whether "always allow this" is meaningful for one consent prompt.
+
+    Only a shell approval carries the two things a session-wide entry is keyed
+    by: a redeemable pending token and an authorization scope.  An install, an
+    activation and a memory wipe are one-shot, so a surface that offered the
+    option for them would be promising something the redemption cannot deliver.
+
+    Asked once, here, because two surfaces now have to give the same answer:
+    the browser hides the button on it and the terminal hides the menu entry on
+    it, and a duplicate of this predicate that drifted would mean one of them
+    offering an answer the other refuses.
+    """
+    if str(name or "") != "shell" or not str(confirmation_token or ""):
+        return False
+    return isinstance(scope, ShellAuthorizationScope)
+
+
 # ── ShellCheckResult ────────────────────────────────────────────────────────
 
 

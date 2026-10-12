@@ -37,6 +37,20 @@ _APPROVAL_LOCK = asyncio.Lock()
 
 _APPROVAL_ACCEPT_ANSWERS = frozenset({"1", "y", "yes", "同意", "批准"})
 _APPROVAL_DECLINE_ANSWERS = frozenset({"2", "n", "no", "拒绝"})
+#: The third answer, offered only where it can be honoured (see
+#: ``shell_session_scope_supported``).  "本会话总是允许" is what the browser's
+#: third button does; the terminal has always had the vocabulary and never the
+#: option, which made the surface most people use the one that cannot say
+#: "stop asking me about this command" -- so the same prompt came back on every
+#: spelling of it.
+_APPROVAL_ALWAYS_ANSWERS = frozenset(
+    {"3", "a", "always", "总是", "总是允许", "本会话总是允许"}
+)
+#: How many unusable answers the TUI's consent prompt accepts before refusing.
+#: The terminal's own PromptSession re-asks through its validator instead; this
+#: bound is for a caller-supplied prompt callable, which the sink cannot see
+#: into and must not trust to terminate.
+_APPROVAL_MAX_REPROMPTS = 3
 _APPROVAL_VALIDATOR = Validator.from_callable(
     lambda text: text.strip().casefold() in (
         _APPROVAL_ACCEPT_ANSWERS | _APPROVAL_DECLINE_ANSWERS
@@ -44,6 +58,39 @@ _APPROVAL_VALIDATOR = Validator.from_callable(
     error_message="请输入 1（批准执行）或 2（拒绝）",
     move_cursor_to_end=True,
 )
+
+
+def _approval_validator(allow_always: bool) -> Validator:
+    """The validator for one prompt, which may or may not offer the third answer."""
+    if not allow_always:
+        return _APPROVAL_VALIDATOR
+    return Validator.from_callable(
+        lambda text: text.strip().casefold()
+        in (
+            _APPROVAL_ACCEPT_ANSWERS
+            | _APPROVAL_DECLINE_ANSWERS
+            | _APPROVAL_ALWAYS_ANSWERS
+        ),
+        error_message="请输入 1（批准执行）、2（拒绝）或 3（本会话总是允许）",
+        move_cursor_to_end=True,
+    )
+
+
+def _approval_choice(answer: str, *, allow_always: bool = False) -> str:
+    """Map an answer to ``"once"``, ``"always"``, ``"deny"`` or ``""``.
+
+    ``""`` means "not an answer to this prompt": the caller re-asks rather than
+    guessing, which is what keeps an unrecognized keystroke from being read as
+    consent.
+    """
+    normalized = str(answer or "").strip().casefold()
+    if allow_always and normalized in _APPROVAL_ALWAYS_ANSWERS:
+        return "always"
+    if normalized in _APPROVAL_ACCEPT_ANSWERS:
+        return "once"
+    if normalized in _APPROVAL_DECLINE_ANSWERS:
+        return "deny"
+    return ""
 
 
 def _approval_choice_accepted(answer: str) -> bool:
@@ -897,6 +944,12 @@ class CliOutputSink(OutputSink):
         """
         if not self._supports_consent_prompt():
             return None
+        from agent.security.shell import (
+            shell_pending_mark_session_scope,
+            shell_session_scope_supported,
+        )
+
+        allow_always = shell_session_scope_supported(name, confirmation_token, scope)
         self._approval_active = True
         try:
             self._stop_activity()
@@ -914,26 +967,45 @@ class CliOutputSink(OutputSink):
             self._console.print(
                 "  [bold cyan]1)[/bold cyan] 批准执行\n"
                 "  [bold cyan]2)[/bold cyan] 拒绝\n"
-                "[dim]输入 1/2 后按 Enter（也可输入 y/n 或 同意/拒绝）；Ctrl+C 取消[/dim]"
+                + (
+                    "  [bold cyan]3)[/bold cyan] 本会话总是允许此命令\n"
+                    if allow_always
+                    else ""
+                )
+                + (
+                    "[dim]输入 1/2/3 后按 Enter（也可输入 y/n/同意/拒绝/总是）；"
+                    "Ctrl+C 取消[/dim]"
+                    if allow_always
+                    else "[dim]输入 1/2 后按 Enter（也可输入 y/n 或 同意/拒绝）；"
+                    "Ctrl+C 取消[/dim]"
+                )
             )
 
             try:
                 if self._confirmation_prompt is not None:
+                    # Bounded: a prompt callable that keeps returning something
+                    # unusable must end in a refusal, not spin.  The interactive
+                    # path already refuses on Ctrl+C; this is the same answer for
+                    # the same reason -- nothing usable was said, so nothing is
+                    # granted.
+                    attempts = 0
                     while True:
                         answer = await self._confirmation_prompt()
-                        normalized = str(answer or "").strip().casefold()
-                        if normalized in (
-                            _APPROVAL_ACCEPT_ANSWERS | _APPROVAL_DECLINE_ANSWERS
-                        ):
+                        if _approval_choice(answer, allow_always=allow_always):
                             break
+                        attempts += 1
+                        if attempts >= _APPROVAL_MAX_REPROMPTS:
+                            return False
                         self._console.print(
-                            "[yellow]请输入 1（批准执行）或 2（拒绝）[/yellow]"
+                            "[yellow]请输入 1（批准执行）、2（拒绝）"
+                            + ("或 3（本会话总是允许）" if allow_always else "")
+                            + "[/yellow]"
                         )
                 else:
                     async def _prompt() -> str:
                         return await _APPROVAL_PROMPT.prompt_async(
-                            "请选择 1/2 › ",
-                            validator=_APPROVAL_VALIDATOR,
+                            "请选择 1/2/3 › " if allow_always else "请选择 1/2 › ",
+                            validator=_approval_validator(allow_always),
                         )
 
                     if get_app_or_none() is not None:
@@ -943,7 +1015,17 @@ class CliOutputSink(OutputSink):
                         answer = await _prompt()
             except (KeyboardInterrupt, EOFError):
                 return False
-            return _approval_choice_accepted(answer)
+            choice = _approval_choice(answer, allow_always=allow_always)
+            if choice == "always":
+                # Hand the intent to the redeem step; it owns the pending
+                # record.  The token is validated there, so a forged intent
+                # widens nothing -- and the mark is discarded on rejection or
+                # cancellation, exactly as the browser's third button behaves.
+                shell_pending_mark_session_scope(
+                    confirmation_token, scope=scope
+                )
+                return True
+            return choice == "once"
         finally:
             self._approval_active = False
             self._flush_consent_buffer()
