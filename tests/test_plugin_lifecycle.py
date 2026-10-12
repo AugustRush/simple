@@ -103,6 +103,11 @@ def catalog_and_plugin(tmp_path):
     )
     service.load_all()
     catalog._host.services.provide("skill_catalog", service)
+    # And the MCP capability, for the same reason: the bundle's ``mcpServers`` entry is
+    # contributed in its own setup.
+    from agent.tools.mcp_servers import MCPServerRegistry
+
+    catalog._host.services.provide("contributed_mcp_servers", MCPServerRegistry())
     loaded = catalog.discover_and_load()
     assert loaded == ["everything"], loaded
     return catalog, plugins_dir
@@ -131,8 +136,8 @@ def test_the_bundled_assets_are_registered(catalog_and_plugin) -> None:
         for _root, source in catalog.resolve_service("skill_catalog").contributed_roots()
     ), "the declarative skill root"
     assert any(
-        name == "everything" and cfg.get("name") == "everything-mcp"
-        for name, cfg in catalog.get_bundled_mcp()
+        owner == "everything" and cfg.get("name") == "everything-mcp"
+        for owner, cfg in catalog.resolve_service("contributed_mcp_servers").records()
     ), "the declarative MCP config"
     assert catalog.get_agent_definition("plugin:everything:helper") is not None
 
@@ -160,7 +165,9 @@ def test_unload_removes_the_bundled_skills(catalog_and_plugin) -> None:
 def test_unload_removes_the_bundled_mcp(catalog_and_plugin) -> None:
     catalog, _ = catalog_and_plugin
     catalog.unload_plugin("everything")
-    assert all(name != "everything" for name, _ in catalog.get_bundled_mcp())
+    assert (
+        catalog.resolve_service("contributed_mcp_servers").records() == ()
+    ), "the MCP config went with the plugin"
 
 
 def test_unload_removes_the_agent_definitions(catalog_and_plugin) -> None:

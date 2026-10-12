@@ -984,6 +984,9 @@ class _CatalogPlugin:
         self._meta = meta
         self._plugin_dir = plugin_dir
         self.name = name
+        #: Read once: ``inject`` and the contribution both ask, and reading the files
+        #: twice could disagree.
+        self._mcp_cache: Any = None
 
     # -- identity ------------------------------------------------------------
 
@@ -1015,6 +1018,11 @@ class _CatalogPlugin:
             # which is why the adapter no longer needs the composition root to attach
             # the skills later.
             declared.append("skill_catalog")
+        if self._mcp_declarations() and "contributed_mcp_servers" not in declared:
+            # Same rule as skills above, for the other kind whose contribution needs a
+            # service: the bundle waits for `mcp_servers`, which the registry plugin
+            # provides before the client plugin (which injects it too) reads it.
+            declared.append("contributed_mcp_servers")
         return tuple(declared)
 
     # -- lifecycle -----------------------------------------------------------
@@ -1042,6 +1050,32 @@ class _CatalogPlugin:
         if callable(real):
             real()
 
+    def _mcp_declarations(self) -> "list[dict]":
+        """The MCP servers this bundle's files declare, manifest entries winning.
+
+        One server, one registration: a manifest that names its MCP file
+        (``"mcpServers": "./.mcp.json"`` -- Codex's documented form, and legal in Claude
+        Code) used to register the file's contents *and* have the reader find the same
+        file, so the same server was offered twice.  Read once and cached, because
+        ``inject`` asks whether there is anything to contribute before ``setup`` does it.
+        """
+        if self._mcp_cache is not None:
+            return self._mcp_cache
+        declared: list[dict] = []
+        for mcp_cfg in self._meta.mcp_servers or ():
+            if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
+                declared.append(mcp_cfg)
+        seen = {str(cfg.get("name")) for cfg in declared}
+        for mcp_cfg in _read_mcp_json(self._plugin_dir, self.name):
+            if not isinstance(mcp_cfg, dict) or not mcp_cfg.get("name"):
+                continue
+            if str(mcp_cfg["name"]) in seen:
+                continue
+            seen.add(str(mcp_cfg["name"]))
+            declared.append(mcp_cfg)
+        self._mcp_cache = declared
+        return declared
+
     def _register_declarative_assets(self, ctx: Any) -> None:
         """Everything the plugin's files declare, each reversible through *ctx*.
 
@@ -1064,30 +1098,10 @@ class _CatalogPlugin:
             if skills_path.is_dir():
                 ctx.skill_catalog.add_root(skills_path)
 
-        # MCP configs are the last contribution with no service of their own: one
-        # production reader (the composition, at connect time) and no plugin asks for
-        # them by name.  So the append and its undo are written here rather than behind
-        # a service that only this method would call.
-
-        # One server, one registration.  A manifest that names its MCP file
-        # (``"mcpServers": "./.mcp.json"`` -- Codex's documented form, and legal
-        # in Claude Code) used to register the file's contents *and* have the
-        # reader find the same file, so the same server was offered twice.  The
-        # manifest's own entry wins, on the same rule as hooks below.
-        declared_mcp: list[dict] = []
-        for mcp_cfg in meta.mcp_servers:
-            if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
-                declared_mcp.append(mcp_cfg)
-        seen_mcp = {str(cfg.get("name")) for cfg in declared_mcp}
-        for mcp_cfg in _read_mcp_json(plugin_dir, self.name):
-            if not isinstance(mcp_cfg, dict) or not mcp_cfg.get("name"):
-                continue
-            if str(mcp_cfg["name"]) in seen_mcp:
-                continue
-            seen_mcp.add(str(mcp_cfg["name"]))
-            declared_mcp.append(mcp_cfg)
-        for mcp_cfg in declared_mcp:
-            ctx.on_unwind(_add_bundled(catalog._bundled_mcp, (self.name, mcp_cfg)))
+        # MCP configs are a contribution like skills: through the capability service,
+        # attributed to this plugin and unwound with its scope.
+        for mcp_cfg in self._mcp_declarations():
+            ctx.contributed_mcp_servers.add(mcp_cfg)
 
         for undo in catalog._load_command_files(
             plugin_dir, self.name, meta.commands
@@ -1223,7 +1237,6 @@ class PluginCatalog:
         self._commands = CommandRegistry()
         # Skills bundled by plugins: list of (plugin_name, skills_root_path)
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
-        self._bundled_mcp: list[tuple[str, dict]] = []
         # plugin_name → source directory entry name (the directory under
         # USER_PLUGINS_DIR or PLUGINS_DIR that this plugin was loaded from).
         self._plugin_source_dirs: dict[str, str] = {}
@@ -1430,7 +1443,6 @@ class PluginCatalog:
         self._plugins.clear()
         self._pending.clear()
         self._commands.clear()
-        self._bundled_mcp.clear()
         self._agent_defs.clear()
         self._plugin_source_dirs.clear()
         # Auto-create user plugins directory
@@ -1960,9 +1972,15 @@ class PluginCatalog:
         """
         # Snapshot pre-reload state.
         old_plugin_names = set(self._plugins.keys())
+        # Through ``_core``, like ``mcp_client``/``registry`` just below: the reload
+        # path's services come from the *components mapping the caller hands over*
+        # (bound by ``register_core_services``), not from this catalog's own registry.
+        mcp_registry = self._core("contributed_mcp_servers")
         old_mcp = {
-            (pname, cfg.get("name", "?"))
-            for pname, cfg in self._bundled_mcp
+            (owner, cfg.get("name", "?"))
+            for owner, cfg in (
+                mcp_registry.records() if mcp_registry is not None else ()
+            )
         }
         old_discovery_state = {
             "plugins": dict(self._plugins),
@@ -1971,7 +1989,6 @@ class PluginCatalog:
             # which is three chances to restore two of them.
             "slash_commands": self._commands.snapshot(),
 
-            "bundled_mcp": list(self._bundled_mcp),
             "plugin_source_dirs": dict(self._plugin_source_dirs),
             "agent_defs": self._agent_defs.snapshot(),
         }
@@ -2001,7 +2018,6 @@ class PluginCatalog:
             except Exception:
                 self._plugins = old_discovery_state["plugins"]
                 self._commands.restore(old_discovery_state["slash_commands"])
-                self._bundled_mcp = old_discovery_state["bundled_mcp"]
                 self._plugin_source_dirs = old_discovery_state[
                     "plugin_source_dirs"
                 ]
@@ -2029,8 +2045,11 @@ class PluginCatalog:
         mcp_client = self._core("mcp_client")
         registry = self._core("registry")
         new_mcp_servers: list[dict] = [
-            cfg for pname, cfg in self._bundled_mcp
-            if (pname, cfg.get("name", "?")) not in old_mcp
+            cfg
+            for owner, cfg in (
+                mcp_registry.records() if mcp_registry is not None else ()
+            )
+            if (owner, cfg.get("name", "?")) not in old_mcp
         ]
         connected_mcp_names: list[str] = []
         if new_mcp_servers and mcp_client is not None:
@@ -2072,10 +2091,6 @@ class PluginCatalog:
             name for name, src_dir in self._plugin_source_dirs.items()
             if src_dir == dir_name
         }
-
-    def get_bundled_mcp(self) -> list[tuple[str, dict]]:
-        """Return list of (plugin_name, mcp_server_config) for bundled MCP servers."""
-        return list(self._bundled_mcp)
 
     def list_plugins(self) -> list[PluginMeta]:
         """Return metadata for all loaded plugins."""

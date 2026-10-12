@@ -476,8 +476,12 @@ def measure_load(root: Path) -> list[dict[str, Any]]:
         builtin_root=root.parent / ".probe-builtin-skills",
     )
     _skills.load_all()
+    from agent.tools.mcp_servers import MCPServerRegistry as _MCPServers
+
+    _mcp_servers = _MCPServers()
     catalog = PluginCatalog(builtin_dir=root)
     catalog._host.services.provide("skill_catalog", _skills)
+    catalog._host.services.provide("contributed_mcp_servers", _mcp_servers)
     loaded = catalog.discover_and_load()
 
     def _fireable(event_name: str) -> bool:
@@ -502,7 +506,7 @@ def measure_load(root: Path) -> list[dict[str, Any]]:
 
     owners = catalog._commands.owners()  # {command_key: plugin_name}
     agents = catalog.list_agent_definitions()
-    mcp = catalog.get_bundled_mcp()
+    mcp = [(owner, cfg) for owner, cfg in _mcp_servers.records()]
     metas = {str(meta.name): meta for meta in catalog.list_plugins()}
 
     rows: list[dict[str, Any]] = []

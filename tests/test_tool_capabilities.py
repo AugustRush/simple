@@ -281,6 +281,10 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
     )
     skills.load_all()
     catalog._host.services.provide("skill_catalog", skills)
+    from agent.tools.mcp_servers import MCPServerRegistry
+
+    mcp_servers = MCPServerRegistry()
+    catalog._host.services.provide("contributed_mcp_servers", mcp_servers)
     try:
         assert catalog.discover_and_load() == ["contrib"]
 
@@ -289,7 +293,7 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
         assert "contrib_tool" in registry.list_tools()
         assert catalog._agent_defs.get("plugin:contrib:auditor") is not None
         assert skills.contributed_roots(), "the skills root was contributed"
-        assert catalog.get_bundled_mcp(), "the mcp config was registered"
+        assert mcp_servers.records(), "the mcp config was contributed"
 
         catalog.unload_plugin("contrib")
 
@@ -300,9 +304,7 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
             catalog._agent_defs.get("plugin:contrib:auditor") is None
         ), "the agent definition"
         assert skills.contributed_roots() == [], "the skills root"
-        assert not [
-            entry for entry in catalog.get_bundled_mcp() if entry[0] == "contrib"
-        ], "the mcp config"
+        assert mcp_servers.records() == (), "the mcp config"
     finally:
         catalog.close()
 

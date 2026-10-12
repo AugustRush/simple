@@ -133,7 +133,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
             "agent/core/agent_plugin.py",  # the agent reaches the composition through it
-            "agent/tools/mcp_plugin.py",  # reads the servers other plugins bundled
         ),
         summary="Loaded plugins and everything they contributed.",
     ),
@@ -268,6 +267,23 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         ),
         summary="The long-term store behind the context manager.",
         contract="agent/memory/contracts.py:MemoryStore",
+    ),
+    CoreService(
+        name="contributed_mcp_servers",
+        owners=(
+            "agent/tools/mcp_servers.py",
+        ),
+        consumers=(
+            "agent/tools/mcp_plugin.py",  # the client merges them, configured first
+            "agent/plugins/catalog.py",  # a bundle's files contribute here
+        ),
+        contract="agent/tools/protocols.py:MCPServerRegistryService",
+        summary=(
+            "The MCP server configs plugins contribute, attributed and unwound with "
+            "their scopes.  Its own plugin provides it *before* the client plugin, which "
+            "injects it: that ordering is what lets a bundle's server be in the list the "
+            "client computes."
+        ),
     ),
     CoreService(
         name="channels",

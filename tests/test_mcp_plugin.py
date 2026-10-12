@@ -17,20 +17,22 @@ from __future__ import annotations
 
 import pytest
 
+from typing import Any
+
 from agent.kernel.plugin import PluginHost
 from agent.kernel.service import ServiceRegistry
 from agent.plugins.core import core_plugins
 from agent.tools.mcp_plugin import MCPPlugin
 
 
-class _Catalog:
-    """Stands in for the plugin catalog: only ``get_bundled_mcp`` is consulted."""
+def _contributed(*configs: dict) -> Any:
+    """A `contributed_mcp_servers` registry holding *configs*, as a bundle left it."""
+    from agent.tools.mcp_servers import MCPServerRegistry
 
-    def __init__(self, bundled=()) -> None:
-        self._bundled = list(bundled)
-
-    def get_bundled_mcp(self):
-        return self._bundled
+    registry = MCPServerRegistry()
+    for config in configs:
+        registry.add(config, owner="acme")
+    return registry
 
 
 def _mount(mapping: dict) -> PluginHost:
@@ -40,7 +42,7 @@ def _mount(mapping: dict) -> PluginHost:
 
 
 def test_no_servers_means_no_client() -> None:
-    mapping: dict = {"cfg": {}, "registry": object(), "plugin_catalog": _Catalog()}
+    mapping: dict = {"cfg": {}, "registry": object(), "contributed_mcp_servers": _contributed()}
 
     _mount(mapping)
 
@@ -53,7 +55,7 @@ def test_the_client_is_built_from_the_configured_servers() -> None:
     mapping: dict = {
         "cfg": {"mcp_servers": [{"name": "one", "command": "a"}]},
         "registry": object(),
-        "plugin_catalog": _Catalog(),
+        "contributed_mcp_servers": _contributed(),
     }
 
     _mount(mapping)
@@ -68,7 +70,7 @@ def test_the_server_list_is_the_configured_ones_plus_the_bundled_ones() -> None:
     mapping: dict = {
         "cfg": {"mcp_servers": [{"name": "configured", "command": "a"}]},
         "registry": object(),
-        "plugin_catalog": _Catalog([("acme", {"name": "bundled", "command": "b"})]),
+        "contributed_mcp_servers": _contributed({"name": "bundled", "command": "b"}),
     }
 
     _mount(mapping)
@@ -86,7 +88,7 @@ def test_bundled_servers_alone_still_get_a_client() -> None:
     mapping: dict = {
         "cfg": {},
         "registry": object(),
-        "plugin_catalog": _Catalog([("acme", {"name": "bundled", "command": "b"})]),
+        "contributed_mcp_servers": _contributed({"name": "bundled", "command": "b"}),
     }
 
     _mount(mapping)

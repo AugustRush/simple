@@ -1,7 +1,7 @@
 # Capability services and the shape of a contribution
 
-**Status:** the shape is implemented for `channels`, `registry` and `skill_catalog`;
-`mcp_servers` is the next kind, and `hooks`/`commands`/`agents` are analysed below.
+**Status:** the shape is implemented for `channels`, `registry`, `skill_catalog` and
+`contributed_mcp_servers`; `hooks`/`commands`/`agents` are analysed below.
 **Context:** the plugin refactor's goal is that adding an ecosystem or replacing an
 implementation is an *adapter* or a *contribution*, never an edit to the loader or the
 composition root.  This note writes down the layering that makes that true, and the one
@@ -41,7 +41,19 @@ Implemented three times now, with the same reasoning each time:
 
 * `ChannelRegistry` + `ScopedChannels.add(channel)`;
 * `ToolRegistry` + its view's `register(...)`;
-* `SkillCatalog` + `ScopedSkillCatalog.add_root(root, ...)`.
+* `SkillCatalog` + `ScopedSkillCatalog.add_root(root, ...)`;
+* `MCPServerRegistry` + `ScopedMCPServers.add(config)`.
+
+Two of them taught a rule about *when* the capability has to exist.  A service whose
+consumer **computes a value from it in `setup`** (the MCP client builds the merged
+server list) cannot be provided by that same consumer: its own `setup` would read the
+registry before the contributors -- which are waiting for it -- have run.  So the
+registry has a plugin of its own, provided before the consumer, and the consumer
+declares `inject = (..., "capability", ...)`: the kernel activates the contributors when
+the registry appears and the consumer last.  And a service whose name is also a **config
+key** (`mcp_servers` is the MCP config's own field) makes every AST scan read the config
+as a provision, so the capability is named for what it holds
+(`contributed_mcp_servers`).
 
 A contribution is therefore: attributed to the plugin that made it, undone when that
 plugin's scope unwinds, and *visible to the ledger* (`CORE_SERVICES` names the owner and
@@ -65,9 +77,10 @@ and today it has none: `ctx.get` always returns the view.)
 
 Moving one kind (skills) onto its service deleted, rather than added:
 
-* `PluginCatalog._bundled_skills` -- the loader's list of what plugins' files declared,
-  and its bookkeeping in the reload snapshot/rollback;
-* `PluginCatalog.get_bundled_skills()` and its `PluginCatalogService` member;
+* `PluginCatalog._bundled_skills` and `_bundled_mcp` -- the loader's lists of what
+  plugins' files declared, and their bookkeeping in the reload snapshot/rollback;
+* `PluginCatalog.get_bundled_skills()`/`get_bundled_mcp()` and their
+  `PluginCatalogService` members;
 * `agent/bootstrap.py`'s three-line loop that attached a plugin's skill roots, and the
   `_rebuild_aliases()` call that went with it;
 * the reload path's private reach into the skill catalog --
@@ -92,7 +105,7 @@ And it made two things true that used to be luck:
 |---|---|---|
 | skills | **service** (this change) | -- |
 | tools / channels | service | -- |
-| MCP configs | loader list `_bundled_mcp` + `mcp_plugin` reads it | a `mcp_servers` service whose view a bundle contributes to |
+| MCP configs | **service** (this change: `contributed_mcp_servers`) | -- |
 | hooks | `PluginMeta.hooks_config`, read by the loader's dispatchers | a `hooks` service, or an explicit statement that a hook is *loader* configuration rather than a contribution |
 | commands / agents | registries provided **by the loader itself** (`catalog.py:1255-1256`) | providers as plugins, like `channels`, plus protocols |
 

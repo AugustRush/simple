@@ -126,6 +126,12 @@ def _sqlite_fts_memory(_: CoreContext) -> Any:
     return SqliteFtsMemoryPlugin()
 
 
+def _mcp_servers(_: CoreContext) -> Any:
+    from agent.tools.mcp_servers import MCPServersPlugin
+
+    return MCPServersPlugin()
+
+
 def _mcp(_: CoreContext) -> Any:
     from agent.tools.mcp_plugin import MCPPlugin
 
@@ -232,6 +238,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         factory=_sqlite_fts_memory,
         provides=("ltm_store", "memory"),
         opt_in=True,
+    ),
+    CorePlugin(
+        name="mcp_servers",
+        summary=(
+            "the MCP server registry; provides `mcp_servers`, which plugins (and a "
+            "bundle's `.mcp.json`) contribute to"
+        ),
+        factory=_mcp_servers,
+        provides=("contributed_mcp_servers",),
     ),
     CorePlugin(
         name="mcp",

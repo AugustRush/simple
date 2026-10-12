@@ -10,11 +10,17 @@ places: the config, the plugin catalog's bundled servers, and the two
 constructions that each had to remember both.
 
 Which servers exist is one question, so it is answered in one place here: the
-configured ones plus the ones other plugins bundled, read from the catalog after
-it has discovered them.  The client is built once and provided under the name
-everyone already resolves, and the status the composition reports is provided
-beside it (its ``configured_servers`` count is the merged total, which is what the
-two old ``_empty_mcp_status`` calls were recomputing by hand).
+configured ones plus the ones other plugins contributed, read from the
+``contributed_mcp_servers`` capability service the registry plugin provides.  That service is
+provided *first* -- by a plugin that needs nothing (``agent/tools/mcp_servers.py``)
+-- which is what makes the order work: the bundles that contribute are waiting for
+it, the kernel activates them when it appears, and this plugin, which declares it in
+``inject`` too, is activated last and therefore sees them.  (It used to read the
+loader's ``_bundled_mcp`` list, which is why the plugin also injected
+``plugin_catalog``.)  The client is built once and provided under the name everyone
+already resolves, and the status the composition reports is provided beside it (its
+``configured_servers`` count is the merged total, which is what the two old
+``_empty_mcp_status`` calls were recomputing by hand).
 
 What stays in the composition, and why
 --------------------------------------
@@ -46,9 +52,9 @@ class MCPPlugin:
 
     name = "mcp"
 
-    #: The config names the configured servers; the catalog knows the bundled
+    #: The config names the configured servers; ``mcp_servers`` holds the contributed
     #: ones; the registry is what the client registers its tools on.
-    inject = ("cfg", "registry", "plugin_catalog")
+    inject = ("cfg", "registry", "contributed_mcp_servers")
 
     def setup(self, ctx: Any) -> None:
         import agent as agent_module
@@ -57,11 +63,8 @@ class MCPPlugin:
 
         cfg = ctx.get("cfg", None) or {}
         configured = list(cfg.get("mcp_servers", []) or [])
-        catalog = ctx.get("plugin_catalog", None)
-        bundled: list[dict] = []
-        if catalog is not None and hasattr(catalog, "get_bundled_mcp"):
-            bundled = [server for _, server in catalog.get_bundled_mcp()]
-        servers = configured + bundled
+        contributed = list(ctx.get("contributed_mcp_servers").all())
+        servers = configured + contributed
 
         client = None
         if servers:

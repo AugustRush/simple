@@ -388,9 +388,6 @@ user-invocable: true
             host.load(plugin)
             return None
 
-        def get_bundled_mcp(self):
-            return []
-
         def discover_and_load(self):
             return []
 

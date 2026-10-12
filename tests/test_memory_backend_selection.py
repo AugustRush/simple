@@ -45,6 +45,7 @@ def test_a_default_composition_is_unchanged() -> None:
         "ralph",
         "model",
         "memory",
+        "mcp_servers",
         "mcp",
         "session",
         "agent",

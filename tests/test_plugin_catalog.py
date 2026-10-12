@@ -44,6 +44,20 @@ def _write_plugin(plugin_dir: Path, code: str) -> None:
     (plugin_dir / "__init__.py").write_text(textwrap.dedent(code), encoding="utf-8")
 
 
+def _provide_mcp_servers(plugin_catalog):
+    """The `contributed_mcp_servers` capability a bundle contributes its configs to.
+
+    Same rule as ``_provide_skill_catalog`` above: a bundle's MCP configs are
+    contributed in its own ``setup``, so a catalog that offers no registry leaves the
+    bundle pending.
+    """
+    from agent.tools.mcp_servers import MCPServerRegistry
+
+    registry = MCPServerRegistry()
+    plugin_catalog._host.services.provide("contributed_mcp_servers", registry)
+    return registry
+
+
 def _provide_skill_catalog(plugin_catalog, tmp_path, name="skills-service"):
     """Give a catalog under test the capability a skills-declaring bundle needs.
 
@@ -636,9 +650,10 @@ def test_plugin_bundles_mcp_config(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
-    bundled = catalog.get_bundled_mcp()
+    bundled = mcp.records()
     assert len(bundled) == 1
     assert bundled[0][0] == "mcp-bundler"
     assert bundled[0][1]["name"] == "test-server"
@@ -1775,9 +1790,10 @@ def test_agent_plugins_v1_reads_its_default_mcp_file(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
-    assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["portable-mcp"]
+    assert [cfg["name"] for _, cfg in mcp.records()] == ["portable-mcp"]
 
 
 def test_a_named_mcp_file_is_registered_once(tmp_path):
@@ -1799,9 +1815,10 @@ def test_a_named_mcp_file_is_registered_once(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
-    assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["one"]
+    assert [cfg["name"] for _, cfg in mcp.records()] == ["one"]
 
 
 def test_hook_commands_get_the_codex_environment_names(tmp_path):
@@ -1971,12 +1988,13 @@ def test_a_new_ecosystem_is_one_adapter(tmp_path, acme_format):
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
     skills = _provide_skill_catalog(catalog, tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     loaded = catalog.discover_and_load()
 
     assert loaded == ["widget"], "the marketplace path came from the adapter"
     assert catalog.get_loaded_names_for_directory("acme-market") == {"widget"}
     assert [source for _, source in skills.contributed_roots()] == ["plugin:widget"]
-    assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["acme-mcp"]
+    assert [cfg["name"] for _, cfg in mcp.records()] == ["acme-mcp"]
     meta = next(m for m in catalog.list_plugins() if m.name == "widget")
     assert "on_pre_tool" in meta.hooks_config, "the adapter's event name was translated"
 
@@ -2105,9 +2123,10 @@ def test_discover_accepts_mcpServers_camelcase(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
-    bundled = catalog.get_bundled_mcp()
+    bundled = mcp.records()
     assert len(bundled) == 1
     assert bundled[0][0] == "mcp-plugin"
     assert bundled[0][1]["name"] == "my-server"
@@ -2445,7 +2464,32 @@ def test_concurrent_reload_serializes_discovery_and_awaited_side_effects(tmp_pat
 
     from agent import PluginCatalog
 
-    catalog = PluginCatalog(builtin_dir=tmp_path)
+    entered_connect = asyncio.Event()
+    release_connect = asyncio.Event()
+    events: list[str] = []
+
+    class MCPClient:
+        async def connect_from_config(self, config):
+            entered_connect.set()
+            await release_connect.wait()
+            events.append("connect")
+
+    class Registry:
+        def unregister_by_source_prefix(self, prefix):
+            events.append(f"unregister:{prefix}")
+
+    # Built *with* the composition's services, as the real catalog is: a bundle
+    # contributes to `contributed_mcp_servers` in its own setup, so a catalog whose
+    # service registry is not the mapping the composition resolves leaves it pending.
+    from agent.tools.mcp_servers import MCPServerRegistry
+
+    mcp_servers = MCPServerRegistry()
+    components = {
+        "mcp_client": MCPClient(),
+        "registry": Registry(),
+        "contributed_mcp_servers": mcp_servers,
+    }
+    catalog = PluginCatalog(builtin_dir=tmp_path, components=components)
     catalog.discover_and_load()
     plugin_dir = tmp_path / "late"
     (plugin_dir / ".claude-plugin").mkdir(parents=True)
@@ -2456,21 +2500,6 @@ def test_concurrent_reload_serializes_discovery_and_awaited_side_effects(tmp_pat
     )
 
     async def scenario():
-        entered_connect = asyncio.Event()
-        release_connect = asyncio.Event()
-        events: list[str] = []
-
-        class MCPClient:
-            async def connect_from_config(self, config):
-                entered_connect.set()
-                await release_connect.wait()
-                events.append("connect")
-
-        class Registry:
-            def unregister_by_source_prefix(self, prefix):
-                events.append(f"unregister:{prefix}")
-
-        components = {"mcp_client": MCPClient(), "registry": Registry()}
         first = asyncio.create_task(catalog.reload(components))
         await entered_connect.wait()
         shutil.rmtree(plugin_dir)
@@ -2489,7 +2518,7 @@ def test_concurrent_reload_serializes_discovery_and_awaited_side_effects(tmp_pat
     assert first_result["added_plugins"] == ["late"]
     assert second_result["removed_plugins"] == ["late"]
     assert catalog.list_plugins() == []
-    assert catalog.get_bundled_mcp() == []
+    assert mcp_servers.records() == (), "the removed plugin's server went with it"
 
 
 def test_user_same_name_plugin_replaces_omitted_builtin_commands(tmp_path):
@@ -2575,10 +2604,11 @@ def test_user_same_name_plugin_replaces_all_builtin_owned_assets(tmp_path):
         builtin_dir=tmp_path / "builtin", user_dir=tmp_path / "user"
     )
     skills = _provide_skill_catalog(catalog, tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
     commands = catalog.get_slash_commands()
-    mcp = catalog.get_bundled_mcp()
+    mcp = mcp.records()
     agents = {
         definition["key"] for definition in catalog.list_agent_definitions()
     }
@@ -3705,9 +3735,10 @@ def test_plugin_mcp_config_expands_claude_plugin_paths(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
-    bundled = catalog.get_bundled_mcp()
+    bundled = mcp.records()
     assert len(bundled) == 1
     cfg = bundled[0][1]
     assert cfg["command"] == str(plugin_dir / "bin" / "server")
@@ -3736,9 +3767,10 @@ def test_plugin_mcp_config_expands_default_env_values(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    mcp = _provide_mcp_servers(catalog)
     catalog.discover_and_load()
 
-    cfg = catalog.get_bundled_mcp()[0][1]
+    cfg = mcp.records()[0][1]
     assert cfg["command"] == "node"
     assert cfg["args"] == ["server.js", str(plugin_dir)]
     assert cfg["env"]["MODE"] == "local"

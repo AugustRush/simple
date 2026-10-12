@@ -17,7 +17,7 @@ different relations to the tree:
   active profile says the composition is), ``who_provides`` (the answer a replacement
   is checked against);
 * **reading and reporting** -- ``pending_report``, ``failed_report``,
-  ``get_bundled_mcp``, ``compose_all_prompts``, and the three
+  ``compose_all_prompts``, and the three
   command-hook firers (``fire_prompt_submit``, ``fire_turn_end``, ``fire_session_end``).
 """
 
@@ -70,9 +70,6 @@ class PluginCatalogService(Protocol):
 
     def failed_report(self) -> "dict[str, str]":
         """Plugin -> why its setup raised."""
-
-    def get_bundled_mcp(self) -> "list[tuple[str, dict]]":
-        """MCP server configs plugins bundled, with their contributor."""
 
     def compose_all_prompts(self, base: str) -> str:
         """Let every plugin append to the system prompt, in load order."""

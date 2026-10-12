@@ -594,6 +594,7 @@ def test_declared_names_match_the_documented_set() -> None:
         "agent_core",
         "channels",
         "context_manager",
+        "contributed_mcp_servers",
         "ltm_store",
         "mcp_client",
         "memory",
@@ -1651,6 +1652,7 @@ _PLUGIN_PROVIDED: dict[str, str] = {
     "mcp_status": "agent/tools/mcp_plugin.py",
     "skill_catalog": "agent/skills/plugin.py",
     "channels": "agent/channels/registry_plugin.py",
+    "contributed_mcp_servers": "agent/tools/mcp_servers.py",
 }
 
 

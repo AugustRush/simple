@@ -26,7 +26,12 @@ from __future__ import annotations
 
 from typing import Any, Optional, Protocol, runtime_checkable
 
-__all__ = ["MCPClientService", "ToolRegistryService"]
+__all__ = [
+    "MCPClientService",
+    "MCPServerContributionView",
+    "MCPServerRegistryService",
+    "ToolRegistryService",
+]
 
 
 @runtime_checkable
@@ -130,3 +135,31 @@ class ToolRegistryService(Protocol):
         self, context: "Any" = None, *, exclude_source_prefixes: "tuple[str, ...]" = ()
     ) -> "ToolRegistryService":
         """A registry with its own context and no inherited tools -- a session's own."""
+
+
+@runtime_checkable
+class MCPServerContributionView(Protocol):
+    """One plugin's handle on the MCP server registry.
+
+    A bundle that ships a ``.mcp.json`` (or names one in its manifest) contributes it
+    here, in its ``setup``: the view attributes the server to the plugin and takes it
+    back when the plugin unloads.  Same shape as the channel and skill views -- one
+    contribution mechanism, four capability services.
+    """
+
+    def add(self, config: dict) -> dict:
+        """Contribute one server config, returning it."""
+
+
+@runtime_checkable
+class MCPServerRegistryService(Protocol):
+    """The MCP server registry a composition provides as ``contributed_mcp_servers``."""
+
+    def all(self) -> "tuple[dict, ...]":
+        """Every contributed server config, in contribution order."""
+
+    def records(self) -> "tuple[tuple[str, dict], ...]":
+        """``(owner, config)`` pairs -- what ``plugin reload`` diffs."""
+
+    def scoped(self, ctx: Any) -> MCPServerContributionView:
+        """The per-plugin view (the kernel calls this by name for ``ctx.contributed_mcp_servers``)."""
