@@ -4069,7 +4069,7 @@ def test_coordinator_chat_approval_redeems_plugin_pending_install() -> None:
 
 @pytest.mark.parametrize(
     "reply",
-    ["同意", "允许执行", "yes", "approve", " 批准 ", "ok"],
+    ["同意", "允许执行", "approve", " 批准 ", "同意执行"],
 )
 def test_coordinator_chat_approval_accepts_common_approval_phrases(reply: str) -> None:
     from agent.security.shell import (
@@ -4090,6 +4090,36 @@ def test_coordinator_chat_approval_accepts_common_approval_phrases(reply: str) -
     assert core.calls
     assert "mkfs /dev/disk0" in core.calls[0].text
     assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is True
+
+
+@pytest.mark.parametrize("reply", ["ok", "okay", "yes", "y"])
+def test_an_acknowledgement_does_not_redeem_a_high_risk_action(reply: str) -> None:
+    """``ok`` is how people say "got it", not how they authorise destruction.
+
+    These four used to be approval phrases on this path, which redeems a
+    *high-risk* action: a message sent to acknowledge something else entirely
+    could approve the one destructive command that happened to be pending.  The
+    phrase set is now only words that cannot plausibly mean anything else.
+    """
+    from agent.security.shell import ShellAuthorizationScope, shell_command_check
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+    asyncio.run(
+        coordinator.handle(_turn(reply), state, _CoordinatorSink())  # type: ignore[arg-type]
+    )
+
+    # Forwarded verbatim: the pending question is still pending.
+    assert core.calls
+    assert core.calls[0].text == reply
+    from agent.security.shell import shell_pending_for_scope
+
+    assert [record.command for record in shell_pending_for_scope(scope)] == [
+        "mkfs /dev/disk0"
+    ]
 
 
 def test_coordinator_chat_approval_is_ignored_without_pending() -> None:
@@ -4252,7 +4282,7 @@ def _phrase_approval_outcome(*, menu_available: bool, sink: object = None):
 
     @dataclass
     class _TurnInput:
-        text: str = "yes"
+        text: str = "同意"
         session_id: str = "cli"
         channel_name: str = "cli"
         metadata: dict = field(default_factory=dict)
@@ -4265,16 +4295,17 @@ def _phrase_approval_outcome(*, menu_available: bool, sink: object = None):
 
     coordinator = CommandCoordinator.__new__(CommandCoordinator)
     turn_input = _TurnInput()
+    original = turn_input.text
     result = coordinator._maybe_redeem_chat_approval(
         turn_input, _Classification(), sink if sink is not None else _Sink()
     )
     redeemed = shell_session_allowlist_contains(dangerous, scope=scope)
     shell_session_allowlist_clear()
-    return redeemed, result.text != "yes"
+    return redeemed, result.text != original
 
 
 def test_phrase_approval_is_inert_when_an_interactive_menu_exists():
-    """A bare "yes" is ambiguous — it may answer some other question.
+    """A bare approval word is ambiguous — it may answer some other question.
 
     Where the human can be prompted at the moment of the side effect, phrase
     matching must not run in parallel, or the weakest consent channel silently
@@ -4285,14 +4316,17 @@ def test_phrase_approval_is_inert_when_an_interactive_menu_exists():
     assert rewritten is False
 
 
-def test_a_connected_browser_cannot_approve_a_command_by_saying_yes():
+def test_a_connected_browser_cannot_approve_a_command_by_phrase():
     """The browser has a menu, so its messages must not be an approval channel.
 
-    Measured on the shipped code: the web sink reported no menu, so ``yes``
-    redeemed the sole pending high-risk command -- and the card asking about
-    that same command was on screen at the time.  A person who is being shown
-    the exact command, its risk and a countdown has already been asked; a
-    second door means the weakest channel decides.
+    Measured on the shipped code: the web sink reported no menu, so a bare
+    approval word redeemed the sole pending high-risk command -- and the card
+    asking about that same command was on screen at the time.  A person who is
+    being shown the exact command, its risk and a countdown has already been
+    asked; a second door means the weakest channel decides.
+
+    The reply is a real approval phrase rather than ``yes``: ``yes`` is no
+    longer one, so using it would make this pass for the wrong reason.
     """
     import asyncio
 
@@ -4317,3 +4351,110 @@ def test_phrase_approval_still_works_where_no_menu_is_possible():
     redeemed, rewritten = _phrase_approval_outcome(menu_available=False)
     assert redeemed is True
     assert rewritten is True
+
+
+# ── several questions at once: the numbered reply ───────────────────────────
+#
+# The cliff this removes: with more than one question outstanding a bare
+# approval word was refused and the human was told to copy a `/confirm <token>`
+# per question -- the highest-friction path in the consent design, firing at
+# exactly the moment the agent is doing a lot of work.
+
+_DANGEROUS_A = "mkfs /dev/disk0"
+_DANGEROUS_B = "echo hi && rm -rf ~/Documents/taxes"
+
+
+def _ask_two_questions(scope):
+    from agent.security.shell import shell_command_check
+
+    shell_command_check(_DANGEROUS_A, scope=scope)
+    shell_command_check(_DANGEROUS_B, scope=scope)
+
+
+def _ask(reply: str) -> tuple[list[str], list[str], object]:
+    """Put *reply* to the coordinator with two questions pending."""
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_pending_for_scope,
+        shell_session_allowlist_clear,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_session_allowlist_clear()
+    _ask_two_questions(scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+    sink = _CoordinatorSink()
+
+    asyncio.run(
+        coordinator.handle(_turn(reply), state, sink)  # type: ignore[arg-type]
+    )
+
+    pending = [record.command for record in shell_pending_for_scope(scope)]
+    shell_session_allowlist_clear()
+    forwarded = [call.text for call in core.calls]
+    return pending, forwarded, sink
+
+
+def test_several_questions_are_answered_by_number() -> None:
+    """``2`` answers the second question without a token and without a guess."""
+    pending, forwarded, _sink = _ask("2")
+
+    assert pending == [_DANGEROUS_A], "only the named question was answered"
+    assert forwarded and _DANGEROUS_B in forwarded[0]
+
+
+def test_one_reply_can_answer_several_by_number() -> None:
+    pending, forwarded, _sink = _ask("1 2")
+
+    assert pending == []
+    assert forwarded
+    assert _DANGEROUS_A in forwarded[0] and _DANGEROUS_B in forwarded[0]
+
+
+def test_an_out_of_range_number_refuses_the_whole_reply() -> None:
+    """A human who answered "1 9" has misread the list; act on none of it."""
+    pending, forwarded, sink = _ask("1 9")
+
+    assert pending == [_DANGEROUS_A, _DANGEROUS_B], "nothing was consumed"
+    assert forwarded and forwarded[0] == "1 9", "forwarded as an ordinary turn"
+    assert any("序号超出范围" in text for text, _level in sink.statuses)
+
+
+def test_a_bare_approval_word_with_several_pending_names_them() -> None:
+    """It refuses to guess, and says how to answer instead."""
+    pending, forwarded, sink = _ask("同意")
+
+    assert pending == [_DANGEROUS_A, _DANGEROUS_B]
+    assert forwarded and forwarded[0] == "同意"
+    warning = [text for text, level in sink.statuses if level == "warning"]
+    assert warning, "the human is told why the reply was not enough"
+    assert "1." in warning[0] and "2." in warning[0]
+
+
+def test_a_refusal_retires_the_question_instead_of_leaving_it_alive() -> None:
+    """A refusal used to be forwarded, leaving the record redeemable.
+
+    Any later unrelated "yes" could then approve the very thing the human had
+    just declined.
+    """
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_pending_for_scope,
+        shell_session_allowlist_clear,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_session_allowlist_clear()
+    shell_command_check(_DANGEROUS_A, scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+    asyncio.run(
+        coordinator.handle(_turn("拒绝"), state, _CoordinatorSink())  # type: ignore[arg-type]
+    )
+
+    assert shell_pending_for_scope(scope) == [], "the question is retired"
+    assert core.calls and "拒绝" in core.calls[0].text
+    shell_session_allowlist_clear()

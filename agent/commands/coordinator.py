@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 _BUSY_MESSAGE = "Session is busy; wait for the current operation to finish."
 _FAILED_MESSAGE = "Command handling failed."
 
+#: Words that can only mean "go ahead".  Deliberately excluded: ``ok``,
+#: ``okay``, ``y`` and ``yes``.  Those are acknowledgements -- "ok, thanks" is a
+#: reply to something else entirely -- and this path redeems a *high-risk*
+#: action, so a word that plausibly means something else is not consent.  The
+#: set that remains is a phrase nobody types except to approve.
 _CHAT_APPROVAL_PHRASES = frozenset(
     {
         "批准",
@@ -36,25 +41,83 @@ _CHAT_APPROVAL_PHRASES = frozenset(
         "确认执行",
         "approve",
         "approved",
-        "yes",
-        "y",
-        "ok",
-        "okay",
     }
 )
+
+#: The inverse, which did not exist at all: a refusal used to be forwarded to
+#: the model as an ordinary turn, leaving the pending record alive for its full
+#: five minutes so a later unrelated "yes" could redeem what the human had just
+#: declined.
+_CHAT_DENIAL_PHRASES = frozenset(
+    {
+        "拒绝",
+        "取消",
+        "不同意",
+        "不批准",
+        "不允许",
+        "不确认",
+        "不要",
+        "别执行",
+        "deny",
+        "denied",
+        "reject",
+        "cancel",
+        "no",
+        "stop",
+    }
+)
+
+#: What is stripped before matching, so " 批准。" and "同意！" are the same reply.
+_CHAT_APPROVAL_SEPARATORS = (
+    r"[\s\u3000，。！？!?.,、;；：:·\-_/\\\"'“”‘’()（）\[\]【】]+"
+)
 _CHAT_APPROVAL_MAX_LENGTH = 24
+#: How many numbered questions one reply may answer, so a stray long run of
+#: digits is not read as a decision about everything outstanding.
+_CHAT_APPROVAL_MAX_QUESTIONS = 8
+
+
+def _normalize_chat_reply(text: str) -> str:
+    """Fold whitespace, punctuation and case: the input of every phrase test."""
+    return re.sub(_CHAT_APPROVAL_SEPARATORS, "", str(text or "")).strip().casefold()
 
 
 def _is_chat_approval_message(text: str) -> bool:
     """Return True only for a short, unambiguous approval reply."""
-    normalized = re.sub(
-        r"[\s\u3000，。！？!?.,、;；：:·\-_/\\\"'“”‘’()（）\[\]【】]+",
-        "",
-        str(text or ""),
-    ).strip()
-    return bool(normalized) and len(normalized) <= _CHAT_APPROVAL_MAX_LENGTH and (
-        normalized.casefold() in _CHAT_APPROVAL_PHRASES
+    normalized = _normalize_chat_reply(text)
+    return (
+        bool(normalized)
+        and len(normalized) <= _CHAT_APPROVAL_MAX_LENGTH
+        and normalized in _CHAT_APPROVAL_PHRASES
     )
+
+
+def _is_chat_denial_message(text: str) -> bool:
+    """Return True only for a short, unambiguous refusal."""
+    normalized = _normalize_chat_reply(text)
+    return (
+        bool(normalized)
+        and len(normalized) <= _CHAT_APPROVAL_MAX_LENGTH
+        and normalized in _CHAT_DENIAL_PHRASES
+    )
+
+
+def _chat_approval_indexes(text: str) -> list[int]:
+    """The 1-based question numbers in a reply that is nothing but numbers.
+
+    This is what replaces "go and copy a token".  With several questions
+    outstanding a bare "同意" is refused as ambiguous, and the only way to
+    answer was ``/confirm <token>`` per question -- the highest-friction path in
+    the whole consent design, firing at exactly the moment the agent is doing a
+    lot of work and the human least wants to transcribe an opaque string.
+    Numbers carry the same disambiguation with one keystroke each.
+    """
+    parts = re.sub(_CHAT_APPROVAL_SEPARATORS, " ", str(text or "")).split()
+    if not parts or len(parts) > _CHAT_APPROVAL_MAX_QUESTIONS:
+        return []
+    if not all(part.isdigit() for part in parts):
+        return []
+    return [int(part) for part in parts]
 
 
 class _QueueEntry(TypedDict):
@@ -780,25 +843,147 @@ class CommandCoordinator:
             metadata=turn_input.metadata,
         )
 
+    def _outstanding_questions(self, scope: Any) -> list[tuple[str, Any]]:
+        """Every pending consent question for *scope*, in the order to print.
+
+        Install/activation questions first, then shell commands: that is the
+        order the redemption message has always named the side effect in, and
+        the order the numbered list is handed to the human in.
+        """
+        from agent.security.plugin_approval import (
+            plugin_install_pending_records,
+        )
+        from agent.security.shell import shell_pending_for_scope
+
+        rows: list[tuple[str, Any]] = [
+            ("install", record)
+            for record in plugin_install_pending_records(scope)
+        ]
+        rows += [
+            ("shell", record) for record in shell_pending_for_scope(scope)
+        ]
+        return rows
+
+    @staticmethod
+    def _question_label(kind: str, what: str) -> str:
+        if kind != "install":
+            return "执行命令"
+        from agent.security.tool_approval import is_tool_source
+
+        return "激活用户工具" if is_tool_source(what) else "安装插件"
+
+    def _question_text(self, kind: str, record: Any) -> str:
+        what = record.what if kind == "install" else record.command
+        return f"{self._question_label(kind, what)}：{what}"
+
+    def _numbered_questions(self, rows: list[tuple[str, Any]]) -> str:
+        """The list a human answers by number, one line per outstanding question."""
+        return "\n".join(
+            f"{position}. {self._question_text(kind, record)}"
+            for position, (kind, record) in enumerate(rows, start=1)
+        )
+
+    def _answer_question(
+        self, kind: str, record: Any, scope: Any
+    ) -> Optional[str]:
+        """Redeem one question; return what was approved, or ``None``."""
+        from agent.security.plugin_approval import plugin_install_approve_record
+        from agent.security.shell import shell_command_confirm
+
+        if kind == "install":
+            return plugin_install_approve_record(record.token, scope)
+        if shell_command_confirm(record.token, scope=scope):
+            return str(record.command)
+        return None
+
+    def _reject_question(self, kind: str, record: Any, scope: Any) -> bool:
+        """Retire one question because the human refused it."""
+        from agent.security import consent
+        from agent.security.shell import shell_pending_reject
+
+        if kind == "install":
+            return consent.SHELL.reject(record.token, scope=scope)
+        return shell_pending_reject(record.token, scope=scope)
+
+    def _approved_turn(
+        self, turn_input: TurnInput, sink: OutputSink, kind: str, what: str
+    ) -> TurnInput:
+        """The rewritten turn that tells the agent what was approved."""
+        if kind != "install":
+            self._safe_status(
+                sink,
+                f"已批准待确认命令：{what}。可以用相同命令重试执行。",
+                level="info",
+            )
+            return replace(
+                turn_input,
+                text=(
+                    f"用户已批准待确认命令：{what}。"
+                    "该命令已加入会话白名单（约 5 分钟有效），"
+                    "请用完全相同的命令重试执行。"
+                ),
+            )
+        from agent.security.tool_approval import (
+            describe_tool_source,
+            is_tool_source,
+        )
+
+        if is_tool_source(what):
+            tool_id = describe_tool_source(what)
+            self._safe_status(
+                sink,
+                f"已批准激活用户工具：{tool_id}。可以用相同参数重试。",
+                level="info",
+            )
+            return replace(
+                turn_input,
+                text=(
+                    f"用户已批准激活工具：{tool_id}。"
+                    "请用完全相同的参数重新调用 create_tool（或 update_tool）。"
+                ),
+            )
+        self._safe_status(
+            sink,
+            f"已批准待确认插件安装：{what}。可以用相同的 source 重试。",
+            level="info",
+        )
+        return replace(
+            turn_input,
+            text=(
+                f"用户已批准安装插件：{what}。"
+                "请用完全相同的 source 参数重新调用 install_plugin"
+                "（如需覆盖已安装版本请带 replace=true）。"
+            ),
+        )
+
     def _maybe_redeem_chat_approval(
         self,
         turn_input: TurnInput,
         classification: CommandClassification,
         sink: OutputSink,
     ) -> TurnInput:
-        """Redeem the sole pending shell confirmation for an approval reply.
+        """Redeem pending consent questions from a short chat reply.
 
-        A short approval message ("批准", "同意", "yes", …) approves the
-        only pending medium-risk command for this session/channel/user
-        scope, mirroring ``/confirm <token>`` without requiring the human to
-        see a token.  It never accepts a command argument, and it refuses to
-        act when zero or several records are pending (ambiguous).  On
-        success the forwarded text is rewritten to tell the agent which
-        command was approved so it can retry the identical command.
+        Three shapes are understood, all of them short and unambiguous:
+
+        * an approval phrase ("批准", "同意", "approve", …) approves the *sole*
+          outstanding question;
+        * a denial phrase ("拒绝", "取消", "no", …) refuses the sole one, so a
+          refusal is terminal instead of leaving the record alive for a later
+          unrelated "yes";
+        * numbers ("1", "1 3") answer exactly those questions, which is what
+          replaces being told to copy a ``/confirm`` token per question.
+
+        It never accepts an argument to the command, and where several questions
+        are outstanding it refuses a bare phrase rather than guessing -- naming
+        the questions and asking for numbers.
         """
-        if classification.kind != "text" or not _is_chat_approval_message(
-            turn_input.text
-        ):
+        if classification.kind != "text":
+            return turn_input
+        approves = _is_chat_approval_message(turn_input.text)
+        denies = _is_chat_denial_message(turn_input.text)
+        indexes = _chat_approval_indexes(turn_input.text)
+        if not (approves or denies or indexes):
             return turn_input
         # Phrase approval exists for transports that cannot prompt a human at
         # the moment of the side effect (chat channels).  Where an interactive
@@ -808,97 +993,95 @@ class CommandCoordinator:
         if getattr(sink, "interactive_confirmation", False):
             return turn_input
 
-        from agent.security.shell import (
-            ShellAuthorizationScope,
-            shell_approve_single_pending,
-            shell_pending_for_scope,
-        )
-        from agent.security.plugin_approval import (
-            plugin_install_approve_single,
-            plugin_install_pending_for_scope,
-        )
+        from agent.security.shell import ShellAuthorizationScope
 
         scope = ShellAuthorizationScope(
             turn_input.session_id,
             turn_input.channel_name,
             str(turn_input.metadata.get("user_id") or ""),
         )
-        # Plugin installs with executable content use the same chat-approval
-        # pattern: one unexpired pending record for the scope, redeemable by
-        # a short approval reply.  User-tool activations share the store, so
-        # the redemption message has to name the right side effect.
-        plugin_pending = plugin_install_pending_for_scope(scope)
-        if plugin_pending:
-            if len(plugin_pending) > 1:
-                self._safe_status(
-                    sink,
-                    f"当前有 {len(plugin_pending)} 个待确认的安装/激活操作，"
-                    "无法用“批准”批量放行；请逐次确认。",
-                    level="warning",
-                )
-                return turn_input
-            source = plugin_install_approve_single(scope)
-            if source is None:
-                return turn_input
-            from agent.security.tool_approval import (
-                describe_tool_source,
-                is_tool_source,
-            )
+        rows = self._outstanding_questions(scope)
+        if not rows:
+            # Nothing to answer: the reply is an ordinary turn.
+            return turn_input
 
-            if is_tool_source(source):
-                tool_id = describe_tool_source(source)
-                self._safe_status(
-                    sink,
-                    f"已批准激活用户工具：{tool_id}。可以用相同参数重试。",
-                    level="info",
-                )
-                return replace(
-                    turn_input,
-                    text=(
-                        f"用户已批准激活工具：{tool_id}。"
-                        "请用完全相同的参数重新调用 create_tool（或 update_tool）。"
-                    ),
-                )
+        if indexes:
+            return self._redeem_by_number(turn_input, sink, scope, rows, indexes)
+
+        if len(rows) > 1:
             self._safe_status(
                 sink,
-                f"已批准待确认插件安装：{source}。可以用相同的 source 重试。",
+                f"当前有 {len(rows)} 项待确认，无法用一句话批量放行。"
+                "请回复序号（例如“1 3”），或用 /confirm <token> 逐条处理：\n"
+                + self._numbered_questions(rows),
+                level="warning",
+            )
+            return turn_input
+
+        kind, record = rows[0]
+        if denies:
+            self._reject_question(kind, record, scope)
+            self._safe_status(
+                sink,
+                f"已拒绝：{self._question_text(kind, record)}",
                 level="info",
             )
             return replace(
                 turn_input,
                 text=(
-                    f"用户已批准安装插件：{source}。"
-                    "请用完全相同的 source 参数重新调用 install_plugin"
-                    "（如需覆盖已安装版本请带 replace=true）。"
+                    f"用户已拒绝：{self._question_text(kind, record)}。"
+                    "不要重试该操作；如需继续，先说明原因并征得用户同意。"
                 ),
             )
-
-        pending = shell_pending_for_scope(scope)
-        if not pending:
+        what = self._answer_question(kind, record, scope)
+        if what is None:
             return turn_input
-        if len(pending) > 1:
+        return self._approved_turn(turn_input, sink, kind, what)
+
+    def _redeem_by_number(
+        self,
+        turn_input: TurnInput,
+        sink: OutputSink,
+        scope: Any,
+        rows: list[tuple[str, Any]],
+        indexes: list[int],
+    ) -> TurnInput:
+        """Answer the numbered questions, all or nothing.
+
+        Out-of-range numbers refuse the whole reply rather than partially
+        applying it: a human who answered "1 4" when three questions are pending
+        has misread the list, and acting on the half that parsed would be
+        guessing at consent.
+        """
+        if any(index < 1 or index > len(rows) for index in indexes):
             self._safe_status(
                 sink,
-                f"当前有 {len(pending)} 条命令待确认，无法用“批准”批量放行；"
-                "请使用 /confirm <token> 逐条批准。",
+                f"序号超出范围（当前 {len(rows)} 项待确认）。请重新回复序号，"
+                "或用 /confirm <token> 逐条处理：\n" + self._numbered_questions(rows),
                 level="warning",
             )
             return turn_input
 
-        command = shell_approve_single_pending(scope)
-        if command is None:
+        approved: list[str] = []
+        for index in indexes:
+            kind, record = rows[index - 1]
+            what = self._answer_question(kind, record, scope)
+            if what is not None:
+                approved.append(f"{self._question_label(kind, what)}：{what}")
+        if not approved:
             return turn_input
         self._safe_status(
             sink,
-            f"已批准待确认命令：{command}。可以用相同命令重试执行。",
+            "已批准：\n" + "\n".join(f"- {item}" for item in approved),
             level="info",
         )
         return replace(
             turn_input,
             text=(
-                f"用户已批准待确认命令：{command}。"
-                "该命令已加入会话白名单（约 5 分钟有效），"
-                "请用完全相同的命令重试执行。"
+                "用户已批准以下待确认事项：\n"
+                + "\n".join(f"- {item}" for item in approved)
+                + "\n请用与批准时完全相同的参数重试这些操作；"
+                "其余待确认事项仍然等待用户决定。"
             ),
         )
 
