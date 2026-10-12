@@ -2,11 +2,14 @@
 
 **Status:** the gate is rewritten and measured (steps 1-3); one consent store holds all
 four consent kinds with three explicit lifetimes, and the shell gate reads and writes it
-(step 4); and a "yes" now remembers the **capability** the question proposed rather than the
+(step 4); a "yes" now remembers the **capability** the question proposed rather than the
 command line (step 5) — measured, answering each of the corpus's questions once for the
-project turns 7 prompts into 0, with no leak into another project.  What remains is `/trust`
-to show and revoke what was granted, the sandbox half of the write boundary, the browser's
-fourth button, and the `why` line on every card — itemised at the end of this document.
+project turns 7 prompts into 0, with no leak into another project; `/trust` shows and
+revokes what was granted (step 7); and every card now names the grant it is offering, while
+`memory_clear` is answerable from a chat channel instead of impossible there (step 6).
+What remains is the browser's fourth button, the sandbox half of the write boundary, and
+aliasing the old consent commands — itemised at the end of this document, with the one item
+this host cannot verify called out.
 
 Everything in "What I measured" was produced by a probe against the code in this repo
 ([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
@@ -463,9 +466,10 @@ Measured where the work is done; predicted where it is not.
 | hazards unasked at the default | 11 of 19 | **1 of 19** | — |
 | prompts after answering each once for the project | 11 | **0** (6 rules) | — |
 | levels a user must understand | 4 (1 real) | **4 (3 real)** | — (collapse withdrawn) |
-| slash commands for consent | 5 | 5 | 2 (`/trust`) |
+| slash commands for consent | 5 | **6** (`/trust` added; the 4 old ones still work) | aliasing the old four onto the store |
 | consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** (the store, plus `user_tools`' digest ledger and the config allowlist, both documented) | — |
 | surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser backend) | the browser's fourth button; chat has numbered replies but no "always" |
+| consent kinds answerable off-terminal | 3 of 4 | **4 of 4** (`memory_clear` gained a pending record) | — |
 | consent lifetime | 5 min, RAM | **once / session / always** | — |
 
 ## Decisions taken
@@ -521,15 +525,26 @@ Measured where the work is done; predicted where it is not.
    remembered `path:` grants into `write_scope`.  The gate already asks about out-of-boundary
    writes, so the behaviour is right; what is missing is that the sandbox still permits them,
    which leaves the prompt as the enforcement rather than a rule behind it.
-6. ⏳ **One card.**  The terminal has four answers, the browser backend advertises and honours
-   `allow_project`, and chat gained a numbered reply plus a refusal.  Still missing: the
+6. ⏳ **One card.**  The terminal has four answers and prints the rule each wider answer
+   would remember ("本项目总是允许（记住：这个程序的所有调用：pip）"); the browser backend
+   advertises and honours `allow_project`, carrying `project_rule` and its rendered label;
+   chat gained a numbered reply, a refusal, and — new — memory clears.  Still missing: the
    browser's fourth *button* (a frontend change plus a rebuild; the backend needs nothing
-   more), `why` on every card, and `memory_clear` minting a pending record so it is
-   answerable off-terminal.
-7. ⏳ **`/trust`**, and the old commands as aliases.  Not started, and now the most valuable
-   remaining item: `always` is reachable and persistent, so the surface that shows and revokes
-   what was granted is the thing that makes it honest — consent that can be granted but not
-   taken back is not consent.  `revoke_scope`, `revoke` and `remembered(workspace=…)` already
-   give it everything it needs.
+   more), and a `why` line on the chat card, which names the command but not the reason.
+   `memory_clear` no longer belongs on this list: it used to be *impossible* off-terminal
+   and now leaves a pending record whose token can be answered from wherever the human is.
+7. ✅ **`/trust`**, and the old commands as aliases.  `/trust` lists both lifetimes, names
+   the *kind* of each grant, revokes by number or wholesale, and honours both scope and
+   workspace so revoking "pip here" cannot drop it for another project or user.  The old
+   commands (`/allow`, `/deny`, `/auto-approve`, `/confirm`) still work and are now the
+   legacy spelling of the same intent; aliasing them onto the store is the small remaining
+   cleanup, not a capability gap.
 
-Steps 1-5 are done.  `/trust` is next, then the sandbox half of the write boundary.
+Steps 1-5 and 7 are done, and 6 is done on every surface whose change is backend-only.  The
+next item is the sandbox half of the write boundary — with one honest caveat, recorded here
+so the decision is visible rather than implied: **it cannot be verified on this host.**
+`sandbox-exec` is unavailable, so all thirteen `tests/test_sandbox_conformance.py` cases
+(and `test_shell_allows_output_dir_writes`) are pre-existing failures on this machine —
+which means a change to the boundary would land with its enforcement untested.  It should be
+done on a host that can run the sandbox, and the tool-state list audited first, so that
+"writes are confined to the workspace" does not break a tool whose cache lives elsewhere.
