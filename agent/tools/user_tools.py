@@ -721,7 +721,11 @@ async def author_tool(
                 }
                 if needs_pending:
                     plugin_install_record_pending(
-                        scope, approval_source(tool_id, digest)
+                        scope,
+                        approval_source(tool_id, digest),
+                        reason=(
+                            "激活它等于在本进程内执行这段生成的 Python"
+                        ),
                     )
                     payload.update(
                         {

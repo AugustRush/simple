@@ -387,7 +387,9 @@ class PluginTools:
                         "cancelled": True,
                     }
                     if needs_pending:
-                        plugin_install_record_pending(scope, source)
+                        plugin_install_record_pending(
+                            scope, source, reason=executable_reason
+                        )
                         payload.update(
                             {
                                 "requires_confirmation": True,

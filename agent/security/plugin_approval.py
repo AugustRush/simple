@@ -47,13 +47,21 @@ def _rule(source: str) -> str:
     return consent.make_rule(consent.PLUGIN, str(source))
 
 
-def plugin_install_record_pending(scope: Any, source: str) -> str:
-    """Register one pending install/activation; returns its opaque token."""
+def plugin_install_record_pending(
+    scope: Any, source: str, *, reason: str = ""
+) -> str:
+    """Register one pending install/activation; returns its opaque token.
+
+    ``reason`` is carried on the record so a card that is not shown at the
+    moment of asking -- a chat channel lists outstanding questions afterwards --
+    can still say why each one is being asked.
+    """
     return consent.SHELL.ask(
         kind=KIND,
         summary=str(source),
         rule=_rule(source),
         scope=scope,
+        reason=str(reason or ""),
     )
 
 

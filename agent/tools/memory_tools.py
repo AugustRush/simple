@@ -192,6 +192,7 @@ class MemoryTools:
             summary=_MEMORY_CLEAR_SUMMARY,
             rule=rule,
             scope=scope,
+            reason="该操作不可恢复",
         )
         return self._error(
             "Clearing memory needs an explicit human answer, and none was "

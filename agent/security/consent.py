@@ -163,6 +163,11 @@ class Pending:
     expires_at: float
     #: The lifetime a "yes" will be recorded at unless the human says otherwise.
     lifetime: str = ONCE
+    #: Why this question is being asked, in the words the gate used.  Carried on
+    #: the record because not every surface shows it at the moment of asking: a
+    #: chat card prints a list of outstanding questions afterwards, and "run
+    #: this" with no reason is what makes a person approve the wrong one.
+    reason: str = ""
     #: The rule an ``always`` answer should record instead of :attr:`rule`, and
     #: the workspace it belongs to.
     #:
@@ -525,6 +530,7 @@ class ConsentStore:
         expires_at: Optional[float] = None,
         always_rule: str = "",
         workspace: str = "",
+        reason: str = "",
     ) -> str:
         """Record a question and return its token.
 
@@ -564,6 +570,7 @@ class ConsentStore:
             lifetime=lifetime if lifetime in LIFETIMES else ONCE,
             always_rule=str(always_rule or ""),
             workspace=str(workspace or ""),
+            reason=str(reason or ""),
         )
         return token
 
@@ -601,6 +608,7 @@ class ConsentStore:
             lifetime=lifetime,
             always_rule=record.always_rule,
             workspace=record.workspace,
+            reason=record.reason,
         )
         return True
 

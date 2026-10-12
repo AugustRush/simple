@@ -4391,6 +4391,34 @@ def test_unknown_explicit_skill_reference_still_reports_an_error():
     assert classification.skill_error == "unknown"
 
 
+def test_the_chat_question_list_says_why_each_question_is_asked(monkeypatch):
+    """The numbered list is the only card a chat user ever sees.
+
+    A bare "run this" asks someone to approve something they cannot judge, and
+    the reason is the one thing that makes the answer informed -- so it travels
+    on the record rather than being known only to the surface that asked first.
+    """
+    from agent.commands.coordinator import CommandCoordinator
+    from agent.security import consent
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+    )
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+    scope = ShellAuthorizationScope("chat-1", "feishu", "")
+    check = shell_command_check("mkfs /dev/disk0", scope=scope)
+    assert check.requires_confirmation is True
+
+    coordinator = CommandCoordinator.__new__(CommandCoordinator)
+    rows = coordinator._outstanding_questions(scope)
+    listed = coordinator._numbered_questions(rows)
+
+    assert listed.startswith("1. ")
+    assert "原因：" in listed
+    assert check.reason in listed
+
+
 def test_a_chat_reply_can_answer_a_memory_clear_question(monkeypatch):
     """The token ``memory_clear`` hands back is redeemable where the human is.
 

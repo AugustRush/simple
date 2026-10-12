@@ -884,7 +884,12 @@ class CommandCoordinator:
         # Store records carry ``what``; the shell's own wrapper carries
         # ``command``.  Both mean "the thing being consented to".
         what = getattr(record, "what", None) or getattr(record, "command", "")
-        return f"{self._question_label(kind, what)}：{what}"
+        text = f"{self._question_label(kind, what)}：{what}"
+        # Why it was asked, when the record knows.  On a chat channel this list
+        # is the *only* card the human ever sees, so a bare "run this" would be
+        # asking them to approve something they cannot judge.
+        reason = str(getattr(record, "reason", "") or "")
+        return f"{text}（原因：{reason}）" if reason else text
 
     def _numbered_questions(self, rows: list[tuple[str, Any]]) -> str:
         """The list a human answers by number, one line per outstanding question."""

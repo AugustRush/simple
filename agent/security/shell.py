@@ -503,6 +503,10 @@ class PendingShellConfirmation:
     command: str
     scope: ShellAuthorizationScope
     expires_at: datetime
+    #: Why the gate asked, so a surface that lists outstanding questions after
+    #: the fact can say so.  Defaulted because the many callers that only read
+    #: ``token``/``command`` never need it.
+    reason: str = ""
 
 
 _DEFAULT_SCOPE = ShellAuthorizationScope("default", "cli", "")
@@ -944,6 +948,7 @@ def shell_pending_for_scope(
             command=record.what,
             scope=scope,
             expires_at=_stamp(record.expires_at),
+            reason=record.reason,
         )
         for record in _pending_records(scope, now)
     ]
@@ -977,6 +982,7 @@ def _pending_confirmation(
     now: datetime,
     approval_rule: str = "",
     workspace: str | None = None,
+    reason: str = "",
 ) -> str:
     normalized_command = _normalize_command(command)
     return consent.SHELL.ask(
@@ -993,6 +999,7 @@ def _pending_confirmation(
         # decided where the reason is known; see ShellCheckResult.approval_rule.
         always_rule=approval_rule,
         workspace=str(workspace or ""),
+        reason=str(reason or ""),
     )
 
 
@@ -1897,6 +1904,7 @@ def shell_command_check(
             now=authorization_now,
             approval_rule=rule,
             workspace=workspace,
+            reason=reason,
         )
         return ShellCheckResult(
             allowed=False,
