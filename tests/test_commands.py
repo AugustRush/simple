@@ -1163,6 +1163,83 @@ def test_builtin_confirm_redeems_with_command_context_identity():
     assert shell_command_check("mkfs /dev/disk0", scope=scope).allowed is True
 
 
+def test_trust_also_shows_the_config_allowlist(monkeypatch):
+    """The second list: standing permissions that no card ever mentioned.
+
+    ``shell_allowed_commands`` pre-approves commands *outside* any consent
+    record, and nothing in the UI said so -- `/allow <program>` silently
+    widened what could run high-risk commands with no confirmation.  It is
+    configuration rather than an answer, so it is listed separately and
+    unnumbered, but it is listed.
+    """
+    import agent as agent_module
+
+    from agent.security import consent
+    from agent.security.shell import shell_session_allowlist_clear
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+    monkeypatch.setattr(
+        agent_module,
+        "load_config",
+        lambda *args, **kwargs: (
+            {"shell_allowed_commands": ["pytest", "rg"]},
+            False,
+        ),
+    )
+    shell_session_allowlist_clear()
+
+    listed = _run_builtin(_builtin_router(), "/trust").response_text or ""
+
+    assert "shell_allowed_commands" in listed
+    assert "pytest" in listed and "rg" in listed
+    # And it says how to take them back, since /trust cannot.
+    assert "/deny" in listed
+
+
+def test_trust_revoke_ignores_the_config_allowlist(monkeypatch):
+    """Config entries are not answers, so they are not numbered or revocable here."""
+    import agent as agent_module
+
+    from agent.security import consent
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_add_persistent,
+        shell_session_allowlist_clear,
+    )
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+    monkeypatch.setattr(
+        agent_module,
+        "load_config",
+        lambda *args, **kwargs: (
+            {"shell_allowed_commands": ["pytest"]},
+            False,
+        ),
+    )
+    scope = ShellAuthorizationScope("s-1", "feishu", "user-1")
+    shell_session_allowlist_clear()
+    shell_session_allowlist_add_persistent("mkfs /dev/disk0", scope=scope)
+
+    router = _builtin_router()
+    revoked = _run_builtin(
+        router,
+        "/trust revoke 1",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "mkfs /dev/disk0" in revoked
+
+    still = _run_builtin(
+        router,
+        "/trust",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    # The answer is gone; the configured program stays, and is still named.
+    assert "mkfs /dev/disk0" not in still
+    assert "pytest" in still
+
+
 def test_builtin_trust_lists_and_revokes_what_was_remembered(tmp_path, monkeypatch):
     """The surface that keeps "always" honest.
 

@@ -1223,9 +1223,10 @@ async def _trust_handler(
 
     workspace = _trust_workspace(context)
     rows = _trust_rows(context)
+    configured = _shell_allowed_commands_from_config()
 
     if not parts:
-        if not rows:
+        if not rows and not configured:
             return CommandResult(
                 response_text=(
                     "本会话与本项目没有记住任何同意。\n\n"
@@ -1235,18 +1236,40 @@ async def _trust_handler(
                 )
             )
         lines = ["## 已记住的同意", ""]
-        for index, row in enumerate(rows, start=1):
-            label = _TRUST_LIFETIME_LABELS.get(row.lifetime, row.lifetime)
-            lines.append(f"{index}. {_trust_rule_label(row.rule)}  （{label}）")
+        if rows:
+            for index, row in enumerate(rows, start=1):
+                label = _TRUST_LIFETIME_LABELS.get(row.lifetime, row.lifetime)
+                lines.append(
+                    f"{index}. {_trust_rule_label(row.rule)}  （{label}）"
+                )
+        else:
+            lines.append("（本会话与本项目没有）")
         if not workspace:
             lines.append("")
             lines.append(
                 "> ℹ 当前没有工作区，所以本项目级别的授予不会显示在这里。"
             )
-        lines.append("")
-        lines.append(
-            "撤销：`/trust revoke <序号>`；清空以上全部：`/trust revoke all`。"
-        )
+        if rows:
+            lines.append("")
+            lines.append(
+                "撤销：`/trust revoke <序号>`；清空以上全部：`/trust revoke all`。"
+            )
+        if configured:
+            # The second list.  It is *configuration* rather than an answer, so
+            # it is neither numbered nor revocable from here -- but leaving it
+            # out is what made "nothing in the UI mentions /allow" true, and a
+            # standing permission nobody can see is the thing this command
+            # exists to fix.
+            lines.append("")
+            lines.append("### 配置里的常驻许可（`shell_allowed_commands`）")
+            lines.append("")
+            for item in configured:
+                lines.append(f"- `{_markdown_inline(item)}`")
+            lines.append("")
+            lines.append(
+                "这些来自 config，不是对某个提问的回答，所以不参与上面的序号；"
+                "用 `/deny <命令>` 移除。"
+            )
         return CommandResult(response_text="\n".join(lines))
 
     if len(parts) != 2:
