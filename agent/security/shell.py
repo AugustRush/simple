@@ -1725,6 +1725,10 @@ def shell_command_check(
         if environment_reason is not None:
             return _confirm(environment_reason)
 
+    # ── Named destructiveness and command-line opacity: confirmed at ``ask`` ──
+    # Auto-allowed from ``medium`` up, exactly as these checks have always been:
+    # ``medium`` means "I trust the *named* dangerous commands inside the
+    # sandbox I was given".
     if effective_level == "ask":
         for _operator, segment, index in segment_indexes:
             if index is None:
@@ -1736,11 +1740,6 @@ def shell_command_check(
                 return _confirm(
                     "inline interpreter code cannot be safely classified"
                 )
-            if _reads_program_from_stdin(segment, index):
-                return _confirm(
-                    f"the pipe feeds '{segment_name}', which executes its input "
-                    "as a program; that text is not classified"
-                )
             high_risk_option = _find_high_risk_option(segment, index)
             if high_risk_option:
                 return _confirm(
@@ -1750,6 +1749,33 @@ def shell_command_check(
             command_reason = _high_risk_command_reason(segment, index)
             if command_reason is not None:
                 return _confirm(command_reason)
+
+        for pattern in HIGH_RISK_PATTERNS:
+            if pattern in command:
+                return _confirm(f"command pattern '{pattern}' is high risk")
+
+    # ── Authority and hidden execution: still confirmed at ``medium`` ───────
+    #
+    # These are what ``medium`` kept asking about back when the operator guard
+    # did this job, and dropping them at ``medium`` would have made the middle
+    # rung silently equal to ``high`` -- a level that turns off remote-code
+    # execution and the workspace boundary without saying so.  Composition
+    # between harmless commands is deliberately absent: it is neither an
+    # authority question nor a hidden program, which is why it stopped asking at
+    # any level.  A pipe *into an interpreter* is the second kind: the program
+    # being run is on the other side of the pipe, not in the string classified.
+    if effective_level in ("ask", "medium"):
+        for _operator, segment, index in segment_indexes:
+            if index is None:
+                continue
+            segment_name = os.path.basename(
+                segment[index].strip().lstrip("./")
+            )
+            if _reads_program_from_stdin(segment, index):
+                return _confirm(
+                    f"the pipe feeds '{segment_name}', which executes its input "
+                    "as a program; that text is not classified"
+                )
             write_reason = _argument_write_reason(
                 segment, index, allowed_roots=allowed_roots
             )
@@ -1758,10 +1784,6 @@ def shell_command_check(
             irreversible_reason = _workspace_irreversible_reason(segment, index)
             if irreversible_reason is not None:
                 return _confirm(irreversible_reason)
-
-        for pattern in HIGH_RISK_PATTERNS:
-            if pattern in command:
-                return _confirm(f"command pattern '{pattern}' is high risk")
 
         for _operator, segment, _index in segment_indexes:
             for target in _redirect_targets(segment):

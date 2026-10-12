@@ -1,11 +1,11 @@
 # Permissions: from per-command approval to capability grants
 
-**Status:** step 1 implemented and measured; steps 2-5 designed, not yet built.  The
-"one boundary, one gate" section below is now the code (`agent/security/shell.py`):
-the command is segmented on its separators, each segment is classified on its own merits,
-a pipe into an interpreter and a write outside the workspace are the two composition rules,
-and the in-workspace irreversibility list closes the three destructive git/rm shapes.  See
-[Measured after step 1](#measured-after-step-1) for what that moved.
+**Status:** the gate is rewritten and measured (steps 1-3, see
+[Measured after step 1](#measured-after-step-1)); the one consent store exists and installs
+and activations run on it, with `always` reachable for the first time; the terminal and
+browser both offer three answers and chat gained a numbered reply and a refusal.  What
+remains is the shell allowlist port, `/trust`, the write boundary, and the `why` line on
+every card — itemised at the end of this document with what each one is worth.
 
 Everything in "What I measured" was produced by a probe against the code in this repo
 ([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
@@ -22,12 +22,13 @@ neither is decisive and the user pays for both:
 * the **OS sandbox** (`agent/security/sandbox/`) decides what a shell child may touch;
 * the **consent gate** (`agent/security/shell.py`) decides when to stop and ask.
 
-Measured, at the default level: the gate asks on **19% of ordinary development commands**
-and the overwhelming majority of those asks are about *syntax* (`|`, `>`, `&&`) — while
-`rm -rf /`, `sudo rm -rf /`, `git clean -fdx`, `mkfs.ext4 /dev/sda1`, `chmod -R 777 /` and
-`diskutil eraseDisk` all **run with no prompt at all**.  The prompt stream and the risk are
-uncorrelated, because the gate classifies the *command name* while the risk lives in the
-*arguments*, and the sandbox permits nearly every write.
+Measured, at the default level **before the change**: the gate asked on **19% of ordinary
+development commands** and the overwhelming majority of those asks were about *syntax*
+(`|`, `>`, `&&`) — while `rm -rf /`, `sudo rm -rf /`, `git clean -fdx`,
+`mkfs.ext4 /dev/sda1`, `chmod -R 777 /` and `diskutil eraseDisk` all **ran with no prompt at
+all**.  The prompt stream and the risk were uncorrelated, because the gate classified the
+*command name* while the risk lives in the *arguments*, and the sandbox permits nearly every
+write.
 
 The fix is not a better list.  It is to stop asking per command and start **granting
 capabilities**:
@@ -36,11 +37,16 @@ capabilities**:
 > something that cannot be undone.  Every answer is remembered, at a lifetime the human
 > chose, for the workspace they chose.
 
-That collapses four levels into two, five consent commands into two, nine consent stores
-into one, and the default prompt rate from 19% to roughly 5% — and to ~0% once a program has
-been granted once.
+After the gate rewrite the default asks on **12%** (9% if the two genuinely destructive git
+commands in the corpus are excluded) and **18 of 19 hazards ask**, with composition between
+harmless commands free at every level.  The remaining simplification — one store, one card,
+`/trust` — is what turns the answers that are still given into grants that are not asked
+again.
 
 ## What I measured
+
+**These are the numbers before the change**, and they are what the design was argued from.
+The same probe now reports the after-state in [Measured after step 1](#measured-after-step-1).
 
 Corpus: 58 commands an agent actually runs doing ordinary work (explore, read, test, build,
 install, git, network, format, docker, misc).  Probe: `scripts/permission_prompt_probe.py`.
@@ -359,21 +365,34 @@ is the one no surface answers today:
   high-risk action; a bare `同意`/`批准`/`approve` still does, because it cannot plausibly
   mean anything else.
 
-### Two levels, not four
+### Levels: the middle rung, not fewer rungs
 
-`ask` (default) and `auto`, plus the sandbox as its own axis.
+**Superseded, and the reason is worth keeping.**  This section originally proposed
+collapsing four levels into two, on the measured grounds that `medium` differed from `ask`
+by almost nothing (19% → 16%): the operator guard asked at *both*, so the middle rung was
+dead and the only way to stop being interrupted was `high` — which also stops asking about
+remote-code execution.  That was a statement about the *guard*, not about the ladder.
 
-* `ask` = the gate above: out-of-boundary and irreversible.
-* `auto` = never ask; the sandbox, the blacklist and the structural guards remain.
+Once composition stopped being a rung, implementing the gate revealed the opposite
+problem: every new authority check was `ask`-only, so `medium` silently became equal to
+`high` — a level that turns off the workspace boundary and hidden-program checks without
+saying so.  Gating the *reason* rather than the *syntax* fixes both at once, and the ladder
+becomes three rungs that each mean something:
 
-`medium` becomes an alias of `ask` (it differs by two prompts in 58 — the inline-interpreter
-cases), `high` an alias of `auto`, and `full` an alias for `auto` + an unsandboxed
-confirmation.  Old configs keep working; `/permissions` prints the two real ones and says
-what the aliases map to.  Removing the middle rungs removes the incentive that currently
-leads users to `high` — which is the whole reason `curl | sh` is one command away.
+| level | asks about | the rung buys |
+|---|---|---|
+| `ask` (default) | named destruction, code it cannot read, out-of-boundary writes, in-workspace irreversibility, hidden programs, env mutation | — |
+| `medium` | out-of-boundary writes, in-workspace irreversibility, hidden programs, env mutation | inline `-c`/`-e` stops asking |
+| `high` / `full` | env mutation only | the whole gate stops; `full` additionally permits an unsandboxed shell |
 
-The gain is that **the user can be asked almost never without switching off the destructive
-guard.**  Today those are the same switch.
+So the collapse is **not needed**, and doing it would have removed a rung that is now load
+bearing.  What the design still wants is the sandbox as an independent axis (today
+`sandbox none` requires level `full`), which is a smaller change with the same point:
+turning the sandbox off should be the human's explicit act, not a side effect of choosing a
+noise level.  Pinned by `tests/test_shell_security.py::test_medium_is_a_real_rung_and_not_a_second_high`.
+
+The gain the collapse was meant to buy is already here: **the user can be asked almost never
+without switching off the destructive guard.**  Before, those were the same switch.
 
 ## Measured after step 1
 
@@ -387,9 +406,14 @@ point of the change: they move in opposite directions, which is what "calibrated
 | destructive probes that run unasked at the default | **11 of 19** | **1 of 19** |
 | destructive probes that run at `high` | 18 of 19 | 18 of 19 |
 | `curl … \| sh` at the default | asks | **asks** (now because the right side is a shell, not because a pipe is present) |
+| `curl … \| sh` at `medium` | asks | **asks** (the authority rung is not skipped) |
 | `echo hi \| sh` end-to-end | asks | **asks** (`tests/test_functional_turns.py`) |
 
-The 7 prompts are now: inline interpreter code ×3, environment mutation ×2, and
+The prompt ladder after the change: **ask 7 (12%) → medium 5 (9%) → high 2 (3%)** — three
+distinct rungs, where before `medium` was within two prompts of `ask` and `high` was the
+only escape.
+
+The 7 prompts at the default are: inline interpreter code ×3, environment mutation ×2, and
 `git reset --hard` / `git clean -fd` ×2 — the last two being *genuinely destructive commands
 that happened to be sitting in the "ordinary work" corpus*.  Excluding them, the noise rate
 on ordinary development commands is **5 of 58 (9%)**, and every one of those is a real
@@ -400,25 +424,27 @@ workspace.  It is the deliberate edge of the in-workspace rule — a target the 
 granted by pointing the agent at the directory — and it is listed in the open questions
 rather than papered over.
 
-Fifteen of the nineteen hazards now ask.  The four that did not ask for the wrong reason
-before, now ask for the right one: `rm -rf ~/Documents` and `chmod -R 777 /` and
-`mv ~/Documents /tmp/x` because their **target** is outside the workspace,
+Fifteen of the nineteen hazards now ask at the default level.  The four that did not ask for
+the wrong reason before now ask for the right one: `rm -rf ~/Documents` and `chmod -R 777 /`
+and `mv ~/Documents /tmp/x` because their **target** is outside the workspace,
 `mkfs.ext4 /dev/sda1` and `diskutil eraseDisk` because the **spelling** no longer escapes a
 name-keyed list, and `cat img > /dev/sda` / `echo x >> ~/.zshrc` by where the **redirect**
 writes.
 
-## What steps 2-5 should do to the numbers
+## What the remaining steps should do to the numbers
 
-Predictions to be verified against the probe after implementation:
+Measured where the work is done; predicted where it is not.
 
-| | today | proposed |
-|---|---|---|
-| prompts after one `always` per program | 7 | ~0 |
-| levels a user must understand | 4 (2 real) | 2 |
-| slash commands for consent | 5 | 2 |
-| consent stores (in-memory + on disk) | 6 + 3 | 1 |
-| surfaces where "always" exists | 1 of 3 | 3 of 3 |
-| consent lifetime | 5 min, RAM | once / session / persisted per workspace |
+| | before | now | remaining work |
+|---|---|---|---|
+| prompts on the corpus at the default | 11 (19%) | **7 (12%)** | — |
+| hazards unasked at the default | 11 of 19 | **1 of 19** | — |
+| prompts after one `always` per program | 11 | 7 | ~0 (store + card) |
+| levels a user must understand | 4 (1 real) | **4 (3 real)** | — (collapse withdrawn) |
+| slash commands for consent | 5 | 5 | 2 (`/trust`) |
+| consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** for install/activation; shell pending + allowlist still own theirs | 1 |
+| surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser) | 3 of 3 (chat) |
+| consent lifetime | 5 min, RAM | **once / session / always** for installs and activations | same for shell commands |
 
 ## Decisions taken
 
@@ -458,14 +484,25 @@ Predictions to be verified against the probe after implementation:
    (`_reads_program_from_stdin`) replaced the operator blanket, and the measured
    name-keyed misses were closed with `_high_risk_command_reason` (`mkfs.*`, `diskutil
    erase*`).
-4. **Introduce one `ConsentStore`** with the three lifetimes; port the three existing stores
-   onto it; keep the existing public functions as thin wrappers so the surface area of the
-   change is the store, not its ~60 call sites.
-5. **Make `always` persistent per workspace**, reusing the `user_tools` approvals file shape,
-   and collapse the write boundary to the workspace with grants feeding `write_scope`.
-6. **Unify the card**: three answers on the terminal, numbered batch in chat, `why` on all
-   three, and `memory_clear` minting a pending record so it is answerable off-terminal.
-7. **Introduce `/trust`; alias the old commands.**  Reduce `/permissions` to the two real
-   levels + the sandbox axis.
+4. ⏳ **One `ConsentStore`, three lifetimes** (`agent/security/consent.py`).  Landed for
+   installs and activations — `plugin_approval.py` is now a thin adapter, the ledger is
+   configured once in the composition root, and "always" is reachable for the first time.
+   The shell allowlist and its pending tokens still own their own dictionaries; porting them
+   is the piece that makes `program:`/`path:` rules apply to shell commands, and therefore
+   the prerequisite for the card's "always for this project" on the surface that matters
+   most.
+5. ⏳ **The write boundary → the workspace**, with grants feeding `write_scope`.  Not
+   started.  The gate already asks about out-of-boundary writes, so the *behaviour* is
+   right; what is missing is that the sandbox still permits them, which leaves the prompt
+   as the enforcement rather than a rule behind it.
+6. ⏳ **One card.**  Two of three surfaces done: the browser always had three answers, the
+   terminal gained the third, and chat gained a numbered reply plus a refusal.  Still
+   missing: `why` on every card (the browser shows a reason string, the terminal a risk
+   level), and `memory_clear` minting a pending record so it is answerable off-terminal.
+7. ⏳ **`/trust`**, and the old commands as aliases.  Not started; it is what makes a
+   remembered answer visible and revocable from one place, and the reason `always` should
+   not ship without it — consent that can be granted but not taken back is not consent.
 
-Steps 1-3 were the behaviour change and are done; steps 4-7 are the simplification proper.
+Steps 1-3 were the behaviour change and are done.  Step 4 is half done and is the next
+highest-value item, because it is what turns a per-command approval into a per-capability
+grant on the surface where the prompts actually happen.
