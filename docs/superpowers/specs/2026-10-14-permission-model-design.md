@@ -1,11 +1,11 @@
 # Permissions: from per-command approval to capability grants
 
-**Status:** the gate is rewritten and measured (steps 1-3, see
-[Measured after step 1](#measured-after-step-1)); the one consent store exists and installs
-and activations run on it, with `always` reachable for the first time; the terminal and
-browser both offer three answers and chat gained a numbered reply and a refusal.  What
-remains is the shell allowlist port, `/trust`, the write boundary, and the `why` line on
-every card — itemised at the end of this document with what each one is worth.
+**Status:** the gate is rewritten and measured (steps 1-3); one consent store holds all
+four consent kinds with three explicit lifetimes, and the shell gate now reads and writes
+it (step 4).  Two of three surfaces offer "always", and chat can answer several questions
+by number.  What remains is making a shell answer generalise (`program:`/`path:` rules),
+`/trust`, the write boundary, and the `why` line on every card — itemised at the end of
+this document with what each one is worth.
 
 Everything in "What I measured" was produced by a probe against the code in this repo
 ([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
@@ -314,30 +314,40 @@ the rule language.  That is the same reason `$(…)` is blocked today, applied c
 
 ### One memory, three lifetimes
 
-One store, keyed by `(scope, rule)`, where a rule is a *capability* rather than a string:
+**Implemented** (`agent/security/consent.py`).  One store, keyed by `(scope, rule)` for the
+two expiring lifetimes and by `(workspace, rule)` for the third, where a rule is a
+*capability* rather than a string:
 
 | lifetime | meaning | storage |
 |---|---|---|
-| `once` | this invocation, five minutes | RAM |
-| `session` | this scope, this process | RAM |
-| `always` | this **workspace**, this rule, with the digest of what was approved | disk |
+| `once` | this request, bounded by the question's own five-minute window | RAM |
+| `session` | every matching request in this scope, until the process exits | RAM |
+| `always` | every matching request in this **workspace**, across restarts and sessions | disk |
 
-`always` is the new part, and it is what removes the long tail.  Precedent exists in both
-places it matters: `user_tools.APPROVALS_FILENAME` (`.approved.json`, a digest of what was
-approved) and the config-level `shell_allowed_commands`.  A rule generalises along the axis
-the human was actually granting — `program:npm` for "npm and its subcommands",
-`path:/Users/august/code/other`, `install:plugin:<source>` — not along the exact bytes.
+All four consent kinds write it: shell commands, plugin installs, user-tool activation and —
+once it is given a pending record — memory clear.  What made the port possible without
+moving behaviour was giving the store the seams the gate's own tests already drove: an
+`at=` clock per call, an `expires_at=` override for `once` (so an approval answers *the
+question's* window rather than the moment of the answer), and a `kind` on every record (so
+two questions from different kinds in one store do not get counted as each other's
+ambiguity).  The store's own state is instance state — five containers on one object rather
+than five module names — which is recorded in `agent/runtime/state_ledger.py` as a decision.
 
-Every consent kind in the repo writes this one store: shell commands, plugin installs
-(`agent/security/plugin_approval.py`), user-tool activation
-(`agent/security/tool_approval.py`), memory clear (`agent/tools/memory_tools.py:104`).
-That deletes two of the three scope-key implementations and the coordinator's
-try-store-A-then-B logic (`agent/commands/coordinator.py:830-888`).
+`always` is the part that removes the long tail, and it is now *reachable* for installs and
+activations, which could not say "always" at all before.  Precedent for the on-disk half
+exists in both places it matters: `user_tools.APPROVALS_FILENAME` (`.approved.json`, a
+digest of what was approved) and the config-level `shell_allowed_commands`.  What is still
+*mine to finish* is the generalisation: the rule a shell answer records is currently the
+exact command, so `program:npm` and `path:/Users/me/code` — the two rules that would make a
+shell answer cover the next spelling — are expressible and not yet written.  That is the
+next step's job, because it is also what the card's third answer needs in order to mean
+"this project" rather than "this line".
 
 Revocation is one command — `/trust` lists rules and revokes one — which is what
-"consent that can be granted but never taken back is not consent"
-(`agent/security/shell.py:459-462`) demands, and what today requires knowing that
-`/deny <program>` removes an entry from a *different* list than the one the card wrote.
+"consent that can be granted but never taken back is not consent" demands, and what today
+requires knowing that `/deny <program>` removes an entry from a *different* list than the
+one the card wrote.  Not built yet; `revoke_scope` (the web session-revoke path) and the
+store's `revoke` already give it everything it needs.
 
 ### One card, every surface
 
@@ -439,12 +449,12 @@ Measured where the work is done; predicted where it is not.
 |---|---|---|---|
 | prompts on the corpus at the default | 11 (19%) | **7 (12%)** | — |
 | hazards unasked at the default | 11 of 19 | **1 of 19** | — |
-| prompts after one `always` per program | 11 | 7 | ~0 (store + card) |
+| prompts after one `always` per program | 11 | 7 | ~0 (the `program:` rule + the card) |
 | levels a user must understand | 4 (1 real) | **4 (3 real)** | — (collapse withdrawn) |
 | slash commands for consent | 5 | 5 | 2 (`/trust`) |
-| consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** for install/activation; shell pending + allowlist still own theirs | 1 |
-| surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser) | 3 of 3 (chat) |
-| consent lifetime | 5 min, RAM | **once / session / always** for installs and activations | same for shell commands |
+| consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** (the store, plus `user_tools`' digest ledger and the config allowlist, both documented) | — |
+| surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser) | chat has numbered replies but no "always" |
+| consent lifetime | 5 min, RAM | **once / session / always** | — |
 
 ## Decisions taken
 
@@ -484,25 +494,31 @@ Measured where the work is done; predicted where it is not.
    (`_reads_program_from_stdin`) replaced the operator blanket, and the measured
    name-keyed misses were closed with `_high_risk_command_reason` (`mkfs.*`, `diskutil
    erase*`).
-4. ⏳ **One `ConsentStore`, three lifetimes** (`agent/security/consent.py`).  Landed for
-   installs and activations — `plugin_approval.py` is now a thin adapter, the ledger is
-   configured once in the composition root, and "always" is reachable for the first time.
-   The shell allowlist and its pending tokens still own their own dictionaries; porting them
-   is the piece that makes `program:`/`path:` rules apply to shell commands, and therefore
-   the prerequisite for the card's "always for this project" on the surface that matters
-   most.
-5. ⏳ **The write boundary → the workspace**, with grants feeding `write_scope`.  Not
-   started.  The gate already asks about out-of-boundary writes, so the *behaviour* is
-   right; what is missing is that the sandbox still permits them, which leaves the prompt
-   as the enforcement rather than a rule behind it.
+4. ✅ **One `ConsentStore`, three lifetimes** (`agent/security/consent.py`).  All four
+   consent kinds write it: `plugin_approval.py` is a thin adapter, the shell gate's
+   allowlist and pending tokens are the shell-facing view of its records, the ledger is
+   configured once in the composition root, and `always` is reachable for the first time
+   (installs and activations previously could not answer it at all).  30 tests in
+   `tests/test_consent_store.py` pin the lifetimes, the persistence, the ambiguity policy,
+   the kind isolation and the two resets that must *not* touch a workspace's grants.
+5. ⏳ **Make a shell answer generalise**, then **collapse the write boundary to the
+   workspace** with grants feeding `write_scope`.  The store can already hold
+   `program:`/`path:` rules; what is missing is that the gate reads them and that the card
+   offers them.  This is the one remaining item that removes *prompts* rather than
+   duplication: one answer is what turns "asked again on the next spelling" into "asked
+   once for this project".  The boundary half is the same change seen from the sandbox's
+   side — the gate already asks about out-of-boundary writes, so today the prompt is the
+   enforcement rather than a rule behind it.
 6. ⏳ **One card.**  Two of three surfaces done: the browser always had three answers, the
-   terminal gained the third, and chat gained a numbered reply plus a refusal.  Still
-   missing: `why` on every card (the browser shows a reason string, the terminal a risk
-   level), and `memory_clear` minting a pending record so it is answerable off-terminal.
+   terminal gained the third, chat gained a numbered reply plus a refusal.  Still missing:
+   `why` on every card (the browser shows a reason string, the terminal a risk level), the
+   project-wide answer, and `memory_clear` minting a pending record so it is answerable
+   off-terminal.
 7. ⏳ **`/trust`**, and the old commands as aliases.  Not started; it is what makes a
    remembered answer visible and revocable from one place, and the reason `always` should
-   not ship without it — consent that can be granted but not taken back is not consent.
+   not ship on the shell side without it — consent that can be granted but not taken back
+   is not consent.  `revoke_scope` and the store's `revoke` already give it everything it
+   needs.
 
-Steps 1-3 were the behaviour change and are done.  Step 4 is half done and is the next
-highest-value item, because it is what turns a per-command approval into a per-capability
-grant on the surface where the prompts actually happen.
+Steps 1-4 are done.  Step 5 is the next highest-value item, because it is the one that
+converts the answers that are still given into grants that are not asked again.
