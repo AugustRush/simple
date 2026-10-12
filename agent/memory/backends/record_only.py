@@ -267,6 +267,66 @@ class RecordOnlyContextService:
         return kept
 
 
+    # ── the three verbs the contract added after this backend existed ───────
+
+    def record_runtime_event(
+        self,
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+        *,
+        turn_id: str = "",
+    ) -> AgentRuntimeEvent:
+        """Append one durable runtime fact, through the store's own event log."""
+        return self.store.append_agent_event(
+            session_id=self.session_id,
+            event_type=event_type,
+            payload=payload,
+            turn_id=turn_id,
+        )
+
+    def observe_token_usage(
+        self,
+        *,
+        predicted: int,
+        actual: int,
+        fingerprint: str = "",
+        head_estimate: int = 0,
+        body_raw: int = 0,
+    ) -> None:
+        """Nothing to calibrate: this service records and retrieves, it does not estimate.
+
+        A no-op rather than a silent gap -- the token budget's own fallback estimator is
+        what a composition with no consolidation engine uses, and its docstring says the
+        calibrated and raw estimates coincide in that case, which is this case.
+        """
+
+    def record_usage_event(
+        self,
+        *,
+        session_id: str,
+        phase: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int = 0,
+        turn_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Persist one provider-usage row; this backend's whole job is recording."""
+        record = getattr(self.store, "append_usage_event", None)
+        if not callable(record):
+            return
+        record(
+            session_id=session_id,
+            turn_id=turn_id,
+            phase=phase,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            metadata=metadata,
+        )
+
 class RecordOnlyContextPlugin:
     """Provides ``context_manager`` -- record and retrieve, no consolidation."""
 

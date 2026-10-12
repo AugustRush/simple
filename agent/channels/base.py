@@ -576,12 +576,11 @@ class ChannelRunner:
             # is answered by the lookup rather than by the order of the chain.
             state = sessions.get(event.session_id)
             ctx_mgr = getattr(state, "context_manager", None)
-            session_log = getattr(ctx_mgr, "session_log", None)
-            if session_log is None:
+            if ctx_mgr is None:
                 # No session bound yet: the fact is still logged above, and dropping the
                 # durable write is a visible gap rather than a mis-filed one.
                 logger.debug(
-                    "no session log for %r; runtime event %s not persisted",
+                    "no context manager for %r; runtime event %s not persisted",
                     event.session_id,
                     event.name,
                 )
@@ -589,7 +588,11 @@ class ChannelRunner:
             metadata = dict(event.metadata or {})
             turn_id = str(metadata.get("turn_id") or metadata.get("message_id") or "")
             try:
-                session_log.append(event.name, dict(event.fields), turn_id=turn_id)
+                # The service's verb, not its log: which log a session writes to is the
+                # manager's business (this used to reach for ``session_log``).
+                ctx_mgr.record_runtime_event(
+                    event.name, dict(event.fields), turn_id=turn_id
+                )
             except Exception:
                 logger.exception("failed to persist runtime event: %s", event.name)
 

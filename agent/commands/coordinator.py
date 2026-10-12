@@ -683,13 +683,13 @@ class CommandCoordinator:
         """
         if state is None or turn_input is None:
             return
-        log = getattr(getattr(state, "context_manager", None), "session_log", None)
-        append = getattr(log, "append", None)
-        if not callable(append):
+        manager = getattr(state, "context_manager", None)
+        record = getattr(manager, "record_runtime_event", None)
+        if not callable(record):
             return
         try:
             metadata = getattr(turn_input, "metadata", None) or {}
-            append(
+            record(
                 "command_result",
                 {
                     "text": str(result.response_text or ""),

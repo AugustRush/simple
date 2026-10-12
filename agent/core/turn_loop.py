@@ -1175,23 +1175,13 @@ def observe_provider_usage(
                 if isinstance(shape, dict)
                 else None
             )
-            consolidation = getattr(context_manager, "consolidation", None)
-            observe_split = getattr(consolidation, "observe_payload_usage", None)
-            if callable(observe_split) and head_fp:
-                with shared._suppress_with_log("token calibration skipped"):
-                    observe_split(
-                        fingerprint=head_fp,
-                        head_estimate=head_cost,
-                        body_raw=body_raw,
-                        actual=usage.input_tokens,
-                    )
-            elif callable(
-                getattr(consolidation, "observe_actual_usage", None)
-            ):
-                with shared._suppress_with_log("token calibration skipped"):
-                    consolidation.observe_actual_usage(
-                        predicted, usage.input_tokens
-                    )
+            context_manager.observe_token_usage(
+                predicted=predicted,
+                actual=usage.input_tokens,
+                fingerprint=head_fp or "",
+                head_estimate=head_cost,
+                body_raw=body_raw,
+            )
         if usage.total_tokens <= 0:
             # Nothing worth recording: a row of zeros reads as a request that
             # cost nothing rather than as one whose cost was never reported, and
@@ -1210,10 +1200,7 @@ def observe_provider_usage(
         phase = "subagent" if ctx.metadata.get("_orchestration_child") else (
             "foreground" if step == 1 else "tool_step"
         )
-        store = getattr(context_manager, "store", None)
-        record = getattr(store, "append_usage_event", None)
-        if callable(record):
-            metadata: dict[str, Any] = {
+        metadata: dict[str, Any] = {
                 "step": step,
                 "predicted_input_tokens": predicted,
                 # The ceiling this call was fitted to.  Recorded beside the
@@ -1223,19 +1210,21 @@ def observe_provider_usage(
                     ctx.metadata.get("_last_input_token_budget") or 0
                 ),
             }
-            if isinstance(shape, dict):
-                metadata.update(shape)
-            with shared._suppress_with_log("provider usage persistence skipped"):
-                record(
-                    session_id=session_id,
-                    turn_id=str(ctx.metadata.get("turn_id") or ""),
-                    phase=phase,
-                    model=deps.effective_model(ctx),
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cached_input_tokens=usage.cached_input_tokens,
-                    metadata=metadata,
-                )
+        if isinstance(shape, dict):
+            metadata.update(shape)
+        # The service's verb: the store's ``append_usage_event`` is deliberately outside
+        # ``MemoryStore`` (accounting, not memory), so the *manager* is where that
+        # optional capability is allowed to be optional.
+        context_manager.record_usage_event(
+            session_id=session_id,
+            turn_id=str(ctx.metadata.get("turn_id") or ""),
+            phase=phase,
+            model=deps.effective_model(ctx),
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            metadata=metadata,
+        )
         _emit_event(
             "provider_usage",
             phase=phase,

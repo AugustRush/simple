@@ -689,11 +689,20 @@ def test_a_command_result_is_a_reply_not_a_status():
 
     appended: list[tuple] = []
 
-    class _Log:
-        def append(self, name, fields, turn_id=""):
-            appended.append((name, fields, turn_id))
+    class _Manager:
+        """The context service, through the member the journal actually uses.
 
-    state = SimpleNamespace(context_manager=SimpleNamespace(session_log=_Log()))
+        It used to stand in with ``session_log=_Log()`` -- the manager's *collaborator*,
+        which the journal reached for directly.  The verb is on the contract now, so the
+        stand-in implements that and the test asserts the interface a replacement
+        service would have to answer.
+        """
+
+        def record_runtime_event(self, event_type, payload=None, *, turn_id=""):
+            appended.append((event_type, payload, turn_id))
+            return None
+
+    state = SimpleNamespace(context_manager=_Manager())
     CommandCoordinator._journal_command_result(
         state,
         SimpleNamespace(text="/help", metadata={"message_id": "m-1"}),

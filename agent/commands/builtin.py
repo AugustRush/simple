@@ -517,16 +517,30 @@ async def _sessions_handler(
 
 
 def _session_turns(context: CommandContext, prefix: str) -> list[Any]:
+    """The recent turns of the session whose id starts with *prefix*.
+
+    Through the store **contract's** ``recent_conversation_turns``.  This used to
+    feature-detect ``get_turns_for_session``, a member nothing implements -- so the
+    fallback answered "Session not found" for every live session, and the one test that
+    covered the heading escaped its way past by injecting a lambda.  The prefix is
+    matched here rather than in SQL because the contract takes an exact session id;
+    reading the recent turns and filtering keeps this to declared members, so a
+    replacement store answers it too.
+    """
     manager = _context_manager(context)
     store = getattr(manager, "store", None)
-    get_turns = getattr(store, "get_turns_for_session", None)
-    if not callable(get_turns):
+    read = getattr(store, "recent_conversation_turns", None)
+    if not callable(read):
         return []
     try:
-        turns = get_turns(prefix)
+        turns = read(limit=500)
     except Exception:
         return []
-    return list(turns or ())
+    return [
+        turn
+        for turn in (turns or ())
+        if str(_field(turn, "session_id", "")).startswith(prefix)
+    ]
 
 
 async def _session_handler(

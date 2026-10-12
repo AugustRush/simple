@@ -37,29 +37,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: rather than breaking.  Recording them keeps the guard's teeth for the hard ones
 #: -- and the next round's queue is exactly this list.
 _ATTRIBUTE_PEEK_ALLOWLIST: dict[tuple[str, str], str] = {
-    ("agent/channels/base.py", "session_log"): (
-        "soft: the durable session log is a separate collaborator; the site logs a "
-        "debug line when a manager has none"
-    ),
-    ("agent/commands/coordinator.py", "session_log"): (
-        "soft: same collaborator, feature-detected through getattr(..., 'append')"
-    ),
     ("agent/channels/web.py", "store"): (
         "soft: the web session service takes the store it is given and degrades "
         "without one; contracting it is a separate decision about SessionService"
     ),
     ("agent/commands/builtin.py", "store"): (
-        "soft: reads session turns through the store's optional get_turns_for_session"
-    ),
-    ("agent/core/turn_loop.py", "consolidation"): (
-        "soft: reads the manager's consolidation engine to decide whether a "
-        "provider-level consolidation model is configured"
+        "soft: the store is the manager's collaborator, and the read goes through the "
+        "contract's recent_conversation_turns (this used to feature-detect "
+        "get_turns_for_session, which nothing implements -- a dead path)"
     ),
     ("agent/core/token_budget.py", "consolidation"): (
-        "soft: the same read for the token budget's consolidation estimate"
-    ),
-    ("agent/core/turn_loop.py", "store"): (
-        "soft: reads the store's optional append_usage_event for token accounting"
+        "not a peek to close: three lazy reads of the engine's estimators, each with a "
+        "pure-Python fallback whose docstring says the calibrated and raw estimates "
+        "coincide when there is no engine -- that fallback is the designed behaviour, "
+        "so contracting it would remove the no-engine path rather than narrow anything"
     ),
     ("agent/session_service.py", "dir"): (
         "not the memory store: this receiver is the *session* store, whose name "

@@ -2522,8 +2522,15 @@ def test_builtin_external_markdown_values_cannot_forge_rows_or_headings(
 
 
 def test_builtin_session_turn_heading_escapes_user_prefix(tmp_path) -> None:
+    # The member the command reads is the contract's ``recent_conversation_turns``;
+    # the old fixture injected ``get_turns_for_session``, which nothing implemented --
+    # so the path it "covered" could not run in production.
     store = SimpleNamespace(
-        get_turns_for_session=lambda _prefix: [{"role": "user", "content": "safe"}]
+        recent_conversation_turns=lambda **_kwargs: [
+            SimpleNamespace(
+                session_id="abc", role="user", content="safe", channel=""
+            )
+        ]
     )
     components = {
         "sessions_file": tmp_path / "missing.jsonl",

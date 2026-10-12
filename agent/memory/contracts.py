@@ -421,6 +421,55 @@ class ContextService(Protocol):
         """Run one queued consolidation job.  False when the queue was empty."""
 
 
+    def record_runtime_event(
+        self,
+        event_type: str,
+        payload: "Optional[dict[str, Any]]" = None,
+        *,
+        turn_id: str = "",
+    ) -> "Any":
+        """Append one durable runtime fact to this session's log.
+
+        Was ``manager.session_log.append(...)`` at two call sites -- a consumer reaching
+        through the service to a collaborator.  The *manager* owns which log a session
+        writes to, so the verb belongs here.
+        """
+
+    def observe_token_usage(
+        self,
+        *,
+        predicted: int,
+        actual: int,
+        fingerprint: str = "",
+        head_estimate: int = 0,
+        body_raw: int = 0,
+    ) -> None:
+        """Feed one call's real usage back to the calibration engine, when there is one.
+
+        Which observer to use is the engine's decision, not the turn loop's: as a
+        ``getattr(manager, "consolidation", ...)`` chain it was a consumer reaching for
+        a collaborator, and a replacement service could not answer it at all.
+        """
+
+    def record_usage_event(
+        self,
+        *,
+        session_id: str,
+        phase: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int = 0,
+        turn_id: str = "",
+        metadata: "Optional[dict[str, Any]]" = None,
+    ) -> None:
+        """Persist one provider-usage row, when the store keeps them.
+
+        A no-op is a legitimate implementation: the row is accounting, and a service
+        that does not keep it says so rather than failing the turn.
+        """
+
+
 @runtime_checkable
 class MemoryService(Protocol):
     """The memory palace: named chapters, each with named entries."""
