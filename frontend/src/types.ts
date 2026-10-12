@@ -6,7 +6,11 @@ export type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error' | 
 
 export type ToolState = 'running' | 'done' | 'blocked' | 'interrupted'
 
-export type ConfirmDecision = 'allow_once' | 'allow_session' | 'deny'
+export type ConfirmDecision =
+  | 'allow_once'
+  | 'allow_session'
+  | 'allow_project'
+  | 'deny'
 
 export type ConfirmRisk = 'high' | 'medium' | 'low'
 
@@ -41,7 +45,10 @@ export interface SubAgentNote {
 /**
  * A pending tool-approval prompt pushed by the server. `allow_session` is only
  * true when the server holds a redeemable pending record for the command, so
- * the "总是允许" option is never offered where it could not be honoured.
+ * the "总是允许" option is never offered where it could not be honoured;
+ * `allow_project` is stricter still, because it needs the question to have said
+ * which rule and which project a durable answer would cover. When it is true,
+ * `project_rule_label` is the sentence to show on the button.
  */
 export interface ConfirmRequest {
   name?: string
@@ -50,6 +57,11 @@ export interface ConfirmRequest {
   reason?: string
   confirmation_token?: string
   allow_session?: boolean
+  allow_project?: boolean
+  /** The rule as the server spells it, e.g. `program:pip`. */
+  project_rule?: string
+  /** The same rule as a sentence, ready to display. */
+  project_rule_label?: string
   timeout_seconds?: number
 }
 

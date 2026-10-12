@@ -112,6 +112,23 @@ export function ApprovalBar({
                 本会话总是允许
               </Button>
             )}
+            {/* No keyboard chord, deliberately. Three chords on one dialog is
+                already a lot to hold, and this is the only answer here that
+                grants something durable and project-wide -- a mistyped
+                modifier should not be able to do that. */}
+            {confirmReq.allow_project && (
+              <Button
+                size="small"
+                title={
+                  confirmReq.project_rule_label ||
+                  confirmReq.project_rule ||
+                  undefined
+                }
+                onClick={() => onDecide('allow_project')}
+              >
+                本项目总是允许
+              </Button>
+            )}
             <Button
               size="small"
               type="primary"
