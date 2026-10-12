@@ -5,11 +5,12 @@ four consent kinds with three explicit lifetimes, and the shell gate reads and w
 (step 4); a "yes" now remembers the **capability** the question proposed rather than the
 command line (step 5) — measured, answering each of the corpus's questions once for the
 project turns 7 prompts into 0, with no leak into another project; `/trust` shows and
-revokes what was granted (step 7); and every card now names the grant it is offering, while
+revokes what was granted, including the config-level list that no card ever mentioned
+(step 7); and every card names the grant it offers and why it is asking, while
 `memory_clear` is answerable from a chat channel instead of impossible there (step 6).
-What remains is the browser's fourth button, the sandbox half of the write boundary, and
-aliasing the old consent commands — itemised at the end of this document, with the one item
-this host cannot verify called out.
+What remains is the browser's fourth button and the sandbox half of the write boundary,
+plus aliasing the old consent commands — itemised at the end of this document, with the one
+item this host cannot verify called out.
 
 Everything in "What I measured" was produced by a probe against the code in this repo
 ([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
@@ -470,6 +471,8 @@ Measured where the work is done; predicted where it is not.
 | consent stores (in-memory + on disk) | 6 + 3 | **1 + 1** (the store, plus `user_tools`' digest ledger and the config allowlist, both documented) | — |
 | surfaces where "always" exists | 1 of 3 | **2 of 3** (terminal, browser backend) | the browser's fourth button; chat has numbered replies but no "always" |
 | consent kinds answerable off-terminal | 3 of 4 | **4 of 4** (`memory_clear` gained a pending record) | — |
+| cards that say *why* they are asking | 2 of 3 | **3 of 3** (the reason travels on the record) | — |
+| places a standing permission could hide | 4 | **1** (`/trust`, which lists the config allowlist too) | — |
 | consent lifetime | 5 min, RAM | **once / session / always** | — |
 
 ## Decisions taken
@@ -528,17 +531,19 @@ Measured where the work is done; predicted where it is not.
 6. ⏳ **One card.**  The terminal has four answers and prints the rule each wider answer
    would remember ("本项目总是允许（记住：这个程序的所有调用：pip）"); the browser backend
    advertises and honours `allow_project`, carrying `project_rule` and its rendered label;
-   chat gained a numbered reply, a refusal, and — new — memory clears.  Still missing: the
-   browser's fourth *button* (a frontend change plus a rebuild; the backend needs nothing
-   more), and a `why` line on the chat card, which names the command but not the reason.
-   `memory_clear` no longer belongs on this list: it used to be *impossible* off-terminal
-   and now leaves a pending record whose token can be answered from wherever the human is.
+   chat gained a numbered reply, a refusal, and memory clears; and every question now
+   carries its **reason** on the record, so the chat list — the only card a chat user ever
+   sees — says why each one is being asked rather than just what would run.  Still missing:
+   the browser's fourth *button* (a frontend change plus a rebuild; the backend needs
+   nothing more).
 7. ✅ **`/trust`**, and the old commands as aliases.  `/trust` lists both lifetimes, names
-   the *kind* of each grant, revokes by number or wholesale, and honours both scope and
-   workspace so revoking "pip here" cannot drop it for another project or user.  The old
-   commands (`/allow`, `/deny`, `/auto-approve`, `/confirm`) still work and are now the
-   legacy spelling of the same intent; aliasing them onto the store is the small remaining
-   cleanup, not a capability gap.
+   the *kind* of each grant, revokes by number or wholesale, honours both scope and
+   workspace so revoking "pip here" cannot drop it for another project or user, and also
+   lists the **config-level** `shell_allowed_commands` as a separate, unnumbered section —
+   that list pre-approves commands outside any consent record and nothing in the UI used to
+   mention it.  The old commands still work and are now the legacy spelling of the same
+   intent; aliasing them onto the store is the small remaining cleanup, not a capability
+   gap.
 
 Steps 1-5 and 7 are done, and 6 is done on every surface whose change is backend-only.  The
 next item is the sandbox half of the write boundary — with one honest caveat, recorded here
