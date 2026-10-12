@@ -512,3 +512,38 @@ def test_the_install_adapter_keeps_its_old_public_names(
     plugin_approval.plugin_install_clear_all()
     assert plugin_approval.plugin_install_pending_for_scope(scope) == []
 
+
+def test_the_composition_root_points_the_store_at_the_home_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger is per agent home, and the home is chosen per build.
+
+    Configured in the composition root rather than at import, because the
+    gateway passes its own global home while a named session uses
+    ``~/.agent-<name>``: a path frozen at import would write every session's
+    trust into whichever home happened to load first.
+
+    The build needs a provider and a database past this point and this test is
+    about neither, so a failure *after* the store was pointed somewhere is
+    tolerated -- what is asserted is the pointer.  That also makes the test fail
+    if ``configure`` ever moves behind something that can fail, which would
+    leave the store unconfigured for exactly the runs that need it.
+    """
+    import asyncio
+
+    from agent.bootstrap import _build_components_async
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+    home = tmp_path / "agent-home"
+
+    try:
+        asyncio.run(
+            _build_components_async({}, announce=False, resource_home=home)
+        )
+    except Exception:
+        pass
+
+    assert consent.SHELL.ledger_root is not None
+    assert consent.SHELL.ledger_root.resolve() == (home / "trust").resolve()
+
+
