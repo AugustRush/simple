@@ -973,6 +973,7 @@ class CliOutputSink(OutputSink):
         if not self._supports_consent_prompt():
             return None
         from agent.security.shell import (
+            shell_pending_approval_rule,
             shell_pending_mark_project_scope,
             shell_pending_mark_session_scope,
             shell_project_scope_supported,
@@ -983,6 +984,18 @@ class CliOutputSink(OutputSink):
         allow_project = shell_project_scope_supported(
             name, confirmation_token, scope
         )
+        # What the fourth answer would grant.  Shown on the card because the
+        # human is being asked for a *capability*: "this program, from now on"
+        # and "this one line" are different promises.
+        project_grant = ""
+        if allow_project:
+            from agent.security import consent as consent_models
+
+            project_grant = consent_models.describe_rule(
+                shell_pending_approval_rule(
+                    confirmation_token, scope=scope
+                )
+            )
         self._approval_active = True
         try:
             self._stop_activity()
@@ -1006,7 +1019,10 @@ class CliOutputSink(OutputSink):
             if allow_always:
                 menu.append("  [bold cyan]3)[/bold cyan] 本会话总是允许此命令")
             if allow_project:
-                menu.append("  [bold cyan]4)[/bold cyan] 本项目总是允许（记住这条规则）")
+                menu.append(
+                    "  [bold cyan]4)[/bold cyan] 本项目总是允许"
+                    + (f"（记住：{_markup_escape(project_grant)}）" if project_grant else "")
+                )
             self._console.print(
                 "\n".join(menu)
                 + f"\n[dim]输入 {'/'.join(choices)} 后按 Enter"

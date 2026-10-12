@@ -1062,6 +1062,10 @@ def test_web_confirm_allow_project_remembers_the_rule_for_the_workspace(
             req = ws.receive_json()
             assert req["type"] == "confirm_request"
             assert req["allow_project"] is True
+            # The rule, and the same rule as a sentence: a client that renders
+            # the fourth button has to be able to say what it would grant.
+            assert req["project_rule"] == "program:pip"
+            assert "pip" in req["project_rule_label"]
             ws.send_json(
                 {
                     "type": "confirm_response",

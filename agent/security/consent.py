@@ -112,6 +112,45 @@ def workspace_key(root: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+#: How each kind of rule reads to the person being asked to grant it.  The
+#: *kind* is the promise: "every call of this program here" and "this one line"
+#: are different, and a card that showed only the value would be asking for the
+#: wider one without saying so.
+_RULE_LABELS: dict[str, str] = {
+    COMMAND: "这条命令",
+    PROGRAM: "这个程序的所有调用",
+    PATH: "这个位置",
+    PLUGIN: "这个安装来源",
+    TOOL: "这个工具",
+}
+
+
+def rule_label(rule: str) -> str:
+    """The phrase naming what *kind* of thing a rule grants, without the value."""
+    return _RULE_LABELS.get(rule_kind(rule), "")
+
+
+def describe_rule(rule: str) -> str:
+    """One line naming what a rule grants, for a consent card or a listing.
+
+    Lives here rather than in each surface so the terminal, the browser and
+    ``/trust`` describe the same rule the same way -- a card that calls
+    ``program:pip`` "the program" while the revocation list calls it "pip" is
+    two answers to one question.
+    """
+    kind = rule_kind(rule)
+    value = rule_value(rule)
+    label = rule_label(rule)
+    if not label:
+        # An unrecognized kind still has to display as *something*: a card that
+        # went blank would be asking about nothing.
+        return value or str(rule)
+    if kind == COMMAND:
+        # The command itself is already on the card; repeating it adds nothing.
+        return label
+    return f"{label}：{value}"
+
+
 @dataclass(frozen=True)
 class Pending:
     """A question that has been put to the human and not yet answered."""
@@ -735,9 +774,11 @@ __all__ = [
     "SESSION",
     "TOOL",
     "configure",
+    "describe_rule",
     "default_ledger_root",
     "make_rule",
     "rule_kind",
+    "rule_label",
     "rule_value",
     "scope_key",
     "workspace_key",

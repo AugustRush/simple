@@ -1192,23 +1192,19 @@ _TRUST_LIFETIME_LABELS = {
 #: How a remembered rule reads to the person deciding whether to revoke it.
 #: The *kind* matters as much as the value: "pip" is a program-wide grant, while
 #: one line of shell is not, and a revocation screen that showed both as a bare
-#: string would hide exactly the distinction it exists to expose.
-_TRUST_KIND_LABELS = {
-    "command": "这条命令",
-    "program": "这个程序（所有调用）",
-    "path": "这个位置",
-    "plugin": "这个安装来源",
-    "tool": "这个工具",
-}
-
-
+#: string would hide exactly the distinction it exists to expose.  The wording
+#: comes from the store (``consent.rule_label``) so this listing and the consent
+#: card that produced the rule describe it the same way; only the code
+#: formatting is local, because markdown is this surface's business.
 def _trust_rule_label(rule: str) -> str:
     from agent.security import consent
 
-    kind = consent.rule_kind(rule)
-    label = _TRUST_KIND_LABELS.get(kind)
-    value = _markdown_inline(consent.rule_value(rule))
-    return f"{label}：`{value}`" if label else f"`{value}`"
+    label = consent.rule_label(rule)
+    value = f"`{_markdown_inline(consent.rule_value(rule))}`"
+    # Unlike the consent card, this listing has no command printed above it, so
+    # every kind spells its value out -- including ``command:``, whose whole
+    # point here is *which* line was allowed.
+    return f"{label}：{value}" if label else value
 
 
 async def _trust_handler(

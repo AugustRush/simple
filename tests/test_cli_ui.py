@@ -807,8 +807,13 @@ def test_the_terminal_offers_the_project_answer_when_the_gate_has_one(
 
     assert outcome["approved"] is True
     assert outcome["pending"] == []
-    assert "4)" in outcome["console"].text
-    assert "本项目总是允许" in outcome["console"].text
+    text = outcome["console"].text
+    assert "4)" in text
+    assert "本项目总是允许" in text
+    # …and it says *what* it would grant: "the program" is the promise, and the
+    # card has to name it for the answer to be informed.
+    assert "这个程序的所有调用" in text
+    assert "pip" in text
 
 
 def test_the_project_answer_generalises_and_survives_a_restart(

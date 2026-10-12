@@ -714,11 +714,28 @@ class WebOutputSink(OutputSink):
         allow_session = self._session_scope_supported(
             name, confirmation_token, scope
         )
-        from agent.security.shell import shell_project_scope_supported
+        from agent.security.shell import (
+            shell_pending_approval_rule,
+            shell_project_scope_supported,
+        )
 
         allow_project = shell_project_scope_supported(
             name, confirmation_token, scope
         )
+        # The rule, and the same rule as a sentence: a client that renders the
+        # fourth button has to be able to say what it would grant, and one that
+        # renders it in another language wants the raw value to do it with.
+        project_rule = (
+            shell_pending_approval_rule(confirmation_token, scope=scope)
+            if allow_project
+            else ""
+        )
+        if project_rule:
+            from agent.security import consent as consent_models
+
+            project_rule_label = consent_models.describe_rule(project_rule)
+        else:
+            project_rule_label = ""
         handler = self._confirmation_handler
         # Claim the answer slot *before* the prompt goes out.  Registering it
         # afterwards left a window in which a fast client's reply reached the
@@ -734,6 +751,8 @@ class WebOutputSink(OutputSink):
             "confirmation_token": confirmation_token,
             "allow_session": allow_session,
             "allow_project": allow_project,
+            "project_rule": project_rule,
+            "project_rule_label": project_rule_label,
             "timeout_seconds": CONFIRMATION_TIMEOUT_SECONDS,
         }
         # Remember the prompt while it is out. A browser that reconnects

@@ -802,6 +802,23 @@ def shell_project_scope_supported(
     )
 
 
+def shell_pending_approval_rule(
+    token: str, *, scope: ShellAuthorizationScope
+) -> str:
+    """What this prompt's "always, for this project" answer would remember.
+
+    Shown on the card, because the human is being asked to grant a *capability*
+    and the capability is the rule: "remember that I trust pip here" and
+    "remember this exact line" are different promises, and a card that showed
+    only the command would be asking for the wider one without saying so.
+    Returns ``""`` when this prompt cannot be answered that way.
+    """
+    record = consent.SHELL.get(token, scope=scope)
+    if record is None or not record.workspace:
+        return ""
+    return str(record.always_rule or "")
+
+
 # ── ShellCheckResult ────────────────────────────────────────────────────────
 
 
