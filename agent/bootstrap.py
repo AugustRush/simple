@@ -500,6 +500,16 @@ async def _build_components_async(
     builtin_tools_cls = agent_module.BuiltinTools
     user_tool_catalog_cls = agent_module.UserToolCatalog
 
+    # The one place an answer from the human is remembered, so the one place the
+    # trust ledger lives.  Configured here rather than at import time because
+    # the home is chosen per component build: the gateway passes its own global
+    # home, a plain CLI uses ``~/.agent``, and a named session uses
+    # ``~/.agent-<name>``.  A store nobody configured stays in memory, which is
+    # what keeps a test from writing a grant into the user's real home.
+    from agent.security import consent
+
+    consent.configure(resource_root / "trust")
+
     if announce:
         client, model, max_tokens = ModelClientFactory.from_config(cfg)
     else:

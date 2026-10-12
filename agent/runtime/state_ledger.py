@@ -66,6 +66,17 @@ them would make the guard test assert something it never verified:
   a session.  Recorded here, and assigned to Task 9, so the process-layout work
   has the complete list to reason about rather than the list the scanner could
   reach.
+- **One store, whose state is instance state.**  ``agent/security/consent.py``
+  replaces two module-level dicts here (``_PENDING``/``_APPROVED``, formerly
+  entries in this ledger) plus the shell allowlist and the user-tool digest
+  file with a single ``ConsentStore``: ``CONSENT.SHELL`` is the documented
+  process singleton of the shape above, and its five containers are attributes
+  of that instance rather than module names, so the scanner cannot reach them.
+  That is the *point* of the move -- state that used to be reachable from
+  anywhere and owned by nobody is now owned by one object with three explicit
+  lifetimes (``once``/``session``/``always``), and a store nobody configured
+  stays in memory.  Recorded here so the omission is a decision, not a blind
+  spot.
 
 Scope vocabulary
 ----------------
@@ -177,10 +188,10 @@ LEDGER: tuple[StateEntry, ...] = (
                "convergence target is a service in the container, so an embedder's "
                "format can be provided and unwound like any other registration "
                "instead of being appended to a module list."),
-    StateEntry("_PENDING", "agent/security/plugin_approval.py", 20, "CONTAINER", "session", "service", 5,
-               "Plugin installs awaiting human approval, TTL 5 minutes."),
-    StateEntry("_APPROVED", "agent/security/plugin_approval.py", 21, "CONTAINER", "session", "service", 5,
-               "Plugin installs already approved for a scope."),
+    # The two dicts that used to sit here (_PENDING, _APPROVED) are gone: both
+    # are now instance state of the one ConsentStore in
+    # agent/security/consent.py, which is where every consent kind records its
+    # answer.  See the "Deliberately not scanned" note in the module docstring.
     # ── Path constants rewritten wholesale by _set_agent_home ───────────────
     # One `global` rewrite path (shared.py:101-133) plus a second writer in
     # agent/__init__.py:126-135.  Every reader in the process sees the change,

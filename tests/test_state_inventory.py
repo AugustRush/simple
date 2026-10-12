@@ -282,13 +282,18 @@ def test_critical_entries_are_accounted_for() -> None:
 
     If one of these disappears the ledger must be updated in the same change,
     so the test names them explicitly rather than trusting the count.
+
+    ``_PENDING`` and ``_APPROVED`` are no longer listed because they no longer
+    exist *as module state*: both became instance containers of the single
+    ``ConsentStore`` in ``agent/security/consent.py``, which is where every
+    consent kind now records its answer.  That is the consolidation this list
+    exists to make somebody notice -- they were not dropped, they were moved
+    somewhere with an owner and three explicit lifetimes.
     """
     for symbol in (
         "_active_sink",
         "_active_event_collector",
         "_active_session_id",
-        "_PENDING",
-        "_APPROVED",
         "_session_allowlist",
         "_session_sandbox_modes",
         "AGENT_HOME",
