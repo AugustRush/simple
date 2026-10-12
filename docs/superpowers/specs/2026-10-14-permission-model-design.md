@@ -1,9 +1,15 @@
 # Permissions: from per-command approval to capability grants
 
-**Status:** proposal.  Nothing here is implemented; this document is the review plus the
-design it argues for.  Every number in "What I measured" was produced by a probe against
-the code in this repo (probes kept as [`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)),
-not estimated.
+**Status:** step 1 implemented and measured; steps 2-5 designed, not yet built.  The
+"one boundary, one gate" section below is now the code (`agent/security/shell.py`):
+the command is segmented on its separators, each segment is classified on its own merits,
+a pipe into an interpreter and a write outside the workspace are the two composition rules,
+and the in-workspace irreversibility list closes the three destructive git/rm shapes.  See
+[Measured after step 1](#measured-after-step-1) for what that moved.
+
+Everything in "What I measured" was produced by a probe against the code in this repo
+([`scripts/permission_prompt_probe.py`](../../../scripts/permission_prompt_probe.py)), not
+estimated.
 
 The complaint this answers: *the user is asked too often, and the design that asks is more
 complicated than the thing it protects.*
@@ -369,66 +375,97 @@ leads users to `high` — which is the whole reason `curl | sh` is one command a
 The gain is that **the user can be asked almost never without switching off the destructive
 guard.**  Today those are the same switch.
 
-## What this should do to the numbers
+## Measured after step 1
+
+Same probe, same corpora, run against the segmented gate.  The first two rows are the whole
+point of the change: they move in opposite directions, which is what "calibrated" means.
+
+| | before | after |
+|---|---|---|
+| prompts on the 58-command corpus at the default (`ask`) | 11 (19%) | **7 (12%)** |
+| …of which are shell syntax rather than authority | 7 | **0** |
+| destructive probes that run unasked at the default | **11 of 19** | **1 of 19** |
+| destructive probes that run at `high` | 18 of 19 | 18 of 19 |
+| `curl … \| sh` at the default | asks | **asks** (now because the right side is a shell, not because a pipe is present) |
+| `echo hi \| sh` end-to-end | asks | **asks** (`tests/test_functional_turns.py`) |
+
+The 7 prompts are now: inline interpreter code ×3, environment mutation ×2, and
+`git reset --hard` / `git clean -fd` ×2 — the last two being *genuinely destructive commands
+that happened to be sitting in the "ordinary work" corpus*.  Excluding them, the noise rate
+on ordinary development commands is **5 of 58 (9%)**, and every one of those is a real
+authority question rather than a spelling of one.
+
+The 1 hazard left unasked is `truncate -s 0 important.db`: a single named file inside the
+workspace.  It is the deliberate edge of the in-workspace rule — a target the human already
+granted by pointing the agent at the directory — and it is listed in the open questions
+rather than papered over.
+
+Fifteen of the nineteen hazards now ask.  The four that did not ask for the wrong reason
+before, now ask for the right one: `rm -rf ~/Documents` and `chmod -R 777 /` and
+`mv ~/Documents /tmp/x` because their **target** is outside the workspace,
+`mkfs.ext4 /dev/sda1` and `diskutil eraseDisk` because the **spelling** no longer escapes a
+name-keyed list, and `cat img > /dev/sda` / `echo x >> ~/.zshrc` by where the **redirect**
+writes.
+
+## What steps 2-5 should do to the numbers
 
 Predictions to be verified against the probe after implementation:
 
 | | today | proposed |
 |---|---|---|
-| prompts on the 58-command corpus at the default | 11 (19%) | ~3 (5%) |
-| prompts after one `always` per program | 11 | ~0 |
-| destructive probes that run unasked at the default | 11 of 19 | 0 |
+| prompts after one `always` per program | 7 | ~0 |
 | levels a user must understand | 4 (2 real) | 2 |
 | slash commands for consent | 5 | 2 |
 | consent stores (in-memory + on disk) | 6 + 3 | 1 |
 | surfaces where "always" exists | 1 of 3 | 3 of 3 |
 | consent lifetime | 5 min, RAM | once / session / persisted per workspace |
 
-## Open questions, in the order they change the design
+## Decisions taken
 
-1. **Write boundary.**  Keep writes open host-wide (today's inverted policy) and ask only on
-   the irreversibility list — or make the **workspace the default write boundary**, allow the
-   enumerated tool-state dirs (`policy.py:135-142`), and make every exception a remembered
-   grant.  The second is what gives "ask" a meaning and is what I designed against; the first
-   needs much less change but leaves `ask` with almost nothing to ask about once the operator
-   guard is gone.
-2. **`git clean -fdx` / `git reset --hard`.**  In-workspace, so the rule runs them silently —
-   but they destroy *uncommitted work*, which is the one in-workspace thing that is hard to
-   undo.  Either add an in-workspace irreversibility list (short: `git clean -fd*`,
-   `git reset --hard`, `git checkout -- .`, `truncate` on a tracked file), or accept the loss
-   as within the workspace's blast radius.
-3. **Inline interpreter bodies.**  Keep asking for every `-c` / `-e` (simple, noise), or
-   parse the body against the rule language and fail closed on the unreadable ones (more
-   code, near-zero noise).  My recommendation is the second, but it is the largest new piece
-   of machinery in this design.
-4. **Command surface.**  Collapse `/allow`, `/deny`, `/auto-approve`, `/confirm` into
-   `/trust` + the card, or keep them as documented aliases.  Folding is cleaner; aliases are
-   free and this repo's users may script them.
-5. **`~/.ssh`.**  Readable today for `git push`.  Make it read-denied by default and grant it
-   per workspace (one more grant the user can choose), or leave it — it is a deliberate
-   trade-off documented in `policy.py:75-82`, but it is the largest credential exposure in
-   the resolved policy above.
+1. **Write boundary — decided: collapse it to the workspace.**  The sandbox becomes the
+   boundary it is documented to be (workspace + the enumerated tool-state dirs + temp),
+   and every exception is a remembered grant.  Not yet implemented (step 5): the gate
+   already *asks* about out-of-boundary writes, so the behaviour is right, but the sandbox
+   still permits them, which means the enforcement is the prompt rather than a rule.
+2. **`git clean -fdx` / `git reset --hard` — decided: they ask, and now they do.**
+   Implemented as `_workspace_irreversible_reason`: `git clean` with any of `f`/`x`/`d`/`X`,
+   `git reset --hard`, `git restore`/`git checkout` on the whole tree, and `rm` through a
+   wildcard or at `.`.  Named targets stay free (`rm -rf node_modules`, `git clean -n`,
+   `git checkout -b`), because a target inside the workspace is inside the blast radius the
+   human granted by pointing the agent at the directory.
+3. **Inline interpreter bodies.**  Still open.  Today every `-c`/`-e`/`-` asks (3 of the 7
+   remaining prompts); the alternative is to parse the body against the rule language and
+   fail closed on the unreadable ones — near-zero noise, but it is the largest new piece of
+   machinery in this design.
+4. **Command surface.**  Still open.  Collapse `/allow`, `/deny`, `/auto-approve`, `/confirm`
+   into `/trust` + the card, or keep them as documented aliases.
+5. **`~/.ssh`.**  Still open.  Readable today for `git push`; making it read-denied by
+   default trades a common workflow for the largest credential exposure in the resolved
+   policy.
 
-## Implementation order (if approved)
+## Implementation order
 
-1. **Segment the operator guard.**  `_shell_operator_guard` stops returning `confirm` for
-   `|`/`&&`/`;`/`&`/newline; `shell_command_check` splits on operators and classifies each
-   segment.  Removes ~64% of the prompts with no new mechanism.  Tests:
-   `tests/test_shell_security.py`.
-2. **Route redirects through the target check.**  `>`/`>>`/`<`/`<<` become a write-target
-   question against the workspace, not a blanket confirm.
-3. **Add the target extractor** (path-like argv + `of=`/`-o`/`--output` + redirect target,
-   with opaque → fail closed) and the out-of-boundary → ask rule.
-4. **Introduce `ConsentRule` / one `ConsentStore`**; port the three existing stores onto it;
-   keep the existing public functions as thin wrappers so the surface area of the change is
-   the store, not its 60-odd call sites.
-5. **Make `always` persistent per workspace**, reusing the `user_tools` approvals file shape.
+1. ✅ **Segment the operator guard.**  `_structural_guard` no longer returns `confirm` for
+   any operator; `shell_command_check` splits the string on `|`/`|&`/`&&`/`||`/`;`/`&`/newline
+   and classifies each segment on its own merits.  Landed, with the operator-era tests
+   rewritten to pin the new intent rather than deleted.
+2. ✅ **Route redirects through the target check.**  `>`/`>>` are judged by where they write
+   (`_redirect_target_reason`); `<`/`<<`/`<<<`/`>&` are descriptor operations and ask nothing.
+3. ✅ **The target extractor and the out-of-boundary → ask rule.**  `_target_outside_roots`
+   (granted roots + temp, relative = inside, unresolvable = fail closed),
+   `_argument_write_reason` for the mutating commands, and `_workspace_irreversible_reason`
+   for the in-workspace unbounded cases.  The pipe-into-an-interpreter rule
+   (`_reads_program_from_stdin`) replaced the operator blanket, and the measured
+   name-keyed misses were closed with `_high_risk_command_reason` (`mkfs.*`, `diskutil
+   erase*`).
+4. **Introduce one `ConsentStore`** with the three lifetimes; port the three existing stores
+   onto it; keep the existing public functions as thin wrappers so the surface area of the
+   change is the store, not its ~60 call sites.
+5. **Make `always` persistent per workspace**, reusing the `user_tools` approvals file shape,
+   and collapse the write boundary to the workspace with grants feeding `write_scope`.
 6. **Unify the card**: three answers on the terminal, numbered batch in chat, `why` on all
-   three.
+   three, and `memory_clear` minting a pending record so it is answerable off-terminal.
 7. **Introduce `/trust`; alias the old commands.**  Reduce `/permissions` to the two real
    levels + the sandbox axis.
-8. **Re-run the probe and the full suite**, and freeze the before/after table into this
-   document.
 
-Steps 1-3 are the ones that change behaviour and are worth doing first; steps 4-7 are the
-simplification proper.  Step 1 alone is a small, safe, high-yield change.
+Steps 1-3 were the behaviour change and are done; steps 4-7 are the simplification proper.

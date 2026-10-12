@@ -97,6 +97,22 @@ def _refusal_reason(safety: Any) -> str | None:
     criterion and now has to change it, so every branch has to say what to
     change.
     """
+    if safety.requires_confirmation:
+        # A command that would ask a human cannot be a check: nobody is there
+        # at 3am.  Named with its risk level, because "why is this refused" and
+        # "how bad is it" are the two things the author has to act on -- and
+        # because a confirm-required result also reports ``allowed=False``, so
+        # without this branch it would be described as blocked outright and lose
+        # the distinction that matters here.
+        detail = (
+            f"（{safety.reason}）"
+            if safety.reason not in ("", _GENERIC_ALLOWED_REASON)
+            else ""
+        )
+        return (
+            f"验收命令被拒绝：该命令需要人工确认，风险等级 {safety.risk_level}"
+            f"{detail}，而验收时没有人在场"
+        )
     if not safety.allowed:
         return f"验收命令被拒绝：{safety.reason}"
     if safety.reason == "command was confirmed for this session":
@@ -108,8 +124,6 @@ def _refusal_reason(safety: Any) -> str | None:
             "本身并不在允许范围内"
         )
     detail = "" if safety.reason == _GENERIC_ALLOWED_REASON else f"（{safety.reason}）"
-    if safety.requires_confirmation:
-        return f"验收命令被拒绝：该命令需要人工确认{detail}，而验收时没有人在场"
     if safety.risk_level != "low":
         return (
             f"验收命令被拒绝：该命令的风险等级是 {safety.risk_level}{detail}，"

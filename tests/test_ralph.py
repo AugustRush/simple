@@ -264,7 +264,13 @@ def test_verifier_does_not_scan_innocent_interpreter_arguments(tmp_path):
     [
         "",
         '"unterminated',
-        "printf ok | cat",
+        # A pipe whose right-hand side executes its input as a program.  This
+        # used to be `printf ok | cat`, which was refused only because *every*
+        # pipe asked; `cat` does not execute its input, so under the segmented
+        # classifier it is an ordinary harmless command and is a legitimate
+        # check -- the refusal has to be pinned to the case that actually can
+        # never be judged unattended.
+        "printf ok | sh",
         "rm old.txt",
         "mkfs disk.img",
         "pytest -q",
