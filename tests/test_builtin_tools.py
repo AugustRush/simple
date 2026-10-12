@@ -114,6 +114,63 @@ def test_registry_rejects_cross_source_replace():
         )
 
 
+def test_memory_clear_is_answerable_off_terminal_and_consumed(
+    tmp_path, monkeypatch
+):
+    """A channel that cannot *ask* is not a channel that cannot be *answered*.
+
+    This used to refuse outright whenever no sink could put a question on
+    screen, which made memory clear impossible on a chat channel rather than
+    merely awkward.  Now the tool leaves a question behind and names the token,
+    the answer can arrive from anywhere, and the retry finds it.
+    """
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.security import consent
+    from agent.security.tool_approval import authorization_scope
+    from agent.tools.memory_tools import memory_clear_pending_records
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    tools.memory.write("identity", "user", "Prefers concise responses")
+
+    context_token = _active_agent_context.set(
+        AgentContext(
+            metadata={
+                "session_id": "chat-1",
+                "channel_name": "feishu",
+                "user_id": "u-1",
+            }
+        )
+    )
+    try:
+        first = json.loads(asyncio.run(registry.call("memory_clear", {})))
+        assert first["ok"] is False
+        assert first["requires_confirmation"] is True
+
+        pending = memory_clear_pending_records(authorization_scope())
+        assert len(pending) == 1
+        assert pending[0].token == first["confirmation_token"]
+        # The refusal names the token, because that is what makes it answerable
+        # from a surface the tool cannot reach.
+        assert first["confirmation_token"] in first["error"]
+
+        # The answer arrives from wherever the human is.
+        assert consent.SHELL.approve(
+            first["confirmation_token"], scope=authorization_scope()
+        )
+
+        second = json.loads(asyncio.run(registry.call("memory_clear", {})))
+        assert second["ok"] is True
+        assert second["deleted_by_store"]["memory_items"] == 1
+
+        # One answer, one clear: the record authorised *this* destruction.
+        third = json.loads(asyncio.run(registry.call("memory_clear", {})))
+        assert third["ok"] is False
+        assert third["requires_confirmation"] is True
+    finally:
+        _active_agent_context.reset(context_token)
+
+
 def test_memory_clear_uses_human_confirmation_and_storage_api(tmp_path):
     from agent.core.agent import AgentContext, _active_agent_context
     from agent.core.output import _active_sink

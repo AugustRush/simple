@@ -4391,6 +4391,161 @@ def test_unknown_explicit_skill_reference_still_reports_an_error():
     assert classification.skill_error == "unknown"
 
 
+def test_a_chat_reply_can_answer_a_memory_clear_question(monkeypatch):
+    """The token ``memory_clear`` hands back is redeemable where the human is.
+
+    Memory clear used to be impossible on a chat channel: with no sink to prompt
+    it refused outright.  It now leaves the same kind of question a shell
+    command does, so it appears in the numbered list and a short reply answers
+    it -- which is the whole reason the record exists.
+    """
+    from dataclasses import dataclass, field
+
+    from agent.commands.coordinator import CommandCoordinator
+    from agent.security import consent
+    from agent.security.shell import ShellAuthorizationScope
+    from agent.tools.memory_tools import memory_clear_rule
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+
+    @dataclass
+    class _Classification:
+        kind: str = "text"
+
+    @dataclass
+    class _TurnInput:
+        text: str = "1"
+        session_id: str = "chat-1"
+        channel_name: str = "feishu"
+        metadata: dict = field(default_factory=dict)
+
+    class _Sink:
+        interactive_confirmation = False
+
+        def __init__(self):
+            self.statuses = []
+
+        def on_status(self, message, *args, **kwargs):
+            self.statuses.append(str(message))
+
+    scope = ShellAuthorizationScope("chat-1", "feishu", "")
+    consent.SHELL.ask(
+        kind="memory_clear",
+        summary="永久清空全部长期记忆",
+        rule=memory_clear_rule(),
+        scope=scope,
+    )
+
+    sink = _Sink()
+    coordinator = CommandCoordinator.__new__(CommandCoordinator)
+    rewritten = coordinator._maybe_redeem_chat_approval(
+        _TurnInput(), _Classification(), sink
+    )
+
+    assert consent.SHELL.approved(memory_clear_rule(), scope=scope) is True
+    # The numbered path rewrites the turn generically, naming each question it
+    # redeemed: that is what makes the retry reachable for *any* kind without
+    # this function having to know the tool.
+    assert "清空记忆" in rewritten.text
+    assert "请用与批准时完全相同的参数重试" in rewritten.text
+
+
+def test_a_single_memory_question_answered_by_phrase_says_what_to_retry(
+    monkeypatch,
+):
+    """A bare approval on the sole question tells the agent which call to make."""
+    from dataclasses import dataclass, field
+
+    from agent.commands.coordinator import CommandCoordinator
+    from agent.security import consent
+    from agent.security.shell import ShellAuthorizationScope
+    from agent.tools.memory_tools import memory_clear_rule
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+
+    @dataclass
+    class _Classification:
+        kind: str = "text"
+
+    @dataclass
+    class _TurnInput:
+        text: str = "同意"
+        session_id: str = "chat-1"
+        channel_name: str = "feishu"
+        metadata: dict = field(default_factory=dict)
+
+    class _Sink:
+        interactive_confirmation = False
+
+        def on_status(self, *args, **kwargs):
+            return None
+
+    scope = ShellAuthorizationScope("chat-1", "feishu", "")
+    consent.SHELL.ask(
+        kind="memory_clear",
+        summary="永久清空全部长期记忆",
+        rule=memory_clear_rule(),
+        scope=scope,
+    )
+
+    coordinator = CommandCoordinator.__new__(CommandCoordinator)
+    rewritten = coordinator._maybe_redeem_chat_approval(
+        _TurnInput(), _Classification(), _Sink()
+    )
+
+    assert consent.SHELL.approved(memory_clear_rule(), scope=scope) is True
+    assert "清空长期记忆" in rewritten.text
+    assert "memory.clear" in rewritten.text
+
+
+def test_a_chat_reply_cannot_answer_another_users_question(monkeypatch):
+    """Scope, not text, decides which question a number answers."""
+    from dataclasses import dataclass, field
+
+    from agent.commands.coordinator import CommandCoordinator
+    from agent.security import consent
+    from agent.security.shell import ShellAuthorizationScope
+    from agent.tools.memory_tools import memory_clear_rule
+
+    monkeypatch.setattr(consent, "SHELL", consent.ConsentStore())
+
+    @dataclass
+    class _Classification:
+        kind: str = "text"
+
+    @dataclass
+    class _TurnInput:
+        text: str = "1"
+        session_id: str = "chat-1"
+        channel_name: str = "feishu"
+        metadata: dict = field(default_factory=dict)
+
+    class _Sink:
+        interactive_confirmation = False
+
+        def on_status(self, *args, **kwargs):
+            return None
+
+    owner = ShellAuthorizationScope("chat-1", "feishu", "owner")
+    consent.SHELL.ask(
+        kind="memory_clear",
+        summary="永久清空全部长期记忆",
+        rule=memory_clear_rule(),
+        scope=owner,
+    )
+
+    coordinator = CommandCoordinator.__new__(CommandCoordinator)
+    turn = _TurnInput(metadata={"user_id": "someone-else"})
+    rewritten = coordinator._maybe_redeem_chat_approval(
+        turn, _Classification(), _Sink()
+    )
+
+    assert rewritten.text == "1"
+    assert (
+        consent.SHELL.approved(memory_clear_rule(), scope=owner) is False
+    )
+
+
 def _phrase_approval_outcome(*, menu_available: bool, sink: object = None):
     """Run the chat-approval path against a sink with/without a menu."""
     from dataclasses import dataclass, field, replace as dc_replace

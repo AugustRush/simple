@@ -846,14 +846,16 @@ class CommandCoordinator:
     def _outstanding_questions(self, scope: Any) -> list[tuple[str, Any]]:
         """Every pending consent question for *scope*, in the order to print.
 
-        Install/activation questions first, then shell commands: that is the
-        order the redemption message has always named the side effect in, and
-        the order the numbered list is handed to the human in.
+        Install/activation questions first, then shell commands, then memory
+        clears: that is the order the redemption message has always named the
+        side effect in, and the order the numbered list is handed to the human
+        in.
         """
         from agent.security.plugin_approval import (
             plugin_install_pending_records,
         )
         from agent.security.shell import shell_pending_for_scope
+        from agent.tools.memory_tools import memory_clear_pending_records
 
         rows: list[tuple[str, Any]] = [
             ("install", record)
@@ -862,10 +864,16 @@ class CommandCoordinator:
         rows += [
             ("shell", record) for record in shell_pending_for_scope(scope)
         ]
+        rows += [
+            ("memory_clear", record)
+            for record in memory_clear_pending_records(scope)
+        ]
         return rows
 
     @staticmethod
     def _question_label(kind: str, what: str) -> str:
+        if kind == "memory_clear":
+            return "清空记忆"
         if kind != "install":
             return "执行命令"
         from agent.security.tool_approval import is_tool_source
@@ -873,7 +881,9 @@ class CommandCoordinator:
         return "激活用户工具" if is_tool_source(what) else "安装插件"
 
     def _question_text(self, kind: str, record: Any) -> str:
-        what = record.what if kind == "install" else record.command
+        # Store records carry ``what``; the shell's own wrapper carries
+        # ``command``.  Both mean "the thing being consented to".
+        what = getattr(record, "what", None) or getattr(record, "command", "")
         return f"{self._question_label(kind, what)}：{what}"
 
     def _numbered_questions(self, rows: list[tuple[str, Any]]) -> str:
@@ -887,11 +897,17 @@ class CommandCoordinator:
         self, kind: str, record: Any, scope: Any
     ) -> Optional[str]:
         """Redeem one question; return what was approved, or ``None``."""
+        from agent.security import consent
         from agent.security.plugin_approval import plugin_install_approve_record
         from agent.security.shell import shell_command_confirm
 
         if kind == "install":
             return plugin_install_approve_record(record.token, scope)
+        if kind == "memory_clear":
+            # Answering records the approval; the tool then finds it and does
+            # the clear on the retry this turn's rewrite asks for.
+            approved = consent.SHELL.approve(record.token, scope=scope)
+            return str(approved.what) if approved is not None else None
         if shell_command_confirm(record.token, scope=scope):
             return str(record.command)
         return None
@@ -901,7 +917,7 @@ class CommandCoordinator:
         from agent.security import consent
         from agent.security.shell import shell_pending_reject
 
-        if kind == "install":
+        if kind in ("install", "memory_clear"):
             return consent.SHELL.reject(record.token, scope=scope)
         return shell_pending_reject(record.token, scope=scope)
 
@@ -909,6 +925,19 @@ class CommandCoordinator:
         self, turn_input: TurnInput, sink: OutputSink, kind: str, what: str
     ) -> TurnInput:
         """The rewritten turn that tells the agent what was approved."""
+        if kind == "memory_clear":
+            self._safe_status(
+                sink,
+                "已批准清空记忆：可以重试 memory.clear。",
+                level="info",
+            )
+            return replace(
+                turn_input,
+                text=(
+                    "用户已明确批准清空长期记忆。"
+                    "请再次调用 memory.clear 来完成这次清空。"
+                ),
+            )
         if kind != "install":
             self._safe_status(
                 sink,
