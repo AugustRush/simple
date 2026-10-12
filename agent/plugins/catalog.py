@@ -614,6 +614,15 @@ def _plugin_hook_config(
     One function because two readers need the same answer -- the activation report
     and the installer's approval message -- and a ``hooks/hooks.json`` that only one
     of them read would be the silent promise this exists to surface.
+
+    Why hooks are *not* a capability service, unlike skills and MCP configs.  Those two
+    were collections the loader kept on a plugin's behalf and the composition root
+    attached afterwards, so a plugin's contribution happened in somebody else's hands.
+    A hook is different in both directions: it lives on the contributing plugin's own
+    :class:`PluginMeta` (there is no central list to drift from) and its only reader is
+    the loader, which *dispatches* it -- the firing, the event names and the environment
+    are loader behaviour, not a value another implementation could be handed.  A service
+    here would be a service whose sole caller is the thing that provides it.
     """
     config: dict[str, list[dict]] = {}
     for event, entries in ((meta.hooks_config if meta is not None else None) or {}).items():

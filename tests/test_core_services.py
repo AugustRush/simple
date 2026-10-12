@@ -32,6 +32,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_ROOT = REPO_ROOT / "agent"
 
 
+def _provider_dicts(tree: ast.AST) -> set[int]:
+    """``id()`` of the dict literals that *are* a component mapping, not data.
+
+    Three shapes, which are the ones the composition root actually uses: a ``return
+    {...}``; an argument to ``update(...)``/``dict(...)``/``provide(...)``; and the value
+    of an assignment to a components-named target (``components``,
+    ``_partial_components``, ``session_components``, ``self._components``).
+    """
+    found: set[int] = set()
+
+    def component_target(node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute):
+            return node.attr.strip("_") == "components"
+        return isinstance(node, ast.Name) and node.id.strip("_") == "components"
+
+    def call_name(node: ast.Call) -> str:
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return func.id if isinstance(func, ast.Name) else ""
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            found.add(id(node.value))
+        elif isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Dict) and any(
+                component_target(target) for target in node.targets
+            ):
+                found.add(id(node.value))
+        elif isinstance(node, ast.Call) and call_name(node) in {"update", "dict", "provide"}:
+            for argument in node.args:
+                if isinstance(argument, ast.Dict):
+                    found.add(id(argument))
+    return found
+
+
 def _is_metadata_receiver(node: ast.AST) -> bool:
     """Whether *node* is a per-turn metadata mapping rather than a component one.
 
@@ -200,13 +236,18 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             if keyword.arg in {"service_replacements", "service_replacement"}
         }
         assignment_targets = _is_assignment_target(tree)
+        provider_dicts = _provider_dicts(tree)
         for node in ast.walk(tree):
-            # **Every** dict literal, anywhere -- not only ones bound by an
-            # assignment.  Bootstrap delivers the component mapping from a
-            # ``return {...}``, and a scanner that looked only at assignments
-            # missed ``memory`` entirely while reporting the ledger as correct,
-            # because the guard and the ledger shared the same blind spot.
-            if isinstance(node, ast.Dict):
+            # A dict literal counts as a provision only when it *is* a component
+            # mapping -- returned, merged with ``update``, or assigned to a
+            # components-named target (see :func:`_provider_dicts`).  The rule began as
+            # "any dict literal, anywhere" because bootstrap delivers the mapping from a
+            # ``return {...}`` and a scanner that looked only at assignments missed
+            # ``memory`` entirely; that was true and too broad, and it read a web
+            # response payload and an ecosystem's own manifest keys as provisions of the
+            # *service* of the same name.  The other direction still guards the ledger: a
+            # declared owner that no longer writes fails its own test.
+            if isinstance(node, ast.Dict) and id(node) in provider_dicts:
                 if id(node) in declarations:
                     continue
                 # A *provider* is not "any dict that mentions a service name".  A helper
@@ -592,7 +633,9 @@ def test_declared_names_match_the_documented_set() -> None:
     assert set(core_service_names()) == {
         "agent",
         "agent_core",
+        "agents",
         "channels",
+        "commands",
         "context_manager",
         "contributed_mcp_servers",
         "ltm_store",
@@ -1651,7 +1694,9 @@ _PLUGIN_PROVIDED: dict[str, str] = {
     "mcp_server_configs": "agent/tools/mcp_plugin.py",
     "mcp_status": "agent/tools/mcp_plugin.py",
     "skill_catalog": "agent/skills/plugin.py",
+    "agents": "agent/plugins/catalog.py",
     "channels": "agent/channels/registry_plugin.py",
+    "commands": "agent/plugins/catalog.py",
     "contributed_mcp_servers": "agent/tools/mcp_servers.py",
 }
 

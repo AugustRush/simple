@@ -256,7 +256,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         owners=(
             "agent/memory/plugin.py",
             "agent/memory/backends/sqlite_fts.py",  # the opt-in alternative backend
-            "agent/config.py",
         ),
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",  # experience is scored against stored memory
@@ -283,6 +282,37 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "their scopes.  Its own plugin provides it *before* the client plugin, which "
             "injects it: that ordering is what lets a bundle's server be in the list the "
             "client computes."
+        ),
+    ),
+    CoreService(
+        name="commands",
+        owners=(
+            "agent/plugins/catalog.py",  # the loader builds and provides it
+        ),
+        consumers=(
+            "agent/plugins/catalog.py",
+        ),
+        contract="agent/commands/protocols.py:CommandRegistryService",
+        summary=(
+            "The slash-command registry.  A **floor**: the loader registers a bundle's "
+            "commands while loading it and restores this registry on a reload rollback, "
+            "so it must exist before any plugin activates -- the same reason "
+            "`plugin_catalog` is one.  A plugin still contributes through the view."
+        ),
+    ),
+    CoreService(
+        name="agents",
+        owners=(
+            "agent/plugins/catalog.py",  # the loader builds and provides it
+        ),
+        consumers=(
+            "agent/plugins/catalog.py",
+        ),
+        contract="agent/core/protocols.py:AgentRegistryService",
+        summary=(
+            "The sub-agent role registry.  A **floor** for the same reasons as "
+            "`commands`: it exists before any plugin activates, and the reload rollback "
+            "restores it."
         ),
     ),
     CoreService(

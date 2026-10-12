@@ -66,6 +66,20 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "plugin_catalog",
     ),
     (
+        "agent.commands.registry",
+        "CommandRegistry",
+        "agent.commands.protocols",
+        "CommandRegistryService",
+        "commands",
+    ),
+    (
+        "agent.core.agent_registry",
+        "AgentRegistry",
+        "agent.core.protocols",
+        "AgentRegistryService",
+        "agents",
+    ),
+    (
         "agent.tools.mcp_servers",
         "MCPServerRegistry",
         "agent.tools.protocols",

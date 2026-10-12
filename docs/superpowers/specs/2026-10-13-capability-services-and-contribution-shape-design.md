@@ -106,10 +106,15 @@ And it made two things true that used to be luck:
 | skills | **service** (this change) | -- |
 | tools / channels | service | -- |
 | MCP configs | **service** (this change: `contributed_mcp_servers`) | -- |
-| hooks | `PluginMeta.hooks_config`, read by the loader's dispatchers | a `hooks` service, or an explicit statement that a hook is *loader* configuration rather than a contribution |
-| commands / agents | registries provided **by the loader itself** (`catalog.py:1255-1256`) | providers as plugins, like `channels`, plus protocols |
+| hooks | `PluginMeta.hooks_config`, read by the loader's dispatchers | **decided: loader configuration, no service** (documented at `_plugin_hook_config`). Unlike skills/MCP there is no central list to drift from -- the config sits on the contributing plugin -- and its only reader *is* the loader, which dispatches it: a service here would have exactly one caller, the thing that provides it |
+| commands / agents | **declared floors, with protocols** (this change) | -- |
 
-The last row is the largest remaining asymmetry: two capability services are provided by
-the loader because the loader's own declarative path writes into them at discovery time.
-Once a bundle's contributions happen in its `setup` (as skills now do), the loader no
-longer needs to own them, and they can be provided the way `channels` is.
+`commands` and `agents` were the largest remaining asymmetry -- two capability services
+provided by the loader.  Measuring them settled it the other way: they are **floors**.
+The loader registers a bundle's commands and roles *while loading that bundle* and the
+reload rollback restores both registries from snapshots, so neither can be provided by a
+plugin (it would have to exist before the first plugin activates) and neither can be
+replaced mid-reload.  That is the same argument as `plugin_catalog`, and the honest
+answer is a written interface plus a stated reason in `tests/test_service_ownership.py`'s
+`FLOORS`, not a forced move.  With hooks decided as loader configuration as well, every
+contribution kind is now either a capability service or an explicitly-reasoned floor.

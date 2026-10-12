@@ -39,6 +39,17 @@ ROOT_ASSEMBLED: dict[str, str] = {
 #: floor is not debt: the loader is mounted *by* the container, so the container
 #: cannot get it from a plugin it has not loaded yet.
 FLOORS: dict[str, str] = {
+    "commands": (
+        "The loader registers a bundle's slash commands *while it loads that bundle*, "
+        "and its reload rollback restores this registry from a snapshot -- so a plugin "
+        "cannot provide it: it has to exist before the first plugin activates, and a "
+        "registry a plugin could replace mid-reload is one the loader cannot roll back."
+    ),
+    "agents": (
+        "The same two reasons as `commands`: the loader registers a bundle's roles "
+        "while loading it, so the registry must exist before any plugin activates, and "
+        "the reload rollback restores it, so a plugin cannot own or replace it."
+    ),
     "agent_core": (
         "A facade over the composition itself: it resolves `agent_loop`, "
         "`skill_catalog`, `plugin_catalog`, `post_turn_maintenance` and `output_dir` at "
