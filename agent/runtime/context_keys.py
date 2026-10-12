@@ -74,7 +74,14 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="workspace_root",
         writers=("agent/tools/registry_plugin.py", "agent/commands/builtin.py",),
-        readers=("agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=(
+            "agent/tools/builtin_tools.py",
+            "agent/tools/user_tool_runner.py",
+            # builtin.py reads it back for /trust, which has to know which
+            # project's grants it is listing: a durable answer nobody can see is
+            # an answer nobody can take back.
+            "agent/commands/builtin.py",
+        ),
     ),
     ContextKey(
         key="output_dir",

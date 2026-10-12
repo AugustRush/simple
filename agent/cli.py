@@ -245,6 +245,10 @@ _COMMAND_OPTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("off", "/auto-approve off", "恢复高风险确认"),
         ("status", "/auto-approve status", "查看当前会话状态"),
     ),
+    "trust": (
+        ("", "/trust", "查看本会话与本项目已记住的同意"),
+        ("revoke all", "/trust revoke all", "撤销以上全部，之后重新询问"),
+    ),
     "permissions": (
         ("", "/permissions", "查看当前权限等级与沙箱模式"),
         ("ask", "/permissions ask", "低/中风险自动执行；高风险需确认"),

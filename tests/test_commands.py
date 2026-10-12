@@ -1163,6 +1163,137 @@ def test_builtin_confirm_redeems_with_command_context_identity():
     assert shell_command_check("mkfs /dev/disk0", scope=scope).allowed is True
 
 
+def test_builtin_trust_lists_and_revokes_what_was_remembered(tmp_path, monkeypatch):
+    """The surface that keeps "always" honest.
+
+    A durable grant nobody can see is one nobody can take back.  ``/trust``
+    lists both lifetimes with the *kind* of grant named -- a program-wide answer
+    and a single command line are different promises -- and revoking one makes
+    the next identical question ask again.
+    """
+    from agent.security import consent
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+        shell_pending_mark_project_scope,
+        shell_session_allowlist_add_persistent,
+        shell_session_allowlist_clear,
+    )
+
+    monkeypatch.setattr(
+        consent,
+        "SHELL",
+        consent.ConsentStore(ledger_root=tmp_path / "trust"),
+    )
+    router = _builtin_router()
+    shell_session_allowlist_clear()
+    scope = ShellAuthorizationScope("s-1", "feishu", "user-1")
+    workspace = str(tmp_path / "project")
+    # The project grants are keyed by workspace, and this is where the running
+    # session records which one it is (the workspace command writes it).
+    import agent as agent_module
+
+    monkeypatch.setattr(agent_module, "workspace_root", workspace, raising=False)
+
+    # One project answer (a program rule) and one session answer (a command).
+    asked = shell_command_check(
+        "pip install -r requirements.txt", scope=scope, workspace=workspace
+    )
+    shell_pending_mark_project_scope(asked.confirmation_token, scope=scope)
+    shell_command_confirm(asked.confirmation_token, scope=scope)
+    shell_session_allowlist_add_persistent("mkfs /dev/disk0", scope=scope)
+
+    listed = _run_builtin(
+        router,
+        "/trust",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+
+    assert "1." in listed and "2." in listed
+    assert "pip" in listed and "本项目" in listed
+    assert "mkfs /dev/disk0" in listed and "本会话" in listed
+
+    revoked = _run_builtin(
+        router,
+        "/trust revoke 1",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "已撤销" in revoked
+
+    # The program grant is gone, so the same question is asked again; the
+    # session command is untouched.
+    assert shell_command_check(
+        "pip install requests", scope=scope, workspace=workspace
+    ).requires_confirmation is True
+    assert shell_command_check("mkfs /dev/disk0", scope=scope).allowed is True
+
+    # And the listing is what tells the user so.
+    after = _run_builtin(
+        router,
+        "/trust",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "pip" not in after
+    assert "mkfs /dev/disk0" in after
+
+
+def test_builtin_trust_revoke_all_and_bad_arguments(tmp_path, monkeypatch):
+    from agent.security import consent
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_add_persistent,
+        shell_session_allowlist_clear,
+        shell_session_allowlist_contains,
+    )
+
+    monkeypatch.setattr(
+        consent,
+        "SHELL",
+        consent.ConsentStore(ledger_root=tmp_path / "trust"),
+    )
+    scope = ShellAuthorizationScope("s-1", "feishu", "user-1")
+    shell_session_allowlist_clear()
+    shell_session_allowlist_add_persistent("mkfs /dev/disk0", scope=scope)
+
+    router = _builtin_router()
+    out_of_range = _run_builtin(
+        router,
+        "/trust revoke 9",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "序号超出范围" in out_of_range
+
+    cleared = _run_builtin(
+        router,
+        "/trust revoke all",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "已撤销" in cleared
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is False
+
+    empty = _run_builtin(
+        router,
+        "/trust",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "没有记住任何同意" in empty
+
+    usage = _run_builtin(
+        router,
+        "/trust wat",
+        channel_name="feishu",
+        metadata={"user_id": "user-1"},
+    ).response_text or ""
+    assert "Usage" in usage
+
+
 def test_builtin_confirm_rejects_wrong_user_and_invalid_arguments():
     from agent.security.shell import (
         ShellAuthorizationScope,

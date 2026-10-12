@@ -1140,6 +1140,152 @@ async def _confirm_handler(
     )
 
 
+def _trust_scope(context: CommandContext):
+    from agent.security.shell import ShellAuthorizationScope
+
+    return ShellAuthorizationScope(
+        context.session_id,
+        context.channel_name,
+        str(context.metadata.get("user_id") or ""),
+    )
+
+
+def _trust_workspace(context: CommandContext) -> str:
+    """The workspace the project grants belong to, or ``""`` when there is none.
+
+    Read from the registry first because that is the composition's answer for
+    the running session, with ``agent.workspace_root`` as the fallback the
+    workspace command itself writes.
+    """
+    registry = _component(context, "registry")
+    if registry is not None:
+        with contextlib.suppress(Exception):
+            value = registry.get_context("workspace_root")
+            if value:
+                return str(value)
+    import agent as agent_module
+
+    value = getattr(agent_module, "workspace_root", None)
+    return str(value) if value else ""
+
+
+def _trust_rows(context: CommandContext) -> list:
+    """Everything in force for this session and this project, listing order."""
+    from agent.security import consent
+
+    rows = consent.SHELL.remembered(
+        scope=_trust_scope(context), workspace=_trust_workspace(context)
+    )
+    # The persistent grants first: those are the ones somebody has to be able to
+    # find and take back later, and the order has to be the same for the listing
+    # and for `/trust revoke <n>`.
+    order = {consent.ALWAYS: 0, consent.SESSION: 1, consent.ONCE: 2}
+    return sorted(rows, key=lambda row: order.get(row.lifetime, 3))
+
+
+_TRUST_LIFETIME_LABELS = {
+    "always": "本项目 · 长期",
+    "session": "本会话",
+    "once": "5 分钟内",
+}
+
+#: How a remembered rule reads to the person deciding whether to revoke it.
+#: The *kind* matters as much as the value: "pip" is a program-wide grant, while
+#: one line of shell is not, and a revocation screen that showed both as a bare
+#: string would hide exactly the distinction it exists to expose.
+_TRUST_KIND_LABELS = {
+    "command": "这条命令",
+    "program": "这个程序（所有调用）",
+    "path": "这个位置",
+    "plugin": "这个安装来源",
+    "tool": "这个工具",
+}
+
+
+def _trust_rule_label(rule: str) -> str:
+    from agent.security import consent
+
+    kind = consent.rule_kind(rule)
+    label = _TRUST_KIND_LABELS.get(kind)
+    value = _markdown_inline(consent.rule_value(rule))
+    return f"{label}：`{value}`" if label else f"`{value}`"
+
+
+async def _trust_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    """Show and revoke what the human has already agreed to.
+
+    An answer nobody can see is an answer nobody can take back, and "always"
+    is now a durable grant -- so this is the surface that keeps it honest.
+    """
+    from agent.security import consent
+
+    parts = request.args.split()
+    if parts and parts[0].casefold() not in ("revoke", "撤销"):
+        return _error("Usage: /trust | /trust revoke <序号> | /trust revoke all")
+
+    workspace = _trust_workspace(context)
+    rows = _trust_rows(context)
+
+    if not parts:
+        if not rows:
+            return CommandResult(
+                response_text=(
+                    "本会话与本项目没有记住任何同意。\n\n"
+                    "需要确认时，卡片上的「本会话总是允许」和「本项目总是允许」"
+                    "会把答案记在这里，之后可以用 `/trust` 查看、用 "
+                    "`/trust revoke <序号>` 撤销。"
+                )
+            )
+        lines = ["## 已记住的同意", ""]
+        for index, row in enumerate(rows, start=1):
+            label = _TRUST_LIFETIME_LABELS.get(row.lifetime, row.lifetime)
+            lines.append(f"{index}. {_trust_rule_label(row.rule)}  （{label}）")
+        if not workspace:
+            lines.append("")
+            lines.append(
+                "> ℹ 当前没有工作区，所以本项目级别的授予不会显示在这里。"
+            )
+        lines.append("")
+        lines.append(
+            "撤销：`/trust revoke <序号>`；清空以上全部：`/trust revoke all`。"
+        )
+        return CommandResult(response_text="\n".join(lines))
+
+    if len(parts) != 2:
+        return _error("Usage: /trust revoke <序号> | /trust revoke all")
+    if not rows:
+        return _warning("没有可撤销的同意。")
+
+    target = parts[1].casefold()
+    if target in ("all", "全部", "所有"):
+        for row in rows:
+            consent.SHELL.revoke(
+                row.rule,
+                scope=_trust_scope(context),
+                workspace=workspace or None,
+            )
+        return CommandResult(
+            response_text=f"已撤销 {len(rows)} 条同意；之后遇到同样的问题会重新询问。"
+        )
+
+    if not target.isdigit() or not 1 <= int(target) <= len(rows):
+        return _error(
+            f"序号超出范围（当前 {len(rows)} 条）。用 `/trust` 查看列表。"
+        )
+    row = rows[int(target) - 1]
+    consent.SHELL.revoke(
+        row.rule, scope=_trust_scope(context), workspace=workspace or None
+    )
+    return CommandResult(
+        response_text=(
+            f"已撤销：{_trust_rule_label(row.rule)}"
+            "；之后遇到同样的问题会重新询问。"
+        )
+    )
+
+
 def _shell_allowed_commands_from_config() -> list[str]:
     import agent as agent_module
 
@@ -1797,6 +1943,16 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
                 "reset [level|sandbox]]"
             ),
             description="Show or set shell permission level and sandbox mode (persistent by default)",
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "trust",
+            _trust_handler,
+            usage="/trust [revoke <序号>|all]",
+            description=(
+                "Show, and revoke, the approvals remembered for this session "
+                "and this project"
+            ),
             concurrency="anytime",
         ),
         CommandDescriptor(

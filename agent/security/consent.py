@@ -325,24 +325,50 @@ class ConsentStore:
         )
 
     def revoke(
-        self, rule: Optional[str] = None, *, workspace: Any = None
+        self,
+        rule: Optional[str] = None,
+        *,
+        scope: Any = None,
+        workspace: Any = None,
     ) -> int:
-        """Drop one rule (or every rule) at every lifetime; return how many."""
+        """Drop one rule (or every rule) at the lifetimes the caller means.
+
+        Both bounds are honoured, which matters because the same rule text can
+        exist in several places: ``always`` is keyed by workspace and the
+        expiring lifetimes by scope, so revoking "pip in this project" must not
+        silently revoke it in another project or for another user.  Passing
+        neither bound clears the rule everywhere, which is what teardown wants.
+        """
         removed = 0
-        for store in (self._once, self._always):
-            for key in [
-                key for key in store if rule is None or key[1] == rule
-            ]:
-                store.pop(key, None)
-                removed += 1
+        scope_bound = scope_key(scope) if scope is not None else None
+        workspace_bound = str(workspace) if workspace is not None else None
         for key in [
-            key for key in self._session if rule is None or key[1] == rule
+            key
+            for key in self._always
+            if (rule is None or key[1] == rule)
+            and (workspace_bound is None or key[0] == workspace_bound)
         ]:
-            self._session.discard(key)
+            self._always.pop(key, None)
             removed += 1
-        if workspace is not None:
-            self._load(str(workspace or ""))
-            self._flush(str(workspace or ""))
+        for entry in [
+            entry
+            for entry in self._once
+            if (rule is None or entry[1] == rule)
+            and (scope_bound is None or entry[0] == scope_bound)
+        ]:
+            self._once.pop(entry, None)
+            removed += 1
+        for entry in [
+            entry
+            for entry in self._session
+            if (rule is None or entry[1] == rule)
+            and (scope_bound is None or entry[0] == scope_bound)
+        ]:
+            self._session.discard(entry)
+            removed += 1
+        if workspace_bound is not None:
+            self._load(workspace_bound)
+            self._flush(workspace_bound)
         else:
             for stored in list(self._loaded):
                 self._flush(stored)
