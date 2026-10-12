@@ -1006,6 +1006,90 @@ def test_web_non_shell_prompt_rejects_session_scope():
     )
 
 
+def test_web_confirm_allow_project_remembers_the_rule_for_the_workspace(
+    tmp_path, monkeypatch
+):
+    """The browser can answer "always, for this project", and it generalises.
+
+    The prompt advertises it only when the question proposed a rule *and* named
+    a workspace; the answer must reach the same redeem step as the terminal's
+    fourth option, because both are the same intent travelling through the same
+    pending record.
+    """
+    from starlette.testclient import TestClient
+
+    from agent.security import consent
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+        shell_session_allowlist_clear,
+    )
+
+    monkeypatch.setattr(
+        consent,
+        "SHELL",
+        consent.ConsentStore(ledger_root=tmp_path / "trust"),
+    )
+    scope = ShellAuthorizationScope("web-project", "web", "")
+    workspace = str(tmp_path / "project")
+    shell_session_allowlist_clear()
+    command = "pip install -r requirements.txt"
+
+    async def handler(msg, sink):
+        check = shell_command_check(command, scope=scope, workspace=workspace)
+        approved = await sink.on_tool_confirmation(
+            "shell",
+            command=command,
+            risk_level=check.risk_level,
+            reason=check.reason,
+            confirmation_token=check.confirmation_token,
+            scope=scope,
+        )
+        if approved:
+            shell_command_confirm(check.confirmation_token, scope=scope)
+        sink.on_stream_chunk("approved" if approved else "denied")
+        sink.on_turn_complete("done", [])
+        return True
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = handler
+    with TestClient(channel.app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        with client.websocket_connect(f"/api/sessions/{sid}/stream") as ws:
+            ws.send_json({"type": "message", "text": "install"})
+            req = ws.receive_json()
+            assert req["type"] == "confirm_request"
+            assert req["allow_project"] is True
+            ws.send_json(
+                {
+                    "type": "confirm_response",
+                    "decision": "allow_project",
+                    "confirmation_token": req["confirmation_token"],
+                }
+            )
+            while True:
+                if ws.receive_json()["type"] == "turn_complete":
+                    break
+
+    # The *program* is granted in that workspace, not the line: a different
+    # install is answered, and another project is still asked.
+    assert shell_command_check(
+        "pip install requests", scope=scope, workspace=workspace
+    ).allowed is True
+    assert shell_command_check(
+        "pip install requests", scope=scope, workspace="/other"
+    ).requires_confirmation is True
+    shell_session_allowlist_clear()
+
+
+def test_web_confirm_request_does_not_advertise_a_project_answer_without_one():
+    """A prompt asked without a workspace cannot promise a project grant."""
+    req, _summary, _still = _run_shell_approval({"decision": "deny"})
+    assert req["allow_project"] is False
+
+
 def test_a_connected_browser_says_it_can_be_asked():
     """The consent callers branch on this flag, so it has to be the truth.
 

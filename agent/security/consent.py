@@ -124,6 +124,18 @@ class Pending:
     expires_at: float
     #: The lifetime a "yes" will be recorded at unless the human says otherwise.
     lifetime: str = ONCE
+    #: The rule an ``always`` answer should record instead of :attr:`rule`, and
+    #: the workspace it belongs to.
+    #:
+    #: A question can be asked for one reason and answered at a wider lifetime,
+    #: and the two are not the same rule.  `python3 -c '…'` is asked because the
+    #: code cannot be read, and what is worth remembering is that exact command;
+    #: `pip install -r …` is asked because it changes the environment, and what
+    #: is worth remembering is the *program*, since the next install is a
+    #: different line.  The gate decides this when it asks, because that is the
+    #: only moment the reason is known.
+    always_rule: str = ""
+    workspace: str = ""
 
     @property
     def what(self) -> str:
@@ -446,6 +458,8 @@ class ConsentStore:
         lifetime: str = ONCE,
         at: Optional[float] = None,
         expires_at: Optional[float] = None,
+        always_rule: str = "",
+        workspace: str = "",
     ) -> str:
         """Record a question and return its token.
 
@@ -453,6 +467,9 @@ class ConsentStore:
         minting a new one: the human's later answer has to be matchable to the
         request that prompted it, and a retry that minted a fresh token each
         time could never be answered at all.
+
+        ``always_rule`` and ``workspace`` say what *this* question's "always"
+        answer should mean; see :class:`Pending`.
         """
         self._forget_expired(at)
         key = scope_key(scope)
@@ -480,6 +497,8 @@ class ConsentStore:
                 else now + PROMPT_TTL_SECONDS
             ),
             lifetime=lifetime if lifetime in LIFETIMES else ONCE,
+            always_rule=str(always_rule or ""),
+            workspace=str(workspace or ""),
         )
         return token
 
@@ -515,6 +534,8 @@ class ConsentStore:
             scope_key=record.scope_key,
             expires_at=record.expires_at,
             lifetime=lifetime,
+            always_rule=record.always_rule,
+            workspace=record.workspace,
         )
         return True
 
@@ -560,9 +581,21 @@ class ConsentStore:
         if scope is not None and record.scope_key != scope_key(scope):
             return None
         self._pending.pop(token, None)
+        chosen = lifetime or record.lifetime
+        if chosen == ALWAYS:
+            # The question's own "always" rule, in the workspace the question
+            # was asked in -- not the rule that answered it once.
+            self.remember(
+                record.always_rule or record.rule,
+                ALWAYS,
+                scope=scope,
+                workspace=record.workspace,
+                at=at,
+            )
+            return record
         self.remember(
             record.rule,
-            lifetime or record.lifetime,
+            chosen,
             scope=scope,
             workspace=workspace,
             expires_at=(

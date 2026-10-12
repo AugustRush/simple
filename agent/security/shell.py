@@ -373,6 +373,41 @@ def _redirect_target_reason(
     )
 
 
+def _resolved_target(target: str) -> str:
+    """The canonical spelling of a write target, for use in a grant.
+
+    A grant has to match a later spelling of the same place, so it is recorded
+    resolved rather than as typed: `~/Documents/x` and `/Users/me/Documents/x`
+    are one path, and only one of them should need answering.
+    """
+    return str(Path(str(target)).expanduser().resolve(strict=False))
+
+
+def _first_outside_argument_target(
+    segment: list[str],
+    index: int,
+    *,
+    allowed_roots: frozenset[Path] | None,
+) -> Optional[str]:
+    """The first argument target outside the write roots, if any."""
+    for target in _argument_write_targets(segment, index):
+        if _target_outside_roots(target, allowed_roots=allowed_roots):
+            return target
+    return None
+
+
+def _first_outside_redirect_target(
+    segment: list[str],
+    *,
+    allowed_roots: frozenset[Path] | None,
+) -> Optional[str]:
+    """The first redirect target outside the write roots, if any."""
+    for target in _redirect_targets(segment):
+        if _target_outside_roots(target, allowed_roots=allowed_roots):
+            return target
+    return None
+
+
 def _argument_write_reason(
     segment: list[str],
     index: int,
@@ -393,14 +428,16 @@ def _argument_write_reason(
     if entry is None:
         return None
     _mode, verb = entry
-    for target in _argument_write_targets(segment, index):
-        if _target_outside_roots(target, allowed_roots=allowed_roots):
-            return (
-                f"'{command_name}' would {verb} '{target}', which is outside "
-                f"the workspace (writes are granted inside "
-                f"{_write_boundary_note(allowed_roots)})"
-            )
-    return None
+    target = _first_outside_argument_target(
+        segment, index, allowed_roots=allowed_roots
+    )
+    if target is None:
+        return None
+    return (
+        f"'{command_name}' would {verb} '{target}', which is outside "
+        f"the workspace (writes are granted inside "
+        f"{_write_boundary_note(allowed_roots)})"
+    )
 
 
 def _unresolvable(target: str) -> bool:
@@ -744,6 +781,27 @@ def shell_session_scope_supported(
     return isinstance(scope, ShellAuthorizationScope)
 
 
+def shell_project_scope_supported(
+    name: str, confirmation_token: str, scope: Any
+) -> bool:
+    """Whether this prompt can be answered "always, for this project".
+
+    The stricter sibling of the session question: it additionally needs the
+    question to have said *what* a project answer should remember
+    (:attr:`ShellCheckResult.approval_rule`) and *which* project that is.  Both
+    travel with the pending record, so a surface can offer the answer without
+    knowing either -- and a prompt asked without a workspace cannot offer it at
+    all, because "this project" with no project would be a grant in the global
+    bucket, which is a different and much wider promise.
+    """
+    if not shell_session_scope_supported(name, confirmation_token, scope):
+        return False
+    record = consent.SHELL.get(confirmation_token, scope=scope)
+    return bool(
+        record is not None and record.always_rule and record.workspace
+    )
+
+
 # ── ShellCheckResult ────────────────────────────────────────────────────────
 
 
@@ -756,6 +814,17 @@ class ShellCheckResult:
     reason: str
     requires_confirmation: bool = False
     confirmation_token: str = ""
+    #: What an "always for this project" answer should remember, as a rule the
+    #: consent store understands: ``path:<target>`` when the question was about
+    #: reaching outside the workspace, ``program:<argv0>`` when it was about
+    #: changing the environment, and the exact command otherwise.
+    #:
+    #: It is decided here because this is the only place that knows *why* the
+    #: question is being asked, and the narrowest rule that would have prevented
+    #: it is different for each reason: remembering "python3" because
+    #: `python3 -c '…'` could not be read would grant arbitrary code, while
+    #: remembering the exact line would ask again on the next line.
+    approval_rule: str = ""
 
     # Backward-compatible truthiness: non-None means "blocked"
     def __bool__(self) -> bool:
@@ -790,6 +859,25 @@ def shell_pending_mark_session_scope(
     if consent.SHELL.get(token, scope=scope) is None:
         return False
     return consent.SHELL.note_lifetime(token, consent.SESSION)
+
+
+def shell_pending_mark_project_scope(
+    token: str,
+    *,
+    scope: ShellAuthorizationScope,
+) -> bool:
+    """Record that *token* was approved for the whole project, not just once.
+
+    The ``always`` lifetime: the answer is remembered as the rule the question
+    proposed (``path:`` for a place, ``program:`` for a program whose arguments
+    were the problem, the exact command otherwise) and, because the pending
+    record carries that rule *and* the workspace, no surface has to know either
+    in order to offer the answer.
+    """
+    record = consent.SHELL.get(token, scope=scope)
+    if record is None or not record.always_rule:
+        return False
+    return consent.SHELL.note_lifetime(token, consent.ALWAYS)
 
 
 def shell_command_confirm(
@@ -870,6 +958,8 @@ def _pending_confirmation(
     *,
     scope: ShellAuthorizationScope,
     now: datetime,
+    approval_rule: str = "",
+    workspace: str | None = None,
 ) -> str:
     normalized_command = _normalize_command(command)
     return consent.SHELL.ask(
@@ -882,6 +972,10 @@ def _pending_confirmation(
         # keeps the shell gate's clock authoritative, which is what its tests
         # drive.
         expires_at=_epoch(now + CONFIRMATION_TTL),
+        # What an "always, for this project" answer means for *this* question,
+        # decided where the reason is known; see ShellCheckResult.approval_rule.
+        always_rule=approval_rule,
+        workspace=str(workspace or ""),
     )
 
 
@@ -1577,6 +1671,59 @@ def _argument_write_targets(segment: list[str], index: int) -> list[str]:
     return operands
 
 
+def _project_grant(
+    normalized_command: str,
+    *,
+    argv0: Optional[str],
+    segments: list[tuple[Optional[str], list[str]]],
+    scope: ShellAuthorizationScope,
+    workspace: Optional[str],
+    allowed_roots: frozenset[Path] | None,
+    now: datetime,
+) -> Optional[str]:
+    """The rule that already answers this command, or ``None``.
+
+    Only consulted when the caller says which project this is: ``always``
+    answers are keyed by workspace, and a gate that does not know its workspace
+    must not fall back to the global bucket -- that would make every project's
+    grants apply in every other.
+
+    The candidates are the same three shapes the gate asks in: the exact
+    command, the program, and each path the command would write outside the
+    workspace.  A grant on any one of them answers the question.
+    """
+    if workspace is None:
+        return None
+    at = _epoch(now)
+    candidates: list[str] = [
+        consent.make_rule(consent.COMMAND, normalized_command)
+    ]
+    if argv0:
+        candidates.append(consent.make_rule(consent.PROGRAM, argv0))
+    for _operator, segment in segments:
+        index = _resolve_effective_command_index(segment)
+        if index is None:
+            continue
+        for target in (
+            _first_outside_argument_target(
+                segment, index, allowed_roots=allowed_roots
+            ),
+            _first_outside_redirect_target(
+                segment, allowed_roots=allowed_roots
+            ),
+        ):
+            if target is not None:
+                candidates.append(
+                    consent.make_rule(consent.PATH, _resolved_target(target))
+                )
+    for candidate in candidates:
+        if consent.SHELL.approved(
+            candidate, scope=scope, workspace=workspace, at=at
+        ):
+            return candidate
+    return None
+
+
 def shell_command_check(
     command: str,
     extra_blocked: Optional[list[str]] = None,
@@ -1586,6 +1733,7 @@ def shell_command_check(
     now: datetime | None = None,
     pre_approved: Optional[list[str]] = None,
     permission_level: Optional[str] = None,
+    workspace: str | None = None,
 ) -> ShellCheckResult:
     """Classify *command* by risk level and determine whether it may run.
 
@@ -1689,6 +1837,29 @@ def shell_command_check(
             reason="command was confirmed for this session",
         )
 
+    # ── …and the grants that outlive the session ─────────────────────────
+    #
+    # A project answer is remembered as a *capability* rather than as a command
+    # line, so the question has to be asked in those terms too: the exact
+    # command, the program whose arguments change the environment, and each path
+    # the command would write outside the workspace.  Any one of them being
+    # granted answers the question that would otherwise be asked.
+    project_grant = _project_grant(
+        normalized_command,
+        argv0=argv0,
+        segments=segments,
+        scope=authorization_scope,
+        workspace=workspace,
+        allowed_roots=allowed_roots,
+        now=authorization_now,
+    )
+    if project_grant is not None:
+        return ShellCheckResult(
+            allowed=True,
+            risk_level="low",
+            reason=f"the project has been granted {project_grant}",
+        )
+
     # ── Explicit allowlist entries bypass confirmation ───────────────────
     if _command_is_pre_approved(normalized_command, argv0, pre_approved):
         return ShellCheckResult(
@@ -1697,11 +1868,18 @@ def shell_command_check(
             reason="command is pre-approved (no confirmation required)",
         )
 
-    def _confirm(reason: str) -> ShellCheckResult:
+    def _confirm(reason: str, rule: str = "") -> ShellCheckResult:
+        # The default answer worth remembering is the exact command, which is
+        # the narrowest rule that cannot over-grant.  Branches that have a
+        # better one -- a path, or the program whose arguments were the problem
+        # -- pass it explicitly.
+        rule = rule or consent.make_rule(consent.COMMAND, normalized_command)
         token = _pending_confirmation(
             normalized_command,
             scope=authorization_scope,
             now=authorization_now,
+            approval_rule=rule,
+            workspace=workspace,
         )
         return ShellCheckResult(
             allowed=False,
@@ -1709,6 +1887,7 @@ def shell_command_check(
             reason=reason,
             requires_confirmation=True,
             confirmation_token=token,
+            approval_rule=rule,
         )
 
     # ── Per-segment classification ───────────────────────────────────────
@@ -1727,7 +1906,17 @@ def shell_command_check(
             continue
         environment_reason = _environment_mutation_reason(segment, index)
         if environment_reason is not None:
-            return _confirm(environment_reason)
+            # Remembering the *program* is the right grant here: the next
+            # install is a different line of the same intent, and `pip install
+            # -r requirements.txt` asked because of what pip does, not because
+            # of which file was named.
+            return _confirm(
+                environment_reason,
+                consent.make_rule(
+                    consent.PROGRAM,
+                    os.path.basename(segment[index].strip().lstrip("./")),
+                ),
+            )
 
     # ── Named destructiveness and command-line opacity: confirmed at ``ask`` ──
     # Auto-allowed from ``medium`` up, exactly as these checks have always been:
@@ -1784,7 +1973,22 @@ def shell_command_check(
                 segment, index, allowed_roots=allowed_roots
             )
             if write_reason is not None:
-                return _confirm(write_reason)
+                # A project answer grants the *place*, not the command: the
+                # question was "may I touch this directory", and the next
+                # command that wants it is a different line.
+                outside = _first_outside_argument_target(
+                    segment, index, allowed_roots=allowed_roots
+                )
+                return _confirm(
+                    write_reason,
+                    (
+                        consent.make_rule(
+                            consent.PATH, _resolved_target(outside)
+                        )
+                        if outside is not None
+                        else ""
+                    ),
+                )
             irreversible_reason = _workspace_irreversible_reason(segment, index)
             if irreversible_reason is not None:
                 return _confirm(irreversible_reason)
@@ -1795,7 +1999,12 @@ def shell_command_check(
                     target, allowed_roots=allowed_roots
                 )
                 if target_reason is not None:
-                    return _confirm(target_reason)
+                    return _confirm(
+                        target_reason,
+                        consent.make_rule(
+                            consent.PATH, _resolved_target(target)
+                        ),
+                    )
 
     # ── Allowed: keep the real risk tier for transparency ───────────────
     inline_execution = any(

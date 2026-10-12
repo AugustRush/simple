@@ -179,6 +179,10 @@ class ShellTools:
         workspace_root = self._active_workspace_root()
         sandbox_dir = self.sandbox_dir()
         _shell_command_check = agent_module._shell_command_check
+        # ``workspace`` is what lets the gate read the *project's* remembered
+        # answers: `always` grants are keyed by workspace, and a gate that did
+        # not say which project this is would fall back to the global bucket and
+        # apply one project's grants in every other.
         safety = _shell_command_check(
             command,
             extra_blocked,
@@ -186,6 +190,7 @@ class ShellTools:
             scope=authorization_scope,
             pre_approved=pre_approved,
             permission_level=permission_level,
+            workspace=str(workspace_root),
         )
         if safety.requires_confirmation and await self._try_interactive_confirmation(
             safety=safety,
@@ -203,6 +208,7 @@ class ShellTools:
                 scope=authorization_scope,
                 pre_approved=pre_approved,
                 permission_level=permission_level,
+                workspace=str(workspace_root),
             )
         if not safety.allowed:
             if safety.requires_confirmation:

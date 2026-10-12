@@ -46,6 +46,13 @@ _APPROVAL_DECLINE_ANSWERS = frozenset({"2", "n", "no", "拒绝"})
 _APPROVAL_ALWAYS_ANSWERS = frozenset(
     {"3", "a", "always", "总是", "总是允许", "本会话总是允许"}
 )
+#: The fourth answer, offered only when the question said *what* a project
+#: answer should remember.  It is the one that ends the interruptions rather
+#: than postponing them: a session answer is asked again tomorrow, and a grant
+#: on the place or the program is not.
+_APPROVAL_PROJECT_ANSWERS = frozenset(
+    {"4", "p", "project", "项目", "本项目", "本项目总是允许"}
+)
 #: How many unusable answers the TUI's consent prompt accepts before refusing.
 #: The terminal's own PromptSession re-asks through its validator instead; this
 #: bound is for a caller-supplied prompt callable, which the sink cannot see
@@ -60,30 +67,51 @@ _APPROVAL_VALIDATOR = Validator.from_callable(
 )
 
 
-def _approval_validator(allow_always: bool) -> Validator:
-    """The validator for one prompt, which may or may not offer the third answer."""
-    if not allow_always:
+def _approval_answers(
+    *, allow_always: bool = False, allow_project: bool = False
+) -> frozenset[str]:
+    """Every answer this prompt accepts, given what it can honour."""
+    answers = _APPROVAL_ACCEPT_ANSWERS | _APPROVAL_DECLINE_ANSWERS
+    if allow_always:
+        answers |= _APPROVAL_ALWAYS_ANSWERS
+    if allow_project:
+        answers |= _APPROVAL_PROJECT_ANSWERS
+    return answers
+
+
+def _approval_validator(
+    allow_always: bool = False, allow_project: bool = False
+) -> Validator:
+    """The validator for one prompt, which may or may not offer the wider answers."""
+    if not allow_always and not allow_project:
         return _APPROVAL_VALIDATOR
+    offered = []
+    if allow_always:
+        offered.append("3（本会话总是允许）")
+    if allow_project:
+        offered.append("4（本项目总是允许）")
     return Validator.from_callable(
         lambda text: text.strip().casefold()
-        in (
-            _APPROVAL_ACCEPT_ANSWERS
-            | _APPROVAL_DECLINE_ANSWERS
-            | _APPROVAL_ALWAYS_ANSWERS
+        in _approval_answers(
+            allow_always=allow_always, allow_project=allow_project
         ),
-        error_message="请输入 1（批准执行）、2（拒绝）或 3（本会话总是允许）",
+        error_message=f"请输入 1（批准执行）、2（拒绝）或 {'、'.join(offered)}",
         move_cursor_to_end=True,
     )
 
 
-def _approval_choice(answer: str, *, allow_always: bool = False) -> str:
-    """Map an answer to ``"once"``, ``"always"``, ``"deny"`` or ``""``.
+def _approval_choice(
+    answer: str, *, allow_always: bool = False, allow_project: bool = False
+) -> str:
+    """Map an answer to a decision, or ``""`` when it is not an answer here.
 
     ``""`` means "not an answer to this prompt": the caller re-asks rather than
     guessing, which is what keeps an unrecognized keystroke from being read as
     consent.
     """
     normalized = str(answer or "").strip().casefold()
+    if allow_project and normalized in _APPROVAL_PROJECT_ANSWERS:
+        return "project"
     if allow_always and normalized in _APPROVAL_ALWAYS_ANSWERS:
         return "always"
     if normalized in _APPROVAL_ACCEPT_ANSWERS:
@@ -945,11 +973,16 @@ class CliOutputSink(OutputSink):
         if not self._supports_consent_prompt():
             return None
         from agent.security.shell import (
+            shell_pending_mark_project_scope,
             shell_pending_mark_session_scope,
+            shell_project_scope_supported,
             shell_session_scope_supported,
         )
 
         allow_always = shell_session_scope_supported(name, confirmation_token, scope)
+        allow_project = shell_project_scope_supported(
+            name, confirmation_token, scope
+        )
         self._approval_active = True
         try:
             self._stop_activity()
@@ -964,21 +997,21 @@ class CliOutputSink(OutputSink):
                 f"{_markup_escape(_clip_single_line(str(reason), 160))}[/dim]",
                 soft_wrap=False,
             )
+            choices = ["1", "2"]
+            if allow_always:
+                choices.append("3")
+            if allow_project:
+                choices.append("4")
+            menu = ["  [bold cyan]1)[/bold cyan] 批准执行", "  [bold cyan]2)[/bold cyan] 拒绝"]
+            if allow_always:
+                menu.append("  [bold cyan]3)[/bold cyan] 本会话总是允许此命令")
+            if allow_project:
+                menu.append("  [bold cyan]4)[/bold cyan] 本项目总是允许（记住这条规则）")
             self._console.print(
-                "  [bold cyan]1)[/bold cyan] 批准执行\n"
-                "  [bold cyan]2)[/bold cyan] 拒绝\n"
-                + (
-                    "  [bold cyan]3)[/bold cyan] 本会话总是允许此命令\n"
-                    if allow_always
-                    else ""
-                )
-                + (
-                    "[dim]输入 1/2/3 后按 Enter（也可输入 y/n/同意/拒绝/总是）；"
-                    "Ctrl+C 取消[/dim]"
-                    if allow_always
-                    else "[dim]输入 1/2 后按 Enter（也可输入 y/n 或 同意/拒绝）；"
-                    "Ctrl+C 取消[/dim]"
-                )
+                "\n".join(menu)
+                + f"\n[dim]输入 {'/'.join(choices)} 后按 Enter"
+                + ("（也可输入 y/n/同意/拒绝/总是）" if allow_always else "（也可输入 y/n 或 同意/拒绝）")
+                + "；Ctrl+C 取消[/dim]"
             )
 
             try:
@@ -991,21 +1024,28 @@ class CliOutputSink(OutputSink):
                     attempts = 0
                     while True:
                         answer = await self._confirmation_prompt()
-                        if _approval_choice(answer, allow_always=allow_always):
+                        if _approval_choice(
+                            answer,
+                            allow_always=allow_always,
+                            allow_project=allow_project,
+                        ):
                             break
                         attempts += 1
                         if attempts >= _APPROVAL_MAX_REPROMPTS:
                             return False
                         self._console.print(
                             "[yellow]请输入 1（批准执行）、2（拒绝）"
-                            + ("或 3（本会话总是允许）" if allow_always else "")
+                            + ("、3（本会话总是允许）" if allow_always else "")
+                            + ("、4（本项目总是允许）" if allow_project else "")
                             + "[/yellow]"
                         )
                 else:
                     async def _prompt() -> str:
                         return await _APPROVAL_PROMPT.prompt_async(
-                            "请选择 1/2/3 › " if allow_always else "请选择 1/2 › ",
-                            validator=_approval_validator(allow_always),
+                            f"请选择 {'/'.join(choices)} › ",
+                            validator=_approval_validator(
+                                allow_always, allow_project
+                            ),
                         )
 
                     if get_app_or_none() is not None:
@@ -1015,15 +1055,22 @@ class CliOutputSink(OutputSink):
                         answer = await _prompt()
             except (KeyboardInterrupt, EOFError):
                 return False
-            choice = _approval_choice(answer, allow_always=allow_always)
-            if choice == "always":
+            choice = _approval_choice(
+                answer, allow_always=allow_always, allow_project=allow_project
+            )
+            if choice in ("always", "project"):
                 # Hand the intent to the redeem step; it owns the pending
                 # record.  The token is validated there, so a forged intent
                 # widens nothing -- and the mark is discarded on rejection or
                 # cancellation, exactly as the browser's third button behaves.
-                shell_pending_mark_session_scope(
-                    confirmation_token, scope=scope
-                )
+                if choice == "project":
+                    shell_pending_mark_project_scope(
+                        confirmation_token, scope=scope
+                    )
+                else:
+                    shell_pending_mark_session_scope(
+                        confirmation_token, scope=scope
+                    )
                 return True
             return choice == "once"
         finally:

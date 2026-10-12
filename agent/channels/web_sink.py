@@ -52,9 +52,17 @@ CONFIRMATION_TIMEOUT_SECONDS = 300
 
 
 # Approval decisions a client may return.  ``allow_session`` widens the consent
-# from "this one command" to "this command for the rest of the session" and is
-# only offered when the pending record can actually carry that intent.
-CONFIRM_DECISIONS = ("allow_once", "allow_session", "deny")
+# from "this one command" to "this command for the rest of the session", and
+# ``allow_project`` to the rule the question proposed, remembered for the
+# workspace.  Each is only offered when the pending record can carry that
+# intent; see ``agent.security.shell.shell_session_scope_supported`` and
+# ``shell_project_scope_supported``.
+CONFIRM_DECISIONS = (
+    "allow_once",
+    "allow_session",
+    "allow_project",
+    "deny",
+)
 
 
 def _normalize_confirm_decision(payload: dict[str, Any]) -> str:
@@ -71,7 +79,9 @@ def _normalize_confirm_decision(payload: dict[str, Any]) -> str:
     reply nobody can classify is a denial.
     """
     raw = str(payload.get("decision") or "").strip().casefold()
-    if raw == "allow_session":
+    if raw == "allow_project":
+        decision = "allow_project"
+    elif raw == "allow_session":
         decision = "allow_session"
     elif raw in ("allow_once", "allow", "approve"):
         decision = "allow_once"
@@ -704,6 +714,11 @@ class WebOutputSink(OutputSink):
         allow_session = self._session_scope_supported(
             name, confirmation_token, scope
         )
+        from agent.security.shell import shell_project_scope_supported
+
+        allow_project = shell_project_scope_supported(
+            name, confirmation_token, scope
+        )
         handler = self._confirmation_handler
         # Claim the answer slot *before* the prompt goes out.  Registering it
         # afterwards left a window in which a fast client's reply reached the
@@ -718,6 +733,7 @@ class WebOutputSink(OutputSink):
             "reason": reason,
             "confirmation_token": confirmation_token,
             "allow_session": allow_session,
+            "allow_project": allow_project,
             "timeout_seconds": CONFIRMATION_TIMEOUT_SECONDS,
         }
         # Remember the prompt while it is out. A browser that reconnects
@@ -754,16 +770,31 @@ class WebOutputSink(OutputSink):
                 decision = _normalize_confirm_decision(data)
             if decision == "deny":
                 return False
-            if decision == "allow_session" and allow_session:
-                # Hand the intent to the redeem step; it owns the pending record.
-                from agent.security.shell import shell_pending_mark_session_scope
+            # Hand the wider intent to the redeem step; it owns the pending
+            # record, and the record is what says which rule a project answer
+            # remembers.  A decision the prompt did not offer widens nothing:
+            # the mark is refused for a token that cannot carry it.
+            if decision in ("allow_session", "allow_project"):
+                from agent.security.shell import (
+                    shell_pending_mark_project_scope,
+                    shell_pending_mark_session_scope,
+                )
 
-                try:
-                    shell_pending_mark_session_scope(
-                        confirmation_token, scope=scope
-                    )
-                except Exception:
-                    logger.debug("session-scope consent mark failed", exc_info=True)
+                offered = allow_project if decision == "allow_project" else allow_session
+                if offered:
+                    try:
+                        if decision == "allow_project":
+                            shell_pending_mark_project_scope(
+                                confirmation_token, scope=scope
+                            )
+                        else:
+                            shell_pending_mark_session_scope(
+                                confirmation_token, scope=scope
+                            )
+                    except Exception:
+                        logger.debug(
+                            "wider-scope consent mark failed", exc_info=True
+                        )
             return True
         finally:
             self._pending_confirmation = None

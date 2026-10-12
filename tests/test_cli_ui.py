@@ -722,6 +722,125 @@ def test_a_prompt_that_never_answers_usablely_refuses_instead_of_spinning():
     assert console.text.count("请输入") >= 1
 
 
+def _drive_project_answer(tmp_path, monkeypatch, answer: str):
+    """One shell approval through the terminal, with a project and a ledger."""
+    import asyncio
+
+    from agent.core.output import CliOutputSink
+    from agent.security import consent
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+        shell_pending_for_scope,
+        shell_session_allowlist_clear,
+    )
+
+    monkeypatch.setattr(
+        consent,
+        "SHELL",
+        consent.ConsentStore(ledger_root=tmp_path / "trust"),
+    )
+    workspace = str(tmp_path / "project")
+    scope = ShellAuthorizationScope("cli", "cli", "")
+    shell_session_allowlist_clear()
+    command = "pip install -r requirements.txt"
+    safety = shell_command_check(
+        command, scope=scope, workspace=workspace
+    )
+    console = _TerminalConsole()
+    sink = CliOutputSink(
+        console,
+        live_status=False,
+        can_prompt=True,
+        confirmation_prompt=_answer(answer),
+    )
+
+    async def drive() -> object:
+        return await sink.on_tool_confirmation(
+            "shell",
+            command=command,
+            risk_level=safety.risk_level,
+            reason=safety.reason,
+            confirmation_token=safety.confirmation_token,
+            scope=scope,
+        )
+
+    approved = asyncio.run(drive())
+    if approved:
+        shell_command_confirm(safety.confirmation_token, scope=scope)
+
+    def verdict(other: str, *, in_workspace: bool = True):
+        return shell_command_check(
+            other,
+            scope=scope,
+            workspace=workspace if in_workspace else "/elsewhere",
+        )
+
+    return {
+        "console": console,
+        "approved": approved,
+        "safety": safety,
+        "pending": shell_pending_for_scope(scope),
+        "same_again": verdict(command),
+        "a_different_install": verdict("pip install requests"),
+        "another_program": verdict("uv add markdown"),
+        "another_project": verdict("pip install requests", in_workspace=False),
+        # A new process reading the same ledger: what "always" is for.
+        "after_restart": consent.ConsentStore(
+            ledger_root=tmp_path / "trust"
+        ).lifetime_of(
+            "program:pip", scope=scope, workspace=workspace
+        ),
+    }
+
+
+def test_the_terminal_offers_the_project_answer_when_the_gate_has_one(
+    tmp_path, monkeypatch
+):
+    """The fourth answer appears only where the gate said what it would remember.
+
+    An install or a memory wipe has nothing to record, so offering "this
+    project" for them would be promising a grant with no rule behind it.
+    """
+    outcome = _drive_project_answer(tmp_path, monkeypatch, "4")
+
+    assert outcome["approved"] is True
+    assert outcome["pending"] == []
+    assert "4)" in outcome["console"].text
+    assert "本项目总是允许" in outcome["console"].text
+
+
+def test_the_project_answer_generalises_and_survives_a_restart(
+    tmp_path, monkeypatch
+):
+    """One answer, and the *program* is granted in that project from then on.
+
+    This is the whole point of the change: a session answer is asked again
+    tomorrow, and the answer the human actually meant was "I trust pip here".
+    """
+    outcome = _drive_project_answer(tmp_path, monkeypatch, "4")
+
+    assert outcome["same_again"].allowed is True
+    assert outcome["a_different_install"].allowed is True
+    assert outcome["after_restart"] == "always"
+    # Still asked: another program, and another project.
+    assert outcome["another_program"].requires_confirmation is True
+    assert outcome["another_project"].requires_confirmation is True
+
+
+def test_the_session_answer_does_not_outlive_the_session(
+    tmp_path, monkeypatch
+):
+    """``3`` and ``4`` differ in exactly the thing this test pins."""
+    outcome = _drive_project_answer(tmp_path, monkeypatch, "3")
+
+    assert outcome["approved"] is True
+    assert outcome["same_again"].allowed is True
+    assert outcome["a_different_install"].requires_confirmation is True
+    assert outcome["after_restart"] == ""
+
+
 def test_consent_prompt_buffers_parallel_tool_rendering(tmp_path):
     from agent.core.output import CliOutputSink
 

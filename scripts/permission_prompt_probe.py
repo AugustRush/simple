@@ -289,6 +289,60 @@ def _memory_behaviour(scope: ShellAuthorizationScope) -> None:
     print()
 
 
+def _project_grant_behaviour(scope: ShellAuthorizationScope) -> None:
+    """What answering each question once, for the project, is worth.
+
+    The gate asks about a command; the answer worth remembering is the *rule*
+    the gate proposed (a path, a program, or the exact command).  This measures
+    the whole point of the change: how many rules it takes to stop the corpus
+    asking at all, and whether a second, different project is still protected.
+    """
+    from pathlib import Path
+
+    from agent.security import consent
+
+    workspace = "/probe/project"
+    other = "/probe/other"
+    roots = frozenset({Path(workspace)})
+    store = consent.SHELL
+
+    # Start from a clean slate so the section measures only its own grants.
+    store.clear()
+
+    def asking(command: str, *, at: str = workspace) -> bool:
+        return shell_command_check(
+            command, scope=scope, allowed_roots=roots, workspace=at
+        ).requires_confirmation
+
+    prompted = [command for _g, command in WORK_CORPUS if asking(command)]
+    rules: list[str] = []
+    for command in prompted:
+        result = shell_command_check(
+            command, scope=scope, allowed_roots=roots, workspace=workspace
+        )
+        rule = result.approval_rule
+        if rule and rule not in rules:
+            rules.append(rule)
+            store.remember(rule, consent.ALWAYS, scope=scope, workspace=workspace)
+
+    remaining = [command for _g, command in WORK_CORPUS if asking(command)]
+    print("## What one project answer per question buys")
+    print()
+    print(f"   prompts before any project answer : {len(prompted)}")
+    print(f"   distinct rules those answers need : {len(rules)}")
+    for rule in rules:
+        print(f"     {rule}")
+    print(f"   prompts after answering each once : {len(remaining)}")
+    for command in remaining:
+        print(f"     still asks  {command}")
+    print()
+    print("   and the grants stay inside their project:")
+    leaks = [c for _g, c in WORK_CORPUS if asking(c, at=other)]
+    print(f"     commands still asked in another project: {len(leaks)} of {len(WORK_CORPUS)}")
+    store.clear()
+    print()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -324,6 +378,7 @@ def main() -> int:
 
     _prompt_rate(scope, args.verbose)
     _danger_coverage(scope)
+    _project_grant_behaviour(scope)
     _memory_behaviour(scope)
     print("=" * 72)
     print("Read the two tables together: the prompts are syntax, the hazards are")
