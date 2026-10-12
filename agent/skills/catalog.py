@@ -179,6 +179,11 @@ def prepare_user_message_for_skills(
     return normalized, [bundle.id]
 
 
+#: "This id was not in the catalog before the read" -- distinct from ``None``, which a
+#: bundle is never equal to but which reads as "no previous bundle" at a glance.
+_ABSENT = object()
+
+
 class SkillCatalog:
     """Load skill bundles from user and built-in skill directories.
 
@@ -210,14 +215,19 @@ class SkillCatalog:
         self._prompt_generation: int = 0
         self._user_root_signature: Optional[tuple[float, int, int]] = None
         self._skill_config = skill_config if isinstance(skill_config, dict) else {}
+        #: The roots other layers attached, in the order they were attached, with the
+        #: undo record each read produced.  A *contribution* is a record here, not a
+        #: bundle: ``load_all`` re-reads every record (so a refresh cannot silently
+        #: drop what a plugin contributed), and the record's removal restores exactly
+        #: the ids that root touched -- see :meth:`add_root`.
+        self._roots: list[dict[str, Any]] = []
+        #: What the intrinsic layers produced -- the base every replay starts from.
+        self._intrinsic: dict[str, SkillBundle] = {}
 
     def load_all(self) -> None:
         self.user_root.mkdir(parents=True, exist_ok=True)
-        self._skills.clear()
-        self._aliases.clear()
-        self._load_root(self.builtin_root, source="builtin")
-        self._load_root(self.user_root, source="user")
-        self._user_root_signature = self._scan_user_root()
+        self._rebuild_intrinsic()
+        self._rebuild_contributed()
 
     def _scan_user_root(self) -> tuple[float, int, int]:
         """Cheap signature for "did the skills directory change on disk?".
@@ -240,22 +250,98 @@ class SkillCatalog:
         activation must observe the directory rather than a startup
         snapshot. Returns True when the user layer was re-read.
 
-        Only the user layer is reloaded: plugin-bundled skills are attached
-        by PluginCatalog after ``load_all()``, so a full reload here would
-        silently drop them until the next plugin reload.
+        A full :meth:`load_all`, which rebuilds the intrinsic layers and replays the
+        contributed ones.  It used to re-read only the user layer, because the plugin
+        roots were attached by the loader *after* a load and a full reload would have
+        dropped them; now the roots are records this class owns, so there is one reload
+        path instead of two, and neither can lose the other's skills.
         """
         if self._scan_user_root() == self._user_root_signature:
             return False
-        for skill_id in [
-            skill_id
-            for skill_id, bundle in self._skills.items()
-            if bundle.source == "user"
-        ]:
-            del self._skills[skill_id]
-        self._load_root(self.user_root, source="user")
-        self._user_root_signature = self._scan_user_root()
+        self.load_all()
         self.invalidate()
         return True
+
+    # -- contributions -------------------------------------------------------
+
+    def skill_count(self) -> int:
+        """How many skills are loaded, for a contributor that reports what it added."""
+        return len(self._skills)
+
+    def scoped(self, ctx: Any) -> Any:
+        """This catalog, for one plugin: what it attaches leaves with the plugin."""
+        from agent.skills.scoped import ScopedSkillCatalog
+
+        return ScopedSkillCatalog(self, ctx)
+
+    def add_root(
+        self,
+        root: "Path | str",
+        *,
+        source: str = "",
+        keep_existing: bool = False,
+        skip_dirs: "tuple[str, ...]" = (),
+    ) -> Any:
+        """Attach a skill root, returning the undo that takes exactly it back.
+
+        A contribution is a **record**, not a set of bundles, and any change replays
+        the contributed layer over the intrinsic one (:meth:`_rebuild_contributed`).
+        The alternative -- remembering the ids a read produced and putting them back on
+        removal -- is a second rule that breaks as soon as two contributors touch one
+        id: removing the first would restore a bundle from a plugin that has since
+        unloaded, or delete the bundle of the one that is still there.  Replay asks the
+        only question the undo can answer exactly: *which records are attached?*
+        """
+        record: dict[str, Any] = {
+            "root": Path(root),
+            "source": source,
+            "keep_existing": keep_existing,
+            "skip_dirs": tuple(skip_dirs),
+        }
+        self._roots.append(record)
+        self._rebuild_contributed()
+
+        def undo() -> None:
+            if record in self._roots:
+                self._roots.remove(record)
+            self._rebuild_contributed()
+
+        return undo
+
+    def contributed_roots(self) -> "list[tuple[Path, str]]":
+        """The roots other layers attached, with the source each was attached under.
+
+        For the screens and reports that ask "which skills came from where", and for a
+        test that wants to assert a contribution rather than a skill's contents.
+        """
+        return [(record["root"], record["source"]) for record in self._roots]
+
+    def _rebuild_intrinsic(self) -> None:
+        """The layers that are always there: the builtin root, then this agent's."""
+        self._skills = {}
+        self._aliases = {}
+        self._load_root(self.builtin_root, source="builtin")
+        self._load_root(self.user_root, source="user")
+        self._intrinsic = dict(self._skills)
+        self._user_root_signature = self._scan_user_root()
+
+    def _rebuild_contributed(self) -> None:
+        """Replay every contributed root over the intrinsic layers, in attach order.
+
+        Contributed roots come last, which is what lets a plugin's skill win a name
+        collision, and they are re-read rather than remembered -- so a reload keeps
+        them, and one plugin's removal cannot take another's skills with it.
+        """
+        self._skills = dict(self._intrinsic)
+        self._aliases = {}
+        for record in list(self._roots):
+            self._load_root(
+                record["root"],
+                source=record["source"],
+                keep_existing=record["keep_existing"],
+                skip_dirs=record["skip_dirs"],
+            )
+        self._rebuild_aliases()
 
     def _load_root(
         self,

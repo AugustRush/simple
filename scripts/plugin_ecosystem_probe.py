@@ -464,7 +464,20 @@ def measure_load(root: Path) -> list[dict[str, Any]]:
     """Discover and load *root* with the project's own loader; report per fixture."""
     from agent import PluginCatalog
 
+    # The skills capability is offered *before* discovery, as a composition does: a
+    # bundle contributes its skill root in its own ``setup`` through that service, so a
+    # probe that offered none would report every skills-declaring bundle as pending.
+    from agent.skills.catalog import SkillCatalog as _SkillCatalog
+
+    # Beside *root*, not inside it: the probe reads every directory under the root as a
+    # fixture, and an empty skills root of our own would be reported as one.
+    _skills = _SkillCatalog(
+        user_root=root.parent / ".probe-user-skills",
+        builtin_root=root.parent / ".probe-builtin-skills",
+    )
+    _skills.load_all()
     catalog = PluginCatalog(builtin_dir=root)
+    catalog._host.services.provide("skill_catalog", _skills)
     loaded = catalog.discover_and_load()
 
     def _fireable(event_name: str) -> bool:
@@ -474,7 +487,8 @@ def measure_load(root: Path) -> list[dict[str, Any]]:
         return hasattr(catalog, "fire_" + event_name.removeprefix("on_"))
 
     skills: dict[str, list[str]] = {}
-    for plugin_name, skills_root in catalog.get_bundled_skills():
+    for skills_root, source in _skills.contributed_roots():
+        plugin_name = source.removeprefix("plugin:")
         found: list[str] = []
         if skills_root.is_dir():
             found = sorted(

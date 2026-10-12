@@ -23,17 +23,51 @@ call sites rather than by trusting the scan.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - types only
     from agent.skills.catalog import SkillBundle
 
-__all__ = ["SkillCatalogService"]
+__all__ = ["SkillCatalogService", "SkillContributionView"]
+
+
+@runtime_checkable
+class SkillContributionView(Protocol):
+    """One plugin's handle on the catalog: how a plugin contributes its own skills.
+
+    A bundle that ships a ``skills/`` directory contributes it here, in its ``setup``,
+    through the injected service.  The view owns attribution (the source names the
+    plugin) and the undo (the root leaves with the plugin's scope), which is the same
+    shape ``channels`` and ``registry`` have -- one contribution mechanism, three
+    capability services.
+    """
+
+    def add_root(
+        self,
+        root: "Path | str",
+        *,
+        source: str = "",
+        keep_existing: bool = False,
+        skip_dirs: "tuple[str, ...]" = (),
+    ) -> int:
+        """Attach a skill root, returning how many skills it contributed."""
 
 
 @runtime_checkable
 class SkillCatalogService(Protocol):
     """The skill catalog a composition provides as ``skill_catalog``."""
+
+    def scoped(self, ctx: Any) -> SkillContributionView:
+        """The per-plugin view (the kernel calls this by name for ``ctx.skill_catalog``)."""
+
+    def skill_count(self) -> int:
+        """How many skills are loaded -- what a contributor reports it added."""
+
+    # ``contributed_roots()`` is deliberately *not* here yet: a protocol is the
+    # contract a production caller uses, and today nothing in ``agent/`` reads it --
+    # tests do, to assert a contribution.  When a screen or a report wants "which
+    # roots are attached, by whom", it joins the protocol with its caller.
 
     def load_all(self) -> None:
         """Read every root again (builtin, the user's, the shared ones)."""

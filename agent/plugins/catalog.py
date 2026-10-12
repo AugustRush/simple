@@ -1006,7 +1006,16 @@ class _CatalogPlugin:
         wants to contribute a command or a role declares ``inject = ("commands",)`` or
         ``("agents",)`` and gets the real registry.
         """
-        return tuple(str(d) for d in (getattr(self._plugin, "inject", ()) or ()))
+        declared = [str(d) for d in (getattr(self._plugin, "inject", ()) or ())]
+        if self._meta.skills and "skill_catalog" not in declared:
+            # A bundle's files can declare a contribution, and a contribution needs the
+            # service it contributes *to*.  Declaring it here is what makes the kernel
+            # hold the bundle until that service exists (the composition mounts
+            # `skill_catalog` as a core plugin and the kernel flushes on every provide),
+            # which is why the adapter no longer needs the composition root to attach
+            # the skills later.
+            declared.append("skill_catalog")
+        return tuple(declared)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1043,16 +1052,22 @@ class _CatalogPlugin:
         meta = self._meta
         plugin_dir = self._plugin_dir
 
-        # Skills and MCP configs are the two contributions with no service of their
-        # own: each has exactly one production reader (bootstrap, at composition time)
-        # and no plugin asks for them by name.  So the append and its undo are written
-        # here rather than behind a service that only this method would call.
+        # Skills are a contribution like any other: through the capability service, in
+        # this plugin's own setup, attributed to it and unwound with its scope.  The
+        # adapter declares ``skill_catalog`` in ``inject`` for a bundle that ships
+        # skills, so this line only runs once the catalog exists.  The loader used to
+        # collect the paths into a list for the *composition root* to attach later,
+        # which made the contribution the root's act and made every reload path that
+        # forgot the list drop the skills.
         for skills_rel in meta.skills:
             skills_path = (plugin_dir / skills_rel).resolve()
             if skills_path.is_dir():
-                ctx.on_unwind(
-                    _add_bundled(catalog._bundled_skills, (self.name, skills_path))
-                )
+                ctx.skill_catalog.add_root(skills_path)
+
+        # MCP configs are the last contribution with no service of their own: one
+        # production reader (the composition, at connect time) and no plugin asks for
+        # them by name.  So the append and its undo are written here rather than behind
+        # a service that only this method would call.
 
         # One server, one registration.  A manifest that names its MCP file
         # (``"mcpServers": "./.mcp.json"`` -- Codex's documented form, and legal
@@ -1207,7 +1222,6 @@ class PluginCatalog:
         #: exist -- and the add/remove pair lives in one place.
         self._commands = CommandRegistry()
         # Skills bundled by plugins: list of (plugin_name, skills_root_path)
-        self._bundled_skills: list[tuple[str, Path]] = []
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
         self._bundled_mcp: list[tuple[str, dict]] = []
         # plugin_name → source directory entry name (the directory under
@@ -1416,7 +1430,6 @@ class PluginCatalog:
         self._plugins.clear()
         self._pending.clear()
         self._commands.clear()
-        self._bundled_skills.clear()
         self._bundled_mcp.clear()
         self._agent_defs.clear()
         self._plugin_source_dirs.clear()
@@ -1958,7 +1971,6 @@ class PluginCatalog:
             # which is three chances to restore two of them.
             "slash_commands": self._commands.snapshot(),
 
-            "bundled_skills": list(self._bundled_skills),
             "bundled_mcp": list(self._bundled_mcp),
             "plugin_source_dirs": dict(self._plugin_source_dirs),
             "agent_defs": self._agent_defs.snapshot(),
@@ -1989,7 +2001,6 @@ class PluginCatalog:
             except Exception:
                 self._plugins = old_discovery_state["plugins"]
                 self._commands.restore(old_discovery_state["slash_commands"])
-                self._bundled_skills = old_discovery_state["bundled_skills"]
                 self._bundled_mcp = old_discovery_state["bundled_mcp"]
                 self._plugin_source_dirs = old_discovery_state[
                     "plugin_source_dirs"
@@ -1997,23 +2008,16 @@ class PluginCatalog:
                 self._agent_defs.restore(old_discovery_state["agent_defs"])
                 raise
 
-        # Reload skill catalog: clear and rewalk both user/builtin trees,
-        # then re-attach every plugin's bundled skills root.
+        # Re-read the skill catalog: the plugins that bundled skills were unloaded
+        # above and re-discovered below, so their roots were taken back and attached
+        # again by their own scopes -- this is only the intrinsic layers, plus a replay
+        # of whatever records are attached.  It used to walk the loader's own list of
+        # plugin skill paths and poke ``_rebuild_aliases``/``_dirty``/``_prompt_generation``
+        # directly, with a fallback branch for catalogs that lacked them.
         skill_catalog = self._core("skill_catalog")
         if skill_catalog is not None:
             try:
-                skill_catalog.load_all()
-                for pname, sroot in self._bundled_skills:
-                    skill_catalog._load_root(sroot, source=f"plugin:{pname}")
-                if hasattr(skill_catalog, "_rebuild_aliases"):
-                    skill_catalog._rebuild_aliases()
-                if hasattr(skill_catalog, "invalidate"):
-                    skill_catalog.invalidate()
-                else:
-                    # Fallback for test fakes / old catalogs without invalidate().
-                    skill_catalog._dirty = True  # noqa: SLF001
-                    if hasattr(skill_catalog, "_prompt_generation"):
-                        skill_catalog._prompt_generation += 1
+                skill_catalog.reload()
             except Exception as exc:
                 shared.CONSOLE.print(
                     f"[yellow]Plugin reload: skill catalog refresh failed: {exc}[/yellow]"
@@ -2068,10 +2072,6 @@ class PluginCatalog:
             name for name, src_dir in self._plugin_source_dirs.items()
             if src_dir == dir_name
         }
-
-    def get_bundled_skills(self) -> list[tuple[str, Path]]:
-        """Return list of (plugin_name, skills_root_path) for bundled skills."""
-        return list(self._bundled_skills)
 
     def get_bundled_mcp(self) -> list[tuple[str, dict]]:
         """Return list of (plugin_name, mcp_server_config) for bundled MCP servers."""

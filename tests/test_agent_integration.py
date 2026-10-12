@@ -388,9 +388,6 @@ user-invocable: true
             host.load(plugin)
             return None
 
-        def get_bundled_skills(self):
-            return [("webwright", plugin_skill_root)]
-
         def get_bundled_mcp(self):
             return []
 
@@ -434,6 +431,10 @@ user-invocable: true
     )
 
     components = agent_module._build_components(cfg)
+    # The bundle's part, played by the fixture: discovery is standing in for here, so
+    # there is no plugin to contribute the skills root -- and a plugin's skills arrive
+    # through the service it injects, not through the loader's bookkeeping.
+    components["skill_catalog"].add_root(plugin_skill_root, source="plugin:webwright")
     registry = components["registry"]
 
     payload = json.loads(asyncio.run(registry.call("activate_skill", {"skill_name": "webwrightx"})))

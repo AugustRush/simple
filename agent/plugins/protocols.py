@@ -17,7 +17,7 @@ different relations to the tree:
   active profile says the composition is), ``who_provides`` (the answer a replacement
   is checked against);
 * **reading and reporting** -- ``pending_report``, ``failed_report``,
-  ``get_bundled_skills``, ``get_bundled_mcp``, ``compose_all_prompts``, and the three
+  ``get_bundled_mcp``, ``compose_all_prompts``, and the three
   command-hook firers (``fire_prompt_submit``, ``fire_turn_end``, ``fire_session_end``).
 """
 
@@ -45,7 +45,11 @@ class PluginCatalogService(Protocol):
         """Load everything on disk; returns the names that are mounted."""
 
     def flush_pending(self) -> "tuple[str, ...]":
-        """Reconsider plugins that were waiting; returns the names still pending."""
+        """Activate what can be activated now; returns the names that just did.
+
+        Not the names still waiting: the caller asks "did anything come up", and the
+        waiters are what ``pending_report`` is for.
+        """
 
     def close(self) -> None:
         """Unload the tree.  Safe to call twice."""
@@ -66,9 +70,6 @@ class PluginCatalogService(Protocol):
 
     def failed_report(self) -> "dict[str, str]":
         """Plugin -> why its setup raised."""
-
-    def get_bundled_skills(self) -> "list[tuple[str, Path]]":
-        """Skill roots plugins bundled, with the plugin that contributed each."""
 
     def get_bundled_mcp(self) -> "list[tuple[str, dict]]":
         """MCP server configs plugins bundled, with their contributor."""

@@ -93,6 +93,16 @@ def catalog_and_plugin(tmp_path):
         encoding="utf-8",
     )
     catalog = PluginCatalog(builtin_dir=plugins_dir)
+    # The skills capability, before discovery: the plugin declares a skill root in its
+    # ``plugin.json``, so it contributes it in its own ``setup`` through that service --
+    # and a catalog that offers none leaves it pending, which is the kernel's contract.
+    from agent.skills.catalog import SkillCatalog
+
+    service = SkillCatalog(
+        user_root=tmp_path / "user-skills", builtin_root=tmp_path / "builtin-skills"
+    )
+    service.load_all()
+    catalog._host.services.provide("skill_catalog", service)
     loaded = catalog.discover_and_load()
     assert loaded == ["everything"], loaded
     return catalog, plugins_dir
@@ -117,7 +127,8 @@ def test_setup_ran_and_registered_a_slash_command(catalog_and_plugin) -> None:
 def test_the_bundled_assets_are_registered(catalog_and_plugin) -> None:
     catalog, _ = catalog_and_plugin
     assert any(
-        name == "everything" for name, _path in catalog.get_bundled_skills()
+        source == "plugin:everything"
+        for _root, source in catalog.resolve_service("skill_catalog").contributed_roots()
     ), "the declarative skill root"
     assert any(
         name == "everything" and cfg.get("name") == "everything-mcp"
@@ -141,7 +152,9 @@ def test_unload_removes_the_slash_command(catalog_and_plugin) -> None:
 def test_unload_removes_the_bundled_skills(catalog_and_plugin) -> None:
     catalog, _ = catalog_and_plugin
     catalog.unload_plugin("everything")
-    assert all(name != "everything" for name, _ in catalog.get_bundled_skills())
+    assert (
+        catalog.resolve_service("skill_catalog").contributed_roots() == []
+    ), "the skills root went with the plugin"
 
 
 def test_unload_removes_the_bundled_mcp(catalog_and_plugin) -> None:

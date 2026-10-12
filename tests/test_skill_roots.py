@@ -194,7 +194,7 @@ def test_the_users_own_skill_wins_a_name_collision(tmp_path, monkeypatch) -> Non
     from agent.plugins import formats
 
     for skill_root in formats.shared_skill_roots():
-        catalog._load_root(
+        catalog.add_root(
             Path(skill_root.path),
             source=f"shared:{skill_root.label}",
             keep_existing=True,
@@ -227,7 +227,7 @@ def test_the_real_codex_home_is_read_without_its_system_skills() -> None:
         pytest.skip("no Codex skill root")
     catalog = SkillCatalog(user_root=Path("/tmp/nonexistent-own-skills"))
     codex_root = roots["codex"]
-    catalog._load_root(
+    catalog.add_root(
         Path(codex_root.path),
         source="shared:codex",
         keep_existing=True,

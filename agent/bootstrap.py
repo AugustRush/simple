@@ -771,10 +771,11 @@ async def _build_components_async(
                 "user_tools.enabled=true to load every ~/.agent/tools/*.py[/dim]"
             )
 
-    # Load skills bundled by plugins into the skill catalog
-    for _pname, _skills_root in plugin_catalog.get_bundled_skills():
-        skill_catalog._load_root(_skills_root, source=f"plugin:{_pname}")
-    skill_catalog._rebuild_aliases()
+    # Skills a plugin bundled are already in the skill catalog: each bundle contributes
+    # them in its own setup, through the ``skill_catalog`` service it injects (see
+    # ``agent/plugins/catalog.py``), so the composition has nothing to attach here.  The
+    # three lines that used to be here were the second mechanism: the loader collected
+    # the paths, the root attached them, and every reload path had to know to do it too.
 
     # Compose system prompt now that plugins are loaded (they may append rules).
     system_prompt = _compose_system_prompt(

@@ -44,6 +44,24 @@ def _write_plugin(plugin_dir: Path, code: str) -> None:
     (plugin_dir / "__init__.py").write_text(textwrap.dedent(code), encoding="utf-8")
 
 
+def _provide_skill_catalog(plugin_catalog, tmp_path, name="skills-service"):
+    """Give a catalog under test the capability a skills-declaring bundle needs.
+
+    A bundle's skills are contributed in its own ``setup``, through the injected
+    ``skill_catalog`` service -- so a catalog that offers none leaves such a bundle
+    *pending*, which is the kernel doing its job.  Handing one over is what a
+    composition does, and these tests did it by hand afterwards before.
+    """
+    from agent.skills.catalog import SkillCatalog
+
+    service = SkillCatalog(
+        user_root=tmp_path / f"{name}-user", builtin_root=tmp_path / f"{name}-builtin"
+    )
+    service.load_all()
+    plugin_catalog._host.services.provide("skill_catalog", service)
+    return service
+
+
 # ─── PluginCatalog discovery ──────────────────────────────────────────────────
 
 
@@ -518,6 +536,43 @@ def test_user_plugin_overrides_builtin_same_name(tmp_path):
     assert metas[0].source == "user"
 
 
+def test_a_skills_bundle_waits_for_the_capability(tmp_path):
+    """A bundle whose files contribute needs the service, and the kernel says so.
+
+    The loader used to collect a bundle's skill paths and the composition root attached
+    them afterwards, so nothing had to exist at load time and a bundle could ship skills
+    into a composition with no skill catalog at all.  Now the bundle contributes through
+    the injected service, so without it the bundle is *pending* -- and ``pending_report``
+    names the dependency, which is the state the kernel exists to make visible instead of
+    a silent no-op.
+    """
+    import json
+
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "skill-bundler"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"name": "skill-bundler", "skills": "./skills/"}), encoding="utf-8"
+    )
+    skill_dir = plugin_dir / "skills" / "bundled"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: Bundled\ndescription: A review skill\n---\nReview the code.",
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    assert catalog.discover_and_load() == [], "nothing activates without the capability"
+    assert catalog.pending_report() == {"skill-bundler": ["skill_catalog"]}
+
+    skills = _provide_skill_catalog(catalog, tmp_path)
+    assert catalog.flush_pending() == ("skill-bundler",), "activating on the capability"
+    assert [source for _, source in skills.contributed_roots()] == [
+        "plugin:skill-bundler"
+    ]
+
+
 def test_plugin_bundles_skills(tmp_path):
     """Plugins with skills field in plugin.json should register bundled skills."""
     import json
@@ -544,12 +599,14 @@ def test_plugin_bundles_skills(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    skills = _provide_skill_catalog(catalog, tmp_path)
     catalog.discover_and_load()
 
-    bundled = catalog.get_bundled_skills()
-    assert len(bundled) == 1
-    assert bundled[0][0] == "skill-bundler"
-    assert bundled[0][1].is_dir()
+    contributed = skills.contributed_roots()
+    assert len(contributed) == 1, "the bundle contributed its skills root"
+    root, source = contributed[0]
+    assert source == "plugin:skill-bundler"
+    assert root.is_dir()
 
 
 def test_plugin_bundles_mcp_config(tmp_path):
@@ -1537,11 +1594,12 @@ def test_discover_loads_codex_plugin_without_python(tmp_path):
     (plugin_dir / "skills").mkdir()
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    skills = _provide_skill_catalog(catalog, tmp_path)
     loaded = catalog.discover_and_load()
 
     assert loaded == ["codex-workflow"]
-    assert catalog.get_bundled_skills() == [
-        ("codex-workflow", (plugin_dir / "skills").resolve())
+    assert skills.contributed_roots() == [
+        ((plugin_dir / "skills").resolve(), "plugin:codex-workflow")
     ]
 
 
@@ -1557,12 +1615,12 @@ def test_discover_auto_finds_skills_subdir(tmp_path):
     (plugin_dir / "skills").mkdir()
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    skills = _provide_skill_catalog(catalog, tmp_path)
     catalog.discover_and_load()
 
-    bundled = catalog.get_bundled_skills()
-    assert len(bundled) == 1
-    assert bundled[0][0] == "with-skills"
-    assert bundled[0][1] == (plugin_dir / "skills").resolve()
+    assert skills.contributed_roots() == [
+        ((plugin_dir / "skills").resolve(), "plugin:with-skills")
+    ]
 
 
 def test_discover_loads_marketplace_with_subplugins(tmp_path):
@@ -1912,11 +1970,12 @@ def test_a_new_ecosystem_is_one_adapter(tmp_path, acme_format):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    skills = _provide_skill_catalog(catalog, tmp_path)
     loaded = catalog.discover_and_load()
 
     assert loaded == ["widget"], "the marketplace path came from the adapter"
     assert catalog.get_loaded_names_for_directory("acme-market") == {"widget"}
-    assert [name for name, _ in catalog.get_bundled_skills()] == ["widget"]
+    assert [source for _, source in skills.contributed_roots()] == ["plugin:widget"]
     assert [cfg["name"] for _, cfg in catalog.get_bundled_mcp()] == ["acme-mcp"]
     meta = next(m for m in catalog.list_plugins() if m.name == "widget")
     assert "on_pre_tool" in meta.hooks_config, "the adapter's event name was translated"
@@ -1964,11 +2023,12 @@ def test_discover_accepts_plugin_directory_as_builtin_root(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=plugin_dir)
+    skills = _provide_skill_catalog(catalog, tmp_path)
     loaded = catalog.discover_and_load()
 
     assert loaded == ["direct-plugin"]
-    assert catalog.get_bundled_skills() == [
-        ("direct-plugin", (plugin_dir / "codex" / "skills").resolve())
+    assert skills.contributed_roots() == [
+        ((plugin_dir / "codex" / "skills").resolve(), "plugin:direct-plugin")
     ]
 
 
@@ -2010,22 +2070,24 @@ def test_plugin_root_with_marketplace_manifest_still_loads_root_plugin(tmp_path)
         encoding="utf-8",
     )
 
-    plugin_catalog = PluginCatalog(builtin_dir=tmp_path)
-    loaded = plugin_catalog.discover_and_load()
-
-    assert "webwright" in loaded
-    assert plugin_catalog.get_loaded_names_for_directory("Webwright") == {"webwright"}
-    assert [name for name, _ in plugin_catalog.get_bundled_skills()] == ["webwright"]
-    assert "webwright:run" in plugin_catalog.get_slash_commands()
-
+    # The capability first, then discovery: the bundle's skills are contributed in its
+    # own setup, so a catalog that offers no `skill_catalog` keeps it pending -- which
+    # is the kernel's contract, and the reason this is a composition-like fixture.
     skill_catalog = SkillCatalog(
         user_root=tmp_path / "user-skills",
         builtin_root=tmp_path / "builtin-skills",
     )
     skill_catalog.load_all()
-    for plugin_name, skills_root in plugin_catalog.get_bundled_skills():
-        skill_catalog._load_root(skills_root, source=f"plugin:{plugin_name}")
-    skill_catalog._rebuild_aliases()
+    plugin_catalog = PluginCatalog(builtin_dir=tmp_path)
+    plugin_catalog._host.services.provide("skill_catalog", skill_catalog)
+    loaded = plugin_catalog.discover_and_load()
+
+    assert "webwright" in loaded
+    assert plugin_catalog.get_loaded_names_for_directory("Webwright") == {"webwright"}
+    assert [source for _, source in skill_catalog.contributed_roots()] == [
+        "plugin:webwright"
+    ]
+    assert "webwright:run" in plugin_catalog.get_slash_commands()
 
     assert skill_catalog.get("webwright:webwright") is not None
 
@@ -2512,17 +2574,19 @@ def test_user_same_name_plugin_replaces_all_builtin_owned_assets(tmp_path):
     catalog = PluginCatalog(
         builtin_dir=tmp_path / "builtin", user_dir=tmp_path / "user"
     )
+    skills = _provide_skill_catalog(catalog, tmp_path)
     catalog.discover_and_load()
 
     commands = catalog.get_slash_commands()
-    skills = catalog.get_bundled_skills()
     mcp = catalog.get_bundled_mcp()
     agents = {
         definition["key"] for definition in catalog.list_agent_definitions()
     }
 
     assert set(commands) == {"release:new"}
-    assert skills == [("release", user_dir / "replacement-skills")]
+    assert skills.contributed_roots() == [
+        (user_dir / "replacement-skills", "plugin:release")
+    ]
     assert [(owner, config["name"]) for owner, config in mcp] == [
         ("release", "new-server")
     ]
@@ -3170,12 +3234,14 @@ def test_reload_marks_skill_catalog_dirty(tmp_path):
         def __init__(self):
             self._dirty = False
             self._prompt_generation = 0
-        def load_all(self):
-            pass
-        def _load_root(self, *a, **k):
-            pass
-        def _rebuild_aliases(self):
-            pass
+            self.reloads = 0
+        def reload(self):
+            # One call, not the loader poking load_all/_rebuild_aliases/_dirty: the
+            # catalog owns what a reload means (intrinsic layers plus a replay of the
+            # roots its contributors attached).
+            self.reloads += 1
+            self._dirty = True
+            self._prompt_generation += 1
 
     plugin_dir = tmp_path / "dummy"
     (plugin_dir / ".claude-plugin").mkdir(parents=True)
@@ -3478,16 +3544,14 @@ def test_claude_plugin_skills_are_namespaced_and_do_not_collide(tmp_path):
             encoding="utf-8",
         )
 
-    plugin_catalog = PluginCatalog(builtin_dir=tmp_path / "plugins")
-    plugin_catalog.discover_and_load()
     skill_catalog = SkillCatalog(
         user_root=tmp_path / "user-skills",
         builtin_root=tmp_path / "builtin-skills",
     )
     skill_catalog.load_all()
-    for plugin_name, skills_root in plugin_catalog.get_bundled_skills():
-        skill_catalog._load_root(skills_root, source=f"plugin:{plugin_name}")
-    skill_catalog._rebuild_aliases()
+    plugin_catalog = PluginCatalog(builtin_dir=tmp_path / "plugins")
+    plugin_catalog._host.services.provide("skill_catalog", skill_catalog)
+    plugin_catalog.discover_and_load()
 
     assert skill_catalog.get("alpha:hello") is not None
     assert skill_catalog.get("beta:hello") is not None
@@ -3712,9 +3776,12 @@ def test_manifest_component_paths_for_skills_commands_agents(tmp_path):
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    skills = _provide_skill_catalog(catalog, tmp_path)
     catalog.discover_and_load()
 
-    assert [name for name, _ in catalog.get_bundled_skills()] == ["custom-paths"]
+    assert [source for _, source in skills.contributed_roots()] == [
+        "plugin:custom-paths"
+    ]
     assert "custom-paths:deploy" in catalog.get_slash_commands()
     assert catalog.get_agent_definition("plugin:custom-paths:reviewer") is not None
 

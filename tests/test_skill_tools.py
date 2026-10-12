@@ -275,10 +275,11 @@ def test_activate_skill_tool_resolves_externally_installed_bundle(tmp_path):
 
 
 def test_user_skill_refresh_keeps_plugin_bundled_skills(tmp_path):
-    """A disk refresh must not drop skills PluginCatalog attached.
+    """A disk refresh must not drop skills another layer contributed.
 
-    The user layer is re-read on staleness; plugin roots are attached after
-    load_all() and would be lost by a full reload.
+    A contributed root is a *record* on the catalog now, so a full reload replays it;
+    when roots were attached after ``load_all()`` by the loader, the refresh had to
+    know not to touch them, and anything that did a full reload lost them.
     """
     root = tmp_path / "skills"
     root.mkdir()
@@ -290,7 +291,7 @@ def test_user_skill_refresh_keeps_plugin_bundled_skills(tmp_path):
     )
     catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
     catalog.load_all()
-    catalog._load_root(plugin_root, source="plugin:demo")
+    catalog.add_root(plugin_root, source="plugin:demo")
     # Plugin skills are namespaced by plugin name.
     assert catalog.get("demo:bundled") is not None
 

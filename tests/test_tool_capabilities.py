@@ -272,6 +272,15 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
     # plugin's ``inject`` finds it.  ``_tool_registry`` was the old private channel,
     # used only by the contribution service that is now gone.
     catalog._host.services.provide("registry", registry)
+    # The skills capability too: a bundle contributes its skills root through it in its
+    # own setup, so without one the bundle stays pending (see `test_plugin_catalog`).
+    from agent.skills.catalog import SkillCatalog
+
+    skills = SkillCatalog(
+        user_root=tmp_path / "user-skills", builtin_root=tmp_path / "builtin-skills"
+    )
+    skills.load_all()
+    catalog._host.services.provide("skill_catalog", skills)
     try:
         assert catalog.discover_and_load() == ["contrib"]
 
@@ -279,7 +288,7 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
         assert catalog._commands.has("contrib_cmd")
         assert "contrib_tool" in registry.list_tools()
         assert catalog._agent_defs.get("plugin:contrib:auditor") is not None
-        assert catalog.get_bundled_skills(), "the skills root was registered"
+        assert skills.contributed_roots(), "the skills root was contributed"
         assert catalog.get_bundled_mcp(), "the mcp config was registered"
 
         catalog.unload_plugin("contrib")
@@ -290,9 +299,7 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
         assert (
             catalog._agent_defs.get("plugin:contrib:auditor") is None
         ), "the agent definition"
-        assert not [
-            entry for entry in catalog.get_bundled_skills() if entry[0] == "contrib"
-        ], "the skills root"
+        assert skills.contributed_roots() == [], "the skills root"
         assert not [
             entry for entry in catalog.get_bundled_mcp() if entry[0] == "contrib"
         ], "the mcp config"

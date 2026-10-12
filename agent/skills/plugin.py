@@ -21,12 +21,18 @@ one found in another tool's directory, and the ecosystem's own bundled subtree
 (Codex's ``.system``) is skipped, because those are its instructions, not the
 user's.
 
-What the composition keeps
---------------------------
-Loading the skills a *plugin* bundled.  That happens after the plugins are
-discovered -- the paths come from the loader -- and it is the same act that
-``plugin reload`` performs, so it stays next to the loader rather than inside a
-plugin that would have to be told about reloading.
+Who attaches a root
+-------------------
+Anyone holding the service: this plugin (the three layers above), and a plugin that
+bundles skills of its own through ``ctx.skill_catalog.add_root(...)``.  That call goes
+through the per-plugin view, so the contribution is attributed to its plugin and
+leaves when the plugin does -- and because the catalog keeps contributed roots as
+*records*, a reload replays them rather than losing them.
+
+The loader used to collect a bundle's skill paths into a list and the composition root
+attached them after discovery.  Two consequences made that the wrong shape: the
+contribution was the root's act rather than the plugin's, and any reload path that did
+not know about the list dropped the skills.  Both are gone with the list.
 """
 
 from __future__ import annotations
@@ -66,11 +72,16 @@ class SkillCatalogPlugin:
         # format adapters rather than from a list here; and the load is a fallback
         # layer, so a skill installed in this agent's own root wins a name collision.
         for skill_root in formats.shared_skill_roots():
-            catalog._load_root(
-                Path(skill_root.path),
-                source=f"shared:{skill_root.label}",
-                keep_existing=True,
-                skip_dirs=(skill_root.system_dir,) if skill_root.system_dir else (),
+            # Through ``add_root``, not the private ``_load_root``: a root this plugin
+            # attaches is a *record* on the catalog, so a reload replays it instead of
+            # dropping it, and the plugin's own scope takes it back if it unloads.
+            ctx.on_unwind(
+                catalog.add_root(
+                    Path(skill_root.path),
+                    source=f"shared:{skill_root.label}",
+                    keep_existing=True,
+                    skip_dirs=(skill_root.system_dir,) if skill_root.system_dir else (),
+                )
             )
         catalog.register_tools(ctx.get("registry"))
         ctx.provide("skill_catalog", catalog)

@@ -132,14 +132,15 @@ def _plugin_with_policy(tmp_path):
         json.dumps({"name": "policy-plugin", "skills": "./skills/"}), encoding="utf-8"
     )
 
-    catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog.discover_and_load()
+    # The capability before discovery: the bundle contributes its skills root in its own
+    # setup through the injected service, so the composition offers it first.
     skill_catalog = SkillCatalog(
         user_root=tmp_path / "none", builtin_root=tmp_path / "none"
     )
     skill_catalog.load_all()
-    for name, root in catalog.get_bundled_skills():
-        skill_catalog._load_root(root, source=f"plugin:{name}")
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._host.services.provide("skill_catalog", skill_catalog)
+    catalog.discover_and_load()
     return skill_catalog
 
 
