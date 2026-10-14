@@ -356,6 +356,33 @@ PROVIDER_MAP_VALUE_KINDS: dict[str, str] = {
 }
 
 
+def resolve_active_model(cfg: dict) -> str:
+    """The model id the active provider will actually be asked for.
+
+    The group's own ``default_model`` is the only authoritative answer, because
+    the group is what owns the endpoint: an id it does not serve reaches it only
+    to be refused with a 400 naming *its* models, which reads like a bug in the
+    agent rather than like a mismatch between a model and the group it belongs
+    to.
+
+    The legacy top-level ``model`` is a last resort, for a config written before
+    the group owned the model or whose active group names none.  It used to
+    *outrank* the group, and that precedence was the bug: with the top-level key
+    naming another group's model, the config said one provider was active while
+    every request went to a different one.  Two sources of truth for one answer
+    is not a feature; the group wins, and the key is tolerated only so an old
+    file still runs.
+    """
+    providers = cfg.get("providers", {})
+    active_name = cfg.get("active_provider", "anthropic")
+    provider_cfg = providers.get(active_name, {}) or {}
+    return str(
+        provider_cfg.get("default_model")
+        or cfg.get("model")
+        or shared.DEFAULT_MODEL
+    )
+
+
 class ModelClientFactory:
     """Build the right async API client from provider config."""
 
@@ -375,13 +402,10 @@ class ModelClientFactory:
         providers = cfg.get("providers", {})
         active_name = cfg.get("active_provider", "anthropic")
         provider_cfg = providers.get(active_name, {}) or {}
-        model = cfg.get("model") or provider_cfg.get(
-            "default_model", shared.DEFAULT_MODEL
-        )
         max_tokens = cfg.get("max_tokens") or provider_cfg.get(
             "max_tokens", shared.DEFAULT_MAX_TOKENS
         )
-        return str(model), int(max_tokens)
+        return resolve_active_model(cfg), int(max_tokens)
 
     @staticmethod
     def from_config(cfg: dict, announce: bool = True) -> tuple[Any, str, int]:
@@ -1076,12 +1100,15 @@ def _first_run_setup() -> bool:
     # ── Write config ──────────────────────────────────────────────────────────
     cfg, _ = load_config()
     cfg["active_provider"] = provider_name
-    cfg["model"] = model
 
     p = cfg.setdefault("providers", {}).setdefault(provider_name, {})
     p["api_format"] = api_format
     p["supports_vision"] = provider_supports_vision(cfg, provider_name)
     p["api_key"] = api_key_val
+    # The model is written once, on the group that owns it.  A top-level
+    # ``model`` used to be written alongside it, and when the two disagreed the
+    # top-level one won -- so the config named one provider while every request
+    # went to another.  The group is the single source of truth now.
     p["default_model"] = model
     if base_url:
         p["base_url"] = base_url

@@ -338,6 +338,15 @@ def test_credentials_are_masked_on_read_and_survive_a_round_trip(config_file):
 
 
 def test_activating_a_provider_switches_the_model_that_moved_with_it(config_file):
+    """Switching groups changes the id a turn carries, without touching config.
+
+    The handler used to rewrite the legacy top-level ``model`` on every switch,
+    re-pointing it at the new group's default.  That was a band-aid over the
+    resolution order that let the top-level key outrank the group: the group
+    wins now, so the id follows the switch on its own and the key is left
+    exactly as the user wrote it.
+    """
+    from agent.config import ModelClientFactory
     from starlette.testclient import TestClient
 
     _seed(
@@ -356,8 +365,11 @@ def test_activating_a_provider_switches_the_model_that_moved_with_it(config_file
     assert resp.status_code == 200, resp.text
     cfg = _read(config_file)
     assert cfg["active_provider"] == "b"
-    # The stale id would have routed to whichever provider owns it.
-    assert cfg["model"] == "model-b"
+    # The legacy key is not rewritten: it is the user's file, and the group's
+    # own default decides the id now.
+    assert cfg["model"] == "model-a"
+    # ...which is why the id a turn carries followed the switch anyway.
+    assert ModelClientFactory.active_model_and_tokens(cfg)[0] == "model-b"
 
 
 def test_deleting_is_refused_for_the_active_and_the_last_provider(config_file):

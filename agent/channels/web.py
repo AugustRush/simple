@@ -617,18 +617,12 @@ class WebChannel(Channel):
         if not isinstance(providers, dict) or name not in providers:
             return JSONResponse({"error": f"找不到 provider '{name}'"}, status_code=404)
         cfg["active_provider"] = name
-        # The model has to follow the switch when the old id is not one this
-        # group offers.  `routable_model_ids` would not catch that -- it spans
-        # every provider, so another group's model id is still "routable" and
-        # the session would keep sending it to the endpoint that does not own
-        # it (the 400-naming-its-own-models failure the routing table exists
-        # to prevent).  The question is group-scoped.
-        from agent.core.transport import provider_model_ids
-
-        provider_cfg = providers.get(name) or {}
-        current_model = str(cfg.get("model") or "")
-        if current_model and current_model not in provider_model_ids(provider_cfg):
-            cfg["model"] = str(provider_cfg.get("default_model") or "")
+        # No top-level ``model`` rewrite here.  One used to follow the switch,
+        # re-pointing the legacy key at the new group's default whenever it did
+        # not belong to that group -- a band-aid over the resolution order that
+        # let a top-level ``model`` outrank the group it was sent to.  The group
+        # wins now, so the id a turn carries follows the switch on its own and
+        # the key is nothing but tolerated legacy input.
         try:
             save_config(cfg)
         except Exception as exc:

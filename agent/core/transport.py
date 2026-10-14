@@ -1396,15 +1396,25 @@ def routing_table(cfg: dict) -> dict[str, str]:
 def routable_model_ids(cfg: dict) -> set[str]:
     """Model ids a model_override may carry.
 
-    Every id the routing table can dispatch, plus the configured top-level
-    ``model`` — which names the *active* provider's model, because that is
-    what the client factory resolves it to.  Anything else is an id no group
-    owns: requesting it could only reach the wrong endpoint.
+    Every id the routing table can dispatch, plus the model the active provider
+    resolves to — read through the same resolver the client factory answers
+    with, so the two cannot disagree about which id a turn will carry.  Anything
+    else is an id no group owns: requesting it could only reach the wrong
+    endpoint.
+
+    The resolved id is normally already a table entry, because a group's own
+    ``default_model`` is one of its ids.  It is added here for the config whose
+    active group names no model, where the legacy top-level ``model`` is what
+    would go out and is owned by nobody.
     """
     ids: set[str] = set(routing_table(cfg))
-    top_level = cfg.get("model")
-    if isinstance(top_level, str) and top_level.strip():
-        ids.add(top_level.strip())
+    # Deferred: agent.config owns the config's own vocabulary, and a
+    # module-level import here would make import order a load-bearing decision.
+    from agent.config import resolve_active_model
+
+    active_model = resolve_active_model(cfg)
+    if active_model:
+        ids.add(active_model)
     return ids
 
 

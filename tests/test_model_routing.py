@@ -432,9 +432,10 @@ def test_routing_table_is_the_one_definition_of_model_ownership():
         "deepseek-pro": "deepseek",
         "glm-5.3-flash": "huoshan",
     }
-    # The top-level `model` names the active provider's model, so it is the
-    # only id a caller may request that is not itself a routing key.
-    assert routable_model_ids(cfg) == set(table) | {"deepseek-flash"}
+    # The top-level `model` here happens to equal the group's own default, so
+    # it adds nothing: the group's ids are what is routable, and the legacy key
+    # is read only through the same resolver everything else answers to.
+    assert routable_model_ids(cfg) == set(table)
 
     routing = build_routing_transport(cfg, "openai", None, lambda *_a: object())
     assert set(routing.routes) == set(table)
@@ -1098,11 +1099,15 @@ def test_the_session_model_follows_the_config_it_is_rebuilt_against():
         "glm-5.3-flash",
         32768,
     )
-    # A top-level ``model`` still outranks the group's default, which is the
-    # rule ``from_config`` has always applied — pinned here so splitting the
-    # resolution out of it cannot quietly change the answer.
+    # The group's own `default_model` outranks the legacy top-level `model`.
+    # The top-level key used to win, and that was the bug: with it naming
+    # another group's model, the config said one provider was active while
+    # every request was routed to a different one.  A group owns its endpoint,
+    # so the id a turn carries has to be one it serves.
     pinned = {**as_huoshan, "model": "glm-5.3"}
-    assert ModelClientFactory.active_model_and_tokens(pinned)[0] == "glm-5.3"
+    assert ModelClientFactory.active_model_and_tokens(pinned)[0] == (
+        "glm-5.3-flash"
+    )
 
     # And it agrees with what the single client factory resolves, so the two
     # cannot drift into different answers.
@@ -1113,6 +1118,74 @@ def test_the_session_model_follows_the_config_it_is_rebuilt_against():
         from_config_model,
         from_config_tokens,
     )
+
+
+def test_a_top_level_model_from_another_group_does_not_hijack_the_route():
+    """The reported failure, reproduced and pinned.
+
+    A config whose top-level ``model`` named another group's model used to send
+    every request there: the resolution order read the top-level key first, the
+    routing table dutifully dispatched the id to the group that owns it, and the
+    config's ``active_provider`` was describing a provider nothing was sent to.
+    With that group's credential unset or its endpoint dead, the run simply did
+    not work -- and the error pointed at a provider the config never claimed to
+    be using.
+
+    The group wins now.  The misnamed id stays routable, because it really is
+    another group's model and an explicit override naming it should still reach
+    the right endpoint; it just stops being the answer to "which model is
+    active".
+    """
+    from agent.config import ModelClientFactory
+    from agent.core.transport import build_routing_transport
+
+    cfg = {
+        "active_provider": "main",
+        # The user's outer-level `model`, pointing at the *other* group.
+        "model": "other-model",
+        "providers": {
+            "main": {
+                "api_format": "openai",
+                "default_model": "main-model",
+            },
+            "other": {
+                "api_format": "openai",
+                "default_model": "other-model",
+            },
+        },
+    }
+
+    # The active group's own model is what goes out.
+    assert ModelClientFactory.active_model_and_tokens(cfg)[0] == "main-model"
+
+    routing = build_routing_transport(cfg, "openai", None, lambda *_a: object())
+    sent = ModelClientFactory.active_model_and_tokens(cfg)[0]
+    assert routing._for(sent).provider_name == "main"
+
+    # ...while the other group's model still routes to its own group when a
+    # caller names it deliberately.
+    assert routing._for("other-model").provider_name == "other"
+
+
+def test_a_legacy_top_level_model_still_runs_when_the_group_names_none():
+    """The top-level `model` is a fallback, not a rival.
+
+    A config written before groups carried their own model has only the
+    top-level key, and dropping it outright would stop that config running
+    rather than merely changing who wins.
+    """
+    from agent.config import resolve_active_model
+
+    legacy = {
+        "active_provider": "main",
+        "model": "old-model",
+        "providers": {"main": {"api_format": "openai"}},
+    }
+    assert resolve_active_model(legacy) == "old-model"
+    # And it is routable, so a session defaulting to it passes validation.
+    from agent.core.transport import routable_model_ids
+
+    assert "old-model" in routable_model_ids(legacy)
 
 
 def test_the_model_named_by_a_config_is_the_groups_default_even_when_unlisted():
