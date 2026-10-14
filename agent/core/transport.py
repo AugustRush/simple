@@ -805,13 +805,28 @@ class OpenAITransport(ModelTransport):
         finish = choice.finish_reason
         msg = choice.message
         text = msg.content or ""
-        if finish == "tool_calls" and msg.tool_calls:
-            tool_calls = []
-            for tc in msg.tool_calls:
-                inp = self._parse_tool_arguments(tc.function.arguments)
-                tool_calls.append(
-                    {"name": tc.function.name, "id": tc.id, "input": inp}
-                )
+        # Evidence over label.  The finish reason is the provider's *opinion*
+        # about why the response ended; the tool calls in the message are the
+        # response.  Gateways that proxy one wire format onto another routinely
+        # report `stop` for a turn that carries tool calls, and gating on the
+        # label threw the calls away: the model asked for a tool, the agent saw
+        # plain text, and the turn ended mid-task to wait for a human
+        # "continue".  Anthropic's transport has always read the content blocks
+        # and ignored `stop_reason` for this decision; this one now reads the
+        # message too.
+        #
+        # Malformed arguments are reported as parsed, faithfully: what not to
+        # execute is the *caller's* policy, and the truncated-call recovery
+        # that runs before this already refuses to commit one.
+        tool_calls = [
+            {
+                "name": tc.function.name,
+                "id": tc.id,
+                "input": self._parse_tool_arguments(tc.function.arguments),
+            }
+            for tc in msg.tool_calls or []
+        ]
+        if tool_calls:
             return "tool_use", text, tool_calls
         return "end_turn", text, []
 

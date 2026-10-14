@@ -6552,6 +6552,51 @@ def test_send_message_heartbeat_reports_request_model_override(monkeypatch):
     assert agent.model == "configured-model"
 
 
+def test_openai_transport_executes_tool_calls_even_when_the_label_says_stop():
+    """The reported "stops mid-task, needs 继续" failure, pinned at the source.
+
+    A gateway that proxies one wire format onto another can report
+    ``finish_reason="stop"`` for a turn that carries tool calls.  Gating on the
+    label discarded them: the model asked for a tool, the agent saw plain text,
+    and the turn ended as if it were finished -- so a long task kept stopping
+    and the human kept typing 继续.  The calls in the message are the evidence;
+    the finish reason is only the provider's opinion about why it stopped.
+    """
+    import agent as agent_module
+    from agent.core.transport import OpenAITransport
+
+    transport = OpenAITransport(object())
+    response = agent_module.shared._OAIResponse(
+        [
+            agent_module.shared._OAIChoice(
+                # A `stop` label on a turn that asks for tools -- what a
+                # proxying gateway reports.
+                "stop",
+                agent_module.shared._OAIMsg(
+                    "Let me check that.",
+                    [
+                        agent_module.shared._OAITC(
+                            "call-1",
+                            agent_module.shared._OAIFunc(
+                                "shell",
+                                '{"command":"echo ok"}',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+    stop_reason, text, tool_calls = transport.parse_response(response)
+
+    assert stop_reason == "tool_use"
+    assert text == "Let me check that."
+    assert tool_calls == [
+        {"name": "shell", "id": "call-1", "input": {"command": "echo ok"}}
+    ]
+
+
 def test_openai_transport_recovers_malformed_tool_arguments():
     import agent as agent_module
     from agent.core.transport import OpenAITransport
