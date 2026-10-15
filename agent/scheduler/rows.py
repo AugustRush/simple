@@ -27,6 +27,8 @@ from agent.scheduler.models import (
     Acceptance,
     DeliveryTarget,
     NewScheduledTask,
+    SignalEmission,
+    Workflow,
     declared_products,
     products_payload,
     ScheduledTask,
@@ -39,6 +41,8 @@ from agent.scheduler.models import (
     optional_datetime,
     validate_acceptance,
     validate_products,
+    validate_workflow_graph,
+    workflow_step_order,
 )
 
 __all__ = ['_task_from_row', '_run_from_row', '_check_acceptance', '_check_products', '_identity_values', '_attention_clause', '_step_workspaces', '_step_task_spec']
@@ -293,4 +297,60 @@ def _step_task_spec(step: WorkflowStep, trigger: TriggerSpec, *, workflow_id: st
         # by nobody" is indistinguishable from a task that appeared without
         # being asked for, which is the one thing this must not look like.
         request_quote=request_quote,
+    )
+
+
+def _emission_from_row(
+    row: sqlite3.Row,
+) -> SignalEmission:
+    return SignalEmission(
+        id=row["id"],
+        name=row["name"],
+        payload=json.loads(row["payload_json"] or "{}"),
+        source=row["source"],
+        depth=int(row["depth"]),
+        origin_id=row["origin_id"],
+        state=row["state"],
+        reason=row["reason"],
+        delivered_run_id=row["delivered_run_id"],
+        created_at=optional_datetime(row["created_at"]),
+        delivered_at=optional_datetime(row["delivered_at"]),
+    )
+
+
+@staticmethod
+def _emission_workflow_run_id(emission: SignalEmission) -> str:
+    return str(emission.payload.get("workflow_run_id", "") or "").strip()
+
+
+def _workflow_from_row(
+    row: sqlite3.Row,
+) -> Workflow:
+    return Workflow.from_graph(
+        row["graph_json"],
+        workflow_id=row["id"],
+        request_quote=row["request_quote"] or "",
+        created_at=optional_datetime(row["created_at"]),
+        updated_at=optional_datetime(row["updated_at"]),
+        version=max(1, int(row["version"] or 1)),
+    )
+
+
+def _validate_graph(
+    steps: list[WorkflowStep],
+) -> list[str]:
+    """Check a graph, including every step's acceptance criterion.
+
+    The folders are resolved first so each criterion is checked against the
+    directory its step will actually run in.  Nothing is written before this
+    returns, which is what keeps a refused graph from leaving a workflow row
+    with no tasks behind it -- the state ``create_workflow`` exists to make
+    impossible.
+    """
+    order = workflow_step_order(steps)
+    workspaces, _ = _step_workspaces(steps, order)
+    return validate_workflow_graph(
+        steps,
+        acceptance_workspaces=workspaces,
+        output_dir=str(shared.DEFAULT_OUTPUT_DIR),
     )

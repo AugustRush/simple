@@ -22,7 +22,7 @@ recording" below.
 
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
-| `agent/scheduler/store.py` | 3575 (was 4086) | `SchedulerStore` | 78 | 3004 | **3 / ~60 lines** |
+| `agent/scheduler/store.py` | 3544 (was 4086) | `SchedulerStore` | 74 | 2966 | **0 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1932 (was 2484) | `ContextManager` | 63 | 1584 | **5 / 43 lines** |
@@ -275,10 +275,18 @@ Two lessons, both paid for in failed runs:
    `agent.scheduler.store._step_task_spec`.  Three test references to the moved names were
    repointed to `rows` for the same reason.
 
-### What remains here
+### The rest of the cluster — **moved**, 3575 → 3544 lines
 
-`workflow_blocked_steps` (21) and the write paths (`create_workflow`, `create_task`,
-`apply_retention`) — the rest of the cluster is out.
+Four more went into the same `scheduler/rows.py` (`_validate_graph` 15, `_emission_from_row` 13,
+`_workflow_from_row` 8, `_emission_workflow_run_id` 1).  Three of them spelled `self` in their
+signature and never used it, which the extraction asserted against before dropping it -- the
+first attempt failed on that assertion and wrote nothing, which is the right failure mode for a
+mechanical move.
+
+**This file's measured cluster is now empty.**  What remains in `SchedulerStore` is the
+transactional core -- `create_workflow`, `create_task`, `apply_retention`,
+`workflow_blocked_steps` (which carries the store's own `@_synchronized`) -- and those need a
+collaborator design, not a move.
 3. **The cheapest coupled methods** — `_upstream_reports_in_transaction` (64 lines, 1 ref),
    `_insert_emission` (52, 1), `renew_lease` (35, 1), `disable_duplicate_enabled_tasks` (32, 1),
    `_join_arrivals` (28, 1).  Each needs the connection passed and nothing else.

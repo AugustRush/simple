@@ -15,6 +15,10 @@ from agent.scheduler.rows import (
     _attention_clause,
     _step_workspaces,
     _step_task_spec,
+    _validate_graph,
+    _emission_from_row,
+    _workflow_from_row,
+    _emission_workflow_run_id,
 )
 from agent.scheduler.migrations import (
     _migrate_to_1,
@@ -676,20 +680,6 @@ class SchedulerStore:
     # start of the cascade, and delivery stops at a ceiling rather than trying
     # to prove the graph acyclic.
 
-    def _emission_from_row(self, row: sqlite3.Row) -> SignalEmission:
-        return SignalEmission(
-            id=row["id"],
-            name=row["name"],
-            payload=json.loads(row["payload_json"] or "{}"),
-            source=row["source"],
-            depth=int(row["depth"]),
-            origin_id=row["origin_id"],
-            state=row["state"],
-            reason=row["reason"],
-            delivered_run_id=row["delivered_run_id"],
-            created_at=optional_datetime(row["created_at"]),
-            delivered_at=optional_datetime(row["delivered_at"]),
-        )
 
     @_synchronized
     def emit_signal(
@@ -778,7 +768,7 @@ class SchedulerStore:
         row = self._conn.execute(
             "SELECT * FROM signal_emissions WHERE id = ?", (emission_id,)
         ).fetchone()
-        return self._emission_from_row(row) if row else None
+        return _emission_from_row(row) if row else None
 
     @_synchronized
     def list_emissions(
@@ -800,7 +790,7 @@ class SchedulerStore:
             """,
             params,
         ).fetchall()
-        return [self._emission_from_row(row) for row in rows]
+        return [_emission_from_row(row) for row in rows]
 
     @_synchronized
     def signal_names(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -883,9 +873,6 @@ class SchedulerStore:
                 subscribers.append(task)
         return subscribers
 
-    @staticmethod
-    def _emission_workflow_run_id(emission: SignalEmission) -> str:
-        return str(emission.payload.get("workflow_run_id", "") or "").strip()
 
     def _satisfied_joins(self, task_id: str, workflow_run_id: str = "") -> set[str]:
         if workflow_run_id:
@@ -939,7 +926,7 @@ class SchedulerStore:
         Caller owns the transaction.
         """
         required = set(signal_names(task.trigger))
-        workflow_run_id = self._emission_workflow_run_id(emission)
+        workflow_run_id = _emission_workflow_run_id(emission)
         satisfied = self._satisfied_joins(task.id, workflow_run_id)
         satisfied.add(emission.name)
         # Intersected with what this join actually waits for, so a name that
@@ -1394,7 +1381,7 @@ class SchedulerStore:
                 (max(1, int(limit)),),
             ).fetchall()
             for row in rows:
-                emission = self._emission_from_row(row)
+                emission = _emission_from_row(row)
                 subscribers = self._signal_subscribers(emission.name)
                 if not subscribers:
                     self._settle_emission(
@@ -1429,7 +1416,7 @@ class SchedulerStore:
                 waiting_on: list[str] = []
                 for task in subscribers:
                     arrivals: dict[str, dict[str, Any]] = {}
-                    workflow_run_id = self._emission_workflow_run_id(emission)
+                    workflow_run_id = _emission_workflow_run_id(emission)
                     if signal_mode(task.trigger) == SIGNAL_MODE_ALL:
                         # A join records this arrival and runs only when the
                         # last one shows up.  Landing here without a run is the
@@ -3211,32 +3198,7 @@ class SchedulerStore:
     # appears in the signal names its downstream steps subscribe to, so
     # recreating tasks on every edit would silently break every edge.
 
-    def _workflow_from_row(self, row: sqlite3.Row) -> Workflow:
-        return Workflow.from_graph(
-            row["graph_json"],
-            workflow_id=row["id"],
-            request_quote=row["request_quote"] or "",
-            created_at=optional_datetime(row["created_at"]),
-            updated_at=optional_datetime(row["updated_at"]),
-            version=max(1, int(row["version"] or 1)),
-        )
 
-    def _validate_graph(self, steps: list[WorkflowStep]) -> list[str]:
-        """Check a graph, including every step's acceptance criterion.
-
-        The folders are resolved first so each criterion is checked against the
-        directory its step will actually run in.  Nothing is written before this
-        returns, which is what keeps a refused graph from leaving a workflow row
-        with no tasks behind it -- the state ``create_workflow`` exists to make
-        impossible.
-        """
-        order = workflow_step_order(steps)
-        workspaces, _ = _step_workspaces(steps, order)
-        return validate_workflow_graph(
-            steps,
-            acceptance_workspaces=workspaces,
-            output_dir=str(shared.DEFAULT_OUTPUT_DIR),
-        )
 
     @_synchronized
     def create_workflow(
@@ -3251,7 +3213,7 @@ class SchedulerStore:
         drawing for as long as the build took, and leave it standing for good if
         the build failed.
         """
-        self._validate_graph(workflow.steps)
+        _validate_graph(workflow.steps)
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         workflow_id = _new_id()
         with self._immediate_transaction():
@@ -3283,14 +3245,14 @@ class SchedulerStore:
         row = self._conn.execute(
             "SELECT * FROM workflows WHERE id = ? LIMIT 1", (workflow_id,)
         ).fetchone()
-        return self._workflow_from_row(row) if row else None
+        return _workflow_from_row(row) if row else None
 
     @_synchronized
     def list_workflows(self) -> list[Workflow]:
         rows = self._conn.execute(
             "SELECT * FROM workflows ORDER BY created_at ASC, id ASC"
         ).fetchall()
-        return [self._workflow_from_row(row) for row in rows]
+        return [_workflow_from_row(row) for row in rows]
 
     @_synchronized
     def update_workflow(
@@ -3314,7 +3276,7 @@ class SchedulerStore:
         """
         if self.get_workflow(workflow_id) is None:
             return None
-        self._validate_graph(workflow.steps)
+        _validate_graph(workflow.steps)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         with self._immediate_transaction():
             self._close_rounds_before_edit(workflow_id, updated_at)
