@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 from .session_log import SessionLog
 from . import fitting
+from . import text as _render
 from ._helpers import (
     _FACT_QUERY_PREDICATE_ALIASES,
     _FACT_QUERY_SUBJECT_ALIASES,
@@ -248,25 +249,6 @@ class ContextManager:
             self._suppress_next_turn_persistence = False
             return suppress
 
-    @staticmethod
-    def _coerce_consolidation_result(result: Any) -> ConsolidationResult:
-        """A consolidator's return value as a result, with a reason when there is one.
-
-        The last branch is a consolidator that answered with something that is not a
-        result at all (a bare ``None``, a flag).  Falsy is a failure, and it is one this
-        code *can* describe -- so it does, instead of leaving the reporter to say only
-        "extraction returned failure" about a return value it never saw.
-        """
-        if isinstance(result, ConsolidationResult):
-            return result
-        if isinstance(result, list):
-            return ConsolidationResult(success=True, compressed_messages=result)
-        success = bool(result)
-        return ConsolidationResult(
-            success=success,
-            compressed_messages=[],
-            error="" if success else f"consolidator returned {type(result).__name__}",
-        )
 
     def spawn_session(
         self,
@@ -749,11 +731,6 @@ class ContextManager:
                 seen.append(cat)
         return seen
 
-    @staticmethod
-    def _format_fact_value(value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
     def _targeted_fact_conflict(self, plan: QueryPlan) -> bool:
         if not plan.target_subjects or not plan.target_predicates:
@@ -827,7 +804,7 @@ class ContextManager:
         query_terms = set(plan.lexical_terms)
 
         def score(fact: ResolvedFact) -> float:
-            value_terms = set(_lexical_terms(self._format_fact_value(fact.value)))
+            value_terms = set(_lexical_terms(_render._format_fact_value(fact.value)))
             total = float(fact.confidence or 0.0)
             if fact.subject in plan.target_subjects:
                 total += 3.0
@@ -853,7 +830,7 @@ class ContextManager:
         lines = [title]
         for fact in facts:
             lines.append(
-                f"- {fact.subject}.{fact.predicate} = {self._format_fact_value(fact.value)}"
+                f"- {fact.subject}.{fact.predicate} = {_render._format_fact_value(fact.value)}"
             )
         return "\n".join(lines)
 
@@ -1064,38 +1041,6 @@ class ContextManager:
                 lines.append(f"- {turn.role.upper()}: {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
-    @staticmethod
-    def _shows_text(content: str, text: str) -> bool:
-        """Whether *content* carries *text* as one of its ``\\n\\n``-separated parts.
-
-        A user message is not the user's words: it is
-        ``"\\n\\n".join([turn_context, user_message, attachment_context])`` (see
-        ``BaseAgent._build_user_message_content``), and ``turn_context`` is itself
-        a ``"\\n\\n"`` join of this turn's blocks.  So the user's words are one
-        *part* of the content -- not the whole of it, and not necessarily the
-        last one, because a non-vision attachment's context is appended after
-        them.
-
-        Comparing the whole string by equality is what this did, and it stopped
-        matching the moment per-turn context moved out of the system prompt and
-        into the message.  Taking the tail instead recovers the attachment
-        context whenever there is one, and only the *last paragraph* of a
-        multi-paragraph message -- both measured, both still re-injected.
-
-        Matching a delimited run is exact for every shape, because a part of a
-        ``"\\n\\n"`` join is always bounded by ``"\\n\\n"`` or by the ends of the
-        string.  It accepts everything the equality test and the tail test
-        accepted, so it can only cause *fewer* re-injections, and a match still
-        means what it should: this text was already sent.
-        """
-        if not content or not text:
-            return False
-        return (
-            content == text
-            or content.startswith(text + "\n\n")
-            or content.endswith("\n\n" + text)
-            or f"\n\n{text}\n\n" in content
-        )
 
     def _recent_unconsolidated_context(
         self,
@@ -1135,7 +1080,7 @@ class ContextManager:
             if not staged_text:
                 continue
             if any(
-                self._shows_text(content, staged_text)
+                _render._shows_text(content, staged_text)
                 for content in visible_contents
             ):
                 continue
@@ -1164,7 +1109,7 @@ class ContextManager:
             lines = ["## Assistant Identity"]
             for fact in facts[: max(1, limit)]:
                 lines.append(
-                    f"- {fact.subject}.{fact.predicate} = {self._format_fact_value(fact.value)}"
+                    f"- {fact.subject}.{fact.predicate} = {_render._format_fact_value(fact.value)}"
                 )
             return "\n".join(lines)
         if name_conflict or role_conflict:
@@ -1179,42 +1124,6 @@ class ContextManager:
                 lines.append(f"- {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
-    @staticmethod
-    def _format_working_state_text(state: dict[str, Any]) -> str:
-        if not isinstance(state, dict) or not state:
-            return ""
-        fields = [
-            ("active_goal", "Active goal"),
-            ("status", "Status"),
-            ("progress", "Progress"),
-            ("next_action", "Next action"),
-            ("last_error", "Last error"),
-        ]
-        lines = ["## Restored Working Context"]
-        lines.append(
-            "A prior working context exists for this session. Use it when relevant; "
-            "if the user's new message is unrelated, do not force the old task."
-        )
-        for key, label in fields:
-            value = str(state.get(key, "") or "").strip()
-            if value:
-                lines.append(f"- {label}: {value}")
-        artifacts = state.get("artifacts")
-        if isinstance(artifacts, list):
-            clean_artifacts = [str(item).strip() for item in artifacts if str(item).strip()]
-            if clean_artifacts:
-                lines.append("- Artifacts: " + ", ".join(clean_artifacts[:8]))
-        recent_turns = state.get("recent_turns")
-        if isinstance(recent_turns, list) and recent_turns:
-            lines.append("- Recent turns:")
-            for turn in recent_turns[-4:]:
-                if not isinstance(turn, dict):
-                    continue
-                role = str(turn.get("role", "") or "").upper()
-                content = str(turn.get("content", "") or "").strip()
-                if role and content:
-                    lines.append(f"  - {role}: {content}")
-        return "\n".join(lines) if len(lines) > 2 else ""
 
     @staticmethod
     def _weighted_term_overlap(
@@ -1327,7 +1236,7 @@ class ContextManager:
                 "status": str(candidate.get("status", "") or ""),
                 "score": round(score, 3),
                 "eligible": bool(eligible),
-                "active_goal": self._clip_working_state_text(
+                "active_goal": _render._clip_working_state_text(
                     candidate.get("active_goal", ""), 120
                 ),
             }
@@ -1384,7 +1293,7 @@ class ContextManager:
         selected_state = self._select_working_state(snapshot.state, query)
         if selected_state is None:
             return ""
-        text = self._format_working_state_text(selected_state)
+        text = _render._format_working_state_text(selected_state)
         events = self.store.recent_agent_events(
             session_id=self.staging.session_id,
             limit=5,
@@ -1398,7 +1307,7 @@ class ContextManager:
                 or ""
             ).strip()
             if detail:
-                detail = self._clip_working_state_text(detail, 160)
+                detail = _render._clip_working_state_text(detail, 160)
                 event_lines.append(f"- {event.event_type}: {detail}")
             else:
                 event_lines.append(f"- {event.event_type}")
@@ -1421,35 +1330,6 @@ class ContextManager:
             )
         return not self._working_state_is_complete(snapshot.state)
 
-    @staticmethod
-    def _checkpoint_summary(messages: list[dict], limit: int = 4000) -> str:
-        lines: list[str] = []
-        length = 0
-        for message in messages:
-            role = str(message.get("role", "unknown") or "unknown").upper()
-            content = message.get("content", "")
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    # Tolerated on purpose: this builds a readable summary, so
-                    # a block it cannot read costs a line of text, not a tool
-                    # result.  Failing here would lose the whole checkpoint.
-                    if not isinstance(block, dict):
-                        continue
-                    text = block.get("text") or block.get("content")
-                    if text:
-                        parts.append(str(text))
-                content = " ".join(parts)
-            clean = re.sub(r"\s+", " ", str(content or "")).strip()
-            if not clean:
-                continue
-            line = f"- {role}: {clean}"
-            remaining = limit - length
-            if remaining <= 0:
-                break
-            lines.append(line[:remaining])
-            length += min(len(line), remaining)
-        return "\n".join(lines)
 
     def save_provider_checkpoint(
         self,
@@ -1498,7 +1378,7 @@ class ContextManager:
 
         existing = self.load_provider_checkpoint() or {}
         previous_summary = str(existing.get("summary") or "").strip()
-        dropped_summary = self._checkpoint_summary(dropped).strip()
+        dropped_summary = _render._checkpoint_summary(dropped).strip()
         summary = "\n".join(
             part for part in (previous_summary, dropped_summary) if part
         )
@@ -1515,12 +1395,6 @@ class ContextManager:
             return None
         return load(self.staging.session_id)
 
-    @staticmethod
-    def _clip_working_state_text(text: str, limit: int = 800) -> str:
-        clean = re.sub(r"\s+", " ", str(text or "").strip())
-        if len(clean) <= limit:
-            return clean
-        return clean[: limit - 1].rstrip() + "…"
 
     @staticmethod
     def _merge_artifacts(*groups: Any, limit: int = 12) -> list[str]:
@@ -1591,9 +1465,9 @@ class ContextManager:
         raw_error = payload.get("error")
         if event_type in TURN_OUTCOME_EVENTS and isinstance(raw_error, str):
             error = raw_error
-        clean_user = self._clip_working_state_text(user_content, 1000)
-        clean_assistant = self._clip_working_state_text(assistant_content, 1000)
-        clean_error = self._clip_working_state_text(error, 1000)
+        clean_user = _render._clip_working_state_text(user_content, 1000)
+        clean_assistant = _render._clip_working_state_text(assistant_content, 1000)
+        clean_error = _render._clip_working_state_text(error, 1000)
 
         error_lower = clean_error.lower()
         if clean_error and "cancel" in error_lower:
@@ -1966,7 +1840,7 @@ class ContextManager:
                 staging=self.staging,
                 project_scope=self.project_scope,
             )
-            return self._coerce_consolidation_result(result).compressed_messages
+            return _render._coerce_consolidation_result(result).compressed_messages
         finally:
             with self._lock:
                 self._needs_consolidation = False
@@ -2058,7 +1932,7 @@ class ContextManager:
                 _emit_consolidation("failed", reason="llm_extraction_error", error=str(exc))
                 shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")
                 return False
-            consolidated = self._coerce_consolidation_result(result)
+            consolidated = _render._coerce_consolidation_result(result)
             if not consolidated.success:
                 _emit_consolidation(
                     "failed", reason="extraction_returned_failure", error=consolidated.error

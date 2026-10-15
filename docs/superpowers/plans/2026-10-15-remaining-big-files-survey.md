@@ -25,7 +25,7 @@ recording" below.
 | `agent/scheduler/store.py` | 4086 | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
 | `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
-| `agent/memory/context.py` | 2098 (was 2484) | `ContextManager` | 72 | 1756 | **11 / 114 lines** |
+| `agent/memory/context.py` | 1972 (was 2484) | `ContextManager` | 66 | 1624 | **8 / 106 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
 the headline, and it is why the extraction orders below start there.
@@ -87,14 +87,23 @@ other ten are reached as `fitting.<name>` from the class.  The two class constan
 them (`_EVICTION_SENTINEL`, `_COMPACTION_LOW_WATER`) and the three test references to them were
 repointed rather than aliased, so the names have one home.
 
+### `memory/text.py` — **extracted**, 2098 → 1972 lines
+
+The rendering half (`_format_working_state_text` 34, `_shows_text` 30, `_checkpoint_summary`
+27, `_clip_working_state_text` 4, `_format_fact_value` 3, `_coerce_consolidation_result` 17):
+how working state is *rendered* — given the state, produce the words — which is why the rules
+can be read and tested apart from when they run.
+
+One candidate was **excluded by the closure check rather than by taste**: `_merge_artifacts`
+looked self-free but reads a free name the bound-name scan missed, so it stays in the class
+until someone gives it a home deliberately.
+
 ### What remains here
 
-1. **`memory/text.py`** — the rendering half (`_format_working_state_text`, `_shows_text`,
-   `_checkpoint_summary`, the other `_format*` helpers; 0 data refs, ≤1 sibling call each).
-2. **The 0-data / 1-call group** (`record_usage_event`, `observe_token_usage`,
+1. **The 0-data / 1-call group** (`record_usage_event`, `observe_token_usage`,
    `_is_episode_recall_query`, `_working_state_relevance_score`, …) — cheap, but each needs the
    one collaborator it calls passed in.
-3. Only then the coupled core (`_project_working_state_from_event` 140 lines / 5 refs,
+2. Only then the coupled core (`_project_working_state_from_event` 140 lines / 5 refs,
    `process_one_job` 107/5, `retrieve_implicit_context` 73).
 
 ## 2. `agent/core/agent.py` — 2536 lines
