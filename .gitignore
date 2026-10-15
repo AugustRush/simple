@@ -25,3 +25,8 @@ output/
 
 # Generated Python package metadata
 *.egg-info/
+
+# Scratch space for measurement/refactoring work.  Kept ignored because a
+# `git add -A` swept a 70k-line measurement JSON into a commit once; scratch
+# belongs somewhere that cannot be committed by accident.
+.scratch/

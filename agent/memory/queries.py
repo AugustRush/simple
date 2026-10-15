@@ -6,6 +6,7 @@ connection and the transaction handling, and these keep the SQL.
 """
 
 from __future__ import annotations
+import json
 
 import sqlite3
 
@@ -15,11 +16,12 @@ from agent import shared
 
 from agent.lexical import LATIN_TOKEN_RE
 from .retrieval import CorpusStats
-from . import rows as _row_mappers, facts
-from ._helpers import _lexical_terms
+from . import rows as _row_mappers, facts, migrations
+from ._helpers import _lexical_terms, _now
 from .models import ConversationTurn, AgentRuntimeEvent
 
 __all__ = [
+    "append_conversation_turn",
     "corpus_stats",
     "transcript_window",
     "_rows_at_seqs",'list_session_ids', 'recent_conversation_turns', 'search_conversation_turns']
@@ -412,3 +414,50 @@ def corpus_stats(conn,
             frequencies[term] = 0
 
     return CorpusStats(total_documents=total, document_frequencies=frequencies)
+
+
+def append_conversation_turn(conn, *,
+    session_id: str,
+    role: str,
+    content: str,
+    channel: str = "",
+    message_id: str = "",
+    reply_to_id: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+    created_at: Optional[str] = None,
+) -> Optional[ConversationTurn]:
+    """Append one durable conversation event without affecting staging."""
+    clean_content = str(content or "").strip()
+    if not clean_content:
+        return None
+    clean_role = str(role or "").strip().lower()
+    if clean_role not in {"user", "assistant"}:
+        return None
+    payload = metadata or {}
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    clean_session_id = str(session_id or "").strip() or "default"
+    cur = conn.execute(
+        """
+        INSERT INTO conversation_turns (
+            session_id, role, content, channel, message_id, reply_to_id,
+            metadata_json, created_at, seq
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            clean_session_id,
+            clean_role,
+            clean_content,
+            str(channel or ""),
+            str(message_id or ""),
+            str(reply_to_id or ""),
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            created_at or _now(),
+            migrations._next_transcript_seq(conn, clean_session_id),
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM conversation_turns WHERE id = ?",
+        (cur.lastrowid,),
+    ).fetchone()
+    return _row_mappers._row_to_conversation_turn(row) if row else None

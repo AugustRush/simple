@@ -689,41 +689,19 @@ class LTMStore:
         created_at: Optional[str] = None,
     ) -> Optional[ConversationTurn]:
         """Append one durable conversation event without affecting staging."""
-        clean_content = str(content or "").strip()
-        if not clean_content:
-            return None
-        clean_role = str(role or "").strip().lower()
-        if clean_role not in {"user", "assistant"}:
-            return None
-        payload = metadata or {}
-        if not isinstance(payload, dict):
-            payload = {"value": payload}
-        clean_session_id = str(session_id or "").strip() or "default"
         with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO conversation_turns (
-                    session_id, role, content, channel, message_id, reply_to_id,
-                    metadata_json, created_at, seq
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    clean_session_id,
-                    clean_role,
-                    clean_content,
-                    str(channel or ""),
-                    str(message_id or ""),
-                    str(reply_to_id or ""),
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    created_at or _now(),
-                    migrations._next_transcript_seq(conn, clean_session_id),
-                ),
+            return queries.append_conversation_turn(
+                conn,
+                session_id=session_id,
+                role=role,
+                content=content,
+                channel=channel,
+                message_id=message_id,
+                reply_to_id=reply_to_id,
+                metadata=metadata,
+                created_at=created_at,
             )
-            row = conn.execute(
-                "SELECT * FROM conversation_turns WHERE id = ?",
-                (cur.lastrowid,),
-            ).fetchone()
-        return _row_mappers._row_to_conversation_turn(row) if row else None
+
 
     @staticmethod
     def _json_object(raw: Any) -> dict[str, Any]:

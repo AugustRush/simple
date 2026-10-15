@@ -176,6 +176,28 @@ def module_index(tree: ast.Module, lines: list[str]):
 # ── main ─────────────────────────────────────────────────────────────────────
 
 
+def import_anchor(header: str) -> int:
+    """Where a new import may go: after the docstring and after ``from __future__``.
+
+    Inserting before ``from __future__ import annotations`` is not a style problem -- it is a
+    ``SyntaxError`` at compile time that ``ast.parse`` does not raise, which is how one of
+    these moves produced a file that parsed and would not import.
+    """
+    offset = 0
+    stripped = header.lstrip()
+    if stripped.startswith('"""') or stripped.startswith("'''"):
+        quote = stripped[:3]
+        end = stripped.find(quote, 3)
+        if end != -1:
+            offset = len(header) - len(stripped) + end + 3
+    tail = header[offset:]
+    future = re.search(r"^from __future__ import [^\n]*\n", tail, re.M)
+    if future:
+        return offset + future.end()
+    first = re.search(r"^(from |import )", tail, re.M)
+    return offset + (first.start() if first else 0)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--file", required=True, help="the module holding the class")
@@ -219,16 +241,21 @@ def main(argv: list[str] | None = None) -> int:
         # the function that will live in the new module
         text, receiver = without_receiver(original, method.name, fn)
         text = with_first_param(text, method.name, args.param)
-        body_lines, dropping = [], False
+        # Drop the local connection acquisition.  The dedent must be relative to the `with`
+        # line: a fixed four-space cut also eats the statement that follows the block (which
+        # sits at the same indent as `with`), pushing it to column 0 and out of the function.
+        body_lines, base = [], None
         for line in text.split("\n"):
             if line.strip() == f"with self._connect() as {args.param}:":
-                dropping = True
+                base = len(line) - len(line.lstrip())
                 continue
-            if dropping:
-                if line.strip() and line.startswith("    "):
+            if base is not None:
+                indent = len(line) - len(line.lstrip())
+                if line.strip() and indent > base:
                     body_lines.append(line[4:])
                     continue
-                dropping = False
+                if line.strip():
+                    base = None
             body_lines.append(line)
         text = "\n".join(body_lines)
         for sibling in moving:
@@ -329,8 +356,7 @@ def main(argv: list[str] | None = None) -> int:
                             "from __future__ import annotations\n\n" + statement, 1,
                         )
         else:
-            anchor = re.search(r"^from |^import ", header, re.M)
-            header = header[:anchor.start()] + statement + "\n" + header[anchor.start():]
+            header = header[:import_anchor(header)] + statement + "\n" + header[import_anchor(header):]
     header = header.replace(
         "__all__ = [", "__all__ = [\n    " + ",\n    ".join(f'"{m}"' for m in moving) + ",", 1,
     )
@@ -394,13 +420,35 @@ def main(argv: list[str] | None = None) -> int:
         anchor = re.search(r"^from \.", text, re.M)
         text = text[:anchor.start()] + module_import + "\n" + text[anchor.start():]
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Two checks, both for injuries that `ast.parse` does not report:
+    #   * a statement dedented out of its function still parses (the `with`-block dedent once
+    #     pushed a trailing `return` to column 0);
+    #   * an import placed before `from __future__` parses and will not import.
+    for method, block in zip(moving, blocks):
+        # The header may legitimately span lines ending at column 0 (`) -> X:`); the *body*
+        # may not.  Find where the header ends, then require indentation after it.
+        depth, header_end = 0, 0
+        for index, line in enumerate(block.split("\n")):
+            depth += line.count("(") + line.count("[") + line.count("{")
+            depth -= line.count(")") + line.count("]") + line.count("}")
+            if line.rstrip().endswith(":") and depth <= 0:
+                header_end = index + 1
+                break
+        stray = [
+            line for line in block.split("\n")[header_end:]
+            if line.strip() and not line.startswith((" ", "\t"))
+        ]
+        if stray:
+            print(f"REFUSING: {method} has body lines outside it: {stray[:2]}", file=sys.stderr)
+            return 1
+    for label, blob in ((target, new_module), (source, text)):
+        try:
+            compile(blob, str(label), "exec")
+        except (SyntaxError, ValueError) as exc:
+            print(f"REFUSING to keep this: {label} does not compile: {exc}", file=sys.stderr)
+            return 1
     target.write_text(new_module, encoding="utf-8")
     source.write_text(text, encoding="utf-8")
-    try:
-        ast.parse(text)
-    except SyntaxError as exc:
-        print(f"REFUSING to keep this: the rewritten source is invalid: {exc}", file=sys.stderr)
-        return 1
     print(f"wrote {target} and rewrote {args.file}")
     print("next: import both modules, run the unbound-name check, then the targeted tests")
     return 0
