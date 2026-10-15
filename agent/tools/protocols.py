@@ -11,7 +11,7 @@ unverifiable for them.
 
 The protocols live next to the services they describe, one module per area, and the
 ledger's ``contract`` column points at them
-(:mod:`agent.runtime.core_services`).  That column is the map: a service with an
+(:mod:`agent.runtime.services`).  That column is the map: a service with an
 empty contract is a service whose interface nobody has written down yet.
 
 What is in the protocol, and what is not

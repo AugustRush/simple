@@ -227,10 +227,10 @@ def test_every_declared_contract_is_checked_somewhere() -> None:
     silently stops being checked -- measured once, when ``llm`` was waived to a file
     containing no mention of ``ModelTransport`` at all.
     """
-    from agent.runtime.core_services import CORE_SERVICES
+    from agent.runtime.services import CONTRACTED_SERVICES
 
     rows = {(row[4], row[3]) for row in SERVICE_CONTRACTS}
-    for entry in CORE_SERVICES:
+    for entry in CONTRACTED_SERVICES:
         if not entry.contract:
             continue
         relative, _, symbol = entry.contract.partition(":")
@@ -461,10 +461,10 @@ def test_absence_is_not_a_violation() -> None:
 
 def test_every_declared_contract_resolves() -> None:
     """The pointer is followed, not trusted: a renamed protocol fails here."""
-    from agent.runtime.core_services import CORE_SERVICES
     from agent.runtime.service_contracts import protocol_for
+    from agent.runtime.services import CONTRACTED_SERVICES
 
-    for entry in CORE_SERVICES:
+    for entry in CONTRACTED_SERVICES:
         assert entry.contract, f"{entry.name} declares no contract"
         protocol = protocol_for(entry.name)
         assert protocol is not None and isinstance(protocol, type)

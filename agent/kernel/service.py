@@ -472,7 +472,7 @@ def resolve(components: Any, name: str, default: Any = None) -> Any:
     Accepts the three shapes this codebase actually passes around:
 
     * a :class:`RuntimeComponents`, which has ``lookup`` (it resolves through the
-      registry and is the declared channel -- see ``agent/runtime/core_services.py``);
+      registry and is the declared channel -- see ``agent/runtime/services.py``);
     * a duck-typed stand-in exposing ``values``, which is how tests substitute a
       ``SimpleNamespace`` for a component mapping;
     * a plain mapping, which is what bootstrap and the channel runner hold while

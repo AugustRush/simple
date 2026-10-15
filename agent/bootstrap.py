@@ -39,7 +39,7 @@ from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
 from agent.runtime.service_contracts import validator_for, violations
-from agent.runtime.service_vocabulary import plugin_service_policy
+from agent.runtime.services import plugin_service_policy
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import (
     RalphIterationResult,

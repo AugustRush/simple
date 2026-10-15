@@ -86,7 +86,7 @@ def refresh_system_prompt(
     # The three services resolve through the container; ``workspace_root`` and
     # ``output_dir`` are paths the runtime looks up by name, not services, so they
     # keep the plain mapping read.  The vocabulary is in
-    # ``agent/runtime/core_services.py``.
+    # ``agent/runtime/services.py``.
     composed = _compose_system_prompt(
         base,
         resolve(components, "registry"),

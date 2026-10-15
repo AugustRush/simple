@@ -4188,7 +4188,7 @@ def test_every_service_backed_kind_names_a_published_service() -> None:
     invented a fifth name that nothing publishes.
     """
     from agent.plugins.catalog import DECLARATIVE_KINDS
-    from agent.runtime.service_vocabulary import PUBLIC_SERVICES
+    from agent.runtime.services import public_names
 
     backed = {kind.service for kind in DECLARATIVE_KINDS if kind.service}
     assert backed == {
@@ -4197,7 +4197,7 @@ def test_every_service_backed_kind_names_a_published_service() -> None:
         "commands",
         "agents",
     }, "a new service-backed kind needs a test, and this list updated"
-    assert backed <= PUBLIC_SERVICES, (
+    assert backed <= public_names(), (
         "a kind contributes through a service the vocabulary does not publish"
     )
 

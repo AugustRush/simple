@@ -787,7 +787,7 @@ async def _interactive_loop_body(
     """Main interactive chat loop."""
     global _current_cancel_token
     # Computed in a container view of the same mapping, so these are service
-    # *lookups* rather than dict pokes.  See agent/runtime/core_services.py:
+    # *lookups* rather than dict pokes.  See agent/runtime/services.py:
     # the difference is what makes a name replaceable.
     agent: BaseAgent = require_service(components, "agent")
     plugin_catalog: PluginCatalog = resolve(components, "plugin_catalog")  # type: ignore[assignment]

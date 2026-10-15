@@ -34,13 +34,20 @@ the earlier rounds are in
 
 ## The map
 
-`agent/runtime/core_services.py` is the ledger: service -> owners, consumers, contract.
-`agent/runtime/service_vocabulary.py` is the **second** declaration, and answers a
-different question: which names a *plugin* may touch at all (44 public; 27 reserved, each
-with the reason it is the composition's).  The ledger describes the services that have
-contracts; the vocabulary is the closed set the kernel's policy enforces.  They overlap
-and neither implies the other -- `agent_core` is in the ledger and deliberately not
-plugin-visible.
+`agent/runtime/services.py` is **the** declaration: one entry per name the composition
+resolves out of its mapping (68 today), each saying whether a *plugin* may touch it, what
+protocol an implementation must satisfy when there is one, and -- for the composition's own
+-- why.  There used to be two modules here, and that was the problem: "is this name a
+service?" had two answers, they could each grow without the other noticing, and the
+`memory` entry pointed at the wrong protocol for months because nothing asked.
+
+**What is not in the table is the point.**  Every entry used to declare `owners` (who
+writes it) and `consumers` (who reads it) as well.  Both are *derivable from the source*,
+so declaring them made the table a hand-maintained mirror of the code, kept in step by a
+1900-line AST scanner and four assertions whose only job was to notice when it fogged.  The
+scanner is still there -- it is how the guards compute the answer -- but the answer is no
+longer copied into the declaration.  That direction cannot drift: the code is the truth and
+the table is the policy.
 
 | plugin-provided (11) | floor (4) |
 |---|---|
@@ -132,7 +139,7 @@ Contribution kinds that are **not** services, with the reason:
 
 | check | what it refuses |
 |---|---|
-| `tests/test_core_services.py` | a ledger that disagrees with the source, in either direction; a service whose name is not documented |
+| `tests/test_core_services.py` | a declared name the source never writes; a name the source uses that is not declared; a reserved entry with no reason; a declaration that has grown back a second copy of the names |
 | `tests/test_service_ownership.py` | a service that is neither plugin-provided nor a written floor |
 | `tests/test_service_contracts.py` | an implementation that does not satisfy its protocol (signatures, async-ness, data members), a protocol member nobody calls, a ledger pointer no file checks, a waiver pointing at a check that does not exist, a hand-written `Scoped*` view |
 | `tests/test_memory_contract.py` | a backend that fails the behavioural suites; a reader that reaches past the contract (an allowlist of 4 documented soft reads remains) |

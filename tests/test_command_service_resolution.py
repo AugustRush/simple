@@ -91,7 +91,7 @@ def test_the_helper_resolves_through_the_container() -> None:
     source = inspect.getsource(builtin._component)
     assert "services" in source, (
         "_component must resolve through the container; see "
-        "agent/runtime/core_services.py for why"
+        "agent/runtime/services.py for why"
     )
 
 

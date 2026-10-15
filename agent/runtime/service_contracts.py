@@ -38,7 +38,7 @@ import importlib
 from functools import lru_cache
 from typing import Any, Callable, Optional
 
-from agent.runtime.core_services import BY_NAME
+from agent.runtime.services import BY_NAME, CONTRACTED_SERVICES
 
 __all__ = [
     "ContractViolation",
@@ -138,7 +138,7 @@ def violations(components: Any, *, names: Any = None) -> list[str]:
     """
     from agent.kernel.service import resolve
 
-    wanted = names if names is not None else (e.name for e in BY_NAME.values())
+    wanted = names if names is not None else (e.name for e in CONTRACTED_SERVICES)
     problems: list[str] = []
     for name in wanted:
         value = resolve(components, name, None)

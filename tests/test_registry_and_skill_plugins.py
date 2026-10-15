@@ -193,12 +193,23 @@ def test_the_warning_stays_quiet_for_a_sandboxed_posture(monkeypatch, tmp_path, 
 
 
 @pytest.mark.parametrize("service", ["registry", "skill_catalog"])
-def test_the_ledger_names_the_plugin_that_provides_it(service: str) -> None:
-    from agent.runtime.core_services import entry_for
+def test_the_plugin_is_what_provides_it(service: str, monkeypatch, tmp_path) -> None:
+    """Asked of the *composition*, not of a hand-written owner list.
 
-    entry = entry_for(service)
+    The declaration used to carry an ``owners`` tuple, and this test read it -- which
+    meant the answer came from the same table the claim was about.  The composition knows:
+    ``who_provides`` reports which plugin actually offered the name.
+    """
+    from test_registry_and_skill_plugins import _compose
 
-    assert any("plugin.py" in owner for owner in entry.owners), (
-        "the ledger's owners must name the plugin, or a reader is told the "
-        "composition still builds it"
-    )
+    components = _compose({}, monkeypatch, tmp_path)
+    try:
+        catalog = components["plugin_catalog"]
+        provider = catalog.who_provides(service)
+        assert provider, f"nothing provided {service}"
+        assert "plugin" in provider or provider == service, (
+            f"{service} is provided by {provider!r}; if the composition root builds it, a "
+            f"reader is told it is replaceable when it is not"
+        )
+    finally:
+        components["plugin_catalog"].close()

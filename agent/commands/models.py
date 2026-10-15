@@ -65,7 +65,7 @@ class CommandContext:
     reached by name, so a handler asks for a *service* rather than for a key in a
     mapping.  Both are kept because the mapping is the live object the runtime
     itself writes to, while the container is what makes a name replaceable -- see
-    ``agent/runtime/core_services.py``.  They cannot disagree: the registry adopts
+    ``agent/runtime/services.py``.  They cannot disagree: the registry adopts
     the mapping rather than copying it.
     """
 

@@ -120,7 +120,7 @@ def _component(context: CommandContext, name: str) -> Any:
     Was ``context.components.get(name)``: a lookup by string key, which worked and
     named nothing.  A command that wants a different ``skill_catalog`` has no name
     to install one under until the name is a service -- see
-    ``agent/runtime/core_services.py``.
+    ``agent/runtime/services.py``.
 
     Still forgiving: twelve call sites branch on a falsy result, so an absent
     service returns ``None`` here rather than raising.  The container is what makes
@@ -164,7 +164,7 @@ def _session_agent(context: CommandContext) -> Any:
     # ``_components.values`` mapping: reaching into the mapping worked and made
     # ``agent`` an unnamed key again, which is what this whole migration is
     # removing.  ``agent`` is not in CORE_SERVICES yet -- see the note in
-    # agent/runtime/core_services.py for why it is read this way.
+    # agent/runtime/services.py for why it is read this way.
     components = getattr(core, "_components", None)
     if components is None:
         return None

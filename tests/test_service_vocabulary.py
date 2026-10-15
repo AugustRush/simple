@@ -3,9 +3,9 @@
 Two questions a closed vocabulary has to answer, and the tests here answer them
 from the tree rather than from a list somebody maintains by hand:
 
-* a plugin that touches a name not in ``PUBLIC_SERVICES`` fails (the vocabulary is
+* a plugin that touches a name not in ``public_names()`` fails (the vocabulary is
   closed);
-* a name in ``PUBLIC_SERVICES`` that no plugin uses and none provides fails (the
+* a name in ``public_names()`` that no plugin uses and none provides fails (the
   vocabulary does not grow speculatively).
 
 Plus the two halves that make the policy real rather than decorative: reserved
@@ -22,12 +22,10 @@ import pytest
 
 from agent.kernel.plugin import PluginHost
 from agent.kernel.service import ReservedServiceError
-from agent.runtime.service_vocabulary import (
-    FOR_THIRD_PARTIES,
-    PUBLIC_SERVICES,
-    RESERVED_COMPONENT_KEYS,
-    RESERVED_REASONS,
+from agent.runtime.services import (
     plugin_service_policy,
+    public_names,
+    reserved_reasons,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -167,42 +165,34 @@ def test_every_name_a_plugin_touches_is_in_the_vocabulary() -> None:
     undeclared: list[str] = []
     for path, groups in sorted(_plugin_modules().items()):
         for name in sorted(groups["declared"] | groups["read"] | groups["provided"]):
-            if name not in PUBLIC_SERVICES:
+            if name not in public_names():
                 undeclared.append(f"{path}: {name}")
     assert not undeclared, (
         "these plugins touch names that are not in the plugin vocabulary. Either the "
-        "name belongs to the composition (add it to RESERVED_REASONS with the reason "
+        "name belongs to the composition (add it to reserved_reasons() with the reason "
         "and stop reading it), or it is a service a plugin may use (add it to "
-        "PUBLIC_SERVICES):\n  " + "\n  ".join(undeclared)
+        "public_names()):\n  " + "\n  ".join(undeclared)
     )
 
 
-def test_the_vocabulary_has_no_unused_names() -> None:
-    """The other direction: no speculative entries.
+def test_the_vocabulary_has_no_waived_entries() -> None:
+    """The other direction: no speculative entries, and no waivers either.
 
-    A name published to plugins is a promise that it will keep working, so it has to
-    be one somebody uses.  The two documented third-party entries are the exception
-    and they carry a reason.
+    A name published to plugins is a promise that it will keep working, so it has to be
+    one somebody uses or provides.  There used to be a ``FOR_THIRD_PARTIES`` map for names
+    published for a third party while nothing here used them -- ``commands`` and
+    ``agents``, whose only in-tree contributor was the loader writing to the *raw*
+    registry.  That path is gone, so the waiver is gone with it, and "published but
+    unused" is simply a failure.
     """
-    unused = sorted(PUBLIC_SERVICES - _used() - set(FOR_THIRD_PARTIES))
+    unused = sorted(public_names() - _used())
     assert not unused, (
-        "these names are published to plugins but no plugin uses or provides them: "
-        f"{unused}. Remove them, or add them to FOR_THIRD_PARTIES with a reason."
+        f"these names are published to plugins but nothing uses or provides them: {unused}"
     )
-
-
-def test_the_third_party_entries_say_why_they_are_unused() -> None:
-    stale = sorted(name for name in FOR_THIRD_PARTIES if name in _used())
-    assert not stale, (
-        f"these now have an in-tree user, so remove them from FOR_THIRD_PARTIES: {stale}"
-    )
-    for name, reason in FOR_THIRD_PARTIES.items():
-        assert len(reason) > 80, f"{name}: the reason is too short to be one"
-        assert name in PUBLIC_SERVICES
 
 
 def test_the_two_vocabularies_are_disjoint() -> None:
-    overlap = sorted(PUBLIC_SERVICES & RESERVED_COMPONENT_KEYS)
+    overlap = sorted(public_names() & set(reserved_reasons()))
     assert not overlap, (
         f"a name cannot be both a plugin service and composition-internal: {overlap}"
     )
@@ -219,7 +209,7 @@ def test_a_reserved_name_is_a_real_component_key() -> None:
         for path in (REPO_ROOT / "agent").rglob("*.py")
         if "__pycache__" not in str(path)
     )
-    missing = sorted(name for name in RESERVED_REASONS if f'"{name}"' not in sources)
+    missing = sorted(name for name in reserved_reasons() if f'"{name}"' not in sources)
     assert not missing, (
         f"these are reserved with a reason but appear nowhere in agent/: {missing}"
     )
@@ -310,9 +300,9 @@ def test_the_reserved_error_is_not_a_missing_service() -> None:
     assert "reserved" in str(error) and error.name == "mcp_task"
 
 
-@pytest.mark.parametrize("name", sorted(RESERVED_REASONS))
+@pytest.mark.parametrize("name", sorted(reserved_reasons()))
 def test_every_reserved_reason_is_usable_prose(name: str) -> None:
-    assert len(RESERVED_REASONS[name]) > 20, f"{name}: say why, not just what"
+    assert len(reserved_reasons()[name]) > 20, f"{name}: say why, not just what"
 
 
 # ── The two documented third-party views actually work ───────────────────────

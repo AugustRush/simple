@@ -19,11 +19,13 @@ from pathlib import Path
 
 import pytest
 
-from agent.runtime.core_services import (
-    CORE_SERVICES,
-    CoreService,
-    core_service_names,
+from agent.runtime.services import (
+    CONTRACTED_SERVICES,
+    SERVICES,
+    ServiceDeclaration,
     entry_for,
+    public_names,
+    reserved_reasons,
 )
 from agent.runtime.contracts import RuntimeComponents
 from agent.kernel.service import MissingServiceError
@@ -43,9 +45,17 @@ def _provider_dicts(tree: ast.AST) -> set[int]:
     found: set[int] = set()
 
     def component_target(node: ast.AST) -> bool:
-        if isinstance(node, ast.Attribute):
-            return node.attr.strip("_") == "components"
-        return isinstance(node, ast.Name) and node.id.strip("_") == "components"
+        """A name that *is* a component mapping, however it is spelled.
+
+        ``components`` was the only spelling this accepted, which made the scanner blind
+        to ``_partial_components`` -- the mapping the composition builds and hands over,
+        and the place most of the values plugins read are written.  Measured: eleven
+        declared names were reported as written by nothing until this was widened.
+        """
+        name = node.attr if isinstance(node, ast.Attribute) else (
+            node.id if isinstance(node, ast.Name) else ""
+        )
+        return name.strip("_").endswith("components")
 
     def call_name(node: ast.Call) -> str:
         func = node.func
@@ -60,6 +70,12 @@ def _provider_dicts(tree: ast.AST) -> set[int]:
             if isinstance(node.value, ast.Dict) and any(
                 component_target(target) for target in node.targets
             ):
+                found.add(id(node.value))
+        elif isinstance(node, ast.AnnAssign):
+            # ``_partial_components: dict = {...}`` -- an annotation makes this an
+            # ``AnnAssign``, and the scanner looked only at ``Assign``, so the whole
+            # literal was invisible.  Same mapping, same keys, different node type.
+            if isinstance(node.value, ast.Dict) and component_target(node.target):
                 found.add(id(node.value))
         elif isinstance(node, ast.Call) and call_name(node) in {"update", "dict", "provide"}:
             for argument in node.args:
@@ -103,13 +119,25 @@ def _is_config_receiver(node: ast.AST) -> bool:
 
 
 def _string_key(node: ast.Call | ast.Subscript) -> str | None:
-    """The literal string key of a ``.get("k")`` / ``["k"]`` expression."""
+    """The literal string key of a ``.get("k")`` / ``["k"]`` expression.
+
+    Also resolves ``bus_name("tool")`` to ``"event_bus.tool"``: the composition writes its
+    buses under a **computed** key (``_partial_components[bus_name(domain)] = bus``), so a
+    scanner that read only the literal could not see them written at all -- and the
+    declaration was right while the scan said otherwise.
+    """
     if isinstance(node, ast.Call):
         if not node.args:
             return None
         first = node.args[0]
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
             return first.value
+        if (
+            isinstance(first, ast.Constant)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "bus_name"
+        ):
+            return f"event_bus.{first.value}"
         return None
     slice_node = node.slice
     if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
@@ -206,7 +234,7 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
 
     A read is any ``.get`` or subscript with the name as a literal key.
     """
-    names = set(core_service_names())
+    names = {entry.name for entry in SERVICES}
     writers: dict[str, set[str]] = {}
     readers: dict[str, set[str]] = {}
     #: Dict literals that *declare* which plugin provides a service rather than
@@ -358,30 +386,44 @@ def _is_assignment_target(tree: ast.AST) -> set[int]:
 # ── The ledger is well formed ────────────────────────────────────────────────
 
 
-def test_every_entry_has_a_name_owners_and_summary() -> None:
-    for entry in CORE_SERVICES:
+def test_every_entry_declares_its_state() -> None:
+    """Each entry says the three things the source cannot: state, summary, reason.
+
+    ``owners`` and ``consumers`` used to be here too, and they were the problem: both are
+    derivable from the source, so declaring them made this table a hand-maintained mirror
+    that only a 1900-line scanner could keep honest.  What a declaration must carry is what
+    the code cannot say -- whether a plugin may touch the name, what it is for, and why the
+    composition keeps the ones it keeps.
+    """
+    for entry in SERVICES:
         assert entry.name.strip()
-        assert entry.owners, f"{entry.name}: a service nothing writes is not one"
-        for owner in entry.owners:
-            assert owner.startswith("agent/"), f"{entry.name}: owner must be a module"
-        assert entry.summary.strip(), f"{entry.name}: a service with no purpose untold"
+        assert (entry.summary or entry.reason).strip(), (
+            f"{entry.name}: a name with neither a purpose nor a reason"
+        )
+        if not entry.plugin_visible:
+            assert entry.reason.strip(), (
+                f"{entry.name}: reserved without a reason is indistinguishable from "
+                f"forgotten"
+            )
 
 
 def test_no_name_is_declared_twice() -> None:
-    names = core_service_names()
+    names = [entry.name for entry in SERVICES]
     assert len(names) == len(set(names))
 
 
-def test_every_entry_has_a_consumer() -> None:
-    """A declared service nothing reads is vocabulary that should be deleted."""
-    for entry in CORE_SERVICES:
-        assert entry.consumers, f"{entry.name!r} is declared but nothing reads it"
+def test_the_two_states_are_disjoint_and_total() -> None:
+    """Every name is either a plugin's to touch or explicitly not.  No third thing."""
+    public = public_names()
+    reserved = set(reserved_reasons())
+    assert not (public & reserved)
+    assert public | reserved == {entry.name for entry in SERVICES}
 
 
 def test_lookup_of_an_undeclared_name_raises() -> None:
     with pytest.raises(KeyError) as caught:
         entry_for("not_a_service")
-    assert "CORE_SERVICES" in str(caught.value), "it says where to add it"
+    assert "SERVICES" in str(caught.value), "it says where to add it"
 
 
 def test_lookup_of_a_declared_name_returns_it() -> None:
@@ -424,71 +466,74 @@ def test_providing_through_the_container_reaches_the_mapping() -> None:
 # ── The ledger agrees with the source ────────────────────────────────────────
 
 
-def test_every_declared_owner_really_writes_the_service() -> None:
-    """A wrong owner is worse than none: it reports a service as filled.
+#: Declared names no scanner can see written, each with the reason.  Two shapes, and
+#: neither is "we did not get round to it":
+#:
+#: * a key computed at runtime (the composition's buses are written under
+#:   ``bus_name(domain)`` for domains it reads from ``default_buses()``, so the literal
+#:   never appears in the source);
+#: * an extension point published for replacement with a built-in fallback -- which is
+#:   why nothing in this tree provides it, and why the name is still read.
+_UNWRITTEN_BY_DESIGN: dict[str, str] = {
+    "event_bus.tool": "written under a computed key: `bus_name(domain)` in bootstrap",
+    "event_bus.turn": "written under a computed key: `bus_name(domain)` in bootstrap",
+    "event_bus.session": "written under a computed key: `bus_name(domain)` in bootstrap",
+    "event_bus.llm": "written under a computed key: `bus_name(domain)` in bootstrap",
+    "post_turn_maintenance": (
+        "a published extension point with a built-in fallback "
+        "(`contracts.py` falls back to `BaseAgent._post_turn_maintenance`), so nothing in "
+        "this tree provides it -- and the read is what makes it replaceable"
+    ),
+}
 
-    Both directions are checked.  A claimed owner that does not write would make
-    the escape hatch look supported where it is not; an **unlisted** writer is the
-    scattered-construction debt itself -- a service whose value depends on who ran
-    last, which is exactly what makes it unsafely replaceable.
+
+def test_the_unwritten_allowance_is_not_stale() -> None:
+    """An allowance for something now written is a lie about the current state."""
+    writers, _ = _scan()
+    stale = sorted(name for name in _UNWRITTEN_BY_DESIGN if writers.get(name))
+    assert not stale, f"these are written now; drop them from _UNWRITTEN_BY_DESIGN: {stale}"
+    for name, reason in _UNWRITTEN_BY_DESIGN.items():
+        assert name in {entry.name for entry in SERVICES}, f"{name} is not declared"
+        assert len(reason) > 40, f"{name}: say why, not just that"
+
+
+def test_every_declared_name_is_written_by_someone() -> None:
+    """A name nothing writes is not a service; it is a hope.
+
+    This *replaces* a pair of assertions that compared the table's ``owners`` and
+    ``consumers`` lists with the scan in both directions.  Those existed to keep a mirror
+    honest; with the mirror gone, the scan is the truth and the question is the one that
+    actually matters -- is this name a thing that exists?  (The other direction, "is every
+    write declared", is :func:`test_every_source_use_is_declared`.)
     """
     writers, _readers = _scan()
-    wrong: list[str] = []
-    for entry in CORE_SERVICES:
-        actual = writers.get(entry.name, set())
-        if not actual:
-            wrong.append(f"{entry.name}: nothing was found writing it")
-            continue
-        for claimed in entry.owners:
-            if claimed not in actual:
-                wrong.append(f"{entry.name}: {claimed} does not write it")
-        for found in sorted(actual):
-            if found not in entry.owners:
-                wrong.append(
-                    f"{entry.name}: {found} writes it but is not listed as an owner"
-                )
-    assert not wrong, "the ledger and the source disagree:\n  " + "\n  ".join(wrong)
+    unwritten = sorted(
+        entry.name
+        for entry in SERVICES
+        if not writers.get(entry.name) and entry.name not in _UNWRITTEN_BY_DESIGN
+    )
+    assert not unwritten, (
+        "declared but nothing writes it:\n  " + "\n  ".join(unwritten)
+    )
 
 
-def test_every_declared_consumer_really_reads_the_service() -> None:
-    _writers, readers = _scan()
-    wrong: list[str] = []
-    for entry in CORE_SERVICES:
-        actual = readers.get(entry.name, set())
-        for claimed in entry.consumers:
-            if claimed not in actual:
-                wrong.append(f"{entry.name}: {claimed} does not read it")
-    assert not wrong, "the ledger and the source disagree:\n  " + "\n  ".join(wrong)
+def test_every_source_use_is_declared() -> None:
+    """The direction that matters, and the one a mirror kept failing at.
 
-
-def test_every_reader_of_a_service_is_declared() -> None:
-    """The direction that was missing, and the one that matters.
-
-    The guard above checks declared -> actual: every file the ledger names really does read
-    the service.  Nothing checked actual -> declared, so **a reader nobody listed was
-    invisible**.  Measured when this was added: 22 reader/file pairs across 7 services, every
-    one of them a plugin added by this refactor.
-
-    That matters because the ledger's stated purpose is to enumerate *every read point* before
-    anything is deleted.  A ledger that misses readers is not incomplete bookkeeping -- it is a
-    false negative, and this session's notes say plainly what those do: "a check with false
-    negatives is worse than no check when it gates a deletion: it does not merely miss a
-    problem, it *authorises* one."
+    Reads *and* writes: a name the source touches and the table does not declare is an
+    undeclared service, and the whole point of the table is that there are none.  Both
+    directions were previously spread across four assertions whose only job was to compare
+    the table against this scan; now the scan simply is the answer.
     """
-    _, readers = _scan()
-    ledger = {entry.name: entry for entry in CORE_SERVICES}
-
-    undeclared = []
-    for name, files in sorted(readers.items()):
-        entry = ledger.get(name)
-        if entry is None:
-            undeclared.append(f"{name}: no ledger entry, read by {sorted(files)}")
-            continue
-        for path in sorted(files - set(entry.consumers)):
-            undeclared.append(f"{name}: {path} reads it but is not a declared consumer")
-
+    writers, readers = _scan()
+    undeclared: list[str] = []
+    for bucket, label in ((writers, "writes"), (readers, "reads")):
+        for name, files in sorted(bucket.items()):
+            if name not in {entry.name for entry in SERVICES}:
+                undeclared.append(f"{name}: not declared, {label} by {sorted(files)}")
     assert not undeclared, (
-        "the ledger under-reports its readers:\n  " + "\n  ".join(undeclared)
+        "the source uses names the declaration does not have:\n  "
+        + "\n  ".join(undeclared)
     )
 
 
@@ -623,31 +668,23 @@ def test_the_scan_detects_the_shared_resolve_helper() -> None:
 # ── The vocabulary is closed ─────────────────────────────────────────────────
 
 
-def test_declared_names_match_the_documented_set() -> None:
-    """The names the vocabulary covers, so an accidental removal is caught.
+def test_the_declaration_covers_every_name_the_source_uses() -> None:
+    """Replaces a hand-typed list of the fifteen names.
 
-    ``ltm_store`` joined when the memory contracts were written down: it was
-    already a service (``agent/memory/plugin.py`` provides it, the session plugin
-    and the composition root resolve it) and being *undeclared* was the reason it
-    had no written interface to replace.
+    That list existed because the ledger was a mirror and nothing else would notice an
+    entry being deleted: removing one from ``core_services.py`` *and* from the literal kept
+    every assertion green.  The scan closes that for good -- a name the source uses and the
+    table does not have is now a failure in its own right
+    (:func:`test_every_source_use_is_declared`) -- so a second copy of the names would be
+    one more thing to keep in step, which is what this whole change is undoing.
     """
-    assert set(core_service_names()) == {
-        "agent",
-        "agent_core",
-        "agents",
-        "channels",
-        "commands",
-        "context_manager",
-        "contributed_mcp_servers",
-        "ltm_store",
-        "mcp_client",
-        "memory",
-        "plugin_catalog",
-        "registry",
-        "skill_catalog",
-        "agent_loop",
-        "llm",
-    }
+    writers, readers = _scan()
+    used = set(writers) | set(readers)
+    declared = {entry.name for entry in SERVICES}
+    assert used <= declared, f"undeclared: {sorted(used - declared)}"
+    assert len(declared) > 15, (
+        "the declaration should cover the names plugins read, not only the contracted ones"
+    )
 
 
 def test_the_declared_contracts_exist() -> None:
@@ -658,7 +695,7 @@ def test_the_declared_contracts_exist() -> None:
     contract module to check one name would make this test depend on the import
     graph it is supposed to describe.
     """
-    for entry in CORE_SERVICES:
+    for entry in SERVICES:
         if not entry.contract:
             continue
         relative, _, symbol = entry.contract.partition(":")
@@ -681,7 +718,7 @@ def test_the_declared_contracts_exist() -> None:
 
 def test_an_entry_is_frozen() -> None:
     with pytest.raises(Exception):
-        CORE_SERVICES[0].name = "other"  # type: ignore[misc]
+        SERVICES[0].name = "other"  # type: ignore[misc]
 
 
 def test_a_service_can_be_replaced_through_the_container() -> None:
@@ -706,12 +743,12 @@ def test_a_service_can_be_replaced_through_the_container() -> None:
     )
 
 
-def test_a_core_service_entry_is_not_blank() -> None:
-    """Control for the dataclass itself."""
-    entry = CoreService(
-        name="x", owners=("agent/x.py",), consumers=("agent/y.py",), summary="s"
-    )
+def test_a_declaration_entry_is_not_blank() -> None:
+    """Control for the dataclass itself, including the rule that reserved needs a why."""
+    entry = ServiceDeclaration(name="x", plugin_visible=True, summary="s")
     assert entry.name == "x"
+    with pytest.raises(ValueError):
+        ServiceDeclaration(name="y", plugin_visible=False)  # reserved, no reason
 
 
 # ── Clause (d): the mapping must not be the only channel ─────────────────────
@@ -758,7 +795,12 @@ def _raw_mapping_service_reads() -> dict[str, list[str]]:
     reads *and* raw ones.  This one counts only the raw ones, which is what clause
     (d) is about: a service reachable only through a mapping is not declared.
     """
-    names = set(core_service_names())
+    # **Contracted** services only.  The clause is "a service reachable only through a
+    # mapping is not declared" -- a claim about names with an interface.  A *value* like
+    # `cfg` or `workspace_root` has no container method promised for it, and the mapping
+    # is the channel: the composition computed it and handed it over.  Widening this to
+    # every declared name turned four files into offenders for reading their own config.
+    names = {entry.name for entry in CONTRACTED_SERVICES}
     found: dict[str, list[str]] = {}
     for path in sorted(AGENT_ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -799,7 +841,7 @@ def test_no_undeclared_file_reads_a_service_from_the_raw_mapping() -> None:
 
     Every consumer either resolves through a container or appears in a list here
     with a reason someone wrote.  A new raw read is the failure this catches --
-    it silently re-creates the unnamed string key that ``CORE_SERVICES`` exists to
+    it silently re-creates the unnamed string key that ``SERVICES`` exists to
     replace, and no functional test can see the difference.
     """
     raw = _raw_mapping_service_reads()
@@ -848,22 +890,19 @@ def test_every_allowlisted_file_still_needs_its_exemption() -> None:
 
 
 def test_the_vocabulary_covers_agent_itself() -> None:
-    """``agent`` is the most fundamental service and was missing from the ledger.
+    """``agent`` is the most fundamental service, and it is declared and plugin-visible.
 
-    Found while checking an unrelated read: ``getattr(core, "_components",
-    None)`` reaching for ``"agent"`` on a *different* object's mapping.  A service
-    read that widely cannot be absent from the vocabulary that is supposed to
-    enumerate every read point.
+    This used to assert the entry's ``owners`` and ``consumers`` -- a mirror of the
+    source.  What matters is that the name is a plugin's to read and to replace, and that
+    the *scan* sees who writes it: the construction moved into ``AgentPlugin``, so
+    ``bootstrap`` became a consumer, which is the shape this refactor is for.
     """
-    names = set(core_service_names())
-    assert "agent" in names
-    entry = entry_for("agent")
-    # The construction moved into `AgentPlugin`, so the owner moved with it -- and
-    # `bootstrap` became a *consumer*, which is the shape this whole refactor is for: the
-    # composition resolves the agent rather than assembling it.
-    assert entry.owners == ("agent/core/agent_plugin.py", "agent/bootstrap.py")
-    assert "agent/commands/builtin.py" in entry.consumers
-    assert "agent/commands/builtin.py" in entry.consumers
+    assert "agent" in public_names()
+    assert entry_for("agent").contract == "agent/core/protocols.py:AgentService"
+
+    writers, readers = _scan()
+    assert "agent/core/agent_plugin.py" in writers["agent"]
+    assert "agent/commands/builtin.py" in readers["agent"]
 
 
 def test_the_scan_detects_a_provide_call_as_a_write() -> None:
@@ -1862,40 +1901,33 @@ def test_the_agent_is_given_only_the_names_it_looks_up() -> None:
         )
 
 
-def test_the_service_primitive_has_exactly_one_import_path() -> None:
-    """The re-export was kept "only while the callers are migrated"; the migration is done.
+def test_the_declaration_has_exactly_one_import_path() -> None:
+    """One module, and the two it replaced are gone.
 
-    `agent/runtime/services.py` existed to make the move verifiable as behaviour-preserving
-    -- a suite that stayed green across it distinguishes "I broke the registry" from "I
-    moved it" -- and it said in its own docstring that it would be deleted once nothing
-    imported it.  Eighteen modules imported it, so "nothing" was a long way off; all of them
-    now import the kernel directly.
-
-    Asserted structurally, because the failure mode is a *new* file reaching for the old
-    path out of habit, and an import that resolves is not an error anybody notices.
+    ``core_services.py`` and ``service_vocabulary.py`` were two overlapping declarations
+    of the same thing.  This asserts nobody re-creates either -- an import that resolves
+    is not an error anybody notices, and a stale declaration that resolves is how the two
+    drifted apart in the first place.
     """
-    import pathlib
+    for relative in (
+        "agent/runtime/core_services.py",
+        "agent/runtime/service_vocabulary.py",
+    ):
+        assert not (REPO_ROOT / relative).exists(), f"{relative} is back"
 
-    root = pathlib.Path(__file__).resolve().parents[1]
-    assert not (root / "agent/runtime/services.py").exists(), (
-        "the re-export is gone; nothing should recreate it"
-    )
-
-    # Parsed, not searched for a substring: the first version of this matched its own
-    # source, because the assertion text names the module it is checking for.  A scan that
-    # cannot tell a mention from an import is the kind of guard that reports itself.
-    offenders = []
-    for path in list((root / "agent").rglob("*.py")) + list((root / "tests").rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8", errors="ignore"))):
-            modules: list[str] = []
+    offenders: list[str] = []
+    for path in list(AGENT_ROOT.rglob("*.py")) + list((REPO_ROOT / "tests").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        for node in ast.walk(tree):
+            module = ""
             if isinstance(node, ast.ImportFrom) and node.module:
-                modules.append(node.module)
+                module = node.module
             elif isinstance(node, ast.Import):
-                modules.extend(alias.name for alias in node.names)
-            if any(
-                module == "agent.runtime.services"
-                or module.startswith("agent.runtime.services.")
-                for module in modules
-            ):
-                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
-    assert not offenders, f"these still import the removed re-export: {offenders}"
+                module = ",".join(alias.name for alias in node.names)
+            if "runtime.core_services" in module or "runtime.service_vocabulary" in module:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno} {module}")
+    assert not offenders, (
+        "import the declaration from agent.runtime.services:\n  " + "\n  ".join(offenders)
+    )

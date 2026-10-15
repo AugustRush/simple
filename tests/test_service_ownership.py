@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.runtime.core_services import CORE_SERVICES
+from agent.runtime.services import CONTRACTED_SERVICES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_ROOT = REPO_ROOT / "agent"
@@ -108,10 +108,10 @@ def test_the_scan_finds_the_plugin_providers() -> None:
 def test_every_service_is_plugin_provided_or_waived() -> None:
     providers = _plugin_providers()
     plugin_provided = sorted(name for name in providers if name in {
-        entry.name for entry in CORE_SERVICES
+        entry.name for entry in CONTRACTED_SERVICES
     })
     root_assembled = sorted(
-        entry.name for entry in CORE_SERVICES if entry.name not in plugin_provided
+        entry.name for entry in CONTRACTED_SERVICES if entry.name not in plugin_provided
     )
 
     unwaived = sorted(
@@ -120,7 +120,7 @@ def test_every_service_is_plugin_provided_or_waived() -> None:
         if name not in ROOT_ASSEMBLED and name not in FLOORS
     )
     assert not unwaived, (
-        f"{len(plugin_provided)} of {len(CORE_SERVICES)} services are provided by a "
+        f"{len(plugin_provided)} of {len(CONTRACTED_SERVICES)} services are provided by a "
         f"plugin ({', '.join(plugin_provided)}). These are assembled by the "
         f"composition root with no recorded reason:\n  "
         + "\n  ".join(unwaived)
@@ -142,7 +142,7 @@ def test_the_waiver_list_has_no_stale_entries() -> None:
     unknown = sorted(
         name
         for name in list(ROOT_ASSEMBLED) + list(FLOORS)
-        if name not in {entry.name for entry in CORE_SERVICES}
+        if name not in {entry.name for entry in CONTRACTED_SERVICES}
     )
     assert not unknown, f"waived but not a declared service: {unknown}"
 
