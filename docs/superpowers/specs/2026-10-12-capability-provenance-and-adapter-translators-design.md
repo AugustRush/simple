@@ -62,11 +62,21 @@ class Execution:
     payload: dict          # command, args, env — exactly what would run
 ```
 
-* `ServiceRegistry.provide(name, value, *, replace=False, provenance=None)` — the
+* ~~`ServiceRegistry.provide(name, value, *, replace=False, provenance=None)` — the
   registration becomes the place the answer lives, because that is the moment a
-  capability enters the composition.
-* `ctx.provide(...)` passes it through, and the *scope* records it, so unwinding
-  a plugin also unwinds its provenance.
+  capability enters the composition.~~ **Corrected, and not taken** (2026-10-15).  The
+  registration is the right *moment* but the wrong *place*: at `provide` time the kernel
+  already knows the declaring plugin (`Context.name` is `install.name`) and the loader
+  already knows the source and kind, so a `provenance=` argument at each of the thirty
+  call sites would be a hand-maintained mirror of one record per plugin — the same defect
+  the service ledger was cured of the same day.  What shipped is a `Provenance` **per
+  plugin**, recorded where the facts are (discovery, and the composition for the plugins
+  it mounts), with the capability half **derived**: `who_provides(name)` → plugin →
+  provenance.  See `agent/runtime/provenance.py` and `tests/test_provenance.py`.
+* The scope still owns the lifetime, but it does so through the plugin record rather than
+  through a per-capability copy: unloading a plugin takes its provenance with it, and a
+  child a plugin loads itself inherits its parent's origin with `declared_by` naming the
+  parent.
 * A durable ledger (a small SQLite table next to the other agent state, or a JSONL
   under the home) records `(provenance.digest, execution.kind) → approved_at,
   approved_by, prompt_shown`. `plugin_approval.py`'s in-process map stays for the
@@ -97,9 +107,15 @@ string that was typed.
 
 ### Migration order (each step testable on its own)
 
-1. `Provenance` + `Execution` + `provide(provenance=...)`; core plugins pass
+1. ~~`Provenance` + `Execution` + `provide(provenance=...)`; core plugins pass
    `kind="core"`, everything else `kind="plugin"`. Behaviour unchanged; a test
-   asserts every `provide` site passes one (a source scan, like the ledger's).
+   asserts every `provide` site passes one (a source scan, like the ledger's).~~
+   **Done, corrected** (2026-10-15): `Provenance`/`Execution` exist, provenance is recorded
+   **per plugin** and derived for capabilities, and the guard is stronger than a source
+   scan — it asks the *composition* whether every name it holds can say where it came from
+   (`tests/test_provenance.py::test_no_capability_in_the_real_composition_is_anonymous`),
+   which a scan of thirty call sites could not have told us.  `digest` is deliberately still
+   empty: a digest nothing compares against is a decoration, and it needs step 3's ledger.
 2. `CapabilityReport` from a plugin directory, built on the adapters' markers;
    the installer renders it. `_plugin_executable_content`'s current strings become
    *one* renderer, so the existing installer tests must stay green unchanged.

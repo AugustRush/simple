@@ -38,7 +38,7 @@ class PluginCatalogService(Protocol):
     """The plugin loader a composition provides as ``plugin_catalog``."""
 
     # -- mounting -----------------------------------------------------------
-    def mount(self, plugin: Any) -> Any:
+    def mount(self, plugin: Any, *, provenance: Any = None) -> Any:
         """Mount a plugin the catalog did not discover; returns its install."""
 
     def discover_and_load(self) -> "list[str]":

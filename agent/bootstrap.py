@@ -41,6 +41,7 @@ from contextlib import contextmanager
 
 from agent.runtime.factory import RuntimeFactory
 from agent.runtime.service_contracts import validator_for, violations
+from agent.runtime.provenance import CORE, Provenance
 from agent.runtime.services import plugin_service_policy
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import (
@@ -166,7 +167,10 @@ def memory_service(cfg: dict):
             replacements=catalog.service_replacements(),
         ):
             if wanted.intersection(entry.provides):
-                catalog.mount(entry.build(CoreContext()))
+                catalog.mount(
+                    entry.build(CoreContext()),
+                    provenance=Provenance(source=f"core:{entry.name}", kind=CORE),
+                )
         yield require_service(catalog._host.services, "memory")
     finally:
         catalog.close()
@@ -744,7 +748,8 @@ async def _build_components_async(
                     agent_class=BaseAgent,
                     tools_class=builtin_tools_cls,
                 )
-            )
+            ),
+            provenance=Provenance(source=f"core:{_core_plugin.name}", kind=CORE),
         )
     # The registry and the skill catalog are provided by plugins now (``registry``,
     # ``skill_catalog``, declared first for a reader; the kernel pends their

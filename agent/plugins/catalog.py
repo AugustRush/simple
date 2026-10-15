@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, replace, field
 import importlib.util
 import json
 import os
@@ -24,6 +25,7 @@ from agent.kernel.plugin import PluginHost
 from agent.plugins import formats as plugin_formats
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
+from agent.runtime.provenance import CORE, PLUGIN, Provenance
 from agent.plugins.reload import ReloadTransaction
 
 CONSOLE = shared.CONSOLE
@@ -1257,6 +1259,13 @@ class PluginCatalog:
         # plugin_name → source directory entry name (the directory under
         # USER_PLUGINS_DIR or PLUGINS_DIR that this plugin was loaded from).
         self._plugin_source_dirs: dict[str, str] = {}
+        #: Per **plugin**, not per capability: where each discovered plugin came from.
+        #: The design that asked for this proposed passing ``provenance=`` at every
+        #: ``provide`` site; the kernel already knows the declaring plugin there
+        #: (``Context.name`` is ``install.name``) and the loader already knows the source,
+        #: so thirty hand-written copies would be a mirror of this one record -- the
+        #: defect the service ledger was cured of.  ``provenance_of`` derives.
+        self._provenance: dict[str, Provenance] = {}
         # Agent definitions discovered from <plugin>/agents/*.md.
         # Key format: "plugin:<plugin>:<agent>".  Value: dict with keys
         # ``name``, ``description``, ``body``, ``plugin``, ``path``.
@@ -1427,7 +1436,7 @@ class PluginCatalog:
             return self._services.get(name)  # raises MissingServiceError
         return self._services.get(name, default)
 
-    def mount(self, plugin: Any) -> Any:
+    def mount(self, plugin: Any, *, provenance: Provenance | None = None) -> Any:
         """Mount a plugin the catalog did not discover, and return its install.
 
         The composition root uses this for the services that are plugins but not
@@ -1435,8 +1444,18 @@ class PluginCatalog:
         rather than reaching into the host, because the host is the catalog's own --
         a caller that pokes ``_host`` breaks on any stand-in for this class, which is
         exactly what happened to a test double when the loop was first mounted.
+
+        *provenance* is optional, and the default is "nobody said" rather than a guess:
+        the composition passes it for the plugins it declares (they are ``core``), while a
+        caller mounting a bare object -- a test double, most often -- has not claimed any
+        origin, and inventing one would be the placeholder this step exists to remove.
         """
-        return self._host.load(plugin)
+        install = self._host.load(plugin)
+        if provenance is not None:
+            name = getattr(install, "name", "") or getattr(plugin, "name", "")
+            if name:
+                self._provenance[name] = provenance
+        return install
 
     @property
     def _installs(self) -> dict[str, Any]:
@@ -1486,6 +1505,7 @@ class PluginCatalog:
         self._commands.clear()
         self._agent_defs.clear()
         self._plugin_source_dirs.clear()
+        self._provenance.clear()
         # Auto-create user plugins directory
         if self._user_dir:
             self._user_dir.mkdir(parents=True, exist_ok=True)
@@ -1544,6 +1564,7 @@ class PluginCatalog:
         but the catalog.
         """
         self._plugin_source_dirs.pop(plugin_name, None)
+        self._provenance.pop(plugin_name, None)
         self._plugins.pop(plugin_name, None)
 
     def unload_plugin(self, plugin_name: str) -> dict:
@@ -1708,6 +1729,15 @@ class PluginCatalog:
         if source_dir_name:
             self._plugin_source_dirs[plugin_name] = source_dir_name
 
+        # Recorded where the facts are, which is here: the loader knows whether this came
+        # from the built-in tree or a directory a human created, and it has the directory.
+        # ``declared_by`` stays empty for a discovered plugin -- discovery loads roots --
+        # and :meth:`provenance` derives it for an install that a plugin loaded itself.
+        self._provenance[plugin_name] = Provenance(
+            source=f"core:{plugin_name}" if source == "builtin" else str(plugin_dir),
+            kind=CORE if source == "builtin" else PLUGIN,
+        )
+
         # The declarative assets and the plugin's own ``setup`` both run inside
         # the adapter's activation, so a plugin whose dependencies are unmet
         # registers *nothing* -- see ``_CatalogPlugin.setup``.  The host gates on
@@ -1760,6 +1790,74 @@ class PluginCatalog:
     def service_replacements(self) -> dict[str, str]:
         """Service name -> the plugin the profile says provides it instead."""
         return dict(self._plugin_profile.service_replacements)
+
+    def provenance(self, plugin_name: str) -> Provenance | None:
+        """Where *plugin_name* came from, or ``None`` if it is not in the tree.
+
+        ``None`` rather than an invented record: a plugin nobody discovered has no
+        provenance, and a placeholder ("unknown") would be indistinguishable from a plugin
+        whose origin genuinely is unknown -- which is the state this whole step exists to
+        make impossible.
+
+        An install a plugin loaded itself (``ctx.plugin(Child())``) has no record of its
+        own -- it never came from a directory -- so it **inherits**: the code is the
+        parent's, declared by the parent.  That is a derivation, not a guess: the parent
+        link is what the kernel recorded when it loaded it.
+        """
+        record = self._provenance.get(plugin_name)
+        if record is not None:
+            return record
+        install = self._installs.get(plugin_name)
+        parent = getattr(install, "parent", None) if install is not None else None
+        if not parent:
+            return None
+        inherited = self.provenance(parent)
+        if inherited is None:
+            return None
+        return replace(inherited, declared_by=parent)
+
+    def provenance_of(self, service: str) -> Provenance | None:
+        """Where the plugin that **provides** *service* came from.
+
+        The derived half of the invariant: a capability does not carry its own provenance,
+        because the composition can say which plugin produced it and that plugin's
+        provenance is a record.  ``None`` when nothing provides the name, or when whatever
+        does cannot be placed.
+        """
+        provider = self.who_provides(service)
+        if provider:
+            found = self.provenance(provider)
+            if found is not None:
+                return found
+        # No plugin claims it, so the composition itself provides it -- the loader's own
+        # floors (``plugin_catalog``, ``commands``, the two registries) and the values the
+        # root hands over.  That is a real answer to "where did this come from", and a
+        # better one than the ``None`` that would be indistinguishable from "nobody knows".
+        # Ask through the same resolution the rest of this class uses, rather than poking
+        # the two storages directly: ``_core`` already knows that the container may be a
+        # ``RuntimeComponents`` wrapper or this catalog's own adopted registry, and a
+        # second implementation of "is this name here" is how the first version came back
+        # ``None`` for the loader's own floors -- ``RuntimeComponents`` is not a Mapping,
+        # so ``in`` is False for every name.
+        absent = object()
+        if self._core(service, absent) is not absent:
+            return Provenance(source=f"core:{service}", kind=CORE)
+        return None
+
+    def provenance_report(self) -> dict[str, Provenance]:
+        """Every plugin currently in the tree, with where it came from.
+
+        Over the **installs**, not over ``self._plugins``: that table is the discovered
+        tree, and a core plugin the composition mounts is a plugin with an install and no
+        adapter -- which is how the first version of this report listed one entry for a
+        composition of nine.
+        """
+        names = set(self._installs) | set(self._provenance)
+        return {
+            name: record
+            for name in sorted(names)
+            if (record := self.provenance(name)) is not None
+        }
 
     def who_provides(self, service: str) -> str | None:
         """The plugin whose ``setup`` provided *service*, or ``None``.

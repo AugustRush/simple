@@ -166,9 +166,15 @@ public / 24 reserved, 15 with contracts**.
 ## Backlog (recorded, not blocking)
 
 1. **Provenance / translators** -- designed in
-   [`2026-10-12-capability-provenance-and-adapter-translators-design.md`](../specs/2026-10-12-capability-provenance-and-adapter-translators-design.md),
-   not implemented.  It answers "where did this capability come from, and may it be
-   trusted", which is a *policy* layer above the plugin tree.
+   [`2026-10-12-capability-provenance-and-adapter-translators-design.md`](../specs/2026-10-12-capability-provenance-and-adapter-translators-design.md).
+   **Step 1 of 4 has shipped, in a corrected shape**: every plugin carries a `Provenance`
+   (`agent/runtime/provenance.py`) recorded where the facts are, and a capability's origin is
+   *derived* through `who_provides`, so the composition can now answer "where did this come
+   from" for every name it holds -- guarded by a test that asks the real composition.
+   Still missing: `Execution` (what it would run, from the format adapters), the `digest` +
+   durable approval ledger, and `import_dsh_profile` as the second producer.  Until those
+   exist the *trust* half is not met: a plugin in `~/.agent/plugins/` is still executed at
+   startup on the strength of being there.
 2. **The 4 remaining soft reads** (`tests/test_memory_contract.py`): the token budget's
    estimator reads (a designed fallback, not a hole), the web's session-service store
    (a decision about `SessionService`), and two name collisions the scan cannot tell

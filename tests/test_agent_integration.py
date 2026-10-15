@@ -378,9 +378,12 @@ user-invocable: true
             # `KeyError` naming a service nobody offered.
             self.components = kwargs.get("components")
 
-        def mount(self, plugin):
+        def mount(self, plugin, *, provenance=None):
             # The composition root mounts internal providers here; a stand-in that cannot
-            # run one is not a stand-in for the catalog any more.
+            # run one is not a stand-in for the catalog any more.  ``provenance`` is part
+            # of the port (``agent/plugins/protocols.py``) because the composition is what
+            # knows its own plugins are core; a stand-in that ignores it is fine, one that
+            # rejects it is not -- which is how this line came to exist.
             from agent.kernel.plugin import PluginHost
             from agent.kernel.service import ServiceRegistry
 
@@ -7821,7 +7824,9 @@ class _MountingCatalog:
         self.observed = observed if observed is not None else {}
         self.mounted: list = []
 
-    def mount(self, plugin):
+    def mount(self, plugin, *, provenance=None):
+        # ``provenance`` is part of the port (the composition passes it for the plugins it
+        # declares); this stand-in records the plugin and ignores the origin.
         self.mounted.append(plugin.name)
         self.components["scheduler"] = self.service
         # Nothing is written into the caller's dict: one test's counters live under a
