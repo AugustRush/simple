@@ -113,8 +113,68 @@ def with_first_param(text: str, name: str, param: str) -> str:
     """Put *param* first, whether or not the parameter list is otherwise empty."""
     op, i = param_span(text, name)
     rest = text[op + 1:i]
-    inner = param if not rest.strip(" \n,") else f"{param}, " + rest.lstrip("\n ")
+    if not rest.strip(" \n,"):
+        inner = param
+    elif rest.startswith("\n"):
+        inner = f"\n    {param}," + rest      # keep the author's one-parameter-per-line shape
+    else:
+        inner = f"{param}, " + rest
     return text[:op + 1] + inner + text[i:]
+
+
+def string_occupied_lines(text: str) -> set[int]:
+    """0-based indexes of every line a multi-line string literal occupies.
+
+    All of them matter: the opening line carries code indentation, the content lines are the
+    value, and the *closing* line's leading whitespace is also part of the value (the text
+    between the last newline and the terminator).  Dedenting a content line or a closing line
+    therefore edits the string.  For SQL that is invisible; for a docstring it silently rewrites
+    committed prose, and this is how that was found.
+    """
+    occupied: set[int] = set()
+    try:
+        tree = ast.parse(text)
+    except IndentationError:
+        try:                       # a fragment carries its block indentation
+            tree = ast.parse(textwrap.dedent(text))
+        except SyntaxError:
+            return occupied
+    except SyntaxError:
+        return occupied
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and node.end_lineno and node.end_lineno > node.lineno):
+            occupied |= set(range(node.lineno, node.end_lineno))
+    return occupied
+
+
+def dedent_outside_strings(text: str, width: int = 4, skip: frozenset[int] = frozenset()) -> str:
+    """Remove up to *width* leading spaces from each line, except string-occupied lines."""
+    protected = string_occupied_lines(text) | set(skip)
+    out = []
+    for index, line in enumerate(text.split("\n")):
+        if index in protected or not line.strip():
+            out.append(line)
+            continue
+        cut = 0
+        while cut < width and line[cut:cut + 1] == " ":
+            cut += 1
+        out.append(line[cut:])
+    return "\n".join(out)
+
+
+def dedent_uniform(text: str, width: int = 4) -> str:
+    """Remove up to *width* leading spaces from every non-blank line."""
+    out = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append(line)
+            continue
+        cut = 0
+        while cut < width and line[cut:cut + 1] == " ":
+            cut += 1
+        out.append(line[cut:])
+    return "\n".join(out)
 
 
 # ── closure ──────────────────────────────────────────────────────────────────
@@ -243,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         start = min([d.lineno for d in method.decorator_list] + [method.lineno]) - 1
         spans[method.name] = (start, method.end_lineno)
-        original = textwrap.dedent("".join(lines[start:method.end_lineno])).strip("\n")
+        original = dedent_outside_strings("".join(lines[start:method.end_lineno])).strip("\n")
         # Decorators are class-level concerns (`@staticmethod`, `@property`, `@contextmanager`,
         # a lock-carrying `@_synchronized`): they stay with the wrapper.  Only `@staticmethod`
         # and `@classmethod` used to be stripped here, which carried the others into the new
@@ -268,19 +328,25 @@ def main(argv: list[str] | None = None) -> int:
             # line: a fixed four-space cut also eats the statement that follows the block (which
             # sits at the same indent as `with`), pushing it to column 0 and out of the function.
             body_lines, base = [], None
-            for line in text.split("\n"):
+            lines_in = text.split("\n")
+            out_lines, index = [], 0
+            while index < len(lines_in):
+                line = lines_in[index]
                 if line.strip() == f"with self._connect() as {args.param}:":
                     base = len(line) - len(line.lstrip())
+                    index += 1
+                    block = []
+                    while index < len(lines_in) and (
+                        not lines_in[index].strip()
+                        or (len(lines_in[index]) - len(lines_in[index].lstrip())) > base
+                    ):
+                        block.append(lines_in[index])
+                        index += 1
+                    out_lines.extend(dedent_outside_strings("\n".join(block), 4).split("\n"))
                     continue
-                if base is not None:
-                    indent = len(line) - len(line.lstrip())
-                    if line.strip() and indent > base:
-                        body_lines.append(line[4:])
-                        continue
-                    if line.strip():
-                        base = None
-                body_lines.append(line)
-            text = "\n".join(body_lines)
+                out_lines.append(line)
+                index += 1
+            text = "\n".join(out_lines)
         for sibling in moving:
             if sibling == method.name:
                 continue
