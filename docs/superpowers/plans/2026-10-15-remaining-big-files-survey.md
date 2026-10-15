@@ -23,7 +23,7 @@ recording" below.
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 4086 | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
-| `agent/memory/store.py` | 2738 (was 2835) | `LTMStore` | 83 | 2489 | **13 / 228 lines** |
+| `agent/memory/store.py` | 2628 (was 2835) | `LTMStore` | 79 | 2377 | **9 / 212 lines** |
 | `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
 | `agent/memory/context.py` | 2098 (was 2484) | `ContextManager` | 72 | 1756 | **11 / 114 lines** |
 
@@ -155,11 +155,15 @@ surfaced, both worth recording:
   called `rows` is shadowed by the first of them, which turned six mappers into attribute
   lookups on a list.  The survey cannot warn about that kind of thing; the first full run can.
 
-### What remains here (19 methods / 317 lines measured)
+### `memory/migrations.py` — **extracted**, 2738 → 2628 lines
 
-1. **`memory/migrations.py`** — `_backfill_transcript_seq` (50), `_add_missing_columns` (21),
-   `_ensure_transcript_indexes` (15), `_next_transcript_seq` (19).
-2. **`memory/facts.py`** — `_insert_fact_assertion` (30), `_fact_assertion_core_score` (22),
+The four schema steps (`_ensure_transcript_indexes` 15, `_add_missing_columns` 21,
+`_backfill_transcript_seq` 50, `_next_transcript_seq` 19) take a connection and nothing else.
+`_ensure_schema` (the only caller) keeps its sequence; the on-disk format does not change.
+
+### What remains here (9 methods / ~212 lines measured)
+
+1. **`memory/facts.py`** — `_insert_fact_assertion` (30), `_fact_assertion_core_score` (22),
    `_retract_inferred_identity_facts` (26), `_turn_keys` (13).
 3. The 0-data / 1-call readers (`corpus_stats` 105, `list_session_ids` 47, `usage_summary` 35,
    `append_usage_event` 34) — each needs the connection passed.
