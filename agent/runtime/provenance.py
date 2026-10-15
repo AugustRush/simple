@@ -139,7 +139,14 @@ class Execution:
         """
         payload = self.payload
         if payload.get("command"):
-            return [_render_command(payload["command"])]
+            # With its arguments: ``npx`` alone is not what runs, and a person being asked
+            # about an MCP server is answering about ``npx -y some-server``.  A command that
+            # already arrives as a list keeps its own parts and the arguments follow it --
+            # wrapping it would render the list's repr as the command.
+            command = payload["command"]
+            args = list(payload.get("args") or ())
+            parts = list(command) + args if isinstance(command, (list, tuple)) else [command, *args]
+            return [_render_command(parts)]
         if payload.get("commands"):
             return [str(item) for item in payload["commands"]]
         found: list[str] = []
@@ -201,14 +208,30 @@ def digest_of(executions: "tuple[Execution, ...] | list[Execution]") -> str:
     """
     if not executions:
         return ""
+    # The **whole payload, minus the path**, rather than a ``digest`` field the producer may
+    # or may not have set.  The first version read only ``payload["digest"]``, so a producer
+    # that built its executions directly -- the DSH import, whose servers are declarations
+    # rather than files -- produced a digest over *names alone*, which is the hole this
+    # docstring warns about, arrived at by omission instead of by choice.  Hashing the
+    # payload makes content-sensitivity the default and leaves nothing for a caller to
+    # forget; ``path`` is dropped because it is the one field that names a *location*.
     parts = [
         {
             "kind": item.kind,
-            "marker": str(item.payload.get("marker") or ""),
-            "digest": str(item.payload.get("digest") or ""),
+            "content": content_digest(
+                json.dumps(
+                    {key: value for key, value in item.payload.items() if key != "path"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            ),
         }
         for item in executions
     ]
-    canonical = json.dumps(sorted(parts, key=lambda part: (part["marker"], part["kind"])),
-                           sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        sorted(parts, key=lambda part: (part["kind"], part["content"])),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return content_digest(canonical)

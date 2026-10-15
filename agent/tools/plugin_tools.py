@@ -215,6 +215,113 @@ def _resolve_user_plugin_target(name: str, root: Path | None = None) -> Path:
     return target
 
 
+async def confirm_executable_content(
+    *,
+    source: str,
+    reason: str,
+    scope: Any,
+    digest: str = "",
+    action: str = "install_plugin",
+) -> tuple[bool, bool]:
+    """Ask before running somebody else's code; return ``(approved, needs_pending)``.
+
+    A sink that can ask decides immediately.  ``None`` back from it means nobody *could* be
+    asked (no dialog, no connected browser), which leaves the caller to record a pending
+    question the coordinator redeems on a later "同意".  A human who was asked and declined
+    is terminal.
+
+    One implementation for both producers of a :class:`~agent.plugins.report.CapabilityReport`
+    -- the installer and the DSH import -- because the parts that must not diverge are the
+    *key* (source plus the digest of what would run) and the lock.  ``action`` is the tool
+    name the sink shows, which is the only thing that legitimately differs.
+    """
+    from agent.core.output import _APPROVAL_LOCK, _active_sink
+    from agent.security.plugin_approval import (
+        plugin_install_mark_approved,
+        plugin_install_was_approved,
+    )
+
+    async with _APPROVAL_LOCK:
+        # *digest* is part of the question: an answer to "may I run this" is an answer about
+        # the code that was shown, not about the address it came from.
+        if plugin_install_was_approved(scope, source, digest):
+            return True, False
+        sink = _active_sink.get()
+        if sink is None:
+            return False, False
+        approved = await sink.on_tool_confirmation(
+            action,
+            command=source,
+            risk_level="high",
+            reason=reason,
+            confirmation_token="",
+            scope=scope,
+        )
+        if approved:
+            plugin_install_mark_approved(scope, source, digest=digest)
+            return True, False
+        return False, approved is None
+
+
+async def import_dsh_profile(
+    profile_dir: Any,
+    *,
+    scope: Any,
+    plugins_dir: Any = None,
+    destination: Any = None,
+) -> dict:
+    """Adopt another application's profile as a plugin this runtime loads.
+
+    The second producer of a :class:`~agent.plugins.report.CapabilityReport`, and the item
+    the provenance design recorded as "blocked on consent": it reports the stdio commands
+    the profile declares, asks **once per content** through the same rule the installer
+    uses, and writes only what was approved.  Nothing new was needed for it after the
+    digest step -- which is the test of whether that step was the right one.
+    """
+    from agent import shared
+    from agent.plugins.dsh_import import plan_dsh_import, write_imported_plugin
+
+    plan = plan_dsh_import(profile_dir, destination=destination)
+    report = plan.report
+    if report.executes:
+        approved, needs_pending = await confirm_executable_content(
+            source=report.source.source,
+            reason=report.reason(),
+            scope=scope,
+            digest=report.digest,
+            action="import_dsh_profile",
+        )
+        if not approved:
+            return {
+                "ok": False,
+                "requires_confirmation": needs_pending,
+                "error": (
+                    f"import cancelled: {report.reason()} requires human confirmation"
+                    if not needs_pending
+                    else "import needs confirmation; see the pending question"
+                ),
+                "would_run": [item.describe() for item in report.would_run],
+                "unsupported": list(report.unsupported),
+            }
+    target = write_imported_plugin(
+        plan,
+        plugins_dir=(
+            Path(plugins_dir)
+            if plugins_dir is not None
+            else Path(shared.USER_PLUGINS_DIR)
+        ),
+    )
+    return {
+        "ok": True,
+        "plugin": str(target),
+        "servers": [server["name"] for server in plan.servers],
+        # Said out loud rather than buried: a profile whose declarations this runtime cannot
+        # honour has *partly* been adopted, and an import that did not say so would leave
+        # the person believing all of it works.
+        "unsupported": list(report.unsupported),
+    }
+
+
 class PluginTools:
     """The plugin and user-tool tools, with the registry they read."""
 
@@ -585,38 +692,14 @@ class PluginTools:
     ) -> tuple[bool, bool]:
         """Ask the human before activating executable plugin content.
 
-        Returns ``(approved, needs_pending)``.  A sink that can ask decides
-        immediately; ``None`` back from it means nobody could be asked (no
-        dialog, no connected browser), which leaves a pending record so the
-        coordinator can redeem a later "同意" reply.  A human who was asked and
-        declined is terminal.
+        Delegates to :func:`confirm_executable_content`, which is the one implementation of
+        the three steps (already-answered, ask, record) -- the DSH import is the second
+        caller, and a second copy of this would be a second place for the answer to be read
+        with a different key.
         """
-        from agent.core.output import _APPROVAL_LOCK, _active_sink
-        from agent.security.plugin_approval import (
-            plugin_install_mark_approved,
-            plugin_install_was_approved,
+        return await confirm_executable_content(
+            source=source, reason=reason, scope=scope, digest=digest
         )
-
-        async with _APPROVAL_LOCK:
-            # *digest* is part of the question: an answer to "may I run this plugin" is an
-            # answer about the code that was shown, not about the address it came from.
-            if plugin_install_was_approved(scope, source, digest):
-                return True, False
-            sink = _active_sink.get()
-            if sink is None:
-                return False, False
-            approved = await sink.on_tool_confirmation(
-                "install_plugin",
-                command=source,
-                risk_level="high",
-                reason=reason,
-                confirmation_token="",
-                scope=scope,
-            )
-            if approved:
-                plugin_install_mark_approved(scope, source, digest=digest)
-                return True, False
-            return False, approved is None
 
     async def uninstall_plugin(self, name: str, intent: str = "") -> dict:
         import shutil

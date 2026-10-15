@@ -167,7 +167,7 @@ public / 24 reserved, 15 with contracts**.
 
 1. **Provenance / translators** -- designed in
    [`2026-10-12-capability-provenance-and-adapter-translators-design.md`](../specs/2026-10-12-capability-provenance-and-adapter-translators-design.md).
-   **Steps 1-3 of 4 have shipped** (step 1 in a corrected shape): every plugin carries a `Provenance`
+   **All four steps have shipped** (step 1 in a corrected shape): every plugin carries a `Provenance`
    (`agent/runtime/provenance.py`) recorded where the facts are, and a capability's origin is
    *derived* through `who_provides`, so the composition can now answer "where did this come
    from" for every name it holds -- guarded by a test that asks the real composition.
@@ -179,7 +179,15 @@ public / 24 reserved, 15 with contracts**.
    keyed by a digest of what would run -- `plugin:<source>@<digest>` -- while the question is
    still shown under the source.  Editing a hook command, an MCP server's command, or a
    Python entry point's bytes asks again; moving the directory does not.
-   Still missing: `import_dsh_profile` as the second producer.  Until those
+   Step 4 shipped too: `import_dsh_profile` reads another application's profile, reports the
+   stdio commands it declares, asks through the same digest-keyed rule, and writes a native
+   plugin directory the loader already contributes and attributes.
+
+   **What is still open, and it is the sharper half of the original finding:** all four steps
+   gate *adoption*.  A plugin directory already sitting in `~/.agent/plugins/` is still
+   executed at startup with no approval record consulted -- the load path, not the install
+   path.  Closing it means every existing deployment approves its plugins once, which is a
+   behaviour change worth taking deliberately rather than as a side effect.  Until those
    exist the *trust* half is not met: a plugin in `~/.agent/plugins/` is still executed at
    startup on the strength of being there.
 2. **The 4 remaining soft reads** (`tests/test_memory_contract.py`): the token budget's

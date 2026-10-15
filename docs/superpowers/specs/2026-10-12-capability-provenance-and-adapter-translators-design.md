@@ -151,9 +151,33 @@ string that was typed.
    asymmetry.  The plain key is read back only for `once`/`session` lifetimes, which is what
    keeps a redeemed pending question working without letting a pre-digest `always` grant
    stand in for consent to whatever the URL serves now.
-4. `import_dsh_profile(path)` as the second producer: it reports
+4. ~~`import_dsh_profile(path)` as the second producer: it reports
    `would_run` (stdio commands) and imports only what a human approved. This is
-   the item that was blocked on "consent" — after step 3 it needs no new concept.
+   the item that was blocked on "consent" — after step 3 it needs no new concept.~~
+   **Done** (2026-10-15), and it needed no new concept — which was the prediction to check.
+   `agent/plugins/dsh_import.py` reads the profile and describes it (one `Execution` per
+   server, with the command line, so a person is asked about `npx -y …` and a digest can say
+   *which* server changed); `agent/tools/plugin_tools.py::import_dsh_profile` asks through the
+   **same** rule the installer uses (`confirm_executable_content`, extracted so there is one
+   implementation of already-answered/ask/record) and writes only what was approved.
+
+   The adoption itself is deliberately boring: it writes a **native plugin directory**
+   (`plugin.json` with `mcpServers`), which the loader already knows how to read,
+   contribute and attribute.  Teaching the loader a second way to receive MCP servers would
+   have meant two paths to keep in step, and the profile's servers would have been the ones
+   no provenance report could place.  `unsupported` (an sse transport, an unevaluated
+   `!!js` command) is carried into the result rather than dropped: a partial import that does
+   not say so is the failure most likely to be believed.
+
+   With no sink to ask, nothing is written and `requires_confirmation` is false -- the
+   import fails closed, which is the whole point of asking.
+
+   **What is still not covered, and is the sharper half of the original finding:** these four
+   steps gate *adoption* (installing from a source, importing from a profile).  A plugin
+   directory that is already in `~/.agent/plugins/` is still `exec_module`-ed at startup with
+   no approval record consulted — the load path, not the install path.  Closing it is a
+   behaviour change for every existing deployment (their plugins would have to be approved
+   once), so it is recorded here rather than taken silently.
 
 ## B. Adapters locate; they do not interpret (measured)
 
