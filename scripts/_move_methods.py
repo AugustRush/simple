@@ -46,6 +46,14 @@ import textwrap
 
 BUILTINS = set(dir(builtins))
 
+#: Names every module has without importing them.  ``__file__`` cost a refused run: it is a real
+#: module global in the destination, and a body computing a path from it is safe to move *only*
+#: while the destination sits at the same package depth (see the subagent work order).
+MODULE_GLOBALS = {
+    "__file__", "__name__", "__doc__", "__package__", "__spec__", "__loader__",
+    "__builtins__", "__annotations__", "__debug__",
+}
+
 
 # ── structural parameter editing ─────────────────────────────────────────────
 
@@ -240,28 +248,34 @@ def main(argv: list[str] | None = None) -> int:
 
         # the function that will live in the new module
         text, receiver = without_receiver(original, method.name, fn)
-        text = with_first_param(text, method.name, args.param)
-        # Drop the local connection acquisition.  The dedent must be relative to the `with`
-        # line: a fixed four-space cut also eats the statement that follows the block (which
-        # sits at the same indent as `with`), pushing it to column 0 and out of the function.
-        body_lines, base = [], None
-        for line in text.split("\n"):
-            if line.strip() == f"with self._connect() as {args.param}:":
-                base = len(line) - len(line.lstrip())
-                continue
-            if base is not None:
-                indent = len(line) - len(line.lstrip())
-                if line.strip() and indent > base:
-                    body_lines.append(line[4:])
+        # `--param ""` means "invent no parameter": the function keeps the signature its body
+        # actually needs.  The store work always needed a connection; the HTTP and channel
+        # work never does.
+        if args.param:
+            text = with_first_param(text, method.name, args.param)
+            # Drop the local connection acquisition.  The dedent must be relative to the `with`
+            # line: a fixed four-space cut also eats the statement that follows the block (which
+            # sits at the same indent as `with`), pushing it to column 0 and out of the function.
+            body_lines, base = [], None
+            for line in text.split("\n"):
+                if line.strip() == f"with self._connect() as {args.param}:":
+                    base = len(line) - len(line.lstrip())
                     continue
-                if line.strip():
-                    base = None
-            body_lines.append(line)
-        text = "\n".join(body_lines)
+                if base is not None:
+                    indent = len(line) - len(line.lstrip())
+                    if line.strip() and indent > base:
+                        body_lines.append(line[4:])
+                        continue
+                    if line.strip():
+                        base = None
+                body_lines.append(line)
+            text = "\n".join(body_lines)
         for sibling in moving:
             if sibling == method.name:
                 continue
             text = text.replace(f"self.{sibling}(", f"{sibling}(")
+            if not args.param:
+                continue
             text = re.sub(
                 rf"(?<![\w.])(?<!def ){sibling}\(\n(\s+)(?!{args.param},)",
                 lambda m: f"{sibling}(\n{m.group(1)}{args.param}, ", text,
@@ -283,24 +297,46 @@ def main(argv: list[str] | None = None) -> int:
 
         # the wrapper that stays in the class
         op, end = param_span(original, method.name)
+        is_async = isinstance(method, ast.AsyncFunctionDef)
+        decorators = [ast.unparse(d) for d in method.decorator_list]
         head = f"def {method.name}({original[op + 1:end]})"
         if fn.returns is not None:
             head += " -> " + ast.unparse(fn.returns)
+        if is_async:
+            head = "async " + head
         names = [
             a.arg for a in list(fn.args.posonlyargs) + list(fn.args.args) + list(fn.args.kwonlyargs)
             if a.arg != receiver
         ]
-        call = f"{pathlib.Path(args.module).stem}.{method.name}(\n"
-        call += f"                {args.param},\n"
-        call += "".join(f"                {n}={n},\n" for n in names) + "            )"
-        doc = ""
-        if ast.get_docstring(fn):
-            doc = ast.get_docstring(fn).strip().split("\n")[0]
-        wrapper = textwrap.indent(head + ":", "    ") + "\n"
-        wrapper += f'        """{doc}"""\n' if doc else ""
-        wrapper += f"        with self._connect() as {args.param}:\n"
+        # Only a body that actually opened the connection gets a wrapper that opens one.  The
+        # first version of this emitted `with self._connect()` unconditionally, which is right
+        # for the store classes it was written against and wrong for every other class -- the
+        # wrapper then raises AttributeError at call time rather than at import time.
+        uses_connect = bool(args.param) and any(
+            line.strip() == f"with self._connect() as {args.param}:" for line in original.splitlines()
+        )
+        stem = pathlib.Path(args.module).stem
+        pad = " " * (12 if uses_connect else 8)
+        call_args = ([args.param] if uses_connect else []) + [f"{n}={n}" for n in names]
+        if call_args:
+            call = f"{stem}.{method.name}(\n"
+            call += "".join(f"{pad}    {a},\n" for a in call_args)
+            call += f"{pad})"
+        else:
+            call = f"{stem}.{method.name}()"
         returns_none = fn.returns is not None and ast.unparse(fn.returns) == "None"
-        wrapper += f"            {'return ' if fn.returns is not None and not returns_none else ''}{call}\n"
+        prefix = "" if returns_none else ("return " if fn.returns is not None else "")
+        if is_async:
+            prefix = "await " if not prefix else "return await "
+        doc = ast.get_docstring(fn).strip().split("\n")[0] if ast.get_docstring(fn) else ""
+        wrapper_lines = [textwrap.indent("@" + d, "    ") for d in decorators]
+        wrapper_lines.append(textwrap.indent(head + ":", "    "))
+        if doc:
+            wrapper_lines.append(f'        """{doc}"""')
+        if uses_connect:
+            wrapper_lines.append(f"        with self._connect() as {args.param}:")
+        wrapper_lines.append(f"{pad}{prefix}{call}")
+        wrapper = "\n".join(wrapper_lines) + "\n"
         try:
             ast.parse("class _Wrapper:\n" + wrapper)
         except SyntaxError as exc:
@@ -310,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
 
     consts = sorted(n for n in needed if n in constants)
     unresolved = [n for n in needed if n not in imports and n not in constants and n not in moving]
+    unresolved = [n for n in unresolved if n not in MODULE_GLOBALS]
     unresolved = [n for n in unresolved if not re.match(r"^(Any|Optional|Callable|Sequence|dict|list|set|tuple)$", n)]
     if unresolved:
         problems.append(f"cannot resolve these free names: {unresolved}")
@@ -385,7 +422,10 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             src = ast.get_source_segment(new_module, node)
             if src and not src.startswith("    "):
-                bad |= {n for n in free_names(src) if n not in imported and n not in top}
+                bad |= {
+                    n for n in free_names(src)
+                    if n not in imported and n not in top and n not in MODULE_GLOBALS
+                }
     if bad:
         print(f"REFUSING: unbound names in {target}: {sorted(bad)}", file=sys.stderr)
         return 1
@@ -394,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     # byte-level faithfulness of each moved body
     for method, (start, end) in spans.items():
         original = textwrap.dedent("".join(lines[start:end])).strip("\n")
-        kept = [b for b in blocks if re.match(rf"def {re.escape(method)}\(", b)]
+        kept = [b for b in blocks if re.match(rf"(?:async )?def {re.escape(method)}\(", b)]
         if not kept:
             continue
         diff = [
@@ -415,10 +455,19 @@ def main(argv: list[str] | None = None) -> int:
     text = "".join(far)
     for name in consts:
         text = text.replace(constants[name][2] + "\n", "", 1)
-    module_import = f"from . import {pathlib.Path(args.module).stem}"
+    # Match the file's own import style: `web.py` has no relative imports at all, so a
+    # `from . import x` line would be the only one of its kind there.
+    stem = pathlib.Path(args.module).stem
+    relative = re.search(r"^from \.", text, re.M)
+    if relative:
+        module_import = f"from . import {stem}"
+        insert_at = relative.start()
+    else:
+        package = ".".join(pathlib.Path(args.file).with_suffix("").parts[:-1])
+        module_import = f"from {package} import {stem}"
+        insert_at = import_anchor(text)
     if module_import not in text:
-        anchor = re.search(r"^from \.", text, re.M)
-        text = text[:anchor.start()] + module_import + "\n" + text[anchor.start():]
+        text = text[:insert_at] + module_import + "\n" + text[insert_at:]
     target.parent.mkdir(parents=True, exist_ok=True)
     # Two checks, both for injuries that `ast.parse` does not report:
     #   * a statement dedented out of its function still parses (the `with`-block dedent once

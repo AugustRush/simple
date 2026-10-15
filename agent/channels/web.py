@@ -7,6 +7,7 @@ response for non-streaming calls).
 """
 
 from __future__ import annotations
+from agent.channels import web_assets
 
 import asyncio
 import contextlib
@@ -224,30 +225,8 @@ class WebChannel(Channel):
 
     @staticmethod
     def _web_dist_dir() -> Path:
-        """Resolve the frontend bundle used by the gateway.
-
-        The bundled copy is the canonical runtime asset and is checked into
-        the package.  ``frontend/dist`` is intentionally ignored by git and
-        may contain an older local build, so it must never silently override
-        the bundled assets after a restart.  Set ``SIMPLE_WEB_USE_SOURCE_DIST``
-        to opt into source-dist serving during local frontend development.
-        """
-        package_dist = Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist"
-        source_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-        # Vite can leave ``index.html`` behind when a build is interrupted or
-        # when only the source tree has been copied.  Treat that as an
-        # incomplete bundle; StaticFiles raises during app construction if the
-        # referenced assets directory is missing.  Falling back to the bundled
-        # release keeps the gateway usable until the next frontend build.
-        use_source = os.getenv("SIMPLE_WEB_USE_SOURCE_DIST", "").strip().casefold() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if use_source and (source_dist / "index.html").is_file() and (source_dist / "assets").is_dir():
-            return source_dist
-        return package_dist
+        """Resolve the frontend bundle used by the gateway."""
+        return web_assets._web_dist_dir()
 
     def bind_runtime(
         self,
@@ -338,17 +317,7 @@ class WebChannel(Channel):
     # -- HTTP endpoints -------------------------------------------------------
 
     async def _index(self, request: Any) -> Any:
-        from starlette.responses import HTMLResponse
-
-        dist = self._web_dist_dir() / "index.html"
-        if dist.is_file():
-            return HTMLResponse(dist.read_text(encoding="utf-8"))
-        return HTMLResponse(
-            "<html><body style='font-family:sans-serif;padding:40px'>"
-            "<h1>Simple Agent API</h1>"
-            "<p>This is the API endpoint for web integrations.</p>"
-            "</body></html>"
-        )
+        return await web_assets._index(request=request)
 
     async def _health(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
