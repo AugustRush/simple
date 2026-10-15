@@ -5,6 +5,7 @@ import threading
 import time
 
 import pytest
+from agent.memory import fitting
 from agent.core.turn_loop import (
     build_user_message_content,
     plan_orchestration,
@@ -2841,7 +2842,7 @@ def _notices(messages):
         message
         for message in messages
         if isinstance(message.get("content"), str)
-        and message["content"].startswith(ContextManager._EVICTION_SENTINEL)
+        and message["content"].startswith(fitting._EVICTION_SENTINEL)
     ]
 
 
@@ -3010,7 +3011,7 @@ def test_the_eviction_notice_never_becomes_the_current_request(tmp_path):
         "the user's request must stay the last message"
     )
     assert not str(compacted[0]["content"]).startswith(
-        ContextManager._EVICTION_SENTINEL
+        fitting._EVICTION_SENTINEL
     ), "position 0 of the body must never be rewritten"
 
 

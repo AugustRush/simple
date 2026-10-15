@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from agent.core.transport import ModelEndpoint
 
 from .session_log import SessionLog
+from . import fitting
 from ._helpers import (
     _FACT_QUERY_PREDICATE_ALIASES,
     _FACT_QUERY_SUBJECT_ALIASES,
@@ -309,6 +310,28 @@ class ContextManager:
         )
 
     # ── Activity tracking ─────────────────────────────────────────────────────
+
+    @classmethod
+    def fit_to_budget(
+        cls,
+        messages: list[dict],
+        *,
+        input_token_budget: int,
+        estimate_tokens: Callable[[list[dict]], int],
+        protected: Optional[Sequence[dict]] = None,
+    ) -> list[dict]:
+        """Fit a provider payload into ``input_token_budget``, dropping oldest first.
+
+        The implementation is :func:`agent.memory.fitting.fit_to_budget`: fitting a request
+        into the provider's window is a property of the request, and the class kept the name
+        for the protocol.  See that module for why the rest of the cluster went with it.
+        """
+        return fitting.fit_to_budget(
+            messages,
+            input_token_budget=input_token_budget,
+            estimate_tokens=estimate_tokens,
+            protected=protected,
+        )
 
     def mark_activity(self) -> None:
         """Call after each user message to arm consolidation and reset idle timer."""
@@ -618,237 +641,14 @@ class ContextManager:
             input_token_budget
         )
 
-    @staticmethod
-    def _content_blocks(message: dict) -> list[dict]:
-        """The message's content blocks, with their one invariant enforced.
 
-        Every writer appends JSON-native blocks: ``ModelTransport`` normalises
-        provider content through ``_json_native_blocks``, and the agent's own
-        messages are built from dicts.  So a non-dict block is not a shape to
-        tolerate -- it means a writer regressed, or the record came back
-        corrupted (``store.py``'s ``default=str`` stores a stray SDK object as a
-        ``repr`` string).
 
-        Skipping it is the exact failure this layer exists to prevent: an
-        unread ``tool_use`` makes its ``tool_result`` look like an orphan, the
-        pair is dropped, and the model is handed a conversation missing the tool
-        results it already ran -- silently, and permanently, since the repaired
-        list is written back to ``ctx.messages``.
-        """
-        content = message.get("content")
-        if not isinstance(content, list):
-            return []
-        for block in content:
-            if not isinstance(block, dict):
-                raise ContextLimitError(
-                    f"message content block is {type(block).__name__}, not a dict; "
-                    "every message in ctx.messages must be JSON-native"
-                )
-        return content
 
-    @classmethod
-    def _anthropic_tool_result_ids(cls, message: dict) -> Optional[set[str]]:
-        if message.get("role") != "user":
-            return None
-        content = message.get("content")
-        if not isinstance(content, list) or not content:
-            return None
-        blocks = cls._content_blocks(message)
-        if not all(block.get("type") == "tool_result" for block in blocks):
-            return None
-        return {str(block.get("tool_use_id") or "") for block in blocks}
 
-    @classmethod
-    def _is_real_user_request(cls, message: dict) -> bool:
-        return message.get("role") == "user" and cls._anthropic_tool_result_ids(
-            message
-        ) is None
 
-    @classmethod
-    def _protected_indexes(
-        cls, messages: list[dict], protected: Optional[Sequence[dict]]
-    ) -> set[int]:
-        """Which messages this cut must not drop, as indexes into *messages*.
-
-        A turn is the unit of intent: compaction may drop history, it may not
-        drop what the turn exists to answer.  A caller inside a turn knows the
-        message object it appended, so it passes it and the message is found by
-        identity -- "which message is the request" is a fact about the object,
-        not about how it reads.
-
-        Without one, fall back to the newest message that *looks* like a
-        request.  That proxy is exactly what an interjection falsifies: it
-        arrives mid-turn as a real user message, so the newest-looking request
-        stops being the turn's own and the original becomes evictable.  Callers
-        inside a turn should pass the object rather than rely on this.
-        """
-        if protected:
-            indexes = {
-                index
-                for index, message in enumerate(messages)
-                if any(message is item for item in protected)
-            }
-            if indexes:
-                return indexes
-        newest = next(
-            (
-                index
-                for index in range(len(messages) - 1, -1, -1)
-                if cls._is_real_user_request(messages[index])
-            ),
-            -1,
-        )
-        return {newest} if newest >= 0 else set()
-
-    @classmethod
-    def _complete_message_units(
-        cls, messages: list[dict], protected: set[int]
-    ) -> list[list[int]]:
-        """Group messages into the smallest units a cut is allowed to remove.
-
-        A unit is a provider protocol unit -- an assistant tool call together
-        with every result answering it -- or a question and the reply to it.
-        ``protected`` indexes messages the cut must keep, and a protected user
-        message is deliberately *not* folded together with the assistant reply
-        that follows: sharing a unit would mean dropping the reply drops the
-        request with it, which is the one thing a cut may not do.
-        """
-        units: list[list[int]] = []
-        index = 0
-        while index < len(messages):
-            message = messages[index]
-            role = message.get("role")
-            openai_calls = message.get("tool_calls") if role == "assistant" else None
-            openai_ids = {
-                str(call.get("id") or "")
-                for call in openai_calls or []
-                if isinstance(call, dict)
-            }
-            anthropic_ids = {
-                str(block.get("id") or "")
-                for block in cls._content_blocks(message)
-                if block.get("type") == "tool_use"
-            }
-            expected_ids = openai_ids | anthropic_ids
-            if expected_ids:
-                if "" in expected_ids:
-                    raise ContextLimitError("tool history is structurally incomplete")
-                unit = [index]
-                answered: set[str] = set()
-                cursor = index + 1
-                while cursor < len(messages):
-                    following = messages[cursor]
-                    if following.get("role") == "tool":
-                        tool_id = str(following.get("tool_call_id") or "")
-                        if tool_id not in expected_ids:
-                            raise ContextLimitError(
-                                "tool history contains an orphan tool result"
-                            )
-                        answered.add(tool_id)
-                        unit.append(cursor)
-                        cursor += 1
-                        continue
-                    result_ids = cls._anthropic_tool_result_ids(following)
-                    if result_ids is not None:
-                        if not result_ids or not result_ids.issubset(expected_ids):
-                            raise ContextLimitError(
-                                "tool history contains an orphan tool result"
-                            )
-                        answered.update(result_ids)
-                        unit.append(cursor)
-                        cursor += 1
-                        continue
-                    break
-                if answered != expected_ids:
-                    raise ContextLimitError("tool history is structurally incomplete")
-                units.append(unit)
-                index = cursor
-                continue
-            if role == "tool" or cls._anthropic_tool_result_ids(message) is not None:
-                raise ContextLimitError("tool history contains an orphan tool result")
-            if (
-                role == "user"
-                and index not in protected
-                and index + 1 < len(messages)
-                and messages[index + 1].get("role") == "assistant"
-                and not messages[index + 1].get("tool_calls")
-                and not any(
-                    block.get("type") == "tool_use"
-                    for block in cls._content_blocks(messages[index + 1])
-                )
-            ):
-                units.append([index, index + 1])
-                index += 2
-                continue
-            units.append([index])
-            index += 1
-        return units
-
-    @classmethod
-    def _repair_tool_history(cls, messages: list[dict]) -> list[dict]:
-        """Drop incomplete provider protocol units left by interrupted turns."""
-        repaired: list[dict] = []
-        index = 0
-        while index < len(messages):
-            message = messages[index]
-            role = message.get("role")
-            openai_calls = message.get("tool_calls") if role == "assistant" else None
-            openai_ids = {
-                str(call.get("id") or "")
-                for call in openai_calls or []
-                if isinstance(call, dict)
-            }
-            # `_content_blocks` raises rather than skipping an unreadable block.
-            # Here that matters most: this function is what *drops* an orphan
-            # tool_result, so an unread `tool_use` is not a missing id -- it is
-            # the tool result of a tool the model already ran, deleted from the
-            # conversation.
-            anthropic_ids = {
-                str(block.get("id") or "")
-                for block in cls._content_blocks(message)
-                if block.get("type") == "tool_use"
-            }
-            expected_ids = openai_ids | anthropic_ids
-            if expected_ids:
-                cursor = index + 1
-                answered: set[str] = set()
-                result_messages: list[dict] = []
-                while cursor < len(messages):
-                    following = messages[cursor]
-                    if following.get("role") == "tool":
-                        tool_id = str(following.get("tool_call_id") or "")
-                        answered.add(tool_id)
-                        result_messages.append(following)
-                        cursor += 1
-                        continue
-                    result_ids = cls._anthropic_tool_result_ids(following)
-                    if result_ids is not None:
-                        answered.update(result_ids)
-                        result_messages.append(following)
-                        cursor += 1
-                        continue
-                    break
-                if "" not in expected_ids and answered == expected_ids:
-                    repaired.append(message)
-                    repaired.extend(result_messages)
-                index = cursor
-                continue
-            if role == "tool" or cls._anthropic_tool_result_ids(message) is not None:
-                index += 1
-                continue
-            repaired.append(message)
-            index += 1
-        if len(repaired) != len(messages):
-            _emit_consolidation(
-                "tool_history_repaired",
-                messages_before=len(messages),
-                messages_after=len(repaired),
-            )
-        return repaired
 
     # Identified by a text sentinel rather than a custom message key: both
     # Anthropic and OpenAI reject unknown fields on a message object.
-    _EVICTION_SENTINEL = "[context-eviction]"
 
     #: How far below the input budget a compaction cuts once it has been
     #: triggered.  Cutting to the brim would put the very next step over the
@@ -857,38 +657,8 @@ class ContextManager:
     #: conversation is re-billed at full rate each time.  A deep, rare cut costs
     #: one re-bill and buys many append-only turns; a shallow, frequent one pays
     #: that price on nearly every request.  See `fit_to_budget`.
-    _COMPACTION_LOW_WATER = 0.5
 
-    @classmethod
-    def _eviction_notice(cls, dropped_count: int) -> dict:
-        return {
-            "role": "user",
-            "content": (
-                f"{cls._EVICTION_SENTINEL} {dropped_count} earlier message(s) were "
-                "dropped to fit the input budget. They are recoverable: use "
-                "context_retrieve to search this session before assuming anything "
-                "about them, rather than guessing or asking the user to repeat."
-            ),
-        }
 
-    @classmethod
-    def _strip_eviction_notices(cls, messages: list[dict]) -> tuple[list[dict], int]:
-        """Remove prior notices and report how many messages they accounted for."""
-        kept: list[dict] = []
-        dropped = 0
-        for message in messages:
-            content = message.get("content")
-            if (
-                message.get("role") == "user"
-                and isinstance(content, str)
-                and content.startswith(cls._EVICTION_SENTINEL)
-            ):
-                head = content[len(cls._EVICTION_SENTINEL):].strip().split(" ", 1)[0]
-                if head.isdigit():
-                    dropped += int(head)
-                continue
-            kept.append(message)
-        return kept, dropped
 
     def compact_messages(
         self,
@@ -910,163 +680,8 @@ class ContextManager:
             protected=protected,
         )
 
-    @classmethod
-    def fit_to_budget(
-        cls,
-        messages: list[dict],
-        *,
-        input_token_budget: int,
-        estimate_tokens: Callable[[list[dict]], int],
-        protected: Optional[Sequence[dict]] = None,
-    ) -> list[dict]:
-        """Fit a provider payload into ``input_token_budget``, dropping oldest first.
 
-        This is the whole of ``compact_messages``, minus the dependency on an
-        instance.  That dependency was the bug: fitting a request into the
-        provider's window is a property of the request, not of memory -- it
-        reads no durable memory and writes none -- but it lived only on
-        ``ContextManager``, so a run that deliberately has no manager (the
-        scheduler's ``stateless`` policy nulls it to stop anything carrying
-        between runs) also lost the ability to drop its own oldest turns.  Such
-        a run hard-failed with ``ContextLimitError`` the moment its transcript
-        outgrew the window, where the interactive path would simply have
-        compacted.
 
-        ``estimate_tokens`` is injected rather than read from a consolidation
-        engine for the same reason: the caller that has no manager still has to
-        be able to say what a message costs.
-        """
-        budget = int(input_token_budget)
-        if budget <= 0:
-            raise ContextLimitError("provider input token budget is not positive")
-        # Collapse any prior notice into a running count so repeated compactions
-        # report cumulative loss instead of stacking notices.
-        messages, dropped_before = cls._strip_eviction_notices(messages)
-        messages = cls._repair_tool_history(messages)
-        # Resolved once, here, because everything below is stated over it: which
-        # units are grouped as one, which may be removed, and where the notice
-        # goes.
-        keep = cls._protected_indexes(messages, protected)
-        if any(estimate_tokens([messages[index]]) >= budget for index in keep):
-            raise ContextLimitError(
-                "a message this turn must keep exceeds the provider input budget"
-            )
-
-        retained = cls._complete_message_units(messages, keep)
-
-        def materialize() -> list[dict]:
-            kept_indexes = {item for unit in retained for item in unit}
-            return [msg for index, msg in enumerate(messages) if index in kept_indexes]
-
-        compacted = materialize()
-        if estimate_tokens(compacted) >= budget:
-            # Compaction has been triggered, so cut deep rather than to the
-            # first size that fits.  The body is what a provider's prefix cache
-            # reuses and every cut rewrites its front, so the whole remaining
-            # conversation is re-billed at full rate.  Trimming to the brim puts
-            # the next step over the line again and re-cuts on nearly every
-            # request; trimming to the low-water mark leaves the turns that
-            # follow append-only and pushes the next cut many turns away.
-            low_water = max(1, int(budget * cls._COMPACTION_LOW_WATER))
-            while retained and estimate_tokens(compacted) > low_water:
-                removable = next(
-                    (unit for unit in retained if not keep.intersection(unit)),
-                    None,
-                )
-                if removable is None:
-                    # Everything left is the newest request, which is never
-                    # dropped.  If that still does not fit, the request itself
-                    # is the problem and there is no cut that would help.
-                    break
-                retained.remove(removable)
-                compacted = materialize()
-            if estimate_tokens(compacted) >= budget:
-                raise ContextLimitError(
-                    "complete conversation context exceeds input budget"
-                )
-        kept_indexes = {item for unit in retained for item in unit}
-        dropped_messages = [
-            message
-            for index, message in enumerate(messages)
-            if index not in kept_indexes
-        ]
-        dropped_now = dropped_before + len(dropped_messages)
-        if dropped_now:
-            # Evicted turns remain reachable through staging and the durable
-            # store, but the model cannot retrieve what it does not know is
-            # missing, so leave an explicit notice.  The notice is an aid, not a
-            # requirement: if it does not fit alongside the conversation it is
-            # omitted rather than allowed to fail the compaction it describes.
-            #
-            # It is never prepended and never last.  Position 0 of the body is
-            # the one place a rewrite costs the whole cached prefix, and the
-            # last message is the one a provider reads as the turn to answer --
-            # putting the notice there means the model replies to the notice
-            # instead of to the user.  It goes at the tail of the *retained*
-            # prefix, immediately before the newest request: every retained
-            # message is untouched, and the user's own words stay last.
-            notice = cls._eviction_notice(dropped_now)
-            if estimate_tokens(compacted + [notice]) < budget:
-                compacted = cls._with_notice_before_protected_request(
-                    compacted, notice, messages, keep
-                )
-        if len(compacted) != len(messages):
-            # Counts alone say how much was lost but not what: a caller
-            # cannot tell a dropped tool batch from a dropped user request.
-            # The role sequence and token estimate make that judgeable.
-            _emit_consolidation(
-                "compaction",
-                messages_before=len(messages),
-                messages_after=len(compacted),
-                messages_dropped=dropped_now,
-                dropped_roles=cls._role_sequence(dropped_messages),
-                dropped_tokens=estimate_tokens(dropped_messages)
-                if dropped_messages
-                else 0,
-            )
-        return compacted
-
-    @classmethod
-    def _with_notice_before_protected_request(
-        cls,
-        compacted: list[dict],
-        notice: dict,
-        messages: list[dict],
-        protected: set[int],
-    ) -> list[dict]:
-        """Place *notice* at the tail of the retained prefix, not after it.
-
-        Appending it to the very end of the body puts the notice where the
-        provider reads the current turn, so the model answers the notice rather
-        than the user -- ``M = [... retained ..., user(request), user(notice)]``.
-        Prepending it instead rewrites position 0, which is the one offset a
-        prefix cache cannot tolerate losing.  Immediately before the request is
-        the only position that satisfies both: every retained message is
-        byte-identical to what the previous call sent, and the turn's own words
-        remain the last thing the provider reads.
-
-        ``protected`` indexes ``messages`` and ``compacted`` holds the same
-        objects, so the request is located by identity rather than by re-testing
-        which message looks like a request.  The *last* protected index is the
-        one to sit before: everything the turn must keep stays after the notice.
-        """
-        if not protected:
-            return compacted + [notice]
-        request = messages[max(protected)]
-        for position, message in enumerate(compacted):
-            if message is request:
-                return compacted[:position] + [notice] + compacted[position:]
-        # The request was not retained, which `fit_to_budget` never does; fall
-        # back to appending rather than dropping the notice.
-        return compacted + [notice]
-
-    @staticmethod
-    def _role_sequence(messages: list[dict], limit: int = 40) -> str:
-        """Comma-joined roles of *messages*, truncated to stay log-sized."""
-        roles = [str(message.get("role", "?")) for message in messages[:limit]]
-        if len(messages) > limit:
-            roles.append(f"+{len(messages) - limit}")
-        return ",".join(roles)
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
@@ -1844,7 +1459,7 @@ class ContextManager:
     ) -> dict[str, Any]:
         """Persist a bounded, structurally complete provider replay tail."""
 
-        repaired = self._repair_tool_history(list(messages))
+        repaired = fitting._repair_tool_history(list(messages))
         compacted = repaired
         if repaired and self.consolidation.estimate_tokens(repaired) >= token_budget:
             compacted = self.compact_messages(
@@ -1861,7 +1476,7 @@ class ContextManager:
             if (
                 item.get("role") == "user"
                 and isinstance(content, str)
-                and content.startswith(self._EVICTION_SENTINEL)
+                and content.startswith(fitting._EVICTION_SENTINEL)
             ):
                 continue
             key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
@@ -1872,7 +1487,7 @@ class ContextManager:
             if (
                 item.get("role") == "user"
                 and isinstance(content, str)
-                and content.startswith(self._EVICTION_SENTINEL)
+                and content.startswith(fitting._EVICTION_SENTINEL)
             ):
                 continue
             key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)

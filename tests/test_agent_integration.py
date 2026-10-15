@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agent.memory import fitting
 from agent.core.turn_loop import (
     CONTINUE_PROMPT,
     promote_turn_orchestration_runs,
@@ -5305,7 +5306,7 @@ def test_a_compacted_body_still_leaves_room_for_the_full_configured_cap():
     # largest the conversation can be when a turn starts.  Read from the
     # constant rather than written as "half", so raising the mark is what makes
     # this fail rather than something the test would keep agreeing with.
-    body_tokens = int(budget * ContextManager._COMPACTION_LOW_WATER)
+    body_tokens = int(budget * fitting._COMPACTION_LOW_WATER)
     body = agent_module.AgentContext(
         system_prompt="s",
         messages=[{"role": "user", "content": "x" * (body_tokens * 4)}],

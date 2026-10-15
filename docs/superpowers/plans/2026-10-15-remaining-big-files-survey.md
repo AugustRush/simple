@@ -20,28 +20,36 @@ arguments passed, while a method that calls four siblings needs a collaborator d
 first.  This is the metric the first version of this survey got wrong — see "A mistake worth
 recording" below.
 
-| file | lines | the big class | methods | method body lines | **`self`-free methods** |
+| file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 4086 | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
-| `agent/memory/store.py` | 2835 | `LTMStore` | 89 | 2578 | **20 / 320 lines** |
+| `agent/memory/store.py` | 2835 | `LTMStore` | 89 | 2578 | **19 / 317 lines** |
 | `agent/core/agent.py` | 2536 | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
-| `agent/memory/context.py` | 2484 | `ContextManager` | 83 | 2140 | **24 / 563 lines** |
+| `agent/memory/context.py` | 2484 | `ContextManager` | 83 | 2140 | **16 / 240 lines** |
 
-90 methods and **1502 lines** can leave their class without designing a single seam.  That is
+81 methods and **1176 lines** can leave their class without designing a single seam.  That is
 the headline, and it is why the extraction orders below start there.
 
-## A mistake worth recording
+## Three mistakes worth recording, all in the same metric
 
-The first version of this measurement counted only `self._attribute` and ignored
-`self.method()`.  It reported `memory/context.py` as having **47 self-free methods and 1007
-lines** — nearly double the truth — because a method whose whole body is a call to a sibling
-looks "self-free" under that rule while being maximally coupled to its class.  The corrected
-numbers are in the table above (24 / 563).
+This measurement was wrong twice more before it was right, each time by counting too little:
 
-It is the same failure this repository keeps finding in its guards: a metric that measures a
-*proxy* and is read as the thing itself.  Recording it here because the extraction order
-depends on the metric, and an order derived from the wrong one would have sent the work at the
-most coupled methods first.
+1. **Only `self._attribute`, not `self.method()`.**  It reported `memory/context.py` as having
+   **47 self-free methods and 1007 lines** — because a method whose whole body calls a sibling
+   looks "self-free" under that rule while being maximally coupled to its class.  Corrected to
+   24 / 563.
+2. **Not `cls.`** — and this was the largest error of the three, because the affected code is
+   `@classmethod` by the dozen.  `fit_to_budget` looked like a pure function; it calls eight
+   `cls._` helpers.  Corrected: `memory/context.py` **16 / 240**, and `memory/store.py`
+   19 / 317.  The cluster that actually left the file (below) was 11 methods / 384 lines, not
+   the 5 / 317 the order first named.
+3. **Signed parameters counted as free names.**  `cls` is bound, so a scan for "free names"
+   filters it out — which is how (2) hid behind a check that looked like it covered it.
+
+The lesson is the one this repository keeps meeting in its guards: a metric is a proxy, and
+reading it as the thing itself produces a plan that is wrong in a direction nobody notices
+until the work is underway.  The extraction order here was re-derived after each correction,
+and the third one changed which cluster to move *first*.
 
 ---
 
@@ -49,35 +57,44 @@ most coupled methods first.
 
 ### Shape
 
-`ContextManager` is 2368 of them: 83 methods, 2140 lines of body.  One module-level function
-(`enqueue_orphan_staging_recovery`, 54) already sits outside it.  This is the file with the
+`ContextManager` was 2368 of them: 83 methods, 2140 lines of body.  One module-level function
+(`enqueue_orphan_staging_recovery`, 54) already sat outside it.  This was the file with the
 most extractable material, and the least excuse for its size.
 
-### The `self`-free cluster (24 methods, 563 lines) — measured
+### `memory/fitting.py` — **extracted**, 2484 → 2098 lines
 
-| lines | method | what it is |
+The cluster is closed under itself and is **11 methods / 384 lines**, not the five the first
+draft of this order named: fitting needs the eviction notices, the protected indexes, the
+message-unit arithmetic and the tool-history repair, and each of those needs another.
+
+| lines | member | what it is |
 |---|---|---|
-| 113 | `fit_to_budget` | pure: messages + a token budget in, messages out |
-| 81 | `_complete_message_units` | pure: message-unit arithmetic |
-| 59 | `_repair_tool_history` | pure: repairs a message list's tool pairing |
-| 34 | `_format_working_state_text` | pure: renders working state |
-| 33 | `_protected_indexes` | pure: which indexes may not be dropped |
-| 31 | `_with_notice_before_protected_request` | pure: inserts a notice |
-| 30 | `_shows_text` | pure |
-| 27 | `_checkpoint_summary` | pure |
+| 113 | `fit_to_budget` | messages + a token budget in, messages out |
+| 81 | `_complete_message_units` | message-unit arithmetic |
+| 59 | `_repair_tool_history` | repairs a message list's tool pairing |
+| 33 | `_protected_indexes` | which indexes a cut may not drop |
+| 31 | `_with_notice_before_protected_request` | inserts the eviction notice |
+| 25 | `_content_blocks` | the message's blocks, with their invariant enforced |
+| 16 | `_strip_eviction_notices` | removes prior notices |
+| 9 | `_eviction_notice` | builds the notice |
+| 9 | `_anthropic_tool_result_ids` | which tool results a message answers |
+| 5 | `_role_sequence` | the roles, in order |
+| 3 | `_is_real_user_request` | user, and not only answering tools |
 
-### Extraction order
+`fit_to_budget` stays on the class as a one-line `@classmethod` delegate: the `ContextService`
+protocol declares it, and three test modules call `ContextManager.fit_to_budget(...)`.  The
+other ten are reached as `fitting.<name>` from the class.  The two class constants moved with
+them (`_EVICTION_SENTINEL`, `_COMPACTION_LOW_WATER`) and the three test references to them were
+repointed rather than aliased, so the names have one home.
 
-1. **`memory/fitting.py`** — `fit_to_budget`, `_complete_message_units`, `_repair_tool_history`,
-   `_protected_indexes`, `_with_notice_before_protected_request` (~317 lines).  The single
-   biggest pure cluster in the four files, and the one with the most test coverage: the budget
-   rules are already asserted directly.
-2. **`memory/text.py`** — the rendering half (`_format_working_state_text`, `_shows_text`,
-   `_checkpoint_summary`, and the other `_format*` helpers).
-3. **The 0-data / 1-call group** (`record_usage_event`, `observe_token_usage`,
+### What remains here
+
+1. **`memory/text.py`** — the rendering half (`_format_working_state_text`, `_shows_text`,
+   `_checkpoint_summary`, the other `_format*` helpers; 0 data refs, ≤1 sibling call each).
+2. **The 0-data / 1-call group** (`record_usage_event`, `observe_token_usage`,
    `_is_episode_recall_query`, `_working_state_relevance_score`, …) — cheap, but each needs the
-   one collaborator it calls passed in, so they go after the pure ones.
-4. Only then the coupled core (`_project_working_state_from_event` 140/5 refs,
+   one collaborator it calls passed in.
+3. Only then the coupled core (`_project_working_state_from_event` 140 lines / 5 refs,
    `process_one_job` 107/5, `retrieve_implicit_context` 73).
 
 ## 2. `agent/core/agent.py` — 2536 lines
