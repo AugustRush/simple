@@ -297,15 +297,115 @@ collaborator design, not a move.
 
 ---
 
+## 5. The three files the 2026-10-09 survey covered — re-measured
+
+That survey's order for `channels/web.py`, `channels/feishu.py` and `tools/builtin_tools.py` is
+**stale**: named helpers no longer exist, and one file's plan is now spent.  Fresh measurements
+(2026-10-15) below supersede it.  All three were measured the same way as the four above, but
+with an independent cross-check against `symtable`, which agreed with the AST analysis on 98 of
+101 scopes for `web.py`.
+
+### `agent/tools/builtin_tools.py` — the plan is spent, and that is the finding
+
+2062 lines, one class, **zero top-level functions** and **zero decorators**.  `_register` is
+**1650 lines** of 44 `r.register(...)` calls and `__init__` is 81 lines: together **84%** of the
+file.  Strictly extractable material is **96 lines**:
+
+| lines | name | refs | what it is |
+|---|---|---|---|
+| 1 | `_ok` | ∅ | the envelope every tool answers in |
+| 1 | `_error` | ∅ | the same, for failures |
+| 20 | `_current_time` | `_ok`, `_error` | one timezone-aware tool handler |
+| 74 | `_try_interactive_confirmation` | ∅ | the shell consent gate |
+
+Plus five attribute-coupled accessors (28 lines) that read the registry's context keys.  The
+honest conclusion is that this file's remaining reduction is *not* extraction: it is
+per-cluster self-registration, which the module docstring already defers.
+
+Traps found: **`SchedulerStore` is undefined in the module** (a return annotation at the
+`_schedule_store` accessor, silent only because `from __future__ import annotations` makes it
+unresolved until someone calls `typing.get_type_hints`); and moving the four context accessors
+**requires editing the `CONTEXT_KEYS` ledger**, because `tests/test_context_keys.py` walks the
+package for `get_context("...")` reads and asserts the ledger matches in both directions.
+
+### `agent/channels/web.py` — 60 candidates, and the traps are all about identity
+
+3256 lines; 97 methods; one `@property`, six `@staticmethod`s, **no `@classmethod` and no `cls.`
+anywhere**.  Every self/cls reference a candidate has points at *methods of the same class* --
+no candidate touches `_config`, `_sessions` or `_handler` directly.  Thirteen are truly
+self-free; 40 more have their only call site as `self.X` handed to `Route(...)`.
+
+The proposed order (cheapest first) is `web_run_artifacts` (already a module function) →
+`web_assets` → `web_feishu_ops` → `web_provider_validation` → `web_attachments` →
+`web_session_files` → `web_trigger_body` → `web_workflow_body` → `web_schedule_body` →
+`web_router` (the ~1200-line route table, which needs a small state object first).
+
+The traps are identity, not structure, and each one turns a passing test into a test that
+passes while testing nothing:
+
+* **A patched constant whose only reader is the candidate.**  `tests/test_web_channel.py` does
+  `monkeypatch.setattr(web_module, "_ARTIFACT_WALK_LIMIT", 4)` and then calls
+  `web_module._list_run_artifacts(...)`.  A function reads *its own* module's globals, so moving
+  both to a new module silently defeats the patch.  The constants must travel with the reader
+  **and the test must be repointed**.
+* **Method monkeypatched by attribute through the class.**
+  `monkeypatch.setattr(WebChannel, "_list_feishu_chats", staticmethod(...))` (and
+  `_send_feishu_text`) only intercepts because the call is `self._list_feishu_chats`.  Turning
+  them into plain module functions without a class-level alias makes those tests vacuous.
+* **Bound-method callbacks are load-bearing.**  `_signal_problem` and `_feishu_ready` are handed
+  to the scheduler builders as *methods*; extraction must pass plain functions, which changes
+  callback identity.
+* **Lazy imports must stay lazy.**  The `_feishu_*` helpers and the provider validators import
+  `lark_oapi` / `agent.config` *inside the body*; that is precisely what makes
+  `monkeypatch.setattr(config_module, "load_config", ...)` work.  Hoisting them to module scope
+  in the new module breaks those tests.
+* **A name defined twice**: `_web_session_upload_dir` is re-defined at web.py:153, shadowing the
+  import at web.py:47, so the module attribute is the local copy while `_web_session_dir` is
+  imported only to serve it.  Deleting the "duplicate" as obviously dead changes the live binding.
+
+### `agent/channels/feishu.py` — 1958 lines, and the same identity traps in a heavier dose
+
+Candidates cluster into: connection helpers (`_ws_reconnect_delay` plus its two constants,
+`build_feishu_client` — already module-level and already imported by `web.py` and
+`scheduler/delivery.py`, so those import paths must keep working), inbound ingest
+(`_is_bot_mentioned`, `_report_processing_failure`, `_message_attachment_specs`,
+`_download_message_attachments`, `_extract_message_attachments`), the send paths
+(`_send_file_async`, `_send_plain_async`, `_send_tool_hint_async`, `_send_response_async`,
+`_add_reaction`) and the outcome handlers.
+
+Traps, worse here than in `web.py`:
+
+* **Eleven methods are monkeypatched by attribute name** across ~60 test sites
+  (`_add_reaction`, `_send_response_async`, `_send_file_async`, `_send_tool_hint_async`,
+  `_send_plain_async`, `_download_message_attachments`, `_download_message_resource`,
+  `_send_file_sync`, `_upload_file_sync`, `_do_send`).  Each must remain a class attribute, or
+  the test stops intercepting.
+* **Module constants patched by string path** (`agent.channels.feishu.LARK_AVAILABLE`,
+  `_ATTACHMENT_CANCEL_GRACE_SECONDS`, `threading.Thread.start`), and two constants
+  (`FEISHU_WS_RECONNECT_*`) whose only reader is a candidate and which tests import *by name* —
+  so they must move **and** be re-exported.
+* **A name that exists twice**: `_interaction_log` is both a module-level function and a method
+  on `FeishuOutputSink`; `self._interaction_log` is the method, the bare calls are the function.
+* **`getattr(sink, "defer_temporary_attachment_cleanup")`** in `coordinator.py` makes that name
+  load-bearing even though the body is five lines.
+* The `on_tool_end`/`on_info`/`on_status`/`on_error` overrides look self-free only because they
+  are thin; they are `OutputSink` contract members, and several test hits for other modules are
+  the *base* sink's methods, not these.
+
+---
+
 ## What this does not cover
 
 * **Whether each cluster is a *good* module.**  This survey measures coupling, which predicts
   what is *cheap*; a cheap move that produces an incoherent module is still a bad move, and
   that judgement is made per extraction, against the module's own docstring.
 * **The other big files.**  `channels/web.py`, `channels/feishu.py` and `tools/builtin_tools.py`
-  were measured in the 2026-10-09 survey; part of its order has since been overtaken (see the
-  note in the delivery document's backlog).  `channels/web_session_paths.py` and
-  `channels/web_provider_config.py` are the two clusters extracted from the first of them since.
+  are re-measured above; `channels/web_session_paths.py` and `channels/web_provider_config.py`
+  are the two clusters extracted from the first of them before that measurement.
 * **Runtime behaviour.**  These numbers say nothing about which code is exercised; a cluster
   with no tests is cheap to move and expensive to move *safely*, and the extraction order above
   assumes the existing suite is the safety net it has been for every extraction so far.
+* **The mechanical transformation itself.**  `scripts/_move_methods.py` performs it and refuses
+  when it cannot prove the result; the rules it encodes are in
+  [`2026-10-15-subagent-work-order.md`](2026-10-15-subagent-work-order.md).
+
