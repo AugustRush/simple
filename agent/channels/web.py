@@ -37,6 +37,15 @@ from agent.channels.web_payloads import (
     workflow_payload,
 )
 from agent.channels.web_sink import WebOutputSink, _normalize_confirm_decision
+from agent.channels.web_provider_config import (
+    _mask_api_keys,
+    _restore_masked_api_keys,
+)
+from agent.channels.web_session_paths import (
+    _web_session_dir,
+    _web_session_output_dir,
+    _web_session_upload_dir,
+)
 from agent.commands.composition import ensure_command_router
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
@@ -141,32 +150,6 @@ def _list_run_artifacts(root: Path, task_id: str, run_id: str) -> list[dict[str,
     return artifacts
 
 
-def _web_session_dir(session_id: str, leaf: str) -> Path:
-    """One directory inside a session's isolated home.
-
-    The two callers below differ only in the leaf, so the rule that matters --
-    resolve the session's home, and if its id cannot be resolved say so *loudly*
-    rather than share a directory with another session -- lives here once.  Every
-    caller validates the id first, so reaching the fallback means something
-    upstream let an unresolvable id through, and two sessions would then share
-    one home: the isolation the web channel exists to provide.
-    """
-    try:
-        return shared.web_session_home(str(session_id)) / leaf
-    except ValueError:
-        logger.warning(
-            "unresolvable web session id, sharing the unknown %s home: %r",
-            leaf,
-            session_id,
-        )
-        return shared.AGENT_HOME / "web" / "sessions" / "unknown" / leaf
-
-
-def _web_session_output_dir(session_id: str) -> Path:
-    """The session's output directory: where its artifacts are written."""
-    return _web_session_dir(session_id, "output")
-
-
 def _web_session_upload_dir(session_id: str) -> Path:
     """The session's upload directory: where the browser's uploads land."""
     return _web_session_dir(session_id, "uploads")
@@ -194,58 +177,6 @@ class WebConfig:
 #: only thing that can be said about one is whether its *name* reads like a
 #: secret -- which is what a masking pass has to go on, and is why the list is
 #: a pattern rather than an enumeration.
-_SECRET_HEADER_RE = re.compile(r"authorization|cookie|(^|[-_])key$|key[-_]|token|secret")
-
-
-def _mask_api_keys(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``cfg`` with provider credentials masked for display.
-
-    ``api_key`` and any header whose name reads like a credential: the settings
-    page round-trips the whole provider block, so a token that happens to be
-    spelled as a header would otherwise be handed back to the browser in the
-    clear.  The masking must be symmetric with :func:`_restore_masked_api_keys`
-    or a save would write ``******`` over a working credential.
-    """
-    import copy
-
-    masked = copy.deepcopy(cfg)
-    providers = masked.get("providers")
-    if isinstance(providers, dict):
-        for provider in providers.values():
-            if not isinstance(provider, dict):
-                continue
-            if provider.get("api_key"):
-                provider["api_key"] = "******"
-            headers = provider.get("headers")
-            if isinstance(headers, dict):
-                for name, value in headers.items():
-                    if value and _SECRET_HEADER_RE.search(str(name).lower()):
-                        headers[name] = "******"
-    return masked
-
-
-def _restore_masked_api_keys(new_cfg: dict[str, Any], current_cfg: dict[str, Any]) -> None:
-    """Keep existing credentials when the UI saved the masked placeholder back."""
-    providers = new_cfg.get("providers")
-    current_providers = current_cfg.get("providers")
-    if not isinstance(providers, dict) or not isinstance(current_providers, dict):
-        return
-    for name, provider in providers.items():
-        if not isinstance(provider, dict):
-            continue
-        current = current_providers.get(name)
-        if provider.get("api_key") == "******":
-            if isinstance(current, dict) and current.get("api_key"):
-                provider["api_key"] = current["api_key"]
-        headers = provider.get("headers")
-        current_headers = current.get("headers") if isinstance(current, dict) else None
-        if isinstance(headers, dict) and isinstance(current_headers, dict):
-            for header_name, value in headers.items():
-                if value == "******" and current_headers.get(header_name):
-                    headers[header_name] = current_headers[header_name]
-
-
-
 def _names_a_trigger_field(raw: dict[str, Any]) -> bool:
     """Whether a step body says anything about *when* it runs, other than type.
 
