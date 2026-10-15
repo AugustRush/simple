@@ -1223,6 +1223,7 @@ class PluginCatalog:
         components: Optional[dict] = None,
         service_policy: Any = None,
         service_validator: Any = None,
+        detect_plugin_changes: bool = False,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
@@ -1266,6 +1267,18 @@ class PluginCatalog:
         #: so thirty hand-written copies would be a mirror of this one record -- the
         #: defect the service ledger was cured of.  ``provenance_of`` derives.
         self._provenance: dict[str, Provenance] = {}
+        #: Change detection for code that appears in the *user's* tree.  Off unless the
+        #: composition root asks for it, because it needs somewhere to record what it has
+        #: seen (the trust ledger) and because a bare catalog in a test or an embedder
+        #: loading what it was handed is not a threat model.
+        self._detect_changes = detect_plugin_changes
+        #: Plugins whose code is in the tree, was never approved and was never seen here.
+        #: Not loaded, and reported: "blocked" rather than "pending", because nothing is
+        #: going to unblock them by itself.
+        self._unapproved: dict[str, dict] = {}
+        #: Set during the one-time first look, printed after discovery so the list is one
+        #: block rather than interleaved with per-plugin warnings.
+        self._first_look: list[tuple[str, tuple]] = []
         # Agent definitions discovered from <plugin>/agents/*.md.
         # Key format: "plugin:<plugin>:<agent>".  Value: dict with keys
         # ``name``, ``description``, ``body``, ``plugin``, ``path``.
@@ -1506,6 +1519,15 @@ class PluginCatalog:
         self._agent_defs.clear()
         self._plugin_source_dirs.clear()
         self._provenance.clear()
+        self._unapproved.clear()
+        self._first_look.clear()
+        # Whether *this* discovery is the machine's first look -- asked once, before any
+        # plugin is admitted.  It used to be inferred from "the first-look list is non-empty",
+        # which meant a machine whose user plugin directory was empty never recorded the
+        # marker: the *next* plugin to appear got blessed silently, which is precisely the
+        # sequence this feature exists to catch (fresh install, then something copies a
+        # directory in).
+        self._first_look_run = not self._baseline_taken()
         # Auto-create user plugins directory
         if self._user_dir:
             self._user_dir.mkdir(parents=True, exist_ok=True)
@@ -1531,7 +1553,104 @@ class PluginCatalog:
                         name_hint=plugin_name_hint,
                         source_dir_name=entry_dir.name,
                     )
+        self._report_change_detection()
         return [name for name in self._plugins]
+
+    def _admit_plugin(self, plugin_dir: Path, plugin_name: str, *, source: str) -> bool:
+        """Whether this plugin's code may run now.  See the gate's comment at the call site.
+
+        Five answers, in the order they are asked:
+
+        1. **Nothing to run** -- a declarative plugin ships no code, so there is nothing to
+           notice and nothing to ask about.  Most plugins.
+        2. **Not the user's tree** -- this runtime's own plugins (`agent/_builtin/`, the ones
+           the composition mounts) are part of the release.  Change detection over them would
+           mean the agent blocking its own upgrade, which is not a threat model.
+        3. **Not switched on** -- a catalog nobody pointed at a ledger cannot record what it
+           has seen, and refusing to load would be enforcement with nowhere to write the
+           answer.
+        4. **Recorded** -- either a human approved this content (recorded at install/import,
+           by digest) or this machine has run it before.
+        5. **Otherwise** it does not load, and it is reported.
+        """
+        if not self._detect_changes or source != "user":
+            return True
+        from agent.plugins import formats as plugin_formats
+        from agent.runtime.provenance import digest_of
+        from agent.security import plugin_approval
+
+        executions = plugin_formats.executions(plugin_dir)
+        if not executions:
+            return True
+        digest = digest_of(executions)
+
+        if plugin_approval.plugin_install_was_approved(None, str(plugin_dir), digest):
+            plugin_approval.record_plugin_content_seen(digest)
+            return True
+        if plugin_approval.plugin_content_was_seen(digest):
+            return True
+        if not plugin_approval.seen_baseline_taken():
+            # The one-time first look.  Collected rather than printed here so the list is a
+            # block, and *recorded* rather than merely shown: this is trust on first use, and
+            # calling it anything else would be claiming a consent nobody gave.
+            self._first_look.append((plugin_name, executions))
+            plugin_approval.record_plugin_content_seen(digest)
+            return True
+
+        self._unapproved[plugin_name] = {
+            "digest": digest,
+            "source": str(plugin_dir),
+            "would_run": [item.describe() for item in executions],
+        }
+        return False
+
+    @staticmethod
+    def _baseline_taken() -> bool:
+        from agent.security import plugin_approval
+
+        return plugin_approval.seen_baseline_taken()
+
+    def _report_change_detection(self) -> None:
+        """Say what was noticed, once, in one block."""
+        from agent.security import plugin_approval
+
+        if self._first_look_run and not self._first_look:
+            # Nothing to list, and the marker still has to be written: an empty tree is a
+            # first look, and leaving it unrecorded would bless whatever shows up next.
+            plugin_approval.record_seen_baseline()
+        if self._first_look:
+            shared.CONSOLE.print(
+                "[yellow]Plugin check: first look at this machine's plugins. "
+                "These run code and are now recorded; from here on only a change is "
+                "reported.[/yellow]"
+            )
+            for name, executions in self._first_look:
+                described = "; ".join(item.describe() for item in executions)
+                shared.CONSOLE.print(f"  {name}: {described}")
+            plugin_approval.record_seen_baseline()
+            self._first_look.clear()
+        if self._unapproved:
+            shared.CONSOLE.print(
+                "[red]Plugin check: these are in the user plugin directory and their code "
+                "is not what was approved or last run here. They were NOT loaded.[/red]"
+            )
+            for name, detail in sorted(self._unapproved.items()):
+                shared.CONSOLE.print(
+                    f"  {name} ({detail['source']}): "
+                    + "; ".join(detail["would_run"])
+                )
+            shared.CONSOLE.print(
+                "[red]  Review them, then approve with the plugin install path or "
+                "remove them.[/red]"
+            )
+
+    def unapproved_report(self) -> dict[str, dict]:
+        """User plugins whose code did not load, with what they would have run.
+
+        The queryable half of the notice: a surface that wants to show it (a status
+        command, a gateway banner) reads this rather than parsing the message above.
+        """
+        return dict(self._unapproved)
 
     @staticmethod
     def _expand_marketplace(entry_dir: Path) -> list[tuple[Path, str]]:
@@ -1651,6 +1770,19 @@ class PluginCatalog:
 
         # Check enable/disable in config
         if not self._is_plugin_enabled(plugin_name):
+            return
+
+        # ── change detection, before anything runs ────────────────────────
+        #
+        # Here, not at activation: ``exec_module`` below *is* the execution, so a gate that
+        # ran after it would be a report about code that already ran.  What it protects is
+        # the *appearance* path -- a sync tool, a package install, a clone, another
+        # application's profile dropping code into a directory this runtime scans -- and it
+        # protects it only this far: the trust ledger is a plain 0644 file in the same home,
+        # so anyone who can write the plugin directory can write the record too.  What it
+        # raises is the cost of the *generic* vector, from "copy a file into a conventional
+        # data directory" to "know this application's ledger path, format and key".
+        if not self._admit_plugin(plugin_dir, plugin_name, source=source):
             return
 
         plugin: Any = None

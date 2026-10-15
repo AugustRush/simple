@@ -172,12 +172,33 @@ string that was typed.
    With no sink to ask, nothing is written and `requires_confirmation` is false -- the
    import fails closed, which is the whole point of asking.
 
-   **What is still not covered, and is the sharper half of the original finding:** these four
-   steps gate *adoption* (installing from a source, importing from a profile).  A plugin
-   directory that is already in `~/.agent/plugins/` is still `exec_module`-ed at startup with
-   no approval record consulted — the load path, not the install path.  Closing it is a
-   behaviour change for every existing deployment (their plugins would have to be approved
-   once), so it is recorded here rather than taken silently.
+   **The load path** (the sharper half of the original finding -- these four steps gate
+   *adoption*, and a directory already in `~/.agent/plugins/` was still `exec_module`-ed with
+   nothing consulted) is now covered by **change detection**, and it is deliberately *not* an
+   approval gate.
+
+   An approval gate there would have been unenforceable against the actor it was meant to
+   stop: the trust ledger is a plain 0644 JSON file in the same home as the plugin directory,
+   so anything that can write code into one can write a record into the other.  What shipped
+   instead is trust-on-first-use over **content**: the loader digests what a user plugin would
+   run (`formats.executions` + `digest_of`, computed *before* `exec_module`, because a gate
+   after it is a report about code that already ran), and
+
+   * a human-approved digest or one this machine has seen → loads;
+   * the machine's **first look** → everything present is listed with what it would run, and
+     recorded: a blessing of what is already there, named and visible rather than silent,
+     because the alternative is a cliff;
+   * anything else → **not loaded**, and reported with what it would have run.
+
+   That raises the cost of the generic vector -- a sync tool, a package install, a clone,
+   another application's profile -- from "write a file in a conventional data directory" to
+   "know this application's ledger path, format and workspace key".  It is not a boundary, and
+   the code says so at the point where it matters.
+
+   Two scoping decisions came from measurement rather than taste: it covers **user** plugins
+   only (gating the distribution's own would mean the agent blocking its own upgrade), and it
+   is **off unless the composition asks** (`detect_plugin_changes=True`), because a catalog
+   nobody pointed at a ledger has nowhere to record what it has seen.
 
 ## B. Adapters locate; they do not interpret (measured)
 

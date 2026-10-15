@@ -183,11 +183,18 @@ public / 24 reserved, 15 with contracts**.
    stdio commands it declares, asks through the same digest-keyed rule, and writes a native
    plugin directory the loader already contributes and attributes.
 
-   **What is still open, and it is the sharper half of the original finding:** all four steps
-   gate *adoption*.  A plugin directory already sitting in `~/.agent/plugins/` is still
-   executed at startup with no approval record consulted -- the load path, not the install
-   path.  Closing it means every existing deployment approves its plugins once, which is a
-   behaviour change worth taking deliberately rather than as a side effect.  Until those
+   The load path is covered too, as **change detection** rather than an approval gate (the
+   ledger shares a trust domain with the plugin directory, so a gate there would be
+   unenforceable against the actor it targets).  A user plugin whose content was approved or
+   has run here before loads; the machine's first look lists and records what is present;
+   anything else does not load and is reported with what it would have run.
+
+   **Open, and a real workflow cost:** a plugin *author* editing their own plugin in
+   `~/.agent/plugins/` looks exactly like a sync tool updating files behind them, so the edit
+   does not load until it is approved or observed again.  The escape hatch -- a directory the
+   user names as their own, trusted by *path* rather than by content -- is not built.  It is a
+   decision about what "mine" means (a config list, or a ledger rule the user grants), which
+   is why it is a separate step rather than an implementation detail.  Until those
    exist the *trust* half is not met: a plugin in `~/.agent/plugins/` is still executed at
    startup on the strength of being there.
 2. **The 4 remaining soft reads** (`tests/test_memory_contract.py`): the token budget's

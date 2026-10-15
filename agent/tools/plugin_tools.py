@@ -239,6 +239,7 @@ async def confirm_executable_content(
     from agent.security.plugin_approval import (
         plugin_install_mark_approved,
         plugin_install_was_approved,
+        record_plugin_content_seen,
     )
 
     async with _APPROVAL_LOCK:
@@ -259,6 +260,12 @@ async def confirm_executable_content(
         )
         if approved:
             plugin_install_mark_approved(scope, source, digest=digest)
+            # And content-addressed, so the *load* path can honour it without knowing which
+            # source string the human was shown: an approval is a stronger reason for this
+            # content to run than "this machine has seen it", and the loader asks the weaker
+            # question.
+            if digest:
+                record_plugin_content_seen(digest)
             return True, False
         return False, approved is None
 

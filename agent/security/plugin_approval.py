@@ -140,6 +140,64 @@ def plugin_install_approve_record(
     return approved.what if approved is not None else None
 
 
+#: The second question, and it is a different one.
+#:
+#: ``plugin:<source>@<digest>`` means **a human said yes** to this code, in a dialog, having
+#: been shown what it would run.  ``plugin-seen:<digest>`` means **this content has run on
+#: this machine before** -- trust on first use, recorded by the loader, with nobody asked.
+#: Keeping them as two rule kinds rather than one is the whole point: "who approved this"
+#: has to stay answerable, and a single rule would make a machine's habit indistinguishable
+#: from a person's decision.
+#:
+#: The digest is the entire value: not the plugin name and not its path.  A rename is not a
+#: change of code, and a move is not a change of code -- what ran is what matters.
+SEEN_KIND = "plugin-seen"
+
+#: The marker that says "this deployment has had its first look".
+#:
+#: Without it, turning change detection on would leave every existing deployment with a
+#: plugin tree nobody had recorded, and the honest choices would be a cliff (everything
+#: inert until re-approved) or a silent blessing.  The marker makes the blessing a *named,
+#: one-time, visible* act instead: on the first run the loader prints every plugin and what
+#: it would run, records them, and from then on only a **change** is loud.
+SEEN_BASELINE = "baseline"
+
+
+def _seen_rule(digest: str) -> str:
+    return consent.make_rule(SEEN_KIND, digest)
+
+
+def plugin_content_was_seen(digest: str) -> bool:
+    """Whether this exact content has run here before (trust on first use)."""
+    if not digest:
+        return False
+    return consent.SHELL.approved(_seen_rule(digest), scope=None, workspace="")
+
+
+def record_plugin_content_seen(digest: str) -> None:
+    """Remember that this content ran here.  Durable, like every ``always`` answer."""
+    if digest:
+        consent.SHELL.remember(
+            _seen_rule(digest), consent.ALWAYS, scope=None, workspace=""
+        )
+
+
+def seen_baseline_taken() -> bool:
+    """Whether this deployment has already had its one-time first look."""
+    return consent.SHELL.approved(
+        consent.make_rule(SEEN_KIND, SEEN_BASELINE), scope=None, workspace=""
+    )
+
+
+def record_seen_baseline() -> None:
+    consent.SHELL.remember(
+        consent.make_rule(SEEN_KIND, SEEN_BASELINE),
+        consent.ALWAYS,
+        scope=None,
+        workspace="",
+    )
+
+
 def plugin_install_was_approved(scope: Any, source: str, digest: str = "") -> bool:
     """True when this source, at this content, was approved for this scope (unexpired).
 
@@ -186,6 +244,12 @@ def plugin_install_clear_all() -> None:
 
 __all__ = [
     "KIND",
+    "SEEN_KIND",
+    "SEEN_BASELINE",
+    "plugin_content_was_seen",
+    "record_plugin_content_seen",
+    "seen_baseline_taken",
+    "record_seen_baseline",
     "_TTL_SECONDS",
     "plugin_install_approve_record",
     "plugin_install_approve_single",

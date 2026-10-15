@@ -707,6 +707,10 @@ async def _build_components_async(
     # ── Plugin Catalog ────────────────────────────────────────────────────────
     # Constructed after the partial components because the kernel adopts them.
     plugin_catalog = PluginCatalog(
+        # Change detection over the user's own plugin directory.  Requires the trust ledger,
+        # which ``consent.configure`` above points at the agent's home, and is off elsewhere
+        # (a bare catalog loads what it is handed).
+        detect_plugin_changes=True,
         builtin_dir=plugins_dir,
         user_dir=user_plugins_dir,
         plugin_config=cfg.get("plugins", {}),

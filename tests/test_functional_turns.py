@@ -623,12 +623,31 @@ def register():
 
 
 def write_plugin(home_dir, marker: str = "v1") -> Any:
-    """A user plugin in the home the composition discovers plugins from."""
+    """A user plugin in the home the composition discovers plugins from.
+
+    Written straight into the user plugin directory, and then **recorded as seen** -- which
+    is what a machine that already had this content would look like.  These tests are about
+    turn wiring (a tool reaching the agent, a hook hearing the turn, a reload picking up new
+    code), and the composition now refuses to execute user plugin code it has neither
+    approved nor seen before; writing the files is no longer enough.  The refusal itself is
+    tested where it belongs, in ``tests/test_plugin_change_detection.py``, so blessing here
+    cannot hide a regression in it.
+    """
     plugin_dir = home_dir / "plugins" / "recorder"
     plugin_dir.mkdir(parents=True, exist_ok=True)
     init = plugin_dir / "__init__.py"
     init.write_text(_PLUGIN % {"marker": marker}, encoding="utf-8")
+    _record_seen(plugin_dir)
     return init
+
+
+def _record_seen(plugin_dir) -> None:
+    """Tell the ledger this content has run here, the way a first look would."""
+    from agent.plugins.formats import executions
+    from agent.runtime.provenance import digest_of
+    from agent.security import plugin_approval
+
+    plugin_approval.record_plugin_content_seen(digest_of(executions(plugin_dir)))
 
 
 def plugin_notes(plugin_dir) -> list[dict]:
@@ -719,7 +738,15 @@ def test_reloading_a_plugin_runs_its_new_code(home):
         assert first.exit_code == 0, first.output
 
         # Same length, same mtime: the edit CPython's .pyc check cannot see.
+        #
+        # Recorded as seen, because a *change* to a plugin's code is exactly what the
+        # composition now refuses to execute until it has been approved or observed -- and
+        # this test is about the bytecode cache, not about that refusal (which has its own
+        # tests in ``tests/test_plugin_change_detection.py``).  What it is simulating is an
+        # author editing their own plugin, which is a real workflow the refusal does
+        # interrupt: see the note in that module's docstring.
         init.write_text(_PLUGIN % {"marker": "v2"}, encoding="utf-8")
+        _record_seen(plugin_dir)
         import os
 
         os.utime(init, (stat.st_atime, stat.st_mtime))
@@ -1635,6 +1662,10 @@ def test_a_sessions_end_reaches_the_plugins_watching_for_it(home):
     plugin_dir = home / "plugins" / "session_recorder"
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "__init__.py").write_text(_SESSION_PLUGIN, encoding="utf-8")
+    # Written by hand here rather than through ``write_plugin``; recorded as seen for the
+    # same reason -- these tests are about the session boundary, and the composition refuses
+    # to execute user plugin code it has not seen.  See ``write_plugin``.
+    _record_seen(plugin_dir)
     try:
 
         async def run() -> list[dict]:
