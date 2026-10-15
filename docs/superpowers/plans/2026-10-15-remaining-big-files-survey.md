@@ -394,6 +394,50 @@ Traps, worse here than in `web.py`:
 
 ---
 
+## 6. Corrections from an independent measurement
+
+A second, independent pass over the three god classes (2026-10-15, read-only, cross-checked
+against `symtable`) found five things this survey got wrong or left out.  They reshape the plan,
+so they are recorded here rather than silently acted on.
+
+1. **A reference count cannot tell a wrapper from a body.**  Twelve of `LTMStore`'s methods that
+   section 3 lists as remaining are *already* thin delegates over `schema/`, `queries/`,
+   `usage/` and `facts/`: `_ensure_schema`, `_ensure_fts_index`, `append_conversation_turn`,
+   `recent_conversation_turns`, `transcript_window`, `_rows_at_seqs`, `list_session_ids`,
+   `search_conversation_turns`, `append_usage_event`, `usage_summary`, `corpus_stats`,
+   `_fact_assertion_total_score`.  The same is true of `ContextManager.fit_to_budget`.  A
+   `self.X` count finds them because a wrapper still says `self._connect` -- the count measures
+   coupling, and a delegate is coupled by construction.  Every "remaining" list here needs
+   re-checking against the current file before it is acted on.
+2. **`apply_retention` is not in `scheduler/store.py`.**  It exists in `memory/store.py` and
+   `backends/sqlite_fts.py`.  A task specification that named it for the scheduler file was
+   simply wrong.
+3. **`@_synchronized` is an invisible dependency.**  **43** methods of `SchedulerStore` carry it,
+   and the decorator's wrapper is `with self._lock: return method(self, *args)`.  Each therefore
+   needs `self._lock`, and the decorator must stay on the class wrapper -- a module function
+   decorated with it would be called as `method(self, ...)` with `self` bound to the connection.
+4. **`scheduler/store.py` spells the connection `self._conn`, not `self._connect()`.**  Its
+   methods do not open the connection; they are *called inside* a transaction the caller owns.
+   Combined with (3) this means `scripts/_move_methods.py` currently **cannot move a single
+   method out of that file** -- it refuses every one.  Before any scheduler work the tool needs a
+   connection-expression option and wrapper-side decorator retention.  By contrast the 14
+   non-decorated `*_in_transaction` helpers have no lock problem and are the right first move.
+5. **The cache seam is one designed collaborator, not nine small moves.**  `apply_retention`,
+   `apply_decay`, `clear_persistent_memory`, `_remove_category`, `merge_categories`,
+   `write_entries`, `add_entry`, `add_entries` and `upsert_manual_note` all assign or clear
+   `self._category_stats_cache`; `_sync_after_mutation` writes instance state and can never be a
+   free function.  They need an `invalidate_category_stats()` callable (or the new function
+   returning the touched categories for the class wrapper to invalidate).  Until that exists,
+   the write path and the maintenance group are not mechanical moves.
+
+One more trap worth its own line, because it inverts a rule this survey states:
+**`_TASK_IDENTITY_COLUMNS` is imported by `tests/test_scheduler_products.py` *from
+`agent.scheduler.store`*, while only two moving methods read it.**  "A constant travels with its
+only reader" is right about *reading*, and wrong about *naming*: a name that outsiders import has
+to be re-exported from its old module even after its reader leaves.
+
+---
+
 ## What this does not cover
 
 * **Whether each cluster is a *good* module.**  This survey measures coupling, which predicts
