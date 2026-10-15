@@ -159,8 +159,9 @@ def free_names(text: str) -> set[str]:
 
 
 def module_index(tree: ast.Module, lines: list[str]):
-    """Module-level constants and the import statements that would restore each name."""
+    """Module-level constants, module-level functions, and the imports for each name."""
     constants: dict[str, tuple[int, int, str]] = {}
+    functions: set[str] = set()
     imports: dict[str, str] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -169,6 +170,8 @@ def module_index(tree: ast.Module, lines: list[str]):
                 node.end_lineno,
                 "".join(lines[node.lineno - 1:node.end_lineno]).rstrip("\n"),
             )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.add(node.name)
         if isinstance(node, ast.ImportFrom):
             module = "." * (node.level or 0) + (node.module or "")
             for alias in node.names:
@@ -178,7 +181,7 @@ def module_index(tree: ast.Module, lines: list[str]):
             for alias in node.names:
                 as_ = f" as {alias.asname}" if alias.asname else ""
                 imports[(alias.asname or alias.name).split(".")[0]] = f"import {alias.name}{as_}"
-    return constants, imports
+    return constants, imports, functions
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -228,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"not methods of {args.klass}: {missing}", file=sys.stderr)
         return 2
 
-    constants, imports = module_index(tree, lines)
+    constants, imports, module_functions = module_index(tree, lines)
     blocks: list[str] = []
     wrappers: list[str] = []
     spans: dict[str, tuple[int, int]] = {}
@@ -241,8 +244,14 @@ def main(argv: list[str] | None = None) -> int:
         start = min([d.lineno for d in method.decorator_list] + [method.lineno]) - 1
         spans[method.name] = (start, method.end_lineno)
         original = textwrap.dedent("".join(lines[start:method.end_lineno])).strip("\n")
+        # Decorators are class-level concerns (`@staticmethod`, `@property`, `@contextmanager`,
+        # a lock-carrying `@_synchronized`): they stay with the wrapper.  Only `@staticmethod`
+        # and `@classmethod` used to be stripped here, which carried the others into the new
+        # module -- where `@_synchronized` would then be called as `method(self, ...)`.
+        decorator_names = {ast.unparse(d) for d in method.decorator_list}
         original = "\n".join(
-            line for line in original.splitlines() if line.strip() not in ("@staticmethod", "@classmethod")
+            line for line in original.splitlines()
+            if line.strip().lstrip("@").split("(")[0] not in decorator_names
         )
         fn = ast.parse(original).body[0]
 
@@ -251,7 +260,9 @@ def main(argv: list[str] | None = None) -> int:
         # `--param ""` means "invent no parameter": the function keeps the signature its body
         # actually needs.  The store work always needed a connection; the HTTP and channel
         # work never does.
-        if args.param:
+        positional = [a.arg for a in list(fn.args.posonlyargs) + list(fn.args.args)]
+        takes_param = bool(args.param) and args.param in positional
+        if args.param and not takes_param:
             text = with_first_param(text, method.name, args.param)
             # Drop the local connection acquisition.  The dedent must be relative to the `with`
             # line: a fixed four-space cut also eats the statement that follows the block (which
@@ -317,7 +328,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         stem = pathlib.Path(args.module).stem
         pad = " " * (12 if uses_connect else 8)
-        call_args = ([args.param] if uses_connect else []) + [f"{n}={n}" for n in names]
+        first = args.param if (uses_connect or takes_param) else ""
+        call_args = ([first] if first else []) + [
+            f"{n}={n}" for n in names if n != first
+        ]
         if call_args:
             call = f"{stem}.{method.name}(\n"
             call += "".join(f"{pad}    {a},\n" for a in call_args)
@@ -347,6 +361,17 @@ def main(argv: list[str] | None = None) -> int:
     consts = sorted(n for n in needed if n in constants)
     unresolved = [n for n in needed if n not in imports and n not in constants and n not in moving]
     unresolved = [n for n in unresolved if n not in MODULE_GLOBALS]
+    # A module-level function cannot be re-imported (the old module imports the new one, so that
+    # is a cycle) and should not be carried silently.  Refuse with the name, so the operator
+    # moves it deliberately -- as its own `--methods` entry it does not qualify, since it is not
+    # a method of the class.
+    carried_functions = sorted(n for n in unresolved if n in module_functions)
+    if carried_functions:
+        problems.append(
+            f"these are module-level functions in {args.file} and must be moved deliberately "
+            f"(or passed in): {carried_functions}"
+        )
+        unresolved = [n for n in unresolved if n not in module_functions]
     unresolved = [n for n in unresolved if not re.match(r"^(Any|Optional|Callable|Sequence|dict|list|set|tuple)$", n)]
     if unresolved:
         problems.append(f"cannot resolve these free names: {unresolved}")
@@ -394,9 +419,12 @@ def main(argv: list[str] | None = None) -> int:
                         )
         else:
             header = header[:import_anchor(header)] + statement + "\n" + header[import_anchor(header):]
-    header = header.replace(
-        "__all__ = [", "__all__ = [\n    " + ",\n    ".join(f'"{m}"' for m in moving) + ",", 1,
-    )
+    if "__all__ = [" in header:
+        listed = re.search(r"__all__ = \[([^]]*)\]", header, re.S)
+        existing = [x.strip().strip('"') for x in listed.group(1).split(",") if x.strip()]
+        merged = existing + [m for m in moving if m not in existing]
+        block = "__all__ = [\n" + "".join(f'    "{m}",\n' for m in merged) + "]"
+        header = header[:listed.start()] + block + header[listed.end():]
     const_text = "\n\n".join(constants[n][2] for n in consts)
     new_module = header.rstrip("\n") + "\n\n\n"
     if const_text:

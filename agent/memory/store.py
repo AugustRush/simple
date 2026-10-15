@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, Sequence
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
 
+from . import fts
 from .retrieval import CorpusStats
 
 from . import facts
@@ -123,7 +124,6 @@ class LTMStore:
         except sqlite3.Error:
             return
 
-
     def _derive_missing_identity_facts(
         self, conn: sqlite3.Connection
     ) -> set[tuple[str, str]]:
@@ -230,17 +230,11 @@ class LTMStore:
                 conn,
             )
 
-
-
-
-
-
     def _ensure_fts_index(self) -> None:
         with self._connect() as conn:
             schema._ensure_fts_index(
                 conn,
             )
-
 
     def _cleanup_legacy_artifacts(self) -> None:
         self._meta_path.unlink(missing_ok=True)
@@ -328,33 +322,15 @@ class LTMStore:
         conn: sqlite3.Connection,
         entry_ids: list[str] | set[str] | tuple[str, ...],
     ) -> None:
-        ids = [entry_id for entry_id in entry_ids if entry_id]
-        if not ids:
-            return
-        conn.execute(
-            f"DELETE FROM memory_items_fts WHERE memory_id IN ({','.join('?' for _ in ids)})",
-            ids,
+        fts._delete_fts_rows(
+            conn,
+            entry_ids=entry_ids,
         )
 
     def _sync_fts_row(self, conn: sqlite3.Connection, entry_id: str) -> None:
-        self._delete_fts_rows(conn, [entry_id])
-        row = conn.execute(
-            """
-            SELECT id, content, entity, category, status
-            FROM memory_items
-            WHERE id = ?
-            LIMIT 1
-            """,
-            (entry_id,),
-        ).fetchone()
-        if row is None or row["status"] in {"archived", "superseded"}:
-            return
-        conn.execute(
-            """
-            INSERT INTO memory_items_fts (memory_id, content, entity, category)
-            VALUES (?, ?, ?, ?)
-            """,
-            (row["id"], row["content"], row["entity"], row["category"]),
+        fts._sync_fts_row(
+            conn,
+            entry_id=entry_id,
         )
 
     def _write_entry_row(self, conn: sqlite3.Connection, entry: LTMEntry) -> set[str]:
@@ -440,13 +416,10 @@ class LTMStore:
         return "concepts"
 
     def _dynamic_category_names(self, conn: sqlite3.Connection) -> set[str]:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT category FROM memory_items
-            WHERE status = 'active'
-            """
-        ).fetchall()
-        return {row["category"] for row in rows if row["category"] not in shared.PALACE_LOCI}
+        return fts._dynamic_category_names(
+            conn,
+        )
+
 
     @property
     def _meta(self) -> dict:
@@ -712,7 +685,6 @@ class LTMStore:
             return {}
         return value if isinstance(value, dict) else {}
 
-
     def write_conversation_exchange(
         self,
         *,
@@ -959,8 +931,6 @@ class LTMStore:
                 limit=limit,
             )
 
-
-
     def message_has_answer(self, *, session_id: str, message_id: str) -> bool:
         """Whether this message already has an assistant answer on record.
 
@@ -1001,7 +971,6 @@ class LTMStore:
                 before_seq=before_seq,
             )
 
-
     def _rows_at_seqs(
         self, session_id: str, table: str, seqs: list[int]
     ) -> list[sqlite3.Row]:
@@ -1013,7 +982,6 @@ class LTMStore:
                 table=table,
                 seqs=seqs,
             )
-
 
     def conversation_turn_count(self, *, session_id: Optional[str] = None) -> int:
         """How many journaled turns exist, so a capped read can say it was capped."""
@@ -1041,7 +1009,6 @@ class LTMStore:
                 prefix=prefix,
                 limit=limit,
             )
-
 
     def delete_conversation_session(self, session_id: str) -> None:
         """Delete a conversation session's journaled turns and working state."""
@@ -1114,7 +1081,6 @@ class LTMStore:
                 exclude_message_id=exclude_message_id,
                 limit=limit,
             )
-
 
     def load_session_working_state(
         self,
@@ -1234,12 +1200,10 @@ class LTMStore:
                 created_at=created_at,
             )
 
-
     def usage_summary(self, session_id: str) -> dict[str, Any]:
         """Return bounded aggregate usage for one session, grouped by phase."""
         with self._connect() as conn:
             return usage.usage_summary(conn, session_id)
-
 
     def append_agent_event(
         self,
@@ -1375,7 +1339,6 @@ class LTMStore:
                 _conn=conn,
             )
         return normalized
-
 
     def _read_facts(
         self,
