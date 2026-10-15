@@ -342,7 +342,16 @@ def test_web_task_guidance_dismiss_endpoint():
         }
     )
     channel = _channel()
-    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+    channel.bind_runtime(
+        {},
+        {
+            # The store **as a service**, which is how the product provides it: the web
+            # session service resolves ``ltm_store`` rather than reaching through the
+            # context manager's attribute.
+            "context_manager": SimpleNamespace(store=store),
+            "ltm_store": store,
+        },
+    )
 
     with TestClient(channel.app) as client:
         response = client.post(
@@ -1610,7 +1619,16 @@ def test_web_delete_session_removes_durable_turns():
 
     store = _FakeStore({"abc123": [_turn("user", "hi")]})
     channel = _channel()
-    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+    channel.bind_runtime(
+        {},
+        {
+            # The store **as a service**, which is how the product provides it: the web
+            # session service resolves ``ltm_store`` rather than reaching through the
+            # context manager's attribute.
+            "context_manager": SimpleNamespace(store=store),
+            "ltm_store": store,
+        },
+    )
 
     with TestClient(channel.app) as client:
         sessions = client.get("/api/sessions").json()["sessions"]
@@ -2784,7 +2802,16 @@ def test_web_bulk_delete_sessions():
         "def456": [_turn("user", "hello")],
     })
     channel = _channel()
-    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+    channel.bind_runtime(
+        {},
+        {
+            # The store **as a service**, which is how the product provides it: the web
+            # session service resolves ``ltm_store`` rather than reaching through the
+            # context manager's attribute.
+            "context_manager": SimpleNamespace(store=store),
+            "ltm_store": store,
+        },
+    )
 
     with TestClient(channel.app) as client:
         resp = client.request(
@@ -2806,7 +2833,16 @@ def test_web_reveal_session_opens_session_snapshot(monkeypatch, tmp_path):
     store = _FakeStore({"abc123": [_turn("user", "hi")]})
     store.dir = context_dir
     channel = _channel()
-    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+    channel.bind_runtime(
+        {},
+        {
+            # The store **as a service**, which is how the product provides it: the web
+            # session service resolves ``ltm_store`` rather than reaching through the
+            # context manager's attribute.
+            "context_manager": SimpleNamespace(store=store),
+            "ltm_store": store,
+        },
+    )
 
     calls = {}
 
@@ -2837,7 +2873,16 @@ def test_web_reveal_session_rejects_unknown_session(tmp_path):
     store.dir = tmp_path / "context"
     store.dir.mkdir()
     channel = _channel()
-    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+    channel.bind_runtime(
+        {},
+        {
+            # The store **as a service**, which is how the product provides it: the web
+            # session service resolves ``ltm_store`` rather than reaching through the
+            # context manager's attribute.
+            "context_manager": SimpleNamespace(store=store),
+            "ltm_store": store,
+        },
+    )
 
     with TestClient(channel.app) as client:
         resp = client.post("/api/sessions/unknown/reveal")
@@ -2889,7 +2934,16 @@ def test_web_rename_session_updates_title():
 
     store = _FakeStore({"abc123": [_turn("user", "hi")]})
     channel = _channel()
-    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+    channel.bind_runtime(
+        {},
+        {
+            # The store **as a service**, which is how the product provides it: the web
+            # session service resolves ``ltm_store`` rather than reaching through the
+            # context manager's attribute.
+            "context_manager": SimpleNamespace(store=store),
+            "ltm_store": store,
+        },
+    )
 
     with TestClient(channel.app) as client:
         resp = client.patch(

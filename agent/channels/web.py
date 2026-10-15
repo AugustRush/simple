@@ -326,8 +326,14 @@ class WebChannel(Channel):
         """Receive the channel runner's live-session dict and components."""
         self._sessions = sessions
         self._components = components
-        base_ctx_mgr = resolve(components, "context_manager")
-        store = getattr(base_ctx_mgr, "store", None)
+        # The store **as a service**.  Both real implementations build their context manager
+        # from this same service (``session_plugin`` and ``record_only`` both inject
+        # ``ltm_store``), so this is the identical object -- and it is the one with a declared
+        # contract (``MemoryStore``) instead of an attribute the ``ContextService`` protocol
+        # deliberately does not declare.  A replacement memory system provides the service;
+        # asking for it is also what keeps this line from depending on the *inside* of
+        # another service.
+        store = resolve(components, "ltm_store")
         self._session_service = SessionService(
             store=store,
             live_states=sessions,

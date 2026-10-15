@@ -274,9 +274,16 @@ class ContextService(Protocol):
     This is the interface the application uses, and the one a replacement memory
     *system* satisfies when it does not want to keep this project's
     ``ContextManager``.  ``store`` is deliberately absent from the protocol even
-    though the class has it: it is an implementation detail, and the two modules
-    that reach through it (``core/spawn_planning``, ``core/subagent_finalize``)
-    are the exception the contract test records.
+    though the class has it: it is an implementation detail, and a replacement is
+    not obliged to expose the store it happens to use.
+
+    Nothing reaches through it any more.  The sentence that used to stand here
+    named ``core/spawn_planning`` and ``core/subagent_finalize``, and by the time
+    anyone checked, the readers were ``channels/web.py`` and ``commands/builtin.py``
+    -- which is what a hand-written list of exceptions does.  Both now resolve the
+    declared ``ltm_store`` service instead (the same object: every implementation
+    builds its manager from it), so the store is reached as a *service with a
+    contract* rather than as an attribute of another service.
     """
 
     @property

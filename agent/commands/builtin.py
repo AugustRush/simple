@@ -527,8 +527,9 @@ def _session_turns(context: CommandContext, prefix: str) -> list[Any]:
     reading the recent turns and filtering keeps this to declared members, so a
     replacement store answers it too.
     """
-    manager = _context_manager(context)
-    store = getattr(manager, "store", None)
+    # The store as the *service*, not as an attribute of the context manager: the two are
+    # the same object in both implementations, and only one of them has a contract.
+    store = _component(context, "ltm_store")
     read = getattr(store, "recent_conversation_turns", None)
     if not callable(read):
         return []

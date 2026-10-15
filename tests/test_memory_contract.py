@@ -35,30 +35,36 @@ _UNSET = object()
 
 #: Attribute peeks that remain, each a decision rather than a blanket exclusion.
 #:
-#: The rule the guard enforces is "an out-of-package reader must not depend on a
-#: member the contract does not declare".  These four do, and each is *soft*: the
-#: caller feature-detects, so an implementation without the member loses a feature
-#: rather than breaking.  Recording them keeps the guard's teeth for the hard ones
-#: -- and the next round's queue is exactly this list.
-_ATTRIBUTE_PEEK_ALLOWLIST: dict[tuple[str, str], str] = {
-    ("agent/channels/web.py", "store"): (
-        "soft: the web session service takes the store it is given and degrades "
-        "without one; contracting it is a separate decision about SessionService"
+#: The rule the guard enforces is "an out-of-package reader must not depend on a member the
+#: contract does not declare".  What is left is two reads that are *soft by design*: the
+#: caller feature-detects them and loses a feature rather than raising.  Recording them keeps
+#: the guard's teeth for the hard ones.
+#:
+#: Keyed by **protocol** as well as by file and attribute.  It used to be ``(file, attr)``,
+#: and that was wrong in a way worth recording: the three protocols share member *names*
+#: (``store`` is undeclared on both ``ContextService`` and ``MemoryService``; ``dir`` collides
+#: with nothing but reads like it might), so one waiver silently covered every protocol that
+#: happened to have a member of that name.  Two of the four entries that used to be here were
+#: exactly that -- a read of a ``ContextManager``'s ``store`` waived under ``MemoryService``'s
+#: name -- and both are now closed at the call site (the callers resolve the declared
+#: ``ltm_store`` service instead of reaching through the context manager).
+#:
+#: The two that remain are **not** name collisions, whatever this list used to say: measured,
+#: each receiver really is the object whose protocol is named.
+_ATTRIBUTE_PEEK_ALLOWLIST: dict[tuple[str, str, str], str] = {
+    ("MemoryStore", "agent/session_service.py", "dir"): (
+        "soft: where a session's export goes -- the store's *context* directory, which the "
+        "contract does not expose (it declares memory_dir, a different directory). The "
+        "caller feature-detects it and exports nothing without it. Note the receiver is the "
+        "memory store (or a per-session one from the store factory), not a session store: "
+        "the earlier reason here claimed a name collision that measurement does not support"
     ),
-    ("agent/commands/builtin.py", "store"): (
-        "soft: the store is the manager's collaborator, and the read goes through the "
-        "contract's recent_conversation_turns (this used to feature-detect "
-        "get_turns_for_session, which nothing implements -- a dead path)"
-    ),
-    ("agent/core/token_budget.py", "consolidation"): (
-        "not a peek to close: three lazy reads of the engine's estimators, each with a "
-        "pure-Python fallback whose docstring says the calibrated and raw estimates "
-        "coincide when there is no engine -- that fallback is the designed behaviour, "
-        "so contracting it would remove the no-engine path rather than narrow anything"
-    ),
-    ("agent/session_service.py", "dir"): (
-        "not the memory store: this receiver is the *session* store, whose name "
-        "collides with LTMStore.dir (a name-based scan cannot tell them apart)"
+    ("ContextService", "agent/core/token_budget.py", "consolidation"): (
+        "soft by design: the consolidation engine behind the manager, and the second "
+        "ContextService implementation (record_only) has no engine at all -- so declaring it "
+        "would not narrow the interface, it would delete the no-engine path. Three lazy reads "
+        "of the engine's estimators, each with a pure-Python fallback whose docstring says "
+        "the calibrated and raw estimates coincide when there is no engine"
     ),
 }
 
@@ -403,7 +409,11 @@ def test_no_reader_reaches_past_the_contract_through_attributes(
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
                 if node.attr in members and ast.unparse(node.value) != "self":
-                    if (str(relative), node.attr) not in _ATTRIBUTE_PEEK_ALLOWLIST:
+                    if (
+                        protocol_name,
+                        str(relative),
+                        node.attr,
+                    ) not in _ATTRIBUTE_PEEK_ALLOWLIST:
                         offenders.append(
                             f"{relative}:{node.lineno} {ast.unparse(node.value)}.{node.attr}"
                         )
@@ -419,7 +429,11 @@ def test_no_reader_reaches_past_the_contract_through_attributes(
                 and isinstance(node.args[1], ast.Constant)
                 and isinstance(node.args[1].value, str)
                 and node.args[1].value in members
-                and (str(relative), node.args[1].value) not in _ATTRIBUTE_PEEK_ALLOWLIST
+                and (
+                    protocol_name,
+                    str(relative),
+                    node.args[1].value,
+                ) not in _ATTRIBUTE_PEEK_ALLOWLIST
             ):
                 offenders.append(
                     f"{relative}:{node.lineno} getattr({ast.unparse(node.args[0])}, "

@@ -197,10 +197,22 @@ public / 24 reserved, 15 with contracts**.
    is why it is a separate step rather than an implementation detail.  Until those
    exist the *trust* half is not met: a plugin in `~/.agent/plugins/` is still executed at
    startup on the strength of being there.
-2. **The 4 remaining soft reads** (`tests/test_memory_contract.py`): the token budget's
-   estimator reads (a designed fallback, not a hole), the web's session-service store
-   (a decision about `SessionService`), and two name collisions the scan cannot tell
-   apart from `LTMStore` members.
+2. ~~**The 4 remaining soft reads** (`tests/test_memory_contract.py`)~~ -- **down to 2, and
+   the description of them was wrong.**  Measured rather than assumed: two of the four were
+   *not* name collisions but real reads of a `ContextManager`'s `store`, waived under
+   `MemoryService`'s name because the allowlist was keyed by `(file, attribute)` and the three
+   protocols share member names.  Both are now closed at the call site -- `channels/web.py`
+   and `commands/builtin.py` resolve the declared `ltm_store` service instead of reaching
+   through the context manager (the same object; every implementation builds its manager from
+   it), so the store is reached as a service *with a contract*.  The allowlist is keyed by
+   **protocol** as well now, so a future waiver cannot silently cover two interfaces.  What
+   remains is two reads that are soft *by design*: `LTMStore.dir` (the context directory, which
+   the contract does not expose) and `ContextManager.consolidation` (the second
+   `ContextService` implementation has no engine at all, so declaring it would delete the
+   no-engine path rather than narrow anything).  The protocol docstring that named two modules
+   which had long since stopped reading `store` is corrected.
+
+
 3. ~~**`MemoryPalace()` at 4 CLI sites**~~ -- **done**: the read-only `memory` commands go
    through `agent.bootstrap.memory_service(cfg)`, which mounts the composition's own
    declaration of that name (and only that name -- no provider, no API key, no session), so
