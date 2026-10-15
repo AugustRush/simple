@@ -144,7 +144,15 @@ from agent.security.content_filter import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from agent.core.transport import ModelEndpoint, ModelTransport
 
-DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
+from agent.core.turn_state import (
+    DEFAULT_SYSTEM_PROMPT,
+    AgentContext,
+    AgentResult,
+    SubAgentProgressEvent,
+    _ContentFilterRecovery,
+    _TaskLocalContextStack,
+    _TurnLoopState,
+)
 logger = logging.getLogger(__name__)
 
 _UPSTREAM_SUMMARY_BUDGET = 2400
@@ -170,30 +178,6 @@ _RENDEZVOUS_INPUT_BUDGET = 6000
 # Context variable so built-in tools can access the active AgentContext
 
 
-class _TurnLoopState:
-    """One turn's step-loop state.
-
-    A plain object the caller owns and passes in, rather than attributes on
-    ``self``: ``send_message`` may run several turns concurrently on one agent
-    instance, and ``self`` is shared between them.  Storing this state on the
-    instance let one turn read another's ``trace_status`` and
-    ``pending_tool_response``, which a concurrent-session test caught.
-    """
-
-    __slots__ = (
-        "pending_tool_response",
-        "result_text",
-        "trace_status",
-        "trace_error",
-        "steps",
-    )
-
-    def __init__(self) -> None:
-        self.pending_tool_response: Any = None
-        self.result_text = ""
-        self.trace_status = "ok"
-        self.trace_error: Optional[str] = None
-        self.steps = 0
 
 
 
@@ -253,50 +237,12 @@ async def _execute_regular_tool_calls(
     return results
 
 
-@dataclass
-class AgentContext:
-    """State for a single agent instance."""
-
-    agent_id: str = field(default_factory=shared._new_id)
-    role: str = "assistant"
-    messages: list[dict] = field(default_factory=list)
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT
-    tools_enabled: bool = True
-    metadata: dict = field(default_factory=dict)
 
 
-@dataclass
-class AgentResult:
-    agent_id: str
-    content: str
-    tool_calls_made: list[str] = field(default_factory=list)
-    error: Optional[str] = None
 
 
-@dataclass
-class SubAgentProgressEvent:
-    kind: str
-    role: Optional[str] = None
-    task: Optional[str] = None
-    message: str = ""
-    completed: int = 0
-    total: int = 0
-    metrics: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class _TaskLocalContextStack:
-    """Deprecated: kept only as a no-op shim for any third-party caller.
-
-    The runtime no longer maintains a context stack — ``_active_agent_context``
-    (a ContextVar) is the single source of truth for the current
-    AgentContext.  Sub-agents run in their own BaseAgent instance with
-    their own ContextVar, so a per-agent stack was always degenerate
-    (at most one item).
-    """
-
-    def __bool__(self) -> bool:
-        return False
 
 
 _ = _TaskLocalContextStack  # publicly importable for any third-party caller
@@ -304,43 +250,6 @@ _ = _TaskLocalContextStack  # publicly importable for any third-party caller
 
 
 
-@dataclass
-class _ContentFilterRecovery:
-    """The rollback state a provider content-filter block needs.
-
-    A provider can reject a request because of what a *tool result* contained.
-    Recovering means un-sending the last protocol unit and resending it with
-    the offending output summarized.  That requires remembering what was last
-    submitted, and carrying the recovered response into the next loop
-    iteration so it is consumed instead of issuing a fresh LLM call.
-
-    That is three pieces of state with one lifecycle.  They used to be three
-    loose locals threaded through a 500-line function, cleared at four
-    separate sites — where forgetting one clears the rollback point and turns
-    a recoverable block into a failed turn.  Naming the state machine makes
-    the invariant ("submission recorded ⇒ rollback possible") checkable.
-    """
-
-    submitted_tool_uses: list[dict] | None = None
-    submitted_results: list[str] | None = None
-    pending_response: Any | None = None
-
-    def record_submission(
-        self, tool_uses: list[dict], results: list[str]
-    ) -> None:
-        """Note what just went to the provider, so it can be rolled back."""
-        self.submitted_tool_uses = list(tool_uses)
-        self.submitted_results = list(results)
-
-    def forget_submission(self) -> None:
-        """Drop the rollback point — nothing recoverable is outstanding."""
-        self.submitted_tool_uses = None
-        self.submitted_results = None
-
-    def take_pending_response(self) -> Any | None:
-        """Consume a recovered response exactly once."""
-        response, self.pending_response = self.pending_response, None
-        return response
 
 
 class BaseAgent:

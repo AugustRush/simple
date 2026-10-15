@@ -24,7 +24,7 @@ recording" below.
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 3575 (was 4086) | `SchedulerStore` | 78 | 3004 | **3 / ~60 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
-| `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
+| `agent/core/agent.py` | 2275 (was 2536) | `BaseAgent` | 79 | 1940 | **34 / 341 lines** |
 | `agent/memory/context.py` | 1972 (was 2484) | `ContextManager` | 66 | 1624 | **8 / 106 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
@@ -130,12 +130,39 @@ tests call it there — through a one-line staticmethod delegate.  Note the *ser
 to sit in front of it was removed earlier as an unenforceable extension point; that decision
 was about the name, and did not keep the code in the class.
 
-### Extraction order
+### `core/turn_state.py` — **moved**, 2366 → 2275 lines
+
+The six data holders (`AgentContext` 10, `_ContentFilterRecovery` 37, `_TurnLoopState` 24,
+`_TaskLocalContextStack` 13, `SubAgentProgressEvent` 9, `AgentResult` 6) plus
+`DEFAULT_SYSTEM_PROMPT`, which moved out of `agent/__init__.py` because `AgentContext`'s field
+default reads it.
+
+That second move is the other half of a decision **already recorded** in
+`agent/core/turn_loop.py`: it kept `AgentContext` at a function-local import, explaining that
+"moving it down instead would mean moving ``DEFAULT_SYSTEM_PROMPT`` out of
+``agent/__init__.py`` as well, because the field default reads it -- a larger change than the
+cycle it would remove".  The judgement was right *for the goal it had* (removing one local
+import).  The goal here is different -- a 2366-line file -- and paying that cost is exactly
+what the survey is for.  The prompt now lives with the dataclass that defaults to it, and the
+cycle is gone.
+
+Two mechanical notes, the second of which cost a failed run:
+
+* The 36-line prompt literal had to move **with** the class, not be imported from the package
+  root: `agent/__init__.py` imports `.core.output` at line 54, well before it defines the
+  prompt at 176, so a module-level `from agent import DEFAULT_SYSTEM_PROMPT` in a core module
+  can execute against a half-initialised package.  `__init__.py` now takes the name *from*
+  `turn_state`.
+* **A class's decorator lines precede its `ClassDef.lineno`.**  Deleting a class by its own
+  lineno leaves `@dataclass` orphaned behind -- which is a syntax error, not a subtle bug.  The
+  method extractions had all used `min(decorator lines + lineno)`; the first class move did not.
+
+### Extraction order (what is left)
 
 1. ~~**`core/post_turn.py`** — `_post_turn_maintenance` (201 lines).~~ **Done.**
-2. **`core/turn_state.py`** — the small top-level classes (`AgentContext`, `AgentResult`,
-   `_TurnLoopState`, `_TaskLocalContextStack`, `_ContentFilterRecovery`), which are data
-   holders for the turn loop.
+2. ~~**`core/turn_state.py`** — the small top-level classes.~~ **Done.**
+3. `_execute_regular_tool_calls` (40 lines, one free name) and the remaining `self`-free
+   helpers.
 3. **The remaining `self`-free helpers** (`_clear_context_restart_message`,
    `_build_tool_loop_stuck_response`, `_extract_summary_text`, `consolidation_model`,
    `_protected_turn_messages`).
