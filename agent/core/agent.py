@@ -144,6 +144,7 @@ from agent.security.content_filter import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from agent.core.transport import ModelEndpoint, ModelTransport
 
+from agent.core.tool_calls import _execute_regular_tool_calls
 from agent.core.turn_state import (
     DEFAULT_SYSTEM_PROMPT,
     AgentContext,
@@ -194,47 +195,6 @@ from agent.core.turn_context import trace_latency as _trace_latency  # noqa: E40
 
 
 
-async def _execute_regular_tool_calls(
-    regular_calls: list[tuple[int, dict]],
-    executor: Any,
-) -> list[str]:
-    """Run a batch of non-orchestration tool calls, preserving call order.
-
-    Batches containing a ``shell`` call run sequentially: a medium-risk
-    shell command blocks on the human consent menu, and other tools must
-    not execute or print while that menu is open (parallel results and
-    heartbeats corrupt the prompt).  Pure parallel batches keep the fast
-    ``asyncio.gather`` path.
-    """
-    results: list[str] = [""] * len(regular_calls)
-    if any(tu.get("name") == "shell" for _idx, tu in regular_calls):
-        for position, (_idx, tu) in enumerate(regular_calls):
-            try:
-                results[position] = await executor.run(tu)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                results[position] = json.dumps(
-                    {"ok": False, "error": f"tool '{tu['name']}' raised: {exc}"}
-                )
-        return results
-    raw = await asyncio.gather(
-        *[executor.run(tu) for _idx, tu in regular_calls],
-        return_exceptions=True,
-    )
-    for position, (_idx, _tu) in enumerate(regular_calls):
-        outcome = raw[position]
-        if isinstance(outcome, asyncio.CancelledError):
-            raise outcome
-        if isinstance(outcome, Exception):
-            results[position] = json.dumps(
-                {"ok": False, "error": f"tool '{_tu['name']}' raised: {outcome}"}
-            )
-        elif isinstance(outcome, BaseException):
-            raise outcome
-        else:
-            results[position] = outcome
-    return results
 
 
 

@@ -24,7 +24,7 @@ recording" below.
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 3575 (was 4086) | `SchedulerStore` | 78 | 3004 | **3 / ~60 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
-| `agent/core/agent.py` | 2275 (was 2536) | `BaseAgent` | 79 | 1940 | **34 / 341 lines** |
+| `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1972 (was 2484) | `ContextManager` | 66 | 1624 | **8 / 106 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
@@ -161,8 +161,19 @@ Two mechanical notes, the second of which cost a failed run:
 
 1. ~~**`core/post_turn.py`** — `_post_turn_maintenance` (201 lines).~~ **Done.**
 2. ~~**`core/turn_state.py`** — the small top-level classes.~~ **Done.**
-3. `_execute_regular_tool_calls` (40 lines, one free name) and the remaining `self`-free
-   helpers.
+3. ~~`core/tool_calls.py` — `_execute_regular_tool_calls` (40 lines).~~ **Done.**
+4. The remaining `self`-free helpers.
+
+### `core/tool_calls.py` — **moved**, 2275 → 2235 lines
+
+`_execute_regular_tool_calls` (40 lines) takes a list of calls and an executor and nothing about
+the agent that owns them -- which is why its tests already build a fake executor and hand it
+calls.  The rule it implements is the interesting part: a batch containing a `shell` call runs
+**sequentially**, because a medium-risk shell command blocks on the human consent menu and
+nothing else may print while that menu is open.
+
+It stays importable as `from agent.core.agent import _execute_regular_tool_calls` (the tests do
+that), so no call site changed.
 3. **The remaining `self`-free helpers** (`_clear_context_restart_message`,
    `_build_tool_loop_stuck_response`, `_extract_summary_text`, `consolidation_model`,
    `_protected_turn_messages`).
