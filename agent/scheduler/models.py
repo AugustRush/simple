@@ -47,6 +47,19 @@ _WEEKDAY_MAP = {
 }
 
 
+def optional_datetime(value: str | None) -> datetime | None:
+    """``parse_datetime`` for a column that may hold no timestamp at all.
+
+    The distinction is the *contract*, not the body: this returns ``None`` for an empty
+    value, while :func:`parse_datetime` would be handed the string ``"None"`` and refuse it.
+    Two functions with the same three lines and different promises are not the same function,
+    and a caller that needs one must not be quietly given the other.
+    """
+    if not value:
+        return None
+    return parse_datetime(value)
+
+
 def parse_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
         dt = value

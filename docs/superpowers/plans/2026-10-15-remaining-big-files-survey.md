@@ -22,7 +22,7 @@ recording" below.
 
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
-| `agent/scheduler/store.py` | 3828 (was 4086) | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
+| `agent/scheduler/store.py` | 3575 (was 4086) | `SchedulerStore` | 78 | 3004 | **3 / ~60 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
 | `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
 | `agent/memory/context.py` | 1972 (was 2484) | `ContextManager` | 66 | 1624 | **8 / 106 lines** |
@@ -200,12 +200,33 @@ only `sqlite3`, so this was a *move*, not an extraction.  The store imports the 
 its own namespace, because the migration **table** — version number to function — is what says
 what order they run in, and that belongs to the store.  No call sites changed.
 
+### `scheduler/rows.py` — **extracted**, 3828 → 3575 lines
+
+Eight of the measured cluster went (`_task_from_row` 29, `_run_from_row` 25, `_step_task_spec`
+55, `_step_workspaces` 45, `_identity_values` 36, `_attention_clause`, `_check_products` 15,
+`_check_acceptance` 14).  Three are **deliberately not there**:
+
+* `_live_workflow_step` — the survey counted it `self`-free; it calls `self.get_workflow`.  The
+  metric was wrong, and reading the moved code against its class caught it.
+* `workflow_blocked_steps` — carries the store's own `@_synchronized`; locking is the store's.
+* `_join_arrivals` — reads ids the caller holds.
+
+Two lessons, both paid for in failed runs:
+
+1. **Same body ≠ same contract.**  The store's `_dt` and `models.parse_datetime` were three
+   identical lines except `_dt` returned `None` for an empty value.  Aliasing one as the other
+   turned `None` into `fromisoformat("None")`.  The fix is a *named* home for the distinction:
+   `models.optional_datetime`, with a docstring saying why it is not `parse_datetime`.
+2. **A test that monkeypatches an instance method is a consumer of the class.**  Two workflow
+   tests inject a mid-build failure by patching `store._step_task_spec`; after the move the
+   call resolves in the importing module's namespace, so the patch target had to become
+   `agent.scheduler.store._step_task_spec`.  Three test references to the moved names were
+   repointed to `rows` for the same reason.
+
 ### What remains here
 
-1. **`scheduler/rows.py`** — `_task_from_row` (29), `_run_from_row` (25), `_step_task_spec`
-   (55), `_step_workspaces` (45), `_identity_values` (36), `_check_products` (15),
-   `_check_acceptance` (14), `_live_workflow_step`, `workflow_blocked_steps` (21) — the
-   row/step translation half, all `self`-free.
+`workflow_blocked_steps` (21) and the write paths (`create_workflow`, `create_task`,
+`apply_retention`) — the rest of the cluster is out.
 3. **The cheapest coupled methods** — `_upstream_reports_in_transaction` (64 lines, 1 ref),
    `_insert_emission` (52, 1), `renew_lease` (35, 1), `disable_duplicate_enabled_tasks` (32, 1),
    `_join_arrivals` (28, 1).  Each needs the connection passed and nothing else.

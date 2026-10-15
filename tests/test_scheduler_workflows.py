@@ -33,6 +33,7 @@ from uuid import uuid4
 
 import pytest
 
+from agent.scheduler import rows
 from agent.scheduler import (
     DeliveryResult,
     DeliveryTarget,
@@ -584,7 +585,7 @@ def test_a_build_that_fails_partway_leaves_no_workflow(tmp_path, monkeypatch):
     """
     store = make_store(tmp_path)
     try:
-        real = store._step_task_spec
+        real = rows._step_task_spec
         calls: list[str] = []
 
         def explode(step_obj, trigger, **kwargs):
@@ -593,7 +594,7 @@ def test_a_build_that_fails_partway_leaves_no_workflow(tmp_path, monkeypatch):
                 raise RuntimeError("建任务时炸了")
             return real(step_obj, trigger, **kwargs)
 
-        monkeypatch.setattr(store, "_step_task_spec", explode)
+        monkeypatch.setattr("agent.scheduler.store._step_task_spec", explode)
         with pytest.raises(RuntimeError):
             store.create_workflow(linear_workflow())
         assert len(calls) == 2, "第一步应该已经建过了，失败才有意义"
@@ -614,7 +615,7 @@ def test_an_edit_that_fails_partway_leaves_the_old_graph_running(tmp_path, monke
         def explode(step_obj, trigger, **kwargs):
             raise RuntimeError("改任务时炸了")
 
-        monkeypatch.setattr(store, "_step_task_spec", explode)
+        monkeypatch.setattr("agent.scheduler.store._step_task_spec", explode)
         with pytest.raises(RuntimeError):
             store.update_workflow(
                 workflow.id,

@@ -33,6 +33,7 @@ from uuid import uuid4
 
 import pytest
 
+from agent.scheduler import rows
 from agent.scheduler import (
     Acceptance,
     DeliveryTarget,
@@ -542,7 +543,7 @@ def test_the_two_readers_share_one_column_list():
         delivery_mode="standalone",
         delivery_target=DeliveryTarget.standalone(),
     )
-    assert len(SchedulerStore._identity_values(spec)) == len(_TASK_IDENTITY_COLUMNS)
+    assert len(rows._identity_values(spec)) == len(_TASK_IDENTITY_COLUMNS)
 
 
 def test_the_product_report_survives_reopening_the_database(tmp_path):
