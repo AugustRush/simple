@@ -4276,3 +4276,105 @@ def test_core_service_reads_work_before_any_reload(tmp_path) -> None:
         assert catalog._core("nothing.here", "absent") == "absent"
     finally:
         catalog.close()
+
+
+# ── The reload transaction ───────────────────────────────────────────────────
+
+
+def test_the_rollback_never_rebinds_the_plugin_table(tmp_path) -> None:
+    """The hook dispatcher holds the table **by reference**, so a restore must mutate.
+
+    The rollback used to do ``self._plugins = snapshot``, which reads correctly while
+    ``self._plugins`` is the only way in.  It stopped reading correctly the moment
+    ``HookDispatcher`` was handed the live table: after a rolled-back reload the dispatcher
+    kept firing hooks against the dict that had just been replaced, so a plugin that was no
+    longer installed still heard events.  Nothing failed -- the reload reported success.
+    """
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        catalog.discover_and_load()
+        live_table = catalog._plugins
+        assert catalog._hooks._plugins is live_table
+
+        def boom():
+            raise RuntimeError("discovery exploded")
+
+        catalog.discover_and_load = boom  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="discovery exploded"):
+            asyncio.run(catalog.reload({}))
+
+        assert catalog._hooks._plugins is catalog._plugins, (
+            "the rollback rebound the table; the dispatcher is now looking at a dict "
+            "nothing writes to"
+        )
+        assert catalog._hooks._plugins is live_table
+    finally:
+        catalog.close()
+
+
+def test_a_failed_discovery_leaves_an_empty_catalog_that_says_so(tmp_path) -> None:
+    """After discovery fails, the tree is not known -- so it is not claimed.
+
+    Restoring a *list* of plugins whose registrations were unloaded is the failure mode
+    this avoids: ``list_plugins`` would report plugins the catalog does not have.
+    """
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "alpha"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "alpha"}', encoding="utf-8"
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        assert catalog.discover_and_load() == ["alpha"]
+
+        def boom():
+            raise RuntimeError("discovery exploded mid-flight")
+
+        catalog.discover_and_load = boom  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            asyncio.run(catalog.reload({}))
+
+        assert catalog.list_plugins() == [], "the catalog must not claim what it lost"
+    finally:
+        catalog.close()
+
+
+def test_a_failure_after_discovery_keeps_the_tree_and_restores_the_registries(tmp_path) -> None:
+    """A reload is atomic about the registries it owns, and says so about the rest.
+
+    Failure *after* discovery leaves a working composition -- the newly discovered tree,
+    with the previous command and role registries put back -- which is more than the old
+    code could say (it restored a table whose services had been unloaded) and more honest
+    than re-discovering from a disk that is usually what broke.
+    """
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "alpha"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "alpha"}', encoding="utf-8"
+    )
+    commands = plugin_dir / "commands"
+    commands.mkdir()
+    (commands / "run.md").write_text("---\ndescription: d\n---\nbody", encoding="utf-8")
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        catalog.discover_and_load()
+        before = catalog._commands.snapshot()
+
+        class Refusing:
+            def register_plugin_catalog(self, target):
+                raise ValueError("the router refuses this catalog")
+
+        with pytest.raises(ValueError, match="refuses this catalog"):
+            asyncio.run(catalog.reload({"command_router": Refusing()}))
+
+        assert catalog._commands.snapshot() == before, "the registries came back"
+        assert "alpha" in catalog._plugins, "and the discovered tree is the loaded one"
+    finally:
+        catalog.close()

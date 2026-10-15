@@ -24,6 +24,7 @@ from agent.kernel.plugin import PluginHost
 from agent.plugins import formats as plugin_formats
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
+from agent.plugins.reload import ReloadTransaction
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
@@ -1964,149 +1965,16 @@ class PluginCatalog:
         self._host.unload_all()
 
     async def reload(self, components: dict) -> dict:
-        """Serialize plugin reload transactions for this catalog instance."""
+        """Serialize reload transactions, and run one.
 
-        async with self._reload_lock:
-            return await self._reload_locked(components)
-
-    async def _reload_locked(self, components: dict) -> dict:
-        # The caller hands over the runtime's components on every reload, so this
-        # is where the container gets bound.  Doing it here rather than asking
-        # every caller to remember a second call keeps the existing API: a reload
-        # with components is a reload that can resolve them.
-        if components is not None:
-            self.register_core_services(components)
-
-        """Re-scan plugin directories and apply diffs in place.
-
-        Re-imports Python plugins (sys.modules cache cleared), re-registers
-        all slash commands, agent definitions, and bundled assets, and adds
-        any newly-declared MCP servers to the running ``mcp_client``.
-
-        Eviction now goes through :meth:`unload_plugin`, so a removed plugin's
-        ``on_session_end`` fires, its scope unwinds, and its ``teardown`` gets a
-        chance to close what a scope cannot -- the two leaks this method used to
-        document.  What reload still cannot do is reload a plugin's code
-        in-place for the plugins that stay loaded: it clears the import cache
-        and re-discovers, so a changed plugin is a new object with a new scope,
-        while the old one is unloaded first.
-
-        Returns a summary dict suitable for surfacing to the user.
+        The transaction itself -- snapshot, unload, re-discover, roll back -- lives in
+        :mod:`agent.plugins.reload`: it is the one part of this class with a *lifetime*
+        rather than a job, and keeping it here made "what does a failed reload restore?" a
+        question about a method rather than about a thing.  What stays is the lock, which
+        belongs to the catalog because it serializes *this instance's* reloads.
         """
-        # Snapshot pre-reload state.
-        old_plugin_names = set(self._plugins.keys())
-        # Through ``_core``, like ``mcp_client``/``registry`` just below: the reload
-        # path's services come from the *components mapping the caller hands over*
-        # (bound by ``register_core_services``), not from this catalog's own registry.
-        mcp_registry = self._core("contributed_mcp_servers")
-        old_mcp = {
-            (owner, cfg.get("name", "?"))
-            for owner, cfg in (
-                mcp_registry.records() if mcp_registry is not None else ()
-            )
-        }
-        old_discovery_state = {
-            "plugins": dict(self._plugins),
-            # One snapshot, because the registry holds handler, metadata and owner
-            # together.  The reload rollback used to restore three dicts separately,
-            # which is three chances to restore two of them.
-            "slash_commands": self._commands.snapshot(),
-
-            "plugin_source_dirs": dict(self._plugin_source_dirs),
-            "agent_defs": self._agent_defs.snapshot(),
-        }
-        # Unload every currently-loaded plugin before re-discovering, so a
-        # plugin that is about to disappear gets its end hook, its scope
-        # unwind, and its teardown.  Without this, eviction was a table rebuild
-        # that left the plugin's non-registration resources behind -- the
-        # documented MCP-subprocess leak.
-        #
-        # Unloading all of them rather than only the removed set is deliberate:
-        # re-discovery re-creates every plugin from a freshly imported module,
-        # so each one genuinely becomes a new install, and the old install's
-        # scope must not stay open beside it.
-        for name in sorted(old_plugin_names):
-            self.unload_plugin(name)
-
-        # Re-discover.  This clears all internal state and rebuilds it.
-        loaded = self.discover_and_load()
-        new_plugin_names = set(loaded)
-        added = new_plugin_names - old_plugin_names
-        removed = old_plugin_names - new_plugin_names
-
-        command_router = self._core("command_router")
-        if command_router is not None:
-            try:
-                command_router.register_plugin_catalog(self)
-            except Exception:
-                self._plugins = old_discovery_state["plugins"]
-                self._commands.restore(old_discovery_state["slash_commands"])
-                self._plugin_source_dirs = old_discovery_state[
-                    "plugin_source_dirs"
-                ]
-                self._agent_defs.restore(old_discovery_state["agent_defs"])
-                raise
-
-        # Re-read the skill catalog: the plugins that bundled skills were unloaded
-        # above and re-discovered below, so their roots were taken back and attached
-        # again by their own scopes -- this is only the intrinsic layers, plus a replay
-        # of whatever records are attached.  It used to walk the loader's own list of
-        # plugin skill paths and poke ``_rebuild_aliases``/``_dirty``/``_prompt_generation``
-        # directly, with a fallback branch for catalogs that lacked them.
-        skill_catalog = self._core("skill_catalog")
-        if skill_catalog is not None:
-            try:
-                skill_catalog.reload()
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[yellow]Plugin reload: skill catalog refresh failed: {exc}[/yellow]"
-                )
-
-        # MCP: connect newly-declared servers; unregister tools belonging
-        # to plugins that were removed.  We cannot kill the stdio process
-        # for the latter — see the docstring limitation.
-        mcp_client = self._core("mcp_client")
-        registry = self._core("registry")
-        new_mcp_servers: list[dict] = [
-            cfg
-            for owner, cfg in (
-                mcp_registry.records() if mcp_registry is not None else ()
-            )
-            if (owner, cfg.get("name", "?")) not in old_mcp
-        ]
-        connected_mcp_names: list[str] = []
-        if new_mcp_servers and mcp_client is not None:
-            try:
-                await mcp_client.connect_from_config(
-                    {"mcp_servers": new_mcp_servers}
-                )
-                connected_mcp_names = [
-                    str(c.get("name", "?")) for c in new_mcp_servers
-                ]
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[yellow]Plugin reload: MCP connect failed: {exc}[/yellow]"
-                )
-        if removed and registry is not None:
-            # Unregister tools whose source prefix matches removed plugins'
-            # bundled MCP server names.  Best-effort: requires us to have
-            # tracked the (plugin → server name) mapping before clearing.
-            for pname, server_name in old_mcp:
-                if pname in removed and hasattr(registry, "unregister_by_source_prefix"):
-                    registry.unregister_by_source_prefix(f"mcp:{server_name}")
-
-        # No re-fire of a session-start signal: `discover_and_load` re-instantiates
-        # every plugin, and the host runs each one's `setup` again -- so a plugin reads
-        # the composition anew.  The old signal existed because the hook protocol handed
-        # plugins their dependencies *once*, at a moment the reload had to reproduce by
-        # hand.
-        return {
-            "ok": True,
-            "added_plugins": sorted(added),
-            "removed_plugins": sorted(removed),
-            "newly_connected_mcp": connected_mcp_names,
-            "total_loaded": len(loaded),
-        }
+        async with self._reload_lock:
+            return await ReloadTransaction(self).run(components)
 
     def get_loaded_names_for_directory(self, dir_name: str) -> set[str]:
         """Return the set of loaded plugin names that originate from *dir_name*."""

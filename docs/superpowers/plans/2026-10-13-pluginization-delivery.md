@@ -179,10 +179,16 @@ been sitting inside the baseline and read as an environment failure.  Smoke **6 
    needs the consent machinery item 1 describes.
 5. ~~**A kind table for declarative assets**~~ -- **done**: `DECLARATIVE_KINDS` is the
    table, and `_register_declarative_assets` only iterates it.
-6. **`PluginCatalog` still owns two concerns it should not.**  The hook surface moved out
-   (2432 -> 2145 lines, 75 -> 39 methods), but the **reload transaction** and the command /
-   agent registries are still there.  The reload path is the harder half: it snapshots and
-   restores the registries it owns, so splitting it means deciding who owns the rollback.
+6. ~~**`PluginCatalog` still owns two concerns it should not.**~~ -- **done**: the hook
+   surface moved to `hook_dispatch.py` and the reload transaction to `reload.py`
+   (2432 -> 2052 lines, 75 -> 39 methods).  The transaction owns its snapshot and rollback;
+   the loader keeps the lock, because that serializes *this instance's* reloads.  Splitting
+   it also settled what a reload actually guarantees: it is atomic about the two registries
+   the loader owns, and **not** about plugin activation -- a failure after discovery leaves
+   the newly discovered tree with the previous registries, and the class says so rather
+   than re-discovering from a disk that is usually what broke.  The old rollback rebound
+   the plugin table, which the hook dispatcher holds by reference; that is fixed and
+   `tests/test_plugin_catalog.py` pins it.
 7. **Two overlapping declarations.**  `CORE_SERVICES` (15, with contracts) and
    `PUBLIC_SERVICES` (44, what a plugin may touch) are maintained separately and their
    relationship is only prose.  Only `agent_core` is in the first and not the second, which

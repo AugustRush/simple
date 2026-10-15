@@ -108,9 +108,12 @@ when they were taken.
 
 Recorded rather than fixed, in the delivery document's backlog:
 
-1. **`PluginCatalog` still owns the reload transaction and the two registries.** The hook
-   surface is out; the reload path is the harder half, because it snapshots and restores
-   the registries it owns, so the split has to decide who owns the rollback.
+1. ~~**`PluginCatalog` still owns the reload transaction and the two registries.**~~ --
+   **done** (next round): the transaction is `agent/plugins/reload.py`, and it owns the
+   snapshot and the rollback.  Deciding "who owns the rollback" produced the useful part:
+   a reload is atomic about the registries the loader owns and not about plugin
+   activation, and the rollback must **mutate in place** -- it used to rebind the plugin
+   table, which the hook dispatcher holds by reference.
 2. **Two overlapping declarations** — `CORE_SERVICES` (15, with contracts) and
    `PUBLIC_SERVICES` (44, what a plugin may touch). Their relationship is prose; only
    `agent_core` is in the first and not the second.
