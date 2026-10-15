@@ -381,3 +381,157 @@ def test_no_capability_in_the_real_composition_is_anonymous(monkeypatch, tmp_pat
         )
     finally:
         asyncio.run(agent_module._close_components(components))
+
+
+# ── what it would run ────────────────────────────────────────────────────────
+
+
+def _claude_plugin(tmp_path: pathlib.Path, *, mcp: bool = True, hooks: bool = True):
+    """A plugin directory in Claude Code's layout, with code in every place it declares."""
+    import json
+
+    root = tmp_path / "widget"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text('{"name": "widget"}', encoding="utf-8")
+    (root / "__init__.py").write_text("", encoding="utf-8")
+    if mcp:
+        (root / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "one": {"command": "npx", "args": ["-y", "one-server"]},
+                        "two": {"command": "uvx", "args": ["two-server"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    if hooks:
+        (root / "hooks").mkdir()
+        (root / "hooks" / "hooks.json").write_text(
+            json.dumps(
+                {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "./check.sh"}]}]}}
+            ),
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_every_executable_location_is_reported_not_only_the_first(tmp_path) -> None:
+    """The defect this step exists to fix, stated as a test.
+
+    ``executable_content`` returned the first marker that matched -- the class of miss its
+    own docstring calls worse than no gate, in the function the gate reads.  A plugin with
+    a Python entry point *and* two MCP servers asked for consent to run one of the three
+    things it ships.
+    """
+    from agent.plugins.formats import executions
+
+    found = executions(_claude_plugin(tmp_path))
+    markers = {item.payload["marker"] for item in found}
+
+    assert "__init__.py" in markers, "the Python entry point"
+    assert ".mcp.json" in markers, "the MCP servers"
+    assert "hooks/hooks.json" in markers, "the hook commands"
+
+
+def test_the_command_is_read_out_of_the_plugin_s_own_files(tmp_path) -> None:
+    """What a person is asked about, not where it is written down.
+
+    Showing ``.mcp.json`` asks them to go and open it; the file already says what runs.
+    """
+    from agent.plugins.formats import executions
+
+    by_kind = {item.kind: item for item in executions(_claude_plugin(tmp_path))}
+
+    assert by_kind["mcp-stdio"].command_summary() == "npx -y one-server (+1 more)"
+    assert by_kind["hook-command"].command_summary() == "./check.sh"
+    # A Python file runs its path; the payload says which, and there is no command line
+    # to invent from it.
+    assert by_kind["python-entry"].command_summary() == ""
+    assert by_kind["python-entry"].describe() == "python-entry: __init__.py"
+
+
+def test_the_count_is_not_silently_truncated(tmp_path) -> None:
+    """"(+2 more)" is the difference between "runs one command" and "runs three"."""
+    from agent.plugins.formats import executions
+
+    mcp = next(
+        item for item in executions(_claude_plugin(tmp_path)) if item.kind == "mcp-stdio"
+    )
+
+    assert "(+1 more)" in mcp.command_summary()
+
+
+def test_the_installer_prompt_names_every_executable_and_keeps_its_wording(
+    tmp_path,
+) -> None:
+    """One scan, one rendering, and the localized label is not lost to the refactor.
+
+    The label is this CLI's wording and the structure is the report's; routing the prompt
+    through the report's own English rendering silently replaced "MCP server" with
+    "mcp-stdio" -- a regression no test noticed, because none of them pinned the words.
+    This one does.
+    """
+    from agent.plugins.report import capability_report
+    from agent.tools.plugin_tools import _plugin_executable_content, render_executions
+
+    root = _claude_plugin(tmp_path)
+    report = capability_report(root, source=str(root))
+
+    rendered = render_executions(report.would_run)
+
+    assert "MCP server (.mcp.json): npx -y one-server (+1 more)" in rendered
+    assert "hooks (hooks/hooks.json): ./check.sh" in rendered
+    assert "Python 入口 (__init__.py)" in rendered
+    # The standalone entry point answers the same question, from its own scan.
+    assert _plugin_executable_content(root) == rendered
+
+
+def test_a_declarative_plugin_runs_nothing_and_says_so(tmp_path) -> None:
+    """The control: no executables, no reason, nothing to confirm."""
+    from agent.plugins.report import capability_report
+
+    root = tmp_path / "plain"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text('{"name": "plain"}', encoding="utf-8")
+
+    report = capability_report(root, source=str(root))
+
+    assert report.would_run == ()
+    assert report.executes is False
+    assert report.reason() == ""
+
+
+def test_a_report_carries_the_source_a_human_was_shown(tmp_path) -> None:
+    """``source`` is what the person chose between, not an internal id."""
+    from agent.plugins.report import capability_report
+
+    report = capability_report(
+        _claude_plugin(tmp_path),
+        source="https://github.com/acme/widget",
+        inert=("SessionStart",),
+        approved=True,
+    )
+
+    assert report.source.source == "https://github.com/acme/widget"
+    assert report.source.kind == PLUGIN
+    assert report.executes is True
+    assert report.approved is True
+    # Inert declarations are reported, not hidden: nothing runs for them, and the person
+    # should not be left believing otherwise.
+    assert report.inert == ("SessionStart",)
+    assert "inert" in report.reason()
+
+
+def test_the_report_is_json_able_for_a_tool_result(tmp_path) -> None:
+    """A producer that is not this CLI (the DSH import, an npm source) needs to ship it."""
+    import json
+
+    from agent.plugins.report import capability_report
+
+    summary = capability_report(_claude_plugin(tmp_path), source="core:widget").summary()
+
+    assert json.loads(json.dumps(summary))["source"] == "core:widget"
+    assert len(summary["would_run"]) == 3
+    assert all("kind" in entry for entry in summary["would_run"])

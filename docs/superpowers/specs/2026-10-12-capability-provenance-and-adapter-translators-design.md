@@ -116,9 +116,22 @@ string that was typed.
    (`tests/test_provenance.py::test_no_capability_in_the_real_composition_is_anonymous`),
    which a scan of thirty call sites could not have told us.  `digest` is deliberately still
    empty: a digest nothing compares against is a decoration, and it needs step 3's ledger.
-2. `CapabilityReport` from a plugin directory, built on the adapters' markers;
+2. ~~`CapabilityReport` from a plugin directory, built on the adapters' markers;
    the installer renders it. `_plugin_executable_content`'s current strings become
-   *one* renderer, so the existing installer tests must stay green unchanged.
+   *one* renderer, so the existing installer tests must stay green unchanged.~~
+   **Done** (2026-10-15): `agent/plugins/formats.py::executions` produces typed
+   `Execution`s (kind + the concrete command, read out of `.mcp.json`, `hooks.json` and the
+   manifest keys), `agent/plugins/report.py::CapabilityReport` is the one structure every
+   adoption path can read, and the installer gates on `report.executes` while rendering the
+   prompt from the same `would_run` -- one scan, so the question asked and the words shown
+   can no longer disagree.
+
+   It also fixed a defect in the step above it: `executable_content` returned the **first**
+   marker that matched, so a plugin with an entry point and two MCP servers asked for
+   consent to run one of the three things it ships -- the class of miss its own docstring
+   calls worse than no gate. The localization is deliberately kept in the CLI
+   (`_executable_label`) rather than in the report: the report is a structure other
+   producers read, and the wording is this tool's.
 3. The durable ledger + digest; `install_plugin` writes and reads it. A test:
    approve, restart the process (fresh module state), install again → already
    approved; edit the hook command → digest changed → asks again.

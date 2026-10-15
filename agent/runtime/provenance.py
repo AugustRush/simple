@@ -92,7 +92,66 @@ class Execution:
 
     def describe(self) -> str:
         """One line for a human: the mechanism, then the concrete thing it runs."""
-        command = self.payload.get("command") or self.payload.get("path") or ""
-        if isinstance(command, (list, tuple)):
-            command = " ".join(str(part) for part in command)
-        return f"{self.kind}: {command}" if command else self.kind
+        subject = self._subject()
+        return f"{self.kind}: {subject}" if subject else self.kind
+
+    def command_summary(self) -> str:
+        """The concrete commands this would run, or ``""`` when the files do not say.
+
+        Separate from :meth:`describe` because the two callers want different text around
+        the same fact: a diagnostic wants the mechanism, and the installer's confirmation
+        already renders the *ecosystem's* name for the marker in the user's language.  What
+        it was missing is this -- the command itself.
+        """
+        commands = self._commands()
+        if not commands:
+            return ""
+        return self._with_remainder(_render_command(commands[0]), len(commands) - 1)
+
+    def _subject(self) -> str:
+        # Commands first: the thing that runs is the answer, and the file it lives in is
+        # only where to go and look.  Then the marker, which is relative and meaningful in
+        # the plugin's own terms; the absolute path last, because it is the least useful to
+        # a person deciding.
+        return (
+            self.command_summary()
+            or str(self.payload.get("marker") or "")
+            or str(self.payload.get("path") or "")
+        )
+
+    def _commands(self) -> list[str]:
+        """Every concrete command this execution would run, best effort.
+
+        ``command`` (one) as well as ``commands`` (several) and ``servers``: the three
+        shapes a producer reasonably writes, and dropping the singular one was a silent
+        regression when this was refactored -- ``describe()`` returned a bare kind for a
+        payload that named its command.
+        """
+        payload = self.payload
+        if payload.get("command"):
+            return [_render_command(payload["command"])]
+        if payload.get("commands"):
+            return [str(item) for item in payload["commands"]]
+        found: list[str] = []
+        for server in payload.get("servers") or ():
+            if not isinstance(server, dict):
+                continue
+            command = server.get("command")
+            if not command:
+                continue
+            args = server.get("args") or ()
+            if isinstance(command, (list, tuple)):
+                found.append(" ".join(str(part) for part in command))
+            else:
+                found.append(" ".join(str(part) for part in (command, *args)))
+        return found
+
+    @staticmethod
+    def _with_remainder(subject: str, remaining: int) -> str:
+        return subject if remaining <= 0 else f"{subject} (+{remaining} more)"
+
+
+def _render_command(command: Any) -> str:
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command)
+    return str(command)

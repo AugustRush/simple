@@ -138,19 +138,47 @@ def _plugin_executable_content(target: Path) -> str:
     """
     from agent.plugins import formats as plugin_formats
 
-    def describe(marker: str) -> str:
-        name = marker.rsplit(":", 1)[-1] if ":" in marker else marker
-        if marker == "__init__.py":
-            return "Python 入口 (__init__.py)"
-        if name.endswith("mcp.json"):
-            return f"MCP server ({name})"
-        if "mcpServers" in marker or "mcp_servers" in marker:
-            return "MCP server (manifest)"
-        if name.startswith("hooks") or "hooks" in marker:
-            return f"hooks ({name})" if name != "hooks" else "hooks"
-        return marker
+    return render_executions(plugin_formats.executions(target))
 
-    return plugin_formats.executable_content(target, describe=describe)
+
+def _executable_label(marker: str) -> str:
+    """This CLI's wording for one marker.
+
+    Kept apart from the report on purpose: ``agent/plugins/report.py`` describes executions
+    for any producer to read, and this is how one of those producers says it in the
+    language its user is reading.
+    """
+    name = marker.rsplit(":", 1)[-1] if ":" in marker else marker
+    if marker == "__init__.py":
+        return "Python 入口 (__init__.py)"
+    if name.endswith("mcp.json"):
+        return f"MCP server ({name})"
+    if "mcpServers" in marker or "mcp_servers" in marker:
+        return "MCP server (manifest)"
+    if name.startswith("hooks") or "hooks" in marker:
+        return f"hooks ({name})" if name != "hooks" else "hooks"
+    return marker
+
+
+def render_executions(entries, *, describe=None) -> str:
+    """The localized account of a list of executions, one clause each.
+
+    Every marker, and -- when the plugin's own files spell it out -- the command it runs.
+    What shipped before named the *first* marker and stopped, so a plugin with an entry
+    point and two MCP servers asked for consent to run one of the three things it ships,
+    while this file's docstring called a missed location worse than no gate.
+
+    The *label* stays here rather than moving into the report: ``agent/plugins/report.py``
+    is a structure for any producer to read, and this is the wording shown to a user of
+    this CLI -- which is a different thing that happens to describe the same executions.
+    """
+    label_for = describe or _executable_label
+    described = []
+    for entry in entries:
+        label = label_for(str(entry.payload.get("marker", "")))
+        command = entry.command_summary()
+        described.append(f"{label}: {command}" if command else label)
+    return "; ".join(described)
 
 
 _PLUGIN_INSTALL_LOCK: Optional[asyncio.Lock] = None
@@ -364,13 +392,25 @@ class PluginTools:
 
             inert_hooks = plugin_inert_hooks(target)
 
-            # Executable plugins are arbitrary code: ask the human first.
-            executable_reason = _plugin_executable_content(target)
+            # Executable plugins are arbitrary code: ask the human first.  Built through
+            # the report, so the string a person is shown and the question the gate asks
+            # are the *same* object -- the previous shape asked one question ("is this
+            # string non-empty") and showed another, and a plugin with an entry point and
+            # two MCP servers named one of the three.
+            from agent.plugins.report import capability_report
+
+            report = capability_report(target, source=source, inert=inert_hooks)
+            executable_reason = (
+                render_executions(report.would_run) if report.executes else ""
+            )
             if executable_reason:
                 inert_note = _inert_hooks_note(inert_hooks)
                 if inert_note:
                     executable_reason = f"{executable_reason}; {inert_note}"
-            if executable_reason:
+            # The gate and the prompt are the same object now: ``report.executes`` is the
+            # question, ``executable_reason`` is the words, and both come from one scan.
+            # They used to be a string and a truthiness test built separately.
+            if report.executes:
                 scope = self.authorization_scope()
                 approved, needs_pending = await self.confirm_plugin_install(
                     source=source,

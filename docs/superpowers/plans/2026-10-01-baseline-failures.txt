@@ -19,6 +19,18 @@ a baseline is a list of environment limits, and a real bug hiding in one is how 
 cross-loop teardown survived here unnoticed.  Two entries have been removed by fixes
 rather than by an environment change, and both are recorded below.
 
+**Measured again under `danger-full-access` (2026-10-15):**
+
+```
+3 failed, 4145 passed, 2 skipped
+```
+
+Only the three console-width probes failed; every entry attributed to `sandbox_apply` above
+**passed** when the file policy allowed it.  That is the independent confirmation the
+classification was right -- the 16 sandbox entries are the file policy talking, not the
+code -- and it is the reason the reasons below are written per entry instead of as a count.
+A baseline captured under one policy must only be compared against a run under the same one.
+
 Reasons:
 
 * `sandbox_apply` — `sandbox-exec: sandbox_apply: Operation not permitted` (12 tests).

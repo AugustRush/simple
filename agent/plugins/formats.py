@@ -50,6 +50,8 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+
+from agent.runtime.provenance import Execution
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -65,6 +67,7 @@ __all__ = [
     "placeholder_environment",
     "looks_like_plugin",
     "executable_content",
+    "executions",
     "CONVENTION_DIRS",
     "STANDALONE_SKILL_FILES",
     "merged_paths",
@@ -657,21 +660,170 @@ def executable_content(
     ecosystem says it ships, not what this project happens to look for.  A gate
     that misses a location is worse than no gate, because it reports consent that
     was never asked for.
+
+    **Every** location, not the first one.  This returned as soon as one marker matched,
+    which is the class of miss its own docstring calls worse than no gate: a plugin with a
+    Python entry point *and* two MCP servers asked for consent to run one of the three
+    things it ships.  Behaviour for a single-executable plugin is unchanged, which is what
+    the installer's existing tests pin.
     """
+    found = executions(root)
+    if not found:
+        return ""
+    markers = [str(item.payload.get("marker", "")) for item in found]
+    if describe is None:
+        return "; ".join(markers)
+    return "; ".join(describe(marker) for marker in markers)
+
+
+#: How a file or manifest key is classified.  Explicit rather than inferred from the
+#: suffix, because "this is code" is the ecosystem's claim and this is where the claim is
+#: translated into a mechanism a person can be asked about.
+def _execution_kind(marker: str) -> str:
+    if marker.endswith(".py"):
+        return "python-entry"
+    if ":" in marker:
+        _, _, key = marker.partition(":")
+        return "mcp-stdio" if key in _MCP_KEYS else "hook-command"
+    if "mcp" in marker:
+        return "mcp-stdio"
+    if "hook" in marker:
+        return "hook-command"
+    return "executable-file"
+
+
+def _mcp_servers(data: Any) -> list[dict[str, Any]]:
+    """The server entries of an MCP declaration, in either shape this tree accepts.
+
+    Claude Code's files and this project's own manifest agree on the mapping form
+    (``{"mcpServers": {"name": {"command": ..., "args": [...]}}}``); the list form
+    (``[{"name": ..., "command": ...}]``) is what a plugin manifest in this tree may also
+    write.  Both are read, because a gate that understands one of the two spellings of the
+    same thing is how this file's docstring describes a miss.
+    """
+    entries: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        for name, config in data.items():
+            entry = dict(config) if isinstance(config, dict) else {}
+            entry.setdefault("name", name)
+            entries.append(entry)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                entries.append(dict(item))
+    return entries[:20]
+
+
+def _hook_commands(data: Any, *, limit: int = 20) -> list[str]:
+    """Every ``command`` string in a hooks declaration, however it is nested.
+
+    Walked rather than addressed by path: both ecosystems nest command hooks two or three
+    levels deep and neither promises the shape, so a fixed path would read nothing on the
+    other one -- and "nothing" would render as an empty promise on the confirmation the
+    user is answering.
+    """
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(node, dict):
+            command = node.get("command")
+            if isinstance(command, str) and command:
+                found.append(command)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return found
+
+
+def executions(root: Path) -> tuple[Execution, ...]:
+    """Everything this plugin would run, from the formats' own markers.
+
+    The typed half of the installer's question.  ``executable_content`` says *that* there
+    is code; this says what it is and, where the plugin's own files spell it out, the
+    concrete command -- which is what a person being asked for consent is actually being
+    asked about.
+
+    Payloads carry ``marker`` as well as the concrete fields, so the installer's existing
+    renderer has one input instead of a second scan of the same files: one truth, one
+    description, no way for the two to disagree.
+
+    Order is the formats' declaration order, deduplicated by marker: the same ``.mcp.json``
+    is declared by more than one ecosystem, and a plugin that ships it runs one server, not
+    one per format that knows the filename.
+    """
+    seen: set[str] = set()
+    found: list[Execution] = []
+
+    def add(marker: str, payload: dict[str, Any]) -> None:
+        if marker in seen:
+            return
+        seen.add(marker)
+        found.append(
+            Execution(
+                kind=_execution_kind(marker),
+                payload={"marker": marker, **payload},
+            )
+        )
+
+    def payload_for(relative: str, path: Path) -> dict[str, Any]:
+        """What a marker's file actually runs, when its content says so.
+
+        One pass, because the alternative -- adding a bare marker here and rewriting that
+        entry later when the convention-files loop reaches it -- is two places that have to
+        agree about what one entry is.  A file that is not readable JSON keeps the path,
+        which is still the truthful answer: the thing exists and will run.
+        """
+        payload: dict[str, Any] = {"path": str(path)}
+        if path.suffix == ".py":
+            return payload
+        data = _read_json(path) if path.suffix == ".json" else {}
+        if not data:
+            return payload
+        if "hook" in relative:
+            payload["commands"] = _hook_commands(data.get("hooks", data))
+        elif "mcp" in relative:
+            payload["servers"] = _mcp_servers(
+                data.get("mcpServers") or data.get("mcp_servers") or data
+            )
+        return payload
+
     for fmt in PLUGIN_FORMATS:
         for relative in fmt.executable_files:
-            if (root / relative).exists():
-                return describe(relative) if describe else relative
+            path = root / relative
+            if path.exists():
+                add(relative, payload_for(relative, path))
         for relative in fmt.executable_dirs:
             directory = root / relative
             if directory.is_dir() and any(directory.iterdir()):
-                return describe(relative) if describe else relative
+                add(
+                    relative,
+                    {
+                        "path": str(directory),
+                        "files": sorted(
+                            child.name for child in directory.iterdir() if child.is_file()
+                        )[:20],
+                    },
+                )
         for relative in fmt.manifests:
             manifest = root / relative
             if not manifest.is_file():
                 continue
             data = _read_json(manifest)
             for key in fmt.executable_keys:
-                if data.get(key):
-                    return describe(f"{relative}:{key}") if describe else key
-    return ""
+                value = data.get(key)
+                if not value:
+                    continue
+                payload: dict[str, Any] = {"path": str(manifest)}
+                if key in _MCP_KEYS:
+                    payload["servers"] = _mcp_servers(value)
+                else:
+                    payload["commands"] = _hook_commands(value)
+                add(f"{relative}:{key}", payload)
+
+    return tuple(found)
