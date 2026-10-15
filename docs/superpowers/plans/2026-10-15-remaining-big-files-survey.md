@@ -438,6 +438,42 @@ to be re-exported from its old module even after its reader leaves.
 
 ---
 
+## 7. Audit: did any extraction change a string?
+
+Every extraction in this campaign claimed its moved bodies were faithful.  Those checks were
+**whitespace-insensitive**, which made them blind to one thing the tool was doing: the line-level
+dedent also stripped the leading whitespace of lines *inside* multi-line literals, and that
+whitespace is part of the string's **value**.  The claim was therefore stronger than the check.
+
+A value-level audit over all eighteen extracted modules (compare the sorted multiset of every
+string literal per class-qualified function, against the pre-move revision) found:
+
+* **zero real content changes** -- no moved literal lost, gained or altered a token;
+* **whitespace-only differences in every module that contained a multi-line string** (7 of
+  `journal.py`'s 12, 5 of `fitting.py`'s 12, 6 of `queries.py`'s 7, and so on): the interior
+  indentation of SQL and of moved docstrings was four spaces shallower than the author wrote.
+
+The tool now leaves every string-occupied line untouched, **including the closing line**, whose
+leading whitespace is also part of the value.  `journal.py` -- re-extracted after the fix -- is
+byte-exact: 12 of 12 functions identical, no whitespace differences at all.  The modules
+extracted before the fix still carry the four-space difference inside their multi-line literals;
+that is left as it is rather than re-running fifteen extractions to restore whitespace that no
+test asserts and no reader is misled by -- but the deviation is recorded here instead of being
+claimed away, and the modules moved from now on are exact.
+
+Three instrument errors were made and corrected while doing this audit, which is why its
+conclusion is stated in terms of a method rather than a boolean:
+
+1. comparing against `HEAD` for an extraction that was **already committed** (so the "original"
+   was the wrapper the move had just created);
+2. comparing string lists **positionally** when `ast.walk` visits them in a different order once
+   the `with` statement is gone -- the fix is a multiset comparison;
+3. keying by function name alone, which matched `_TurnLoopState.__init__` against
+   `BaseAgent.__init__` and reported a difference that a class-qualified comparison showed to be
+   byte-identical.
+
+---
+
 ## What this does not cover
 
 * **Whether each cluster is a *good* module.**  This survey measures coupling, which predicts

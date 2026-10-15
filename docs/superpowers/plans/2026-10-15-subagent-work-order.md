@@ -80,6 +80,27 @@ Each of these is a bug that actually happened while doing this work.
     would point it somewhere else and no test here would notice, because the fallback is a
     bundled directory that exists.  Check this by hand for every candidate that mentions
     `__file__`; the tool does not.
+11. **Dedenting edits multi-line strings, and that is a silent content change.**  A line-level
+    dedent also strips the leading whitespace of lines *inside* a triple-quoted literal, which
+    changes the string's value.  Every occupied line matters, including the **closing** line:
+    the whitespace between the last newline and the terminator is part of the value.  The first
+    attempt at protecting them replaced the closing line with a marker, which removed the
+    terminator and swallowed the code after it (`IndentationError: unexpected indent`); the
+    second protected only the content lines, which still changed SQL from 16 spaces to 8.
+    `scripts/_move_methods.py` now leaves every string-occupied line alone.  Consequences to
+    accept knowingly: a moved literal keeps its original internal indentation, so it can look
+    deeper than the code around it -- preserving the author's text is worth more than tidiness,
+    and *this is exactly what used to be rewritten silently*.  Verify with a value-level check,
+    not a whitespace-insensitive diff:
+
+    ```python
+    sorted(string_literals(moved_function)) == sorted(string_literals(original_method))
+    ```
+
+    Compare **multisets**: `ast.walk` order changes when the `with` statement is removed, so a
+    positional comparison reports false differences.  And key by class *and* method name -- the
+    first audit keyed by name alone and flagged `_TurnLoopState.__init__` against
+    `BaseAgent.__init__`, a false positive that took three attempts to see through.
 
 ## Report format for an implementation subagent
 
