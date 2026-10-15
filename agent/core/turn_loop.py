@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from agent import shared
 from agent.core.bounded_text import bounded_text
 from agent.core.turn_helpers import protected_turn_messages
+from agent.core.turn_state import AgentContext, AgentResult
 from agent.config import _now
 from agent.core.event_domains import (
     LLMResponseParsed,
@@ -88,7 +89,7 @@ from agent.usage import extract_provider_usage
 from agent.skills.catalog import SkillCatalog
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from agent.core.agent import AgentContext
+    from agent.core.turn_state import AgentContext  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -780,15 +781,6 @@ def build_continuation_context(ctx: "AgentContext") -> "AgentContext":
         inside the continuation cannot evict the request the turn exists to
         answer.
         """
-        # Imported here rather than at module scope: ``AgentContext`` lives in
-        # ``agent/core/agent.py``, which imports this module, so a module-level
-        # import would be a cycle.  The class is nine fields and its only runtime
-        # use in this file is this constructor.  Moving it down instead would mean
-        # moving ``DEFAULT_SYSTEM_PROMPT`` out of ``agent/__init__.py`` as well,
-        # because the field default reads it -- a larger change than the cycle it
-        # would remove.
-        from agent.core.agent import AgentContext
-
         return AgentContext(
             agent_id=ctx.agent_id,
             role=ctx.role,
@@ -1286,11 +1278,6 @@ async def run_turn_loop(
         Locals were correct for that reason, and a mutable holder keeps them
         correct while making them visible to the caller.
         """
-        # Imported here rather than at module scope: ``AgentResult`` lives in
-        # ``agent/core/agent.py``, which imports this module.  Same cycle break as
-        # ``build_continuation_context`` uses for ``AgentContext``.
-        from agent.core.agent import AgentResult
-
         try:
             ctx.metadata[TURN_IN_PROGRESS_KEY] = True
             orchestration_decision = prepare_turn(deps, ctx, user_message, attachments)
