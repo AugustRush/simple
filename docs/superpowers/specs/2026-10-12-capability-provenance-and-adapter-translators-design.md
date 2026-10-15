@@ -132,9 +132,25 @@ string that was typed.
    calls worse than no gate. The localization is deliberately kept in the CLI
    (`_executable_label`) rather than in the report: the report is a structure other
    producers read, and the wording is this tool's.
-3. The durable ledger + digest; `install_plugin` writes and reads it. A test:
+3. ~~The durable ledger + digest; `install_plugin` writes and reads it. A test:
    approve, restart the process (fresh module state), install again → already
-   approved; edit the hook command → digest changed → asks again.
+   approved; edit the hook command → digest changed → asks again.~~
+   **Done, with the ledger already there** (2026-10-15).  The durable record did not have to
+   be built: `agent/security/consent.py` already persists `always` answers to
+   `~/.agent/trust/<workspace>.json`, and `plugin_approval` was already a thin adapter over
+   it.  So this step was a **re-keying**, not a new store -- and it inherits restart
+   survival instead of duplicating it.
+
+   The digest is over the *content* of `would_run` (each file's bytes; a manifest
+   declaration canonicalised), deliberately **not** over the directory path: moving a plugin
+   does not change what it runs, and a digest that changed on a move would re-ask a question
+   already answered.  The key split matters as much as the digest: the question is **shown**
+   under the source (`Pending.what` is the rule's value, so a hash in `rule` would print a
+   hash at a person), and a durable answer is **remembered** under
+   `plugin:<source>@<digest>` through the `always_rule` field that exists for exactly this
+   asymmetry.  The plain key is read back only for `once`/`session` lifetimes, which is what
+   keeps a redeemed pending question working without letting a pre-digest `always` grant
+   stand in for consent to whatever the URL serves now.
 4. `import_dsh_profile(path)` as the second producer: it reports
    `would_run` (stdio commands) and imports only what a human approved. This is
    the item that was blocked on "consent" — after step 3 it needs no new concept.

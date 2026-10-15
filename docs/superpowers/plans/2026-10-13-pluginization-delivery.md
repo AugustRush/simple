@@ -167,15 +167,19 @@ public / 24 reserved, 15 with contracts**.
 
 1. **Provenance / translators** -- designed in
    [`2026-10-12-capability-provenance-and-adapter-translators-design.md`](../specs/2026-10-12-capability-provenance-and-adapter-translators-design.md).
-   **Steps 1 and 2 of 4 have shipped** (step 1 in a corrected shape): every plugin carries a `Provenance`
+   **Steps 1-3 of 4 have shipped** (step 1 in a corrected shape): every plugin carries a `Provenance`
    (`agent/runtime/provenance.py`) recorded where the facts are, and a capability's origin is
    *derived* through `who_provides`, so the composition can now answer "where did this come
    from" for every name it holds -- guarded by a test that asks the real composition.
    Step 2 shipped too: `formats.executions` says what a plugin would *run* (including the
    concrete command, read from its own files) and `CapabilityReport` is the one structure
    every adoption path reads, with the installer gating and wording from that single scan.
-   Still missing: the `digest` + durable approval ledger, and `import_dsh_profile` as the
-   second producer.  Until those
+   Step 3 shipped as a re-keying rather than a new store: the durable ledger already
+   existed (`agent/security/consent.py`), so a durable grant for an executable plugin is now
+   keyed by a digest of what would run -- `plugin:<source>@<digest>` -- while the question is
+   still shown under the source.  Editing a hook command, an MCP server's command, or a
+   Python entry point's bytes asks again; moving the directory does not.
+   Still missing: `import_dsh_profile` as the second producer.  Until those
    exist the *trust* half is not met: a plugin in `~/.agent/plugins/` is still executed at
    startup on the strength of being there.
 2. **The 4 remaining soft reads** (`tests/test_memory_contract.py`): the token budget's

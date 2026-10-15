@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.runtime.provenance import CORE, PLUGIN, Execution, Provenance
+from agent.runtime.provenance import CORE, PLUGIN, Execution, Provenance, digest_of
 
 __all__ = ["CapabilityReport", "capability_report"]
 
@@ -40,6 +40,11 @@ class CapabilityReport:
 
     source: Provenance
     would_run: tuple[Execution, ...] = ()
+    #: Of ``would_run`` only, and over content rather than location.  *This* is what an
+    #: approval is bound to: keyed by the source string a human was shown, "always" meant
+    #: "always for whatever is at that URL from now on", which the design measured as an
+    #: approval attached to nothing that ends up running.  Empty when nothing runs.
+    digest: str = ""
     #: Declarations that were understood and will do nothing -- a hook event this runtime
     #: has no dispatcher for, most often.
     inert: tuple[str, ...] = ()
@@ -77,6 +82,7 @@ class CapabilityReport:
             "would_run": [
                 {"kind": item.kind, **item.payload} for item in self.would_run
             ],
+            "digest": self.digest,
             "inert": list(self.inert),
             "approved": self.approved,
             "unsupported": list(self.unsupported),
@@ -100,9 +106,11 @@ def capability_report(
     """
     from agent.plugins import formats as plugin_formats
 
+    would_run = plugin_formats.executions(root)
     return CapabilityReport(
         source=Provenance(source=source, kind=kind),
-        would_run=plugin_formats.executions(root),
+        would_run=would_run,
+        digest=digest_of(would_run),
         inert=tuple(inert),
         approved=approved,
         unsupported=tuple(unsupported),

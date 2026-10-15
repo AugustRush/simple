@@ -35,10 +35,20 @@ only the type.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["Execution", "Provenance", "CORE", "PLUGIN", "IMPORT"]
+__all__ = [
+    "Execution",
+    "Provenance",
+    "CORE",
+    "PLUGIN",
+    "IMPORT",
+    "digest_of",
+    "content_digest",
+]
 
 #: The three provenances a capability can have.  ``core`` is shipped with the agent,
 #: ``plugin`` arrived from a directory a human put there, ``import`` from another
@@ -155,3 +165,50 @@ def _render_command(command: Any) -> str:
     if isinstance(command, (list, tuple)):
         return " ".join(str(part) for part in command)
     return str(command)
+
+
+# ── the digest: an edit is not the same approval ─────────────────────────────
+
+
+def content_digest(data: bytes | str) -> str:
+    """A short, stable digest of the bytes something will run.
+
+    SHA-256 truncated to 16 hex characters.  Short because this ends up inside a *rule
+    string* a human may be shown and that gets written to a ledger, and 64 bits is far more
+    than enough to make an accidental collision impossible while keeping the line readable.
+    """
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def digest_of(executions: "tuple[Execution, ...] | list[Execution]") -> str:
+    """The digest of everything adopting this would run, or ``""`` when nothing runs.
+
+    Two deliberate properties:
+
+    * **Content, not location.**  The absolute path is *not* hashed.  Moving a plugin
+      directory does not change what it runs, and a digest that changed on a move would
+      re-ask a question whose answer was already given -- teaching the human to approve
+      without reading, which is how a consent gate stops working.
+    * **Contents, not just names.**  Each item's own digest is over the bytes of the file
+      (or the canonical JSON of the declaration).  A digest over marker *names* would say
+      that an edited ``__init__.py`` is the plugin that was approved, which for arbitrary
+      code is the whole risk.
+
+    ``""`` when there is nothing to run: the caller's "no executables" case, where a digest
+    would be a number with no question behind it.
+    """
+    if not executions:
+        return ""
+    parts = [
+        {
+            "kind": item.kind,
+            "marker": str(item.payload.get("marker") or ""),
+            "digest": str(item.payload.get("digest") or ""),
+        }
+        for item in executions
+    ]
+    canonical = json.dumps(sorted(parts, key=lambda part: (part["marker"], part["kind"])),
+                           sort_keys=True, separators=(",", ":"))
+    return content_digest(canonical)

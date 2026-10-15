@@ -51,7 +51,7 @@ import json
 import os
 from dataclasses import dataclass, field
 
-from agent.runtime.provenance import Execution
+from agent.runtime.provenance import Execution, content_digest
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -771,6 +771,31 @@ def executions(root: Path) -> tuple[Execution, ...]:
             )
         )
 
+    def file_digest(path: Path) -> str:
+        """The digest of a file's bytes, or ``""`` when it cannot be read.
+
+        Empty rather than a placeholder: a file that cannot be read is one whose content
+        cannot be approved, and the digest's job is to make "an edit is not the same
+        approval" true.  ``""`` makes the *report* re-ask, which is the safe direction.
+        """
+        try:
+            return content_digest(path.read_bytes())
+        except OSError:
+            return ""
+
+    def dir_digest(directory: Path) -> str:
+        """Every file's content, so a script added later is not covered by an old grant.
+
+        All of them, not the twenty the payload lists for display: a cap that quietly
+        excluded files would be the "missed location" this file's own docstring calls worse
+        than no gate, in the thing that decides whether to ask again.
+        """
+        parts = []
+        for child in sorted(directory.rglob("*")):
+            if child.is_file():
+                parts.append(f"{child.relative_to(directory).as_posix()}:{file_digest(child)}")
+        return content_digest("\n".join(parts))
+
     def payload_for(relative: str, path: Path) -> dict[str, Any]:
         """What a marker's file actually runs, when its content says so.
 
@@ -779,7 +804,7 @@ def executions(root: Path) -> tuple[Execution, ...]:
         agree about what one entry is.  A file that is not readable JSON keeps the path,
         which is still the truthful answer: the thing exists and will run.
         """
-        payload: dict[str, Any] = {"path": str(path)}
+        payload: dict[str, Any] = {"path": str(path), "digest": file_digest(path)}
         if path.suffix == ".py":
             return payload
         data = _read_json(path) if path.suffix == ".json" else {}
@@ -805,8 +830,9 @@ def executions(root: Path) -> tuple[Execution, ...]:
                     relative,
                     {
                         "path": str(directory),
+                        "digest": dir_digest(directory),
                         "files": sorted(
-                            child.name for child in directory.iterdir() if child.is_file()
+                            child.name for child in directory.rglob("*") if child.is_file()
                         )[:20],
                     },
                 )
@@ -819,7 +845,15 @@ def executions(root: Path) -> tuple[Execution, ...]:
                 value = data.get(key)
                 if not value:
                     continue
-                payload: dict[str, Any] = {"path": str(manifest)}
+                payload: dict[str, Any] = {
+                    "path": str(manifest),
+                    # The declaration itself, canonicalised: editing a server's command or
+                    # args has to change the digest, and the manifest's formatting (or a
+                    # comment field) has not.
+                    "digest": content_digest(
+                        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+                    ),
+                }
                 if key in _MCP_KEYS:
                     payload["servers"] = _mcp_servers(value)
                 else:

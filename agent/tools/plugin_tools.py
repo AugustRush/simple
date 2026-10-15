@@ -416,6 +416,7 @@ class PluginTools:
                     source=source,
                     reason=executable_reason,
                     scope=scope,
+                    digest=report.digest,
                 )
                 if not approved:
                     payload = {
@@ -428,7 +429,13 @@ class PluginTools:
                     }
                     if needs_pending:
                         plugin_install_record_pending(
-                            scope, source, reason=executable_reason
+                            scope,
+                            source,
+                            reason=executable_reason,
+                            # Same rule the answer will be read back with: a pending record
+                            # keyed without the digest would be redeemed into a grant that
+                            # ``was_approved(..., digest)`` never finds.
+                            digest=report.digest,
                         )
                         payload.update(
                             {
@@ -574,6 +581,7 @@ class PluginTools:
         source: str,
         reason: str,
         scope: Any,
+        digest: str = "",
     ) -> tuple[bool, bool]:
         """Ask the human before activating executable plugin content.
 
@@ -590,7 +598,9 @@ class PluginTools:
         )
 
         async with _APPROVAL_LOCK:
-            if plugin_install_was_approved(scope, source):
+            # *digest* is part of the question: an answer to "may I run this plugin" is an
+            # answer about the code that was shown, not about the address it came from.
+            if plugin_install_was_approved(scope, source, digest):
                 return True, False
             sink = _active_sink.get()
             if sink is None:
@@ -604,7 +614,7 @@ class PluginTools:
                 scope=scope,
             )
             if approved:
-                plugin_install_mark_approved(scope, source)
+                plugin_install_mark_approved(scope, source, digest=digest)
                 return True, False
             return False, approved is None
 
