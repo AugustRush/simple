@@ -1571,9 +1571,19 @@ class PluginCatalog:
            answer.
         4. **Recorded** -- either a human approved this content (recorded at install/import,
            by digest) or this machine has run it before.
-        5. **Otherwise** it does not load, and it is reported.
+        5. **Declared as the user's own** -- a directory named in the ``plugins``
+           configuration's ``trusted_paths``.  This is the **author's** door, and it exists
+           because the rest of this mechanism cannot tell an author editing their own plugin
+           from a sync tool editing files behind them: both are "the content changed".  A
+           path is a statement about *ownership* rather than about content, which is exactly
+           what an author needs and exactly what a URL cannot honestly offer -- "always for
+           whatever is at this address" was the hole in the old approval key.  A directory
+           the user names is a different claim: the code in it is mine, and I will read it.
+        6. **Otherwise** it does not load, and it is reported.
         """
         if not self._detect_changes or source != "user":
+            return True
+        if self._is_trusted_path(plugin_dir):
             return True
         from agent.plugins import formats as plugin_formats
         from agent.runtime.provenance import digest_of
@@ -1602,6 +1612,32 @@ class PluginCatalog:
             "source": str(plugin_dir),
             "would_run": [item.describe() for item in executions],
         }
+        return False
+
+    def _is_trusted_path(self, plugin_dir: Path) -> bool:
+        """Whether *plugin_dir* is under a directory the user named as their own.
+
+        Read from the ``plugins`` configuration rather than from the trust ledger, and the
+        difference is deliberate: "this directory is mine" is a fact about configuration --
+        it belongs in a file the user versions and reads -- while the ledger holds answers to
+        questions that were *asked*.  Filing it as a consent record would have made a
+        standing property of the setup look like a decision made once in a dialog.
+        """
+        declared = self._plugin_config.get("trusted_paths")
+        if not declared:
+            return False
+        if isinstance(declared, str):
+            declared = [declared]
+        if not isinstance(declared, (list, tuple)):
+            return False
+        target = Path(plugin_dir).expanduser().resolve(strict=False)
+        for entry in declared:
+            try:
+                root = Path(str(entry)).expanduser().resolve(strict=False)
+            except (TypeError, ValueError):
+                continue
+            if target == root or root in target.parents:
+                return True
         return False
 
     @staticmethod

@@ -688,6 +688,42 @@ started.
 `description` front-matter for a markdown command and from the handler's
 docstring for a Python one — so write one.
 
+#### Code that appears in your plugin directory
+
+A plugin that runs code (a `__init__.py`, an MCP server, a hook command) is checked before it
+is loaded, and the answer is about **content** rather than about the plugin's name:
+
+- the **first time** this machine sees your plugin directory, every plugin is listed with what
+  it would run and then recorded. That is a blessing of what is already there, printed rather
+  than silent;
+- after that, a plugin that was **already recorded** loads without a word, and one whose code
+  **changed** — or one that simply appeared — does not load, and is reported with what it would
+  have run;
+- installing or importing through `install_plugin` / `import_dsh_profile` records the approval,
+  so the supported paths keep working.
+
+The reason a change stops rather than warns is that this cannot tell *you* editing your own
+plugin from a sync tool, a package install or a clone updating files behind you: both are
+"the content changed".
+
+**If a directory is yours, say so**, and edits in it load without re-approval:
+
+```json
+{
+  "plugins": {
+    "trusted_paths": ["~/src/my-plugins"]
+  }
+}
+```
+
+A path is a statement about ownership, which is what an author needs; it is deliberately not
+the same as "always allow whatever is at this address", which is a promise no URL can keep.
+
+One honest limit: the record of what has been seen lives in `~/.agent/trust/`, a plain file in
+the same home as the plugin directory. Anything that can write code into one can write a record
+into the other, so this raises the cost of a generic tool dropping files into a conventional
+directory — it is not a boundary against someone who can already write to your home.
+
 ### Memory management
 
 ```bash

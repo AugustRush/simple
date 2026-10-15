@@ -313,3 +313,95 @@ def test_the_two_rule_kinds_do_not_impersonate_each_other(tmp_path, ledger) -> N
     assert plugin_approval.seen_baseline_taken() is False
     plugin_approval.record_seen_baseline()
     assert plugin_approval.seen_baseline_taken() is True
+
+
+# ── the author's door ────────────────────────────────────────────────────────
+
+
+def test_an_author_s_directory_is_trusted_by_path_not_by_content(tmp_path, ledger) -> None:
+    """The escape hatch for the workflow the strict default interrupts.
+
+    A local directory the user *names* is a different claim from a URL: "the code in here is
+    mine, and I will read it" rather than "always for whatever is at this address" -- which
+    is the hole the old approval key had, and the reason this is configuration rather than a
+    consent record.  Under it, an author's edit loads without being re-approved; outside it,
+    nothing changes.
+    """
+    from agent import PluginCatalog
+
+    work = tmp_path / "work"
+    plugin = _code_plugin(work, "mine", body="v1")
+    trusted = PluginCatalog(
+        builtin_dir=tmp_path / "builtin",
+        user_dir=work,
+        plugin_config={"trusted_paths": [str(work)]},
+        detect_plugin_changes=True,
+    )
+    try:
+        assert trusted.discover_and_load() == ["mine"]
+        assert _ran(plugin)
+    finally:
+        trusted.close()
+
+    # The author edits their own plugin.  No re-approval, and no change notice.
+    (plugin / "ran.txt").unlink()
+    (plugin / "__init__.py").write_text(
+        (plugin / "__init__.py").read_text(encoding="utf-8").replace("v1", "v2"),
+        encoding="utf-8",
+    )
+    again = PluginCatalog(
+        builtin_dir=tmp_path / "builtin",
+        user_dir=work,
+        plugin_config={"trusted_paths": [str(work)]},
+        detect_plugin_changes=True,
+    )
+    try:
+        assert again.discover_and_load() == ["mine"], (
+            "a trusted path is trusted for its content too"
+        )
+        assert _ran(plugin)
+        assert again.unapproved_report() == {}
+    finally:
+        again.close()
+
+
+def test_a_trusted_path_does_not_leak_to_its_neighbours(tmp_path, ledger) -> None:
+    """Trusting one directory must not trust the tree it happens to sit in."""
+    from agent import PluginCatalog
+
+    mine = _code_plugin(tmp_path / "work", "mine", body="v1")
+    neighbour = _code_plugin(tmp_path / "elsewhere", "theirs", body="v1")
+
+    from agent.security import plugin_approval
+
+    plugin_approval.record_seen_baseline()
+    catalog = PluginCatalog(
+        builtin_dir=tmp_path / "builtin",
+        user_dir=tmp_path / "work",
+        plugin_config={"trusted_paths": [str(mine.parent)]},
+        detect_plugin_changes=True,
+    )
+    try:
+        assert catalog.discover_and_load() == ["mine"]
+        assert catalog._is_trusted_path(neighbour.parent) is False
+    finally:
+        catalog.close()
+
+
+def test_a_string_trusted_path_is_accepted_like_a_list(tmp_path, ledger) -> None:
+    """One directory is a common thing to write, and config is read by people."""
+    from agent import PluginCatalog
+
+    work = tmp_path / "work"
+    plugin = _code_plugin(work, "mine", body="v1")
+    catalog = PluginCatalog(
+        builtin_dir=tmp_path / "builtin",
+        user_dir=work,
+        plugin_config={"trusted_paths": str(work)},
+        detect_plugin_changes=True,
+    )
+    try:
+        assert catalog.discover_and_load() == ["mine"]
+        assert _ran(plugin)
+    finally:
+        catalog.close()
