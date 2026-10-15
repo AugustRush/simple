@@ -72,6 +72,14 @@ Each of these is a bug that actually happened while doing this work.
    and confirm the *only* differences are the intended ones (name, receiver, imports, sibling
    calls).  My first attempt at this verification was itself wrong -- it joined `splitlines()`
    with `""` and reported the whole function as one changed line.
+10. **A `__file__`-relative path silently changes meaning with the module's depth.**  A body that
+    computes `Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist"` means the
+    same thing only if the new module sits at the same package depth.  Moving
+    `_web_dist_dir` from `agent/channels/web.py` to `agent/channels/web_assets.py` is safe
+    (`parent.parent` is `agent/` either way, verified before the move); adding a directory level
+    would point it somewhere else and no test here would notice, because the fallback is a
+    bundled directory that exists.  Check this by hand for every candidate that mentions
+    `__file__`; the tool does not.
 
 ## Report format for an implementation subagent
 
