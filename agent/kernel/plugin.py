@@ -148,6 +148,13 @@ class PluginHost:
         #: "no vocabulary", which is the behaviour an embedder that provides nothing
         #: already had -- and what keeps the kernel's own tests using invented names.
         self.service_policy: Optional[Callable[[str, str], bool]] = None
+        #: ``(name, value) -> None``, or ``None`` when no contracts are wired.
+        #: Called by :class:`~agent.kernel.context.Context.provide` **before** the
+        #: registration is recorded, so a refused value leaves nothing behind.  The
+        #: kernel has no contracts of its own for the same reason it has no vocabulary:
+        #: that a *tool registry* must look like a tool registry is the composition's
+        #: declaration, and the kernel would have to name it to know.
+        self.service_validator: Optional[Callable[[str, Any], None]] = None
         self._installs: dict[str, Install] = {}
         #: Plugins waiting for a dependency, keyed by name.
         self._pending: dict[str, Install] = {}

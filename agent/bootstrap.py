@@ -38,6 +38,7 @@ from agent.tools.plugin import ToolsPlugin
 from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
+from agent.runtime.service_contracts import validator_for, violations
 from agent.runtime.service_vocabulary import plugin_service_policy
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import (
@@ -115,6 +116,7 @@ def build_gateway_channels(cfg: dict) -> list[Channel]:
     # ``host.services.provide("cfg", ...)`` below is the *composition* acting, which
     # is not subject to the plugin policy.
     host.service_policy = plugin_service_policy
+    host.service_validator = validator_for()
     host.services.provide("cfg", cfg)
     for entry in core_plugins(enabled=("channels", "channel.web", "channel.feishu")):
         host.load(entry.build(CoreContext()))
@@ -663,6 +665,9 @@ async def _build_components_async(
         # which has no list of its own.  Without this line the closed vocabulary is a
         # module nobody reads -- see tests/test_service_vocabulary.py.
         service_policy=plugin_service_policy,
+        # The other half of a declaration being real: what a plugin *offers* is checked
+        # against the contract its name declares, before the registration is recorded.
+        service_validator=validator_for(),
     )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
@@ -948,6 +953,26 @@ async def _build_components_async(
         shared.CONSOLE.print(
             f"[yellow]Plugin '{plugin_name}' is waiting for: "
             f"{', '.join(missing)}[/yellow]"
+        )
+
+    # The composition checks its own declarations before it returns.
+    #
+    # A plugin's `provide` is validated where it happens, but the composition root writes
+    # several services into the mapping **itself** (`agent_core`, `plugin_catalog`,
+    # `commands`, `agents`), and a raw write crosses no plugin boundary.  This is the one
+    # place that sees the finished result, so it is the one place that can say "what you
+    # declared is what you got" for all of it.
+    #
+    # Raising rather than warning: a service that does not satisfy its contract is a
+    # composition that fails at the first caller, three frames from the cause, and a
+    # startup that names it once is worth more than a session that discovers it later.
+    # Only *present* services are checked -- a composition may legitimately hold no
+    # `mcp_client`, and the ledger says so.
+    contract_problems = violations(components)
+    if contract_problems:
+        raise RuntimeError(
+            "the composition does not satisfy the contracts it declares:\n  "
+            + "\n  ".join(contract_problems)
         )
 
     return components

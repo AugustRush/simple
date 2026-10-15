@@ -42,11 +42,19 @@ def _mount(mapping: dict) -> PluginHost:
 
 
 def test_no_servers_means_no_client() -> None:
+    """Nothing to connect means the name is **absent**, not ``None``.
+
+    The plugin used to provide ``mcp_client = None``, and every caller resolved the name
+    and then checked.  Those callers cannot tell the difference -- they pass a default --
+    but the *declaration* can: `mcp_client` says "if I am present I am an MCP client", and
+    ``None`` is not one.  The contract audit refuses it, so the plugin leaves the name
+    unset when there is nothing to connect.
+    """
     mapping: dict = {"cfg": {}, "registry": object(), "contributed_mcp_servers": _contributed()}
 
     _mount(mapping)
 
-    assert mapping["mcp_client"] is None
+    assert "mcp_client" not in mapping, "absence, not a None claiming to be a client"
     assert mapping["mcp_server_configs"] == []
     assert mapping["mcp_status"]["configured_servers"] == 0
 

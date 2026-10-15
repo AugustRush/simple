@@ -419,6 +419,30 @@ user-invocable: true
         def compose_all_prompts(self, base):
             return base
 
+        # The rest of `PluginCatalogService`, which the composition audit now insists on.
+        #
+        # This stand-in had grown a member at a time, each one added when the composition
+        # root happened to start calling it -- and the audit is what makes that
+        # observation actionable: `plugin_catalog` is a *declared* service, so a stand-in
+        # for it has to be one.  Five members were missing, and the class satisfied the
+        # protocol by accident until something asked.
+        def close(self):
+            return None
+
+        def who_provides(self, service):
+            return None
+
+        async def fire_prompt_submit(self, text, metadata=None):
+            from agent.plugins.hook_types import HookResult
+
+            return HookResult()
+
+        async def fire_turn_end(self, event):
+            return []
+
+        async def fire_session_end(self, event):
+            return None
+
     import agent.bootstrap as bootstrap_mod
 
     monkeypatch.setattr(
@@ -8489,13 +8513,48 @@ def test_base_agent_keeps_non_image_attachments_as_context_for_vision_model(tmp_
     assert str(path) in content
 
 
+
+class _ConformingAgent:
+    """The members ``AgentService`` declares, for doubles standing in for the agent.
+
+    Substituting the agent class is a documented composition choice
+    (``CoreContext.agent_class``), so a substitute *is* a service and has to satisfy the
+    service's declaration -- which the composition audit now refuses to take on trust.
+    These are the members the protocol names; a double adds only what its own test
+    observes (``observed.update(kwargs)`` and the like).
+    """
+
+    api_format = "anthropic"
+    max_tokens = 0
+    context_window = None
+    supports_vision = False
+    content_filter = None
+
+    def endpoint_for(self, model=None):
+        raise NotImplementedError
+
+    def consolidation_model(self, cfg):
+        raise NotImplementedError
+
+    def consolidation_endpoint(self, cfg):
+        raise NotImplementedError
+
+    async def send_message(
+        self, ctx, user_message, stream_callback=None, attachments=()
+    ):
+        raise NotImplementedError
+
+    def register_spawn_capability(self, base_system_prompt, workspace_root=None):
+        return None
+
+
 def test_build_components_passes_provider_vision_capability(monkeypatch, tmp_path):
     import agent as agent_module
     import agent.bootstrap as bootstrap_module
 
     observed = {}
 
-    class _FakeBaseAgent:
+    class _FakeBaseAgent(_ConformingAgent):
         def __init__(self, client, registry, **kwargs):
             observed.update(kwargs)
             self.context_manager = None
@@ -8565,7 +8624,7 @@ def test_build_components_uses_default_provider_vision_capability_when_missing(
 
     observed = {}
 
-    class _FakeBaseAgent:
+    class _FakeBaseAgent(_ConformingAgent):
         def __init__(self, client, registry, **kwargs):
             observed.update(kwargs)
             self.context_manager = None

@@ -383,3 +383,108 @@ def test_no_scoped_view_escapes_the_scan() -> None:
         "attribution and its undo:\n  " + "\n  ".join(offenders)
     )
     assert ScopedContribution is not None
+
+
+# ── The contract is enforced at runtime, not only by these tests ─────────────
+#
+# Everything above checks a *class* against a protocol, which is the stronger check and
+# the reason it stays.  What none of it did was ask the question a
+# ``@runtime_checkable`` Protocol exists to answer: is the object the composition is
+# actually holding an instance of what its declaration promises?  Measured before this:
+# zero ``isinstance`` calls against any capability protocol in ``agent/``.  The `memory`
+# ledger pointer named ``MemoryStore`` while the service held a *palace*, and nothing
+# asked -- which is what a contract that is only documentation buys you.
+
+
+def test_a_plugin_offering_the_wrong_object_is_refused_where_it_happened() -> None:
+    from agent.kernel.plugin import PluginHost
+    from agent.runtime.service_contracts import validator_for
+
+    host = PluginHost()
+    host.service_validator = validator_for()
+
+    class Sloppy:
+        name = "sloppy"
+        inject: tuple[str, ...] = ()
+
+        def setup(self, ctx):
+            ctx.provide("registry", object())  # not a ToolRegistryService
+
+    host.load(Sloppy())
+
+    assert host.loaded() == (), "a refused provide registers nothing"
+    failure = host.failed()["sloppy"]
+    assert "does not satisfy its declared contract" in failure
+    assert "ToolRegistryService" in failure, "the message names the protocol"
+
+
+def test_a_plugin_offering_a_conforming_object_is_accepted() -> None:
+    """Control: the validator refuses the wrong shape, not everything."""
+    from agent.kernel.plugin import PluginHost
+    from agent.runtime.service_contracts import validator_for
+    from agent.tools.runtime import ToolRegistry
+
+    host = PluginHost()
+    host.service_validator = validator_for()
+
+    class Careful:
+        name = "careful"
+        inject: tuple[str, ...] = ()
+
+        def setup(self, ctx):
+            ctx.provide("registry", ToolRegistry())
+
+    host.load(Careful())
+
+    assert host.loaded() == ("careful",)
+
+
+def test_a_name_with_no_declared_contract_is_not_checked() -> None:
+    """The ledger is explicit about which names have an interface; nothing invents one."""
+    from agent.kernel.plugin import PluginHost
+    from agent.runtime.service_contracts import protocol_for, validator_for
+
+    assert protocol_for("registry") is not None
+    assert protocol_for("not_a_service") is None
+
+    host = PluginHost()
+    host.service_validator = validator_for()
+    host.services.provide("anything", object())  # raw write: no plugin boundary
+    assert host.services.get("anything") is not None
+
+
+def test_absence_is_not_a_violation() -> None:
+    from agent.runtime.service_contracts import violations
+
+    assert violations({}) == []
+
+
+def test_every_declared_contract_resolves() -> None:
+    """The pointer is followed, not trusted: a renamed protocol fails here."""
+    from agent.runtime.core_services import CORE_SERVICES
+    from agent.runtime.service_contracts import protocol_for
+
+    for entry in CORE_SERVICES:
+        assert entry.contract, f"{entry.name} declares no contract"
+        protocol = protocol_for(entry.name)
+        assert protocol is not None and isinstance(protocol, type)
+
+
+def test_the_real_composition_satisfies_every_declared_contract(
+    monkeypatch, tmp_path
+) -> None:
+    """The composition audits itself; this is the same question, asked out here.
+
+    The composition raises during construction if this fails, so the test can only
+    reach this point when it holds -- which is the point: it fails *here*, naming the
+    service and the protocol, instead of at the first caller three frames away.
+    """
+    from test_registry_and_skill_plugins import _compose
+
+    from agent.runtime.service_contracts import violations
+
+    components = _compose({}, monkeypatch, tmp_path)
+    try:
+        assert violations(components) == []
+    finally:
+        components["plugin_catalog"].close()

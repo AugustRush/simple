@@ -1200,6 +1200,7 @@ class PluginCatalog:
         event_bus: Any = None,
         components: Optional[dict] = None,
         service_policy: Any = None,
+        service_validator: Any = None,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
@@ -1209,6 +1210,10 @@ class PluginCatalog:
         #: names (``greeter``), and a loader that imposed a vocabulary on them would
         #: be imposing the application's.  ``None`` is the permissive embedder path.
         self._service_policy = service_policy
+        #: Checked before a plugin's ``provide`` is recorded.  Wired by the
+        #: composition, like the vocabulary: the kernel is handed a callable, not a
+        #: list of contracts.
+        self._service_validator = service_validator
         #: The composition to load under, named by the ``plugins`` section's
         #: reserved ``_profile`` key.  Resolved once, at construction: an unknown
         #: name raises here rather than silently loading the default set, so a
@@ -1270,6 +1275,7 @@ class PluginCatalog:
         #: ``None`` for an embedder that published no vocabulary.  The kernel asks
         #: this before every plugin read and provide; the kernel itself has no list.
         self._host.service_policy = self._service_policy
+        self._host.service_validator = self._service_validator
         #: The capability services, provided so a plugin reaches them by name.
         #: ``ctx.commands`` and ``ctx.agents`` are the plan's idiom -- a plugin
         #: registers a capability *on a service* -- and they replace the ``assets``

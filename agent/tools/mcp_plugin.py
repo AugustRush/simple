@@ -79,6 +79,15 @@ class MCPPlugin:
                 f"{len(configured)} configured server(s)[/dim]"
             )
 
-        ctx.provide("mcp_client", client)
+        # ``mcp_client`` is **absent**, not ``None``, when there is nothing to connect.
+        #
+        # The two used to be the same thing by accident: this line provided ``None``, and
+        # every caller resolved the name and then checked for it.  That is a declaration
+        # saying "if I am here, I am a client" while the composition holds something that
+        # is not one -- and the contract audit now refuses it, correctly.  Callers read
+        # the name with a default, so absence and ``None`` were already indistinguishable
+        # to them; only the declaration was lying.
+        if client is not None:
+            ctx.provide("mcp_client", client)
         ctx.provide("mcp_server_configs", servers)
         ctx.provide("mcp_status", empty_mcp_status(len(servers)))

@@ -221,8 +221,18 @@ class Context:
 
         Recorded on the scope, so unloading removes it and dependents waiting on it
         are taken down with it.
+
+        A wired ``service_validator`` is asked **before** anything is recorded: a
+        service whose declaration the value does not satisfy is refused here, where the
+        mistake was made and with a message that names the plugin, the name and the
+        protocol -- rather than three frames away, at the first caller, as an
+        ``AttributeError``.  Validating after the write would leave a refused value
+        registered, which is the half-applied state the kernel refuses elsewhere.
         """
         self.require_allowed(name, "provide")
+        validator = getattr(self._host, "service_validator", None)
+        if validator is not None:
+            validator(name, value)
         self._install.scope.provide(name, value, replace=replace)
         # Told, not inferred: only a *newly* offered service can unblock a waiter,
         # so the host re-checks pending plugins after a setup that provided one --
