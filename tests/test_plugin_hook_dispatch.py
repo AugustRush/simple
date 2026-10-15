@@ -135,11 +135,16 @@ def test_the_dispatchers_named_here_exist() -> None:
 def _dispatched_from_source() -> set[str]:
     """The event names that actually reach the command-hook runner.
 
-    Read out of ``catalog.py``: ``COMMAND_HOOK_EVENTS`` is a claim about the code,
-    and this is what makes the claim checkable.  A new ``fire_*`` method that
-    passes a different name to ``_run_command_hooks`` shows up here at once.
+    Read out of the module that *runs* them: ``COMMAND_HOOK_EVENTS`` is a claim about
+    the code, and this is what makes the claim checkable.  A new ``fire_*`` method that
+    passes a different name to ``_run_command_hooks`` shows up here at once -- and the
+    path moves with the code, which is why this reads ``hook_dispatch.py`` rather than
+    the loader: the runner is a collaborator now, and a scan left pointing at the old
+    file would find nothing and call that agreement.
     """
-    tree = ast.parse((REPO_ROOT / "agent/plugins/catalog.py").read_text(encoding="utf-8"))
+    tree = ast.parse(
+        (REPO_ROOT / "agent/plugins/hook_dispatch.py").read_text(encoding="utf-8")
+    )
     found: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -289,3 +294,164 @@ def test_a_long_list_is_truncated_not_dumped() -> None:
 def test_the_dispatched_set_is_not_empty() -> None:
     """Control: the scan reads the map, and an empty map would pass everything above."""
     assert len(_cc_event_map()) >= 20
+
+
+# ── The boundary between the two event systems ───────────────────────────────
+#
+# ``ctx.on(Type, handler)`` is this runtime's event API; the string hooks are the
+# cross-ecosystem surface.  They are deliberately not merged (a shell command cannot
+# be a kernel subscription), so what has to be checked is that they do not *drift*:
+# every string hook the loader dispatches names the typed event it mirrors, or says
+# why it has none.
+
+
+def _fire_methods() -> set[str]:
+    """The hook names the catalog's ``fire_*`` dispatchers answer, derived.
+
+    ``fire_pre_tool`` dispatches ``on_pre_tool`` -- the naming rule is the loader's
+    own, so reading it here is exact rather than a convenience.
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(
+        (Path(__file__).resolve().parents[1] / "agent/plugins/catalog.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "PluginCatalog":
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("fire_"):
+                    names.add("on_" + item.name[len("fire_"):])
+    return names
+
+
+def test_every_dispatcher_is_on_the_boundary_map() -> None:
+    """A new ``fire_*`` has to say which typed event it mirrors, or why it has none."""
+    from agent.plugins.catalog import LOADER_HOOK_BOUNDARY
+
+    listed = {hook.name for hook in LOADER_HOOK_BOUNDARY}
+    assert _fire_methods() == listed, (
+        "the dispatchers and LOADER_HOOK_BOUNDARY disagree: "
+        f"only in code={sorted(_fire_methods() - listed)}, "
+        f"only in the map={sorted(listed - _fire_methods())}"
+    )
+
+
+def test_each_boundary_entry_names_a_real_typed_event() -> None:
+    """The map is a promise that "subscribe to the typed event instead" is possible."""
+    import importlib
+
+    from agent.plugins.catalog import LOADER_HOOK_BOUNDARY
+
+    for hook in LOADER_HOOK_BOUNDARY:
+        if hook.typed_event is None:
+            continue
+        module_name, _, class_name = hook.typed_event.partition(":")
+        event = getattr(importlib.import_module(module_name), class_name, None)
+        assert event is not None, (
+            f"{hook.name} names {hook.typed_event}, which does not exist -- a rename "
+            f"of a typed event must update the boundary"
+        )
+        assert isinstance(event, type)
+
+
+def test_an_entry_without_a_typed_event_says_why() -> None:
+    """The escape has to carry a reason, or "no counterpart" becomes the easy answer."""
+    from agent.plugins.catalog import LOADER_HOOK_BOUNDARY
+
+    for hook in LOADER_HOOK_BOUNDARY:
+        if hook.typed_event is None:
+            assert len(hook.reason) > 60, f"{hook.name}: say why there is no event"
+
+
+def test_the_boundary_multiplies_nothing() -> None:
+    """Control: the map is not a second copy of the dispatched-event list.
+
+    The command-hook events that *execute* are ``COMMAND_HOOK_EVENTS``; this map is
+    about what can be *observed*.  ``on_session_end`` is on the map and not in the
+    executable list -- it has a dispatcher but no command form -- so the two are
+    different questions and neither can be derived from the other.
+    """
+    from agent.plugins.catalog import COMMAND_HOOK_EVENTS, LOADER_HOOK_BOUNDARY
+
+    boundary = {hook.name for hook in LOADER_HOOK_BOUNDARY}
+    executable = set(COMMAND_HOOK_EVENTS)
+    assert boundary - executable == {"on_session_end"}, (
+        "the documented asymmetry changed; say what it is now"
+    )
+    assert executable <= boundary
+
+
+# ── The split: the loader no longer owns the hook machinery ──────────────────
+
+
+def test_the_loader_no_longer_owns_the_hook_machinery(tmp_path: Path) -> None:
+    """The absence that makes the split real, asserted on the class.
+
+    ``PluginCatalog`` had grown to own discovery, the registries, the reload
+    transaction *and* the hook surface.  The five ``fire_*`` methods stay (three are on
+    ``PluginCatalogService``), and the machinery behind them moved to
+    :class:`~agent.plugins.hook_dispatch.HookDispatcher` -- so these names must not be
+    attributes of the loader again.
+    """
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        for name in (
+            "_run_command_hooks",
+            "_hook_env",
+            "_matches_tool",
+            "_entry_matches_tool",
+            "_hook_timeout",
+            "_on_tool_pre_execute",
+            "_on_tool_post_execute",
+        ):
+            assert not hasattr(catalog, name), (
+                f"{name} is back on PluginCatalog; it belongs to HookDispatcher"
+            )
+        from agent.plugins.hook_dispatch import HookDispatcher
+
+        assert isinstance(catalog._hooks, HookDispatcher)
+    finally:
+        catalog.close()
+
+
+def test_the_dispatcher_sees_plugins_loaded_after_construction(tmp_path: Path) -> None:
+    """The table is shared by reference, which is why loading order does not matter.
+
+    A dispatcher handed a *copy* would run the hooks of the plugins that existed when
+    the catalog was built and silently ignore every one loaded afterwards -- the failure
+    being a hook that reports success and never runs.
+    """
+    from agent import PluginCatalog
+    from agent.plugins.catalog import PluginMeta
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        assert "late" not in catalog._hooks._plugins
+        catalog._plugins["late"] = (object(), PluginMeta(name="late"))
+        assert "late" in catalog._hooks._plugins, "the dispatcher must see the live table"
+    finally:
+        catalog.close()
+
+
+def test_closing_the_catalog_releases_the_dispatchers_resources(tmp_path: Path) -> None:
+    """One lifetime, not two: the executor and the bridge belong to the tree."""
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._hooks.ensure_event_bridge()
+    assert catalog._hooks._event_subscriptions, "the bridge subscribed"
+
+    catalog.close()
+
+    assert catalog._hooks._event_subscriptions == []
+    # The executor is shut down: submitting now raises rather than queueing forever.
+    import pytest as _pytest
+
+    with _pytest.raises(RuntimeError):
+        catalog._hook_executor.submit(lambda: None)

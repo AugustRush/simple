@@ -38,6 +38,7 @@ from agent.tools.plugin import ToolsPlugin
 from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
+from agent.runtime.service_vocabulary import plugin_service_policy
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import (
     RalphIterationResult,
@@ -109,6 +110,11 @@ def build_gateway_channels(cfg: dict) -> list[Channel]:
     from agent.plugins.core import CoreContext, core_plugins
 
     host = PluginHost()
+    # Same vocabulary as the runtime path: this tree mounts the same plugins, so a
+    # name that is closed there must be closed here too.  The direct
+    # ``host.services.provide("cfg", ...)`` below is the *composition* acting, which
+    # is not subject to the plugin policy.
+    host.service_policy = plugin_service_policy
     host.services.provide("cfg", cfg)
     for entry in core_plugins(enabled=("channels", "channel.web", "channel.feishu")):
         host.load(entry.build(CoreContext()))
@@ -653,6 +659,10 @@ async def _build_components_async(
         user_dir=user_plugins_dir,
         plugin_config=cfg.get("plugins", {}),
         components=_partial_components,
+        # The composition owns the vocabulary: the loader wires it into the kernel,
+        # which has no list of its own.  Without this line the closed vocabulary is a
+        # module nobody reads -- see tests/test_service_vocabulary.py.
+        service_policy=plugin_service_policy,
     )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()

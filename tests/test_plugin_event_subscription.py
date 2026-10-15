@@ -454,10 +454,27 @@ def test_the_session_event_is_emitted_from_the_single_dispatch_point() -> None:
     """
     import ast as _ast
 
-    source = (Path(__file__).resolve().parents[1] / "agent/plugins/catalog.py").read_text(
-        encoding="utf-8"
+    # The body lives in the dispatcher now; the loader keeps a delegate, so reading
+    # ``catalog.py`` would find the delegate and no ``emit`` at all.  Both halves are
+    # asserted: the real emitter is scanned where it is, and the loader is checked to
+    # *delegate* rather than emit -- a second emitter in the loader is exactly the
+    # drift this test exists to catch.
+    root = Path(__file__).resolve().parents[1]
+    catalog_tree = _ast.parse((root / "agent/plugins/catalog.py").read_text(encoding="utf-8"))
+    delegate = next(
+        node
+        for node in _ast.walk(catalog_tree)
+        if isinstance(node, _ast.AsyncFunctionDef) and node.name == "fire_session_end"
     )
-    tree = _ast.parse(source)
+    assert not [
+        node
+        for node in _ast.walk(delegate)
+        if isinstance(node, _ast.Call) and getattr(node.func, "attr", "") == "emit"
+    ], "the loader must delegate the dispatch, not emit the session event itself"
+
+    tree = _ast.parse(
+        (root / "agent/plugins/hook_dispatch.py").read_text(encoding="utf-8")
+    )
     fire = next(
         node
         for node in _ast.walk(tree)

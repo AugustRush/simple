@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from functools import partial
 import importlib.util
-import inspect
 import json
 import os
 from pathlib import Path
@@ -14,15 +12,18 @@ import sys
 from typing import Any, Callable, Mapping, Optional
 
 from agent import shared
-from agent.core.events import ToolPostExecute, ToolPreExecute, bus_name
+from agent.core.events import bus_name
 from agent.commands.registry import CommandRegistry
 from agent.core.agent_registry import AgentRegistry, role_key
-from agent.core.output import _active_event_collector
+from agent.plugins.hook_dispatch import (
+    HookDispatcher,
+    _plugin_data_dir,
+    _safe_float,
+)
 from agent.kernel.plugin import PluginHost
 from agent.plugins import formats as plugin_formats
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
-from agent.core.event_domains import SessionFinished
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
@@ -37,19 +38,6 @@ PLUGINS_DIR = shared.PLUGINS_DIR
 # misbehaving plugin cannot stall hooks for every other plugin.
 PLUGIN_HOOK_POOL_WORKERS = 4
 
-
-def _safe_float(value: Any, default: float) -> float:
-    """Parse *value* as float, returning *default* on failure."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _emit_plugin_event(name: str, plugin_name: str = "", **fields: Any) -> None:
-    collector = _active_event_collector.get()
-    if collector is not None:
-        collector.emit(name, plugin_name=plugin_name, **fields)
 
 class AgentPlugin:
     """What ``PluginCatalog`` loads: an object with a ``name`` and, optionally, a ``register()``.
@@ -125,62 +113,16 @@ class AgentPlugin:
     version: str = ""
 
 
-@dataclass
-class TurnEvent:
-    """Emitted after each assistant turn completes."""
-
-    user_input: str
-    agent_response: str
-    tool_calls: list[str]
-    session_id: str = ""
-    timestamp: str = ""
-    turn_index: int = 0
-
-
-@dataclass
-class SessionEvent:
-    """Emitted when the interactive session ends."""
-
-    messages: list[dict]
-    tools_used: list[str]
-    session_id: str = ""
-    timestamp: str = ""
-    turn_count: int = 0
-
-
-@dataclass
-class PreToolEvent:
-    """Emitted before a tool call executes."""
-
-    tool_name: str
-    tool_kwargs: dict
-
-
-@dataclass
-class PostToolEvent:
-    """Emitted after a tool call completes."""
-
-    tool_name: str
-    tool_kwargs: dict
-    result: str
-
-
-@dataclass
-class HookResult:
-    """Return value from plugin hook methods.
-
-    Actions:
-        ``"noop"``     — no effect (default).
-        ``"block"``    — prevent the operation (tool execution, prompt delivery).
-        ``"continue"`` — (turn_end only) run another turn with ``message`` as prompt.
-        ``"context"``  — inject ``context`` into the next turn's system instructions.
-        ``"warning"``  — surface ``message`` as a user-visible warning.
-    """
-
-    action: str = "noop"
-    message: str = ""
-    context: str = ""
-
+# The hook payloads live in their own module (the loader should not be the thing a
+# plugin imports to *name* a hook event); re-exported here because this is where
+# they were defined and where callers and tests look for them.
+from agent.plugins.hook_types import (  # noqa: E402  (kept beside their old home)
+    HookResult,
+    PostToolEvent,
+    PreToolEvent,
+    SessionEvent,
+    TurnEvent,
+)
 
 # Valid characters for plugin directory names (P0-3 safety).
 _SAFE_PLUGIN_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -218,39 +160,6 @@ class PluginMeta:
 
 # Tool name translation: our tool name → Claude Code tool name.
 # Used when matching a Claude Code matcher pattern against our tools.
-_OUR_TO_CC_TOOL_NAME = {
-    # File tools
-    "read_file": "Read",
-    "write_file": "Write",
-    "list_files": "Glob",
-    # Shell
-    "shell": "Bash",
-    # Memory & context
-    "memory_read": "Read",
-    "memory_write": "Write",
-    "set_identity": "Write",
-    "memory_search": "Grep",
-    # Web
-    "web_search": "WebSearch",
-    "web_fetch": "WebFetch",
-    # Plugin management
-    "install_plugin": "Bash",
-    "uninstall_plugin": "Bash",
-    # Skills
-    "activate_skill": "Skill",
-    "create_skill": "Write",
-    "update_skill": "Write",
-    "delete_skill": "Bash",
-    # Scheduling
-    "schedule_create": "Task",
-    "schedule_list": "Read",
-    "schedule_delete": "Bash",
-    # Agent
-    "spawn_agent": "Task",
-    "send_message": "Bash",
-}
-
-
 def _as_path_list(value: Any) -> list[str]:
     """Normalize Claude Code manifest path fields to a list of strings."""
     if value is None or value == "":
@@ -276,12 +185,6 @@ def _dedupe_paths(paths: list[str]) -> list[str]:
         seen.add(key)
         out.append(raw)
     return out
-
-
-def _plugin_data_dir(plugin_name: str) -> Path:
-    """Claude Code-compatible persistent data directory for a plugin."""
-    safe_name = re.sub(r"[^0-9A-Za-z_-]+", "-", plugin_name).strip("-") or "plugin"
-    return shared.AGENT_HOME / "plugins" / "data" / safe_name
 
 
 def _plugin_substitution_env(plugin_dir: Path, plugin_name: str) -> dict[str, str]:
@@ -314,61 +217,24 @@ def _substitute_plugin_vars(value: Any, env: dict[str, str]) -> Any:
     return value
 
 
-def _normalize_claude_hook_entries(
-    plugin_name: str,
-    event_name: str,
-    entries: Any,
-) -> tuple[str, list[dict]]:
-    """Translate Claude Code hook matcher groups to internal flat entries."""
-    # Asked live, not snapshotted at import: a format registered later (an
-    # embedder's, or a test's) brings its event vocabulary with it.  A name this
-    # project has no counterpart for passes through unchanged, so "this hook does
-    # nothing yet" stays distinguishable from "this hook is not recognised".
-    internal_event = plugin_formats.all_hook_events().get(event_name, event_name)
-    if not isinstance(entries, list):
-        return internal_event, []
-    flat: list[dict] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        matcher = entry.get("matcher", "")
-        nested = entry.get("hooks")
-        if isinstance(nested, list):
-            for inner in nested:
-                if not isinstance(inner, dict):
-                    continue
-                if inner.get("type", "command") != "command":
-                    continue
-                cmd = str(inner.get("command", "") or "").strip()
-                if not cmd:
-                    continue
-                normalized = dict(inner)
-                normalized["type"] = "command"
-                normalized["matcher"] = matcher
-                normalized["command"] = cmd
-                normalized["timeout"] = _safe_float(inner.get("timeout", 60.0), 60.0)
-                flat.append(normalized)
-            continue
-        if entry.get("type", "command") != "command":
-            continue
-        cmd = str(entry.get("command", "") or "").strip()
-        if not cmd:
-            continue
-        normalized = dict(entry)
-        normalized["type"] = "command"
-        normalized["command"] = cmd
-        normalized["timeout"] = _safe_float(entry.get("timeout", 60.0), 60.0)
-        flat.append(normalized)
-    return internal_event, flat
-
-
 def _merge_hooks_block(
+    plugin_dir: Path,
     plugin_name: str,
     source: dict[str, Any],
     into: dict[str, list[dict]],
 ) -> None:
+    """Merge a hooks block through the format that governs *plugin_dir*.
+
+    The translation is the **format's** strategy, not this loader's knowledge: the
+    shapes (matcher groups, event vocabulary) are an ecosystem's conventions, and a
+    loader that hardcoded them could not accept an ecosystem whose files mean
+    something else without a branch here.
+    """
+    strategy = plugin_formats.strategy_for(plugin_dir)
     for event_name, entries in source.items():
-        internal_event, flat = _normalize_claude_hook_entries(plugin_name, event_name, entries)
+        internal_event, flat = strategy.normalize_hook_entries(
+            plugin_name, event_name, entries
+        )
         if flat:
             into.setdefault(internal_event, []).extend(flat)
 
@@ -407,7 +273,7 @@ def _read_default_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
         block = data.get("hooks", {})
         if not isinstance(block, dict):
             continue
-        _merge_hooks_block(plugin_dir.name, block, out)
+        _merge_hooks_block(plugin_dir, plugin_dir.name, block, out)
     return out
 
 
@@ -431,7 +297,7 @@ def _merge_hooks_from_file(
     source = hooks_block.get("hooks", hooks_block)
     if not isinstance(source, dict):
         return
-    _merge_hooks_block(plugin_dir.name, source, into)
+    _merge_hooks_block(plugin_dir, plugin_dir.name, source, into)
 
 
 def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dict]:
@@ -494,7 +360,7 @@ def _read_plugin_hooks(
             if isinstance(hook_path, str):
                 _merge_hooks_from_file(plugin_dir, hook_path, raw_hooks)
     elif isinstance(hooks_cfg, dict):
-        _merge_hooks_block(plugin_name, hooks_cfg, raw_hooks)
+        _merge_hooks_block(plugin_dir, plugin_name, hooks_cfg, raw_hooks)
     hook_matchers: dict[str, re.Pattern] = {}
     hook_timeouts: dict[str, float] = {}
     for hook_name, entries in raw_hooks.items():
@@ -579,6 +445,72 @@ COMMAND_HOOK_EVENTS: tuple[str, ...] = (
     "on_turn_end",
     "on_pre_tool",
     "on_post_tool",
+)
+
+
+#: The boundary between this runtime's **two ways of observing a turn**, written down
+#: once so a plugin author has one place to read.
+#:
+#: ``ctx.on(Type, handler)`` (``agent.kernel.context``) is this runtime's event API:
+#: typed, published on a domain bus, and what an in-tree plugin should use.  It carries
+#: the composition's events -- ``ToolPreExecute``, ``TurnCompleted``, ``SessionFinished``
+#: -- and it is where a *new* event belongs.
+#:
+#: The string hooks below are the **cross-ecosystem** surface.  They exist because other
+#: plugin formats describe a plugin as a set of named methods (``on_pre_tool``,
+#: ``on_turn_end``) and a set of shell commands in a manifest, neither of which can be a
+#: typed subscription: the command form runs an external process, and the method form is
+#: what an ecosystem's own documentation tells its authors to write.  So the loader
+#: translates them, dispatches them, and reports the ones nothing dispatches
+#: (:func:`inert_command_hooks`) rather than letting a plugin install a hook that never
+#: runs.
+#:
+#: The two are not being merged, and the reason is not effort: a shell command cannot be
+#: a kernel subscription, and a plugin written against another product's documentation
+#: must not have to learn this runtime's types.  What they must not do is *drift* -- each
+#: entry names the typed event it mirrors, or says why it has none, and
+#: ``tests/test_plugin_hook_dispatch.py`` checks both directions.
+@dataclass(frozen=True)
+class LoaderHook:
+    """One string hook the loader dispatches, and the typed event it mirrors."""
+
+    name: str
+    #: ``module:ClassName`` a plugin could subscribe to instead, or ``None`` when the
+    #: fact has no typed counterpart.
+    typed_event: Optional[str]
+    #: What the string form adds over the typed one -- read only for the entries whose
+    #: ``typed_event`` is ``None``.
+    reason: str = ""
+
+
+LOADER_HOOK_BOUNDARY: tuple[LoaderHook, ...] = (
+    LoaderHook(
+        name="on_pre_tool",
+        typed_event="agent.core.events:ToolPreExecute",
+    ),
+    LoaderHook(
+        name="on_post_tool",
+        typed_event="agent.core.events:ToolPostExecute",
+    ),
+    LoaderHook(
+        name="on_turn_end",
+        typed_event="agent.core.event_domains:TurnCompleted",
+    ),
+    LoaderHook(
+        name="on_session_end",
+        typed_event="agent.core.event_domains:SessionFinished",
+    ),
+    LoaderHook(
+        name="on_prompt_submit",
+        typed_event=None,
+        reason=(
+            "a *gate* rather than an observation: it runs before the turn exists and may "
+            "refuse the message, so there is no event to publish -- an event is a fact, "
+            "and 'this message was rejected' would be a fact about a turn that never "
+            "started.  A code plugin with a typed subscription cannot express it; an "
+            "ecosystem plugin does, as a command hook whose exit code refuses"
+        ),
+    ),
 )
 
 
@@ -798,67 +730,9 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _substitute_command_args(body: str, args_text: str) -> str:
-    """Replace ``$ARGUMENTS`` and ``$1`` .. ``$N`` placeholders.
-
-    Mirrors Claude Code's command argument convention.  ``args_text`` is the
-    full string after the command name (preserves quoting); positional
-    ``$1`` etc. use whitespace-split tokens.
-    """
-    if not body:
-        return body
-    out = body.replace("$ARGUMENTS", args_text)
-    tokens = args_text.split()
-    # Replace highest-index first so $10 doesn't get mangled by $1's substitution.
-    for i in range(len(tokens), 0, -1):
-        out = out.replace(f"${i}", tokens[i - 1])
-    return out
-
-
-def _hook_result_from_json(raw: dict[str, Any], event_name: str) -> Optional[HookResult]:
-    """Translate Claude Code hook JSON output to the local HookResult shape."""
-    if raw.get("continue") is False:
-        return HookResult(
-            action="block",
-            message=str(raw.get("stopReason", "") or "stopped by hook"),
-        )
-    decision = str(raw.get("decision", "") or "")
-    if decision == "block":
-        reason = str(raw.get("reason", "") or raw.get("message", "") or "blocked")
-        if event_name == "on_turn_end":
-            return HookResult(action="continue", message=reason)
-        return HookResult(action="block", message=reason)
-    specific = raw.get("hookSpecificOutput")
-    if not isinstance(specific, dict):
-        if any(key in raw for key in ("action", "message", "context")):
-            return HookResult(
-                action=str(raw.get("action", "noop")),
-                message=str(raw.get("message", "")),
-                context=str(raw.get("context", "")),
-            )
-        return None
-    additional_context = str(specific.get("additionalContext", "") or "")
-    if event_name == "on_pre_tool":
-        permission = str(specific.get("permissionDecision", "") or "")
-        if permission in {"deny", "block"}:
-            return HookResult(
-                action="block",
-                message=str(
-                    specific.get("permissionDecisionReason", "")
-                    or specific.get("reason", "")
-                    or "blocked"
-                ),
-            )
-        if additional_context:
-            return HookResult(action="context", context=additional_context)
-    if event_name in {"on_post_tool", "on_prompt_submit", "on_turn_end"}:
-        if additional_context:
-            return HookResult(action="context", context=additional_context)
-    return None
-
-
 def _make_markdown_command_handler(
     *,
+    strategy: Any,
     plugin_name: str,
     cmd_key: str,
     body: str,
@@ -879,7 +753,7 @@ def _make_markdown_command_handler(
         else:
             parts = raw_cmd.split(maxsplit=1)
             args_text = parts[1] if len(parts) > 1 else ""
-        return _substitute_command_args(body, args_text)
+        return strategy.substitute_command_args(body, args_text)
 
     _handler.__plugin_name__ = plugin_name  # type: ignore[attr-defined]
     _handler.__cmd_key__ = cmd_key  # type: ignore[attr-defined]
@@ -960,6 +834,173 @@ def _add_bundled(store: list, entry: Any) -> Any:
     return forget
 
 
+# ── What a bundle's files can declare, as data ───────────────────────────────
+#
+# This used to be a sequence of per-kind blocks in ``_CatalogPlugin`` with a second
+# sequence in its ``inject`` property that had to agree with it: a kind that
+# contributed through a capability service but forgot to declare it would never run,
+# because the service was absent at the moment the plugin activated and nothing
+# re-checked.  One record per kind carries both facts, so they cannot disagree, and
+# "which kinds exist" is answerable from one place instead of by reading two.
+#
+# The kinds the *loader* registers rather than a service carry the reason: the same
+# decision the design note records (a floor is a decision, not debt).
+
+
+@dataclass(frozen=True)
+class DeclarativeKind:
+    """One kind of contribution a plugin directory's files can declare."""
+
+    key: str
+    #: The capability service the contribution goes through, or ``None`` for a kind
+    #: the loader registers itself (or that is not a contribution at all).
+    service: Optional[str]
+    #: Whether this bundle declares any of this kind -- what decides the ``inject``
+    #: entry.  Only meaningful together with ``service``.
+    present: Callable[[Any], bool]
+    #: ``(adapter, ctx) -> None``: register what the files declared, reversibly.
+    register: Callable[[Any, Any], None]
+    #: For the kinds with no service: why the loader is the one that registers it.
+    reason: str = ""
+
+
+def _register_skills(adapter: Any, ctx: Any) -> None:
+    """Skill roots, through the capability service, attributed and unwound."""
+    for skills_rel in adapter._meta.skills:
+        skills_path = (adapter._plugin_dir / skills_rel).resolve()
+        if skills_path.is_dir():
+            ctx.skill_catalog.add_root(skills_path)
+
+
+def _register_mcp_servers(adapter: Any, ctx: Any) -> None:
+    for mcp_cfg in adapter._mcp_declarations():
+        ctx.contributed_mcp_servers.add(mcp_cfg)
+
+
+def _register_command_files(adapter: Any, ctx: Any) -> None:
+    for undo in adapter._catalog._load_command_files(
+        adapter._plugin_dir, adapter.name, adapter._meta.commands
+    ):
+        ctx.on_unwind(undo)
+
+
+def _register_agent_files(adapter: Any, ctx: Any) -> None:
+    for undo in adapter._catalog._load_agent_files(
+        adapter._plugin_dir, adapter.name, adapter._meta.agents
+    ):
+        ctx.on_unwind(undo)
+
+
+def _merge_hook_files(adapter: Any, ctx: Any) -> None:
+    """Merge ``hooks/hooks.json`` and report the events nothing dispatches.
+
+    Merged rather than contributed because the config is the plugin's own ``meta``;
+    left un-undone because nothing reads a removed plugin's hooks -- the catalog
+    looks them up by name.
+    """
+    plugin_dir = adapter._plugin_dir
+    meta = adapter._meta
+    for event_name, entries in _read_default_hooks_json(plugin_dir).items():
+        meta.hooks_config.setdefault(event_name, []).extend(entries)
+    # Reported *after* the merge above, because a plugin's hooks live in two places
+    # and the file is the one the manifest never mentions -- reporting before it would
+    # have said "nothing dead" for exactly the plugins whose hooks are all in
+    # ``hooks/hooks.json`` (measured while writing this test).
+    inert = inert_command_hooks(meta.hooks_config)
+    if inert:
+        shown = ", ".join(inert[:4]) + ("…" if len(inert) > 4 else "")
+        shared.CONSOLE.print(
+            f"[dim]Plugin '{adapter.name}': {len(inert)} hook event(s) have no "
+            f"dispatcher in this runtime and will not run: {shown}[/dim]"
+        )
+    if meta.hooks_config:
+        # The only thing the tool bridge is for.  See `_ensure_event_bridge`.
+        adapter._catalog._ensure_event_bridge()
+
+
+def _register_python_commands(adapter: Any, ctx: Any) -> None:
+    """Slash commands the plugin declares *in Python*, not in markdown files."""
+    plugin = adapter._plugin
+    if not hasattr(plugin, "register_slash_commands"):
+        return
+    catalog = adapter._catalog
+    for declared, handler in (plugin.register_slash_commands() or {}).items():
+        cmd_key = adapter._plugin_command_key(str(declared))
+        if catalog._commands.has(cmd_key):
+            existing = catalog._commands.owner(cmd_key) or "?"
+            shared.CONSOLE.print(
+                f"[yellow]Plugin '{adapter.name}': slash command '{cmd_key}' "
+                f"conflicts with plugin '{existing}' -- overriding[/yellow]"
+            )
+        ctx.on_unwind(
+            catalog._commands.add(
+                cmd_key,
+                handler,
+                metadata=_command_metadata(handler),
+                owner=adapter.name,
+            )
+        )
+
+
+DECLARATIVE_KINDS: tuple[DeclarativeKind, ...] = (
+    DeclarativeKind(
+        key="skills",
+        service="skill_catalog",
+        present=lambda adapter: bool(adapter._meta.skills),
+        register=_register_skills,
+    ),
+    DeclarativeKind(
+        key="mcp_servers",
+        service="contributed_mcp_servers",
+        present=lambda adapter: bool(adapter._mcp_declarations()),
+        register=_register_mcp_servers,
+    ),
+    DeclarativeKind(
+        key="commands",
+        service=None,
+        present=lambda adapter: bool(adapter._meta.commands),
+        register=_register_command_files,
+        reason=(
+            "the loader's markdown adapter registers a bundle's slash commands while "
+            "loading that bundle, and the reload rollback restores the registry from a "
+            "snapshot -- so `commands` is a floor and this kind has no inject entry"
+        ),
+    ),
+    DeclarativeKind(
+        key="agents",
+        service=None,
+        present=lambda adapter: bool(adapter._meta.agents),
+        register=_register_agent_files,
+        reason=(
+            "the same floor as `commands`: roles are registered during the load and "
+            "restored by the reload rollback"
+        ),
+    ),
+    DeclarativeKind(
+        key="hooks",
+        service=None,
+        present=lambda adapter: bool(adapter._meta.hooks_config),
+        register=_merge_hook_files,
+        reason=(
+            "loader *configuration*, not a contribution: the config sits on the "
+            "contributing plugin (there is no central list to drift from) and its only "
+            "reader is the loader, which dispatches it -- a service here would have "
+            "exactly one caller, the thing that provides it"
+        ),
+    ),
+    DeclarativeKind(
+        key="python_commands",
+        service=None,
+        present=lambda adapter: hasattr(adapter._plugin, "register_slash_commands"),
+        register=_register_python_commands,
+        reason=(
+            "declared on the plugin object rather than in a manifest file; registered "
+            "by the loader like the markdown kind, for the same floor reason"
+        ),
+    ),
+)
+
+
 class _CatalogPlugin:
     """Adapts a discovered plugin object to the kernel's protocol.
 
@@ -1009,7 +1050,14 @@ class _CatalogPlugin:
 
     @property
     def inject(self) -> tuple[str, ...]:
-        """The plugin's declared dependencies, and nothing added.
+        """The plugin's declared dependencies, plus what its **files** need.
+
+        One contribution, one dependency: a bundle that ships skills contributes them
+        through ``skill_catalog``, so the kernel has to hold the bundle until that
+        service exists -- otherwise the contribution is silently skipped, because the
+        adapter's ``setup`` only runs once.  The requirement is read off
+        :data:`DECLARATIVE_KINDS` rather than restated here, so a new kind cannot
+        contribute through a service it forgot to declare.
 
         The adapter used to prepend ``assets`` -- a contribution service the catalog
         provided up front -- because gating on ``inject`` cannot express "a service
@@ -1019,19 +1067,9 @@ class _CatalogPlugin:
         ``("agents",)`` and gets the real registry.
         """
         declared = [str(d) for d in (getattr(self._plugin, "inject", ()) or ())]
-        if self._meta.skills and "skill_catalog" not in declared:
-            # A bundle's files can declare a contribution, and a contribution needs the
-            # service it contributes *to*.  Declaring it here is what makes the kernel
-            # hold the bundle until that service exists (the composition mounts
-            # `skill_catalog` as a core plugin and the kernel flushes on every provide),
-            # which is why the adapter no longer needs the composition root to attach
-            # the skills later.
-            declared.append("skill_catalog")
-        if self._mcp_declarations() and "contributed_mcp_servers" not in declared:
-            # Same rule as skills above, for the other kind whose contribution needs a
-            # service: the bundle waits for `mcp_servers`, which the registry plugin
-            # provides before the client plugin (which injects it too) reads it.
-            declared.append("contributed_mcp_servers")
+        for kind in DECLARATIVE_KINDS:
+            if kind.service and kind.present(self) and kind.service not in declared:
+                declared.append(kind.service)
         return tuple(declared)
 
     # -- lifecycle -----------------------------------------------------------
@@ -1090,80 +1128,19 @@ class _CatalogPlugin:
 
         Last before the plugin's own ``setup``, so its registration sees a catalog
         that already holds what its files declared.
+
+        A loop over :data:`DECLARATIVE_KINDS`, not a per-kind sequence: the kinds are
+        data, so adding one does not mean editing this method and hoping the ``inject``
+        property agrees.  What is *not* uniform lives on the kind -- the capability
+        service it goes through, whether this bundle declares it, and (for the kinds
+        with no service) the reason the loader is the one that registers it.
         """
-        catalog = self._catalog
-        meta = self._meta
-        plugin_dir = self._plugin_dir
+        for kind in DECLARATIVE_KINDS:
+            kind.register(self, ctx)
 
-        # Skills are a contribution like any other: through the capability service, in
-        # this plugin's own setup, attributed to it and unwound with its scope.  The
-        # adapter declares ``skill_catalog`` in ``inject`` for a bundle that ships
-        # skills, so this line only runs once the catalog exists.  The loader used to
-        # collect the paths into a list for the *composition root* to attach later,
-        # which made the contribution the root's act and made every reload path that
-        # forgot the list drop the skills.
-        for skills_rel in meta.skills:
-            skills_path = (plugin_dir / skills_rel).resolve()
-            if skills_path.is_dir():
-                ctx.skill_catalog.add_root(skills_path)
-
-        # MCP configs are a contribution like skills: through the capability service,
-        # attributed to this plugin and unwound with its scope.
-        for mcp_cfg in self._mcp_declarations():
-            ctx.contributed_mcp_servers.add(mcp_cfg)
-
-        for undo in catalog._load_command_files(
-            plugin_dir, self.name, meta.commands
-        ):
-            ctx.on_unwind(undo)
-        for undo in catalog._load_agent_files(plugin_dir, self.name, meta.agents):
-            ctx.on_unwind(undo)
-
-        # Claude Code's ``hooks/hooks.json`` merges into the plugin's own hook
-        # config, with a plugin.json entry winning on the same event key.  Merged
-        # here because the config is the plugin's; left un-undone because nothing
-        # reads a removed plugin's hooks -- the catalog looks them up by name.
-        for event_name, entries in _read_default_hooks_json(plugin_dir).items():
-            meta.hooks_config.setdefault(event_name, []).extend(entries)
-        # Reported *after* the merge above, because a plugin's hooks live in two
-        # places and the file is the one the manifest never mentions -- reporting
-        # before it would have said "nothing dead" for exactly the plugins whose
-        # hooks are all in ``hooks/hooks.json`` (measured while writing this test).
-        inert = inert_command_hooks(meta.hooks_config)
-        if inert:
-            shown = ", ".join(inert[:4]) + ("…" if len(inert) > 4 else "")
-            shared.CONSOLE.print(
-                f"[dim]Plugin '{self.name}': {len(inert)} hook event(s) have no "
-                f"dispatcher in this runtime and will not run: {shown}[/dim]"
-            )
-        if meta.hooks_config:
-            # The only thing the tool bridge is for.  See `_ensure_event_bridge`.
-            self._catalog._ensure_event_bridge()
-
-        meta.path = plugin_dir
-
-        # Slash commands the plugin declares in Python, as opposed to the markdown
-        # files handled above.
-        if hasattr(self._plugin, "register_slash_commands"):
-            for declared, handler in (
-                self._plugin.register_slash_commands() or {}
-            ).items():
-                cmd_key = self._plugin_command_key(str(declared))
-                if catalog._commands.has(cmd_key):
-                    existing = catalog._commands.owner(cmd_key) or "?"
-                    shared.CONSOLE.print(
-                        f"[yellow]Plugin '{self.name}': slash command "
-                        f"'{cmd_key}' conflicts with plugin "
-                        f"'{existing}' -- overriding[/yellow]"
-                    )
-                ctx.on_unwind(
-                    catalog._commands.add(
-                        cmd_key,
-                        handler,
-                        metadata=_command_metadata(handler),
-                        owner=self.name,
-                    )
-                )
+        # Bookkeeping for the manifest, not a contribution: the path a diagnostic or
+        # an ``installed at`` line reports.
+        self._meta.path = self._plugin_dir
 
     def _plugin_command_key(self, declared: str) -> str:
         """The name a plugin's Python-declared command is registered under.
@@ -1222,10 +1199,16 @@ class PluginCatalog:
         turn_hook_timeout_seconds: float = shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
         event_bus: Any = None,
         components: Optional[dict] = None,
+        service_policy: Any = None,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
         self._plugin_config = plugin_config or {}
+        #: Which names a plugin may touch.  Wired by the composition rather than
+        #: defaulted here: the catalog is also built by tests that invent service
+        #: names (``greeter``), and a loader that imposed a vocabulary on them would
+        #: be imposing the application's.  ``None`` is the permissive embedder path.
+        self._service_policy = service_policy
         #: The composition to load under, named by the ``plugins`` section's
         #: reserved ``_profile`` key.  Resolved once, at construction: an unknown
         #: name raises here rather than silently loading the default set, so a
@@ -1283,6 +1266,10 @@ class PluginCatalog:
         _registry = ServiceRegistry.adopt(components) if isinstance(components, dict) else ServiceRegistry()
         self._host = PluginHost(services=_registry)
         self._services = self._host.services
+        #: The composition's answer to "is this name a plugin's to touch", or
+        #: ``None`` for an embedder that published no vocabulary.  The kernel asks
+        #: this before every plugin read and provide; the kernel itself has no list.
+        self._host.service_policy = self._service_policy
         #: The capability services, provided so a plugin reaches them by name.
         #: ``ctx.commands`` and ``ctx.agents`` are the plan's idiom -- a plugin
         #: registers a capability *on a service* -- and they replace the ``assets``
@@ -1307,9 +1294,17 @@ class PluginCatalog:
         # every existing test of the bridge called ``fire_pre_tool`` directly, so none of
         # them could see it.  ``_bus_for`` reads the same names ``Domain.attach`` does.
         self._event_bus = event_bus if event_bus is not None else self._bus_for("tool")
-        #: Subscribed lazily, by :meth:`_ensure_event_bridge`.  Empty until a plugin
-        #: declares a command hook -- see that method for why the timing matters.
-        self._event_subscriptions: list[Callable[[], None]] = []
+        #: The hook surface: dispatch, matchers, hook environments, the command-hook
+        #: subprocess runner and the tool-event bridge.  Handed the **live** plugin
+        #: table, so a plugin loaded after this line is dispatched to, and the catalog's
+        #: own executor, whose lifetime it releases in :meth:`close`.
+        self._hooks = HookDispatcher(
+            plugins=self._plugins,
+            event_bus=self._event_bus,
+            bus_for=self._bus_for,
+            executor=self._hook_executor,
+            turn_hook_timeout_seconds=self._turn_hook_timeout_seconds,
+        )
         # One bus for the composition: the kernel host publishes the typed events a
         # plugin subscribes to through ``ctx.bus``, and the catalog's hook dispatch
         # listens on the same one.  Two buses would mean a plugin's subscription and
@@ -1347,11 +1342,18 @@ class PluginCatalog:
     def register_core_services(self, components: Any) -> None:
         """Point this catalog at the runtime's container for core services.
 
-        Its own :attr:`_services` holds what plugins *provide*; this holds what
-        the runtime *has*.  Called by whoever wires the catalog up, so the four
-        reads in ``_reload_locked`` resolve through the container rather than
-        through a ``components`` mapping -- which is what makes a core service
-        replaceable from a plugin's point of view.
+        Kept as a call because a caller may hand over a *different* container than the
+        mapping this catalog adopted at construction (a reload binds the runtime's
+        ``RuntimeComponents``).  When it is the same mapping -- the normal path --
+        :meth:`_core` answers from the host registry anyway.
+
+        The docstring here used to claim the two held "different populations, and
+        conflating them would let a plugin's service shadow a core one".  That was
+        wrong in both directions: the registry **adopts** the component mapping, so
+        they are one storage, and "a plugin replaces a service for the runtime too" is
+        the documented point of replacement.  What is true is that a plugin cannot take
+        a core name by *accident* -- the registry refuses a second ``provide`` without
+        ``replace=True`` -- which is a rule about provisioning, not two containers.
         """
         from agent.runtime.contracts import RuntimeComponents
 
@@ -1364,17 +1366,21 @@ class PluginCatalog:
     def _core(self, name: str, default: Any = None) -> Any:
         """One core service, absence tolerated.
 
-        Returns *default* rather than raising, matching the ``components.get``
-        it replaces: every call site branches on a missing value, and a
-        composition legitimately has no ``mcp_client``.  The container is what
-        makes the absence *distinguishable* for a caller that wants that.
+        Returns *default* rather than raising, matching the ``components.get`` it
+        replaces: every call site branches on a missing value, and a composition
+        legitimately has no ``mcp_client``.
+
+        Falls back to this catalog's own registry when no container was handed over.
+        That is the same storage -- the registry adopts the component mapping -- so the
+        answer is the real one rather than a default.  It used to return *default*
+        instead, and since ``register_core_services`` is called only by the reload
+        path, every read before the first reload silently answered "absent": a
+        composition that had the service, a caller that could not see it, and no error
+        either way.
         """
-        if self._core_services is None:
-            # Not wired: an unsupported way to run, but a missing call to
-            # ``register_core_services`` must not turn into an AttributeError in
-            # the middle of a reload.
-            return default
-        return self._core_services.lookup(name, default)
+        if self._core_services is not None:
+            return self._core_services.lookup(name, default)
+        return self._services.get(name, default)
 
     def resolve_service(self, name: str, default: Any = _NO_DEFAULT) -> Any:
         """A service some plugin provided, or *default*.
@@ -1809,6 +1815,7 @@ class PluginCatalog:
                 continue
             metadata, body = parse_skill_markdown(raw)
             handler = _make_markdown_command_handler(
+                strategy=plugin_formats.strategy_for(plugin_dir),
                 plugin_name=plugin_name,
                 cmd_key=cmd_key,
                 body=body,
@@ -1909,45 +1916,13 @@ class PluginCatalog:
         """
         # The bridge first, so nothing routes a tool call into a hook chain while the
         # plugins are coming down.
-        for unsubscribe in self._event_subscriptions:
-            unsubscribe()
-        self._event_subscriptions.clear()
+        self._hooks.close()
         # Then the plugins themselves.  Without this, closing a catalog released its own
         # subscriptions and nothing else: a plugin's `TOOL.attach` stayed live, so a
         # **closed** catalog went on gating tools through plugins it no longer owned.
         # Found by asking who was still listening on the process-wide tool bus after a
         # catalog was closed -- the answer was a plugin the catalog had loaded.
         self._host.unload_all()
-        self._hook_executor.shutdown(wait=False, cancel_futures=True)
-
-    def _ensure_event_bridge(self) -> None:
-        """Subscribe the tool bridge, once, for a catalog that has command hooks.
-
-        The bridge exists to run ``hooks_config`` commands -- external commands an
-        operator declares -- so a catalog whose plugins declare none has nothing for it to
-        do.  Subscribing anyway is not merely idle: a catalog with no composition behind it
-        falls back to the **process-wide** bus, so every such catalog ever constructed
-        installed two listeners on one shared object.
-
-        That is how it was found: a test's ``PreToolUse: deny`` command hook outlived the
-        test, stayed a listener, and gated an unrelated tool call in a *different* test --
-        and because ``emit_blocking`` stops at the first refusal, the leftover gate won
-        and the failure named the wrong test's reason string.
-
-        Which bus it subscribes to is :meth:`_bus_for` -- the composition's when it has
-        one, the process default otherwise.  Getting that wrong is the same class of
-        failure in the other direction: this docstring's own lesson, a listener nobody
-        publishes to.
-
-        Called when a plugin's ``hooks_config`` becomes non-empty, which is during loading
-        and therefore before any executor publishes.
-        """
-        if self._event_subscriptions:
-            return
-        self._event_subscriptions = [
-            self._event_bus.on(ToolPreExecute, self._on_tool_pre_execute),
-            self._event_bus.on(ToolPostExecute, self._on_tool_post_execute),
-        ]
 
     async def reload(self, components: dict) -> dict:
         """Serialize plugin reload transactions for this catalog instance."""
@@ -2136,297 +2111,35 @@ class PluginCatalog:
 
     # ── Hook helpers ────────────────────────────────────────────────────────────
 
-    def _hook_timeout(self, meta: PluginMeta, hook_name: str) -> float:
-        """Return the per-hook timeout override, or the global default."""
-        return meta.hook_timeouts.get(hook_name, self._turn_hook_timeout_seconds)
 
-    def _matches_tool(
-        self, meta: PluginMeta, hook_name: str, tool_name: str
-    ) -> bool:
-        """Check whether *hook_name* on *meta* has a matcher for *tool_name*.
+    # ── Hook dispatch ────────────────────────────────────────────────────────
+    # The dispatch machinery -- the five dispatchers, the matchers, the hook
+    # environments, the subprocess runner and the tool-event bridge -- lives in
+    # :mod:`agent.plugins.hook_dispatch`.  The loader had grown to own discovery, the
+    # registries, the reload transaction *and* this, and the hook surface is the one
+    # piece with no dependency on loading at all: it reads a plugin table and runs
+    # things.
+    #
+    # These are delegates rather than removals because three of them are on
+    # ``PluginCatalogService`` and every in-tree caller uses the catalog: the boundary
+    # can move without moving every caller, and the protocol stays the loader's.
 
-        No matcher → always matches (opt-in to filtering by declaring one).
-        Honors both our snake_case names and Claude Code PascalCase names
-        when a CC plugin's matcher targets the latter.
-        """
-        matcher = meta.hook_matchers.get(hook_name)
-        if matcher is None:
-            return True
-        if matcher.search(tool_name):
-            return True
-        cc_name = _OUR_TO_CC_TOOL_NAME.get(tool_name)
-        return bool(cc_name and matcher.search(cc_name))
-
-    @staticmethod
-    def _entry_matches_tool(entry: dict, tool_name: str) -> bool:
-        """Per-entry matcher check (used for Claude Code hook entries that
-        carry their own matcher string instead of a per-event compiled one)."""
-        matcher_str = str(entry.get("matcher", "") or "").strip()
-        if not matcher_str or matcher_str == "*":
-            return True
-        try:
-            pattern = re.compile(matcher_str)
-        except re.error:
-            return matcher_str == tool_name or matcher_str == _OUR_TO_CC_TOOL_NAME.get(tool_name)
-        if pattern.search(tool_name):
-            return True
-        cc_name = _OUR_TO_CC_TOOL_NAME.get(tool_name)
-        return bool(cc_name and pattern.search(cc_name))
-
-    def _hook_env(self, meta: PluginMeta, event_payload: dict) -> dict[str, str]:
-        """Build Claude Code-compatible environment variables for hook exec."""
-        env = dict(os.environ)
-        if meta.path is not None:
-            # Every format's spelling of "where this plugin lives" and "where it
-            # may write", from the adapters: a Codex hook command says
-            # ``"$PLUGIN_ROOT/hooks/x.sh"`` and a Claude Code one says
-            # ``${CLAUDE_PLUGIN_ROOT}/...``, and both have to resolve.
-            env.update(
-                plugin_formats.hook_environment(
-                    meta.path, _plugin_data_dir(meta.name), Path.cwd()
-                )
-            )
-        tool_name = str(event_payload.get("tool_name", "") or "")
-        if tool_name:
-            env["TOOL_NAME"] = _OUR_TO_CC_TOOL_NAME.get(tool_name, tool_name)
-        tool_kwargs = event_payload.get("tool_kwargs")
-        if tool_kwargs is not None:
-            try:
-                env["TOOL_INPUT"] = json.dumps(tool_kwargs, ensure_ascii=False)
-            except Exception:
-                env["TOOL_INPUT"] = str(tool_kwargs)
-        result = event_payload.get("result")
-        if result is not None:
-            env["TOOL_OUTPUT"] = str(result)
-        text = event_payload.get("text")
-        if text is not None and event_payload.get("event") == "on_prompt_submit":
-            env["CLAUDE_USER_PROMPT"] = str(text)
-        return env
-
-    async def _run_command_hooks(
-        self,
-        event_name: str,
-        event_payload: dict,
-        meta: PluginMeta,
-    ) -> list[HookResult]:
-        """Execute command-type hooks declared in plugin.json for *event_name*."""
-        results: list[HookResult] = []
-        entries = meta.hooks_config.get(event_name, [])
-        tool_name = str(event_payload.get("tool_name", "") or "")
-        env = self._hook_env(meta, event_payload)
-        for entry in entries:
-            cmd = str(entry.get("command", "") or "").strip()
-            if not cmd:
-                continue
-            # Per-entry matcher (Claude Code style).  Legacy entries with no
-            # matcher field always pass and remain compatible with the older
-            # per-event matcher cache on PluginMeta.
-            if tool_name and "matcher" in entry and not self._entry_matches_tool(entry, tool_name):
-                continue
-            timeout = max(0.0, _safe_float(entry.get("timeout"), self._hook_timeout(meta, event_name)))
-            try:
-                proc = await asyncio.create_subprocess_shell(
-                    cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                stdin_data = json.dumps(event_payload, ensure_ascii=False).encode("utf-8")
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(stdin_data), timeout=max(1.0, timeout)
-                )
-                if proc.returncode == 2:
-                    reason = stderr_bytes.decode(errors="replace").strip() or "blocked"
-                    results.append(HookResult(action="block", message=reason))
-                    continue
-                try:
-                    raw = json.loads(stdout_bytes.decode("utf-8"))
-                    if isinstance(raw, dict):
-                        parsed_result = _hook_result_from_json(raw, event_name)
-                        if parsed_result is not None:
-                            results.append(parsed_result)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-            except asyncio.TimeoutError:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' command hook '{event_name}' "
-                    f"timed out after {timeout:.2f}s[/dim]"
-                )
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' command hook '{event_name}' "
-                    f"error: {exc}[/dim]"
-                )
-        return results
-
-    # ── Lifecycle event firing ─────────────────────────────────────────────────
+    def _ensure_event_bridge(self) -> None:
+        self._hooks.ensure_event_bridge()
 
     async def fire_prompt_submit(
         self, text: str, metadata: Optional[dict] = None
     ) -> HookResult:
-        """Run the ``on_prompt_submit`` command hooks before the message is submitted.
-
-        Returns the first blocking result, or the last non-noop one -- a gate, which is
-        why it is the last of the hook dispatchers to lose its Python half: a mistake here
-        changes whether a submission can be refused rather than whether a plugin is
-        notified.
-        """
-        meta_dict = metadata or {}
-        result = HookResult()
-        for _plugin, meta in self._plugins.values():
-            cmd_results = await self._run_command_hooks(
-                "on_prompt_submit",
-                {"event": "on_prompt_submit", "text": text, "metadata": meta_dict},
-                meta,
-            )
-            for r in cmd_results:
-                if r.action == "block":
-                    return r
-                if r.action != "noop":
-                    result = r
-        return result
+        return await self._hooks.fire_prompt_submit(text, metadata)
 
     async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
-        """Notify all plugins after each assistant turn; collect HookResults.
-
-        A result with ``action="continue"`` signals the caller to run another
-        turn with ``message`` as the next user prompt.
-        """
-        results: list[HookResult] = []
-        for _plugin, meta in self._plugins.values():
-            cmd_results = await self._run_command_hooks(
-                "on_turn_end",
-                {
-                    "event": "on_turn_end",
-                    "user_input": event.user_input,
-                    "agent_response": event.agent_response,
-                    "tool_calls": event.tool_calls,
-                    "session_id": event.session_id,
-                    "timestamp": event.timestamp,
-                    "turn_index": event.turn_index,
-                },
-                meta,
-            )
-            for r in cmd_results:
-                if r.action != "noop":
-                    _emit_plugin_event(
-                        "hook_fired",
-                        plugin_name=meta.name,
-                        hook_name="on_turn_end",
-                        source="command",
-                        action=r.action,
-                        message=r.message[:200] if r.message else "",
-                    )
-                if r.context:
-                    _emit_plugin_event(
-                        "hook_context_injected",
-                        plugin_name=meta.name,
-                        hook_name="on_turn_end",
-                        source="command",
-                    )
-            results.extend(cmd_results)
-        return results
+        return await self._hooks.fire_turn_end(event)
 
     async def fire_session_end(self, event: SessionEvent) -> None:
-        """Announce that the interactive session ended.
-
-        This is the only place the typed event is published, and that matters: emitting
-        at the two call sites of this method (``cli`` and the channel layer) would be the
-        same event constructed twice, and the day one of them stopped emitting would be a
-        plugin that silently stops scoring sessions.
-
-        It used to notify two protocols from here -- the typed event, plus a Python
-        ``on_session_end`` hook.  No plugin implements that hook any more; the event is
-        what a plugin subscribes to.
-
-        Published on the composition's session bus, which is the one ``SESSION.attach``
-        resolves.  The process-wide default would be a third instance of the same miss:
-        the event constructed, emitted, and heard by nobody the composition knows about.
-        """
-        # Emitted unconditionally: the bus does nothing when nobody listens, and a
-        # session that ended is a fact whether or not this composition has plugins.
-        await self._bus_for("session").emit(
-            SessionFinished(
-                agent_id="",
-                messages=list(event.messages),
-                tools_used=list(event.tools_used),
-                session_id=str(getattr(event, "session_id", "") or ""),
-                turn_count=int(getattr(event, "turn_count", 0) or 0),
-            )
-        )
-    async def _on_tool_pre_execute(self, event: ToolPreExecute) -> Optional[str]:
-        """Bus listener for :class:`ToolPreExecute`.
-
-        Runs the ``plugin.json`` command hooks for a tool call and returns their
-        refusal reason, or None.  It used to adapt the typed event to a Python hook
-        chain as well -- ``on_pre_tool`` -- which no plugin implements now, so only
-        the command half remains.  ``hooks_config`` is a separate mechanism: external
-        commands the operator declares, not Python methods a plugin defines.
-        """
-        result = await self.fire_pre_tool(
-            PreToolEvent(tool_name=event.tool_name, tool_kwargs=event.arguments)
-        )
-        if result.action == "block":
-            return result.message or "blocked"
-        return None
-
-    async def _on_tool_post_execute(self, event: ToolPostExecute) -> None:
-        """Bus listener for :class:`ToolPostExecute`; purely observational."""
-        await self.fire_post_tool(
-            PostToolEvent(
-                tool_name=event.tool_name,
-                tool_kwargs=event.arguments,
-                result=event.result,
-            )
-        )
+        return await self._hooks.fire_session_end(event)
 
     async def fire_pre_tool(self, event: PreToolEvent) -> HookResult:
-        """Fire before a tool call; first blocking result short-circuits the chain.
-
-        Matchers declared in plugin.json scoped to ``on_pre_tool`` are honoured:
-        a plugin without a matcher is called for every tool; a plugin with a
-        matcher is only called when the tool name matches.
-        """
-        for _plugin, meta in self._plugins.values():
-            if not self._matches_tool(meta, "on_pre_tool", event.tool_name):
-                continue
-
-            cmd_results = await self._run_command_hooks(
-                "on_pre_tool",
-                {
-                    "event": "on_pre_tool",
-                    "tool_name": event.tool_name,
-                    "tool_kwargs": event.tool_kwargs,
-                },
-                meta,
-            )
-            for r in cmd_results:
-                if r.action == "block":
-                    return r
-        return HookResult()
+        return await self._hooks.fire_pre_tool(event)
 
     async def fire_post_tool(self, event: PostToolEvent) -> HookResult:
-        """Fire after a tool call completes; last non-noop context wins.
-
-        Matchers declared in plugin.json scoped to ``on_post_tool`` are honoured.
-        """
-        result = HookResult()
-        for _plugin, meta in self._plugins.values():
-            if not self._matches_tool(meta, "on_post_tool", event.tool_name):
-                continue
-
-            cmd_results = await self._run_command_hooks(
-                "on_post_tool",
-                {
-                    "event": "on_post_tool",
-                    "tool_name": event.tool_name,
-                    "tool_kwargs": event.tool_kwargs,
-                    "result": event.result,
-                },
-                meta,
-            )
-            for r in cmd_results:
-                if r.context:
-                    result = r
-        return result
+        return await self._hooks.fire_post_tool(event)

@@ -656,7 +656,8 @@ def main() -> int:
             if not plugin["hooks"]:
                 continue
             meta = next((m for m in catalog.list_plugins() if m.name == plugin["name"]), None)
-            env = catalog._hook_env(meta, {}) if meta is not None else {}
+            # The hook surface is a collaborator of the loader now (agent/plugins/hook_dispatch.py).
+            env = catalog._hooks._hook_env(meta, {}) if meta is not None else {}
             wanted = ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT", "PLUGIN_DATA")
             missing = [key for key in wanted if key not in env]
             status = OK if not missing else FAIL

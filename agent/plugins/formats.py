@@ -74,6 +74,10 @@ __all__ = [
     "SHARED_SKILL_ROOTS",
     "CLAUDE_CODE_HOOK_EVENTS",
     "CODEX_HOOK_EVENTS",
+    "default_normalize_hook_entries",
+    "default_translate_hook_output",
+    "default_substitute_command_args",
+    "strategy_for",
 ]
 
 #: Asset directories every supported format uses the same way.  A format may
@@ -108,9 +112,154 @@ class SkillRoot:
     system_dir: str = ""
 
 
+# ── The strategies: what an ecosystem's files *mean* ─────────────────────────
+#
+# These three were functions in the loader, and their bodies were Claude Code's
+# conventions applied to every ecosystem -- so "one ecosystem = one adapter" held for
+# the *paths* and not for the shapes.  Moved here and hung off :class:`PluginFormat`
+# as overridable callables: the loader now asks the format instead of knowing.
+#
+# The defaults are this project's compatibility baseline.  It is Claude Code's shape
+# (matcher groups around command hooks, ``$ARGUMENTS`` in a command body, the hook
+# JSON output contract) because that is what Codex's plugin format also speaks for the
+# names it has -- but a format whose files mean something else supplies its own
+# callable, and the loader does not change.
+
+
+def _timeout_or(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def default_normalize_hook_entries(
+    plugin_name: str, event_name: str, entries: Any
+) -> "tuple[str, list[dict]]":
+    """Translate an event's declared hooks into flat internal entries.
+
+    The **event name** is looked up in the merged vocabulary rather than the format's
+    own table: asked live, not snapshotted at import, so a format registered later (an
+    embedder's, or a test's) brings its event vocabulary with it.  A name this project
+    has no counterpart for passes through unchanged, so "this hook does nothing yet"
+    stays distinguishable from "this hook is not recognised".
+
+    The **entries** may be Claude Code's matcher groups (``{"matcher": ...,
+    "hooks": [...]}``) or already-flat dicts; both are accepted, because both spellings
+    appear in the wild and refusing the flat one would break a project's own manifest.
+    """
+    internal_event = all_hook_events().get(event_name, event_name)
+    if not isinstance(entries, list):
+        return internal_event, []
+    flat: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        matcher = entry.get("matcher", "")
+        nested = entry.get("hooks")
+        if isinstance(nested, list):
+            for inner in nested:
+                if not isinstance(inner, dict):
+                    continue
+                if inner.get("type", "command") != "command":
+                    continue
+                cmd = str(inner.get("command", "") or "").strip()
+                if not cmd:
+                    continue
+                normalized = dict(inner)
+                normalized["type"] = "command"
+                normalized["matcher"] = matcher
+                normalized["command"] = cmd
+                normalized["timeout"] = _timeout_or(inner.get("timeout", 60.0), 60.0)
+                flat.append(normalized)
+            continue
+        if entry.get("type", "command") != "command":
+            continue
+        cmd = str(entry.get("command", "") or "").strip()
+        if not cmd:
+            continue
+        normalized = dict(entry)
+        normalized["type"] = "command"
+        normalized["command"] = cmd
+        normalized["timeout"] = _timeout_or(entry.get("timeout", 60.0), 60.0)
+        flat.append(normalized)
+    return internal_event, flat
+
+
+def default_translate_hook_output(raw: dict, event_name: str) -> Any:
+    """Translate a command hook's JSON output into this runtime's ``HookResult``.
+
+    The default reads the hook output contract the supported ecosystems share:
+    ``continue: false`` stops a turn, ``decision: "block"`` refuses, and
+    ``hookSpecificOutput.additionalContext`` injects context.  A format that answers
+    some other way overrides this and returns its own ``HookResult`` (or ``None`` for
+    "no effect").
+
+    ``HookResult`` is imported inside the function because it lives in the loader,
+    which imports this module: a module-level import would be a cycle for the sake of
+    one name.
+    """
+    from agent.plugins.catalog import HookResult
+
+    if raw.get("continue") is False:
+        return HookResult(
+            action="block",
+            message=str(raw.get("stopReason", "") or "stopped by hook"),
+        )
+    decision = str(raw.get("decision", "") or "")
+    if decision == "block":
+        reason = str(raw.get("reason", "") or raw.get("message", "") or "blocked")
+        if event_name == "on_turn_end":
+            return HookResult(action="continue", message=reason)
+        return HookResult(action="block", message=reason)
+    specific = raw.get("hookSpecificOutput")
+    if not isinstance(specific, dict):
+        if any(key in raw for key in ("action", "message", "context")):
+            return HookResult(
+                action=str(raw.get("action", "noop")),
+                message=str(raw.get("message", "")),
+                context=str(raw.get("context", "")),
+            )
+        return None
+    additional_context = str(specific.get("additionalContext", "") or "")
+    if event_name == "on_pre_tool":
+        permission = str(specific.get("permissionDecision", "") or "")
+        if permission in {"deny", "block"}:
+            return HookResult(
+                action="block",
+                message=str(
+                    specific.get("permissionDecisionReason", "")
+                    or specific.get("reason", "")
+                    or "blocked"
+                ),
+            )
+        if additional_context:
+            return HookResult(action="context", context=additional_context)
+    if event_name in {"on_post_tool", "on_prompt_submit", "on_turn_end"}:
+        if additional_context:
+            return HookResult(action="context", context=additional_context)
+    return None
+
+
+def default_substitute_command_args(body: str, args_text: str) -> str:
+    """Replace ``$ARGUMENTS`` and ``$1`` .. ``$N`` in a command body.
+
+    ``args_text`` is the full string after the command name (so quoting survives);
+    positional placeholders use whitespace-split tokens.
+    """
+    if not body:
+        return body
+    out = body.replace("$ARGUMENTS", args_text)
+    tokens = args_text.split()
+    # Highest index first, so $10 is not mangled by $1's substitution.
+    for i in range(len(tokens), 0, -1):
+        out = out.replace(f"${i}", tokens[i - 1])
+    return out
+
+
 @dataclass(frozen=True)
 class PluginFormat:
-    """One ecosystem's on-disk conventions.
+    """One ecosystem's on-disk conventions, **and what to do with them**.
 
     ``manifests``, ``marketplaces`` and the marker paths are relative and
     ordered: the first one that exists wins, and the first *format* that matches
@@ -155,6 +304,15 @@ class PluginFormat:
     #: Plugin-*bundled* skills are a different thing and are not listed here: those
     #: arrive with a plugin directory and the loader already loads them.
     user_skill_roots: tuple["SkillRoot", ...] = ()
+    # -- what the files *mean*, overridable per ecosystem ---------------------
+    #: ``(plugin_name, event_name, entries) -> (internal_event, flat_entries)``.
+    normalize_hook_entries: Callable[[str, str, Any], "tuple[str, list[dict]]"] = (
+        default_normalize_hook_entries
+    )
+    #: ``(raw_output, event_name) -> HookResult | None``.
+    translate_hook_output: Callable[[dict, str], Any] = default_translate_hook_output
+    #: ``(body, args_text) -> str`` for a markdown command's placeholders.
+    substitute_command_args: Callable[[str, str], str] = default_substitute_command_args
 
 
 #: Claude Code's hook event vocabulary, as published.  Names this project has no
@@ -399,6 +557,27 @@ def format_for_manifest(path: Path) -> Optional[PluginFormat]:
             if name.endswith(relative):
                 return fmt
     return None
+
+
+def strategy_for(plugin_dir: Optional[Path]) -> PluginFormat:
+    """The format whose **strategies** govern *plugin_dir*.
+
+    The loader's question, and a different one from :func:`format_for_manifest`: it
+    is asked while reading a directory's hook and command files, where there is no
+    manifest path to match.  Resolution order is the format list's own (which is the
+    precedence order the loader already documents), then :data:`NATIVE` -- so a
+    directory no ecosystem claimed is handled by this project's own conventions,
+    which is exactly what happened before the strategies existed.
+
+    Returning a format rather than ``None`` is the point: every caller wants
+    *something* to ask, and a ``None`` branch at each call site is how a default
+    quietly diverges from the real one.
+    """
+    if plugin_dir is not None:
+        for fmt in PLUGIN_FORMATS:
+            if any((plugin_dir / relative).exists() for relative in fmt.manifests):
+                return fmt
+    return NATIVE
 
 
 def all_hook_events() -> dict[str, str]:

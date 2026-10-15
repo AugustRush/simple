@@ -1846,7 +1846,7 @@ def test_hook_commands_get_the_codex_environment_names(tmp_path):
     catalog.discover_and_load()
     meta = next(m for m in catalog.list_plugins() if m.name == "hooked")
 
-    env = catalog._hook_env(meta, {})
+    env = catalog._hooks._hook_env(meta, {})
 
     assert env["PLUGIN_ROOT"] == str(plugin_dir)
     assert env["PLUGIN_DATA"]
@@ -1998,7 +1998,7 @@ def test_a_new_ecosystem_is_one_adapter(tmp_path, acme_format):
     meta = next(m for m in catalog.list_plugins() if m.name == "widget")
     assert "on_pre_tool" in meta.hooks_config, "the adapter's event name was translated"
 
-    env = catalog._hook_env(meta, {})
+    env = catalog._hooks._hook_env(meta, {})
     assert env["ACME_ROOT"] == str(plugin_dir)
     assert env["ACME_DATA"] and env["ACME_PROJECT"]
 
@@ -4126,3 +4126,138 @@ def test_a_plugin_waiting_for_a_dependency_is_reported_by_the_catalog(tmp_path):
 
     assert catalog.pending_report() == {"waiter": ["nothing_provides_this"]}
     assert catalog.failed_report() == {}, "waiting is not failing"
+
+
+# ── The declarative kinds are data, and the data is the only source ──────────
+
+
+def _adapter(meta, plugin_dir, *, plugin=None):
+    """A ``_CatalogPlugin`` with a stub catalog: enough to ask what it declares."""
+    from agent.plugins.catalog import _CatalogPlugin
+
+    class _Catalog:
+        _commands = None
+
+    return _CatalogPlugin(
+        catalog=_Catalog(),
+        name=meta.name,
+        plugin=plugin or object(),
+        meta=meta,
+        plugin_dir=plugin_dir,
+    )
+
+
+def test_a_bundle_declaring_skills_waits_for_the_skill_catalog(tmp_path) -> None:
+    """The requirement comes off the table, so a kind cannot forget to declare it.
+
+    A contribution that needs a service has to put that service in ``inject``: the
+    adapter's ``setup`` runs once, so a bundle that activated before the service
+    existed would contribute nothing and say nothing.
+    """
+    from agent.plugins.catalog import PluginMeta
+
+    meta = PluginMeta(name="bundled", skills=["skills"])
+    assert "skill_catalog" in _adapter(meta, tmp_path).inject
+
+
+def test_a_bundle_with_no_skills_does_not_wait_for_the_catalog(tmp_path) -> None:
+    """Control: the requirement is per-bundle, not unconditional."""
+    from agent.plugins.catalog import PluginMeta
+
+    meta = PluginMeta(name="plain")
+    assert "skill_catalog" not in _adapter(meta, tmp_path).inject
+
+
+def test_a_bundle_declaring_mcp_servers_waits_for_the_registry(tmp_path) -> None:
+    from agent.plugins.catalog import PluginMeta
+
+    meta = PluginMeta(
+        name="bundled", mcp_servers=[{"name": "demo", "command": "run"}]
+    )
+    assert "contributed_mcp_servers" in _adapter(meta, tmp_path).inject
+
+
+def test_every_service_backed_kind_is_declared_by_some_test() -> None:
+    """The table is the list; this is the check that the list is what runs."""
+    from agent.plugins.catalog import DECLARATIVE_KINDS
+
+    backed = {kind.service for kind in DECLARATIVE_KINDS if kind.service}
+    assert backed == {"skill_catalog", "contributed_mcp_servers"}, (
+        "a new service-backed kind needs a test above, and this list updated"
+    )
+
+
+def test_every_loader_registered_kind_says_why() -> None:
+    """A kind with no service is a decision, and a decision has a reason."""
+    from agent.plugins.catalog import DECLARATIVE_KINDS
+
+    for kind in DECLARATIVE_KINDS:
+        if kind.service is None:
+            assert len(kind.reason) > 60, (
+                f"{kind.key}: a kind the loader registers rather than a service has to "
+                f"say why, the way a floor does"
+            )
+
+
+def test_the_kind_keys_are_unique() -> None:
+    from agent.plugins.catalog import DECLARATIVE_KINDS
+
+    keys = [kind.key for kind in DECLARATIVE_KINDS]
+    assert len(keys) == len(set(keys)), keys
+
+
+def test_the_registration_body_is_a_loop_not_a_sequence() -> None:
+    """The point of the table: adding a kind must not mean editing this method.
+
+    Asserted on the source because that is the property -- the method iterating the
+    table, with no kind named in its body.  The per-kind knowledge lives in the
+    table's ``register`` functions, which is what makes "which kinds exist" one
+    answerable list.
+    """
+    import ast
+    import inspect
+
+    from agent.plugins.catalog import _CatalogPlugin
+
+    source = inspect.getsource(_CatalogPlugin._register_declarative_assets)
+    body = ast.parse(source.strip())
+    called = {
+        node.func.attr
+        for node in ast.walk(body)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "register" in called, "the method must iterate the kinds"
+    for helper in (
+        "_register_skills",
+        "_register_mcp_servers",
+        "_register_command_files",
+        "_register_agent_files",
+        "_merge_hook_files",
+        "_register_python_commands",
+    ):
+        assert helper not in source, (
+            f"{helper} is called directly from the method again; the kind belongs in "
+            f"DECLARATIVE_KINDS"
+        )
+
+
+def test_core_service_reads_work_before_any_reload(tmp_path) -> None:
+    """``_core`` used to answer "absent" until the reload path wired it.
+
+    ``register_core_services`` is called only from ``_reload_locked``, so every read
+    before the first reload returned the caller's default -- a composition that *had*
+    the service, a caller that could not see it, and no error either way.  The
+    registry adopts the component mapping, so the catalog can answer from its own
+    storage, which is the same one.
+    """
+    from agent import PluginCatalog
+
+    marker = object()
+    catalog = PluginCatalog(
+        builtin_dir=tmp_path / "plugins", components={"registry": marker}
+    )
+    try:
+        assert catalog._core("registry") is marker
+        assert catalog._core("nothing.here", "absent") == "absent"
+    finally:
+        catalog.close()
