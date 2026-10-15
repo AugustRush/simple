@@ -25,7 +25,7 @@ recording" below.
 | `agent/scheduler/store.py` | 3544 (was 4086) | `SchedulerStore` | 74 | 2966 | **0 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
-| `agent/memory/context.py` | 1932 (was 2484) | `ContextManager` | 63 | 1584 | **5 / 43 lines** |
+| `agent/memory/context.py` | 1911 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
 the headline, and it is why the extraction orders below start there.
@@ -115,8 +115,8 @@ believed uncoupled gets moved, or in this case wrongly believed coupled gets lef
 1. **The 0-data / 1-call group** (`record_usage_event`, `observe_token_usage`,
    `_is_episode_recall_query`, `_working_state_relevance_score`, …) — cheap, but each needs the
    one collaborator it calls passed in.
-2. `_working_state_candidates`, `_working_state_is_complete`, `_merge_artifacts` (22 lines) —
-   pure, waiting for a coherent home rather than a third tiny module.
+2. ~~`_working_state_candidates`, `_working_state_is_complete`, `_merge_artifacts`.~~
+   **Done** -- `memory/working_state.py`, 1932 -> 1911 lines.
 3. Only then the coupled core (`_project_working_state_from_event` 140 lines / 5 refs,
    `process_one_job` 107/5, `retrieve_implicit_context` 73).
 

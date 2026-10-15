@@ -20,6 +20,12 @@ if TYPE_CHECKING:
 from .session_log import SessionLog
 from . import fitting
 from . import query_terms
+from . import working_state
+from .working_state import (
+    _merge_artifacts,
+    _working_state_candidates,
+    _working_state_is_complete,
+)
 from .query_terms import (
     _has_multi_intent_marker,
     _matched_fact_alias_terms,
@@ -1130,18 +1136,7 @@ class ContextManager:
                 )
         return score
 
-    @staticmethod
-    def _working_state_is_complete(state: dict[str, Any]) -> bool:
-        status = str(state.get("status", "") or "").strip().lower()
-        return status in {"completed", "updated", "done", "success", "dismissed"}
 
-    def _working_state_candidates(self, state: dict[str, Any]) -> list[dict[str, Any]]:
-        tasks = state.get("tasks")
-        if isinstance(tasks, list):
-            candidates = [task for task in tasks if isinstance(task, dict)]
-            if candidates:
-                return candidates
-        return [state] if isinstance(state, dict) and state else []
 
     def _select_working_state(
         self,
@@ -1158,7 +1153,7 @@ class ContextManager:
         selected_task_id = str(decision.get("selected_task_id", "") or "")
         if not selected_task_id:
             return None
-        for candidate in self._working_state_candidates(state):
+        for candidate in _working_state_candidates(state):
             if str(candidate.get("task_id", "") or "") == selected_task_id:
                 return candidate
         return None
@@ -1179,8 +1174,8 @@ class ContextManager:
         )
         candidates: list[dict[str, Any]] = []
         scored: list[tuple[float, dict[str, Any]]] = []
-        for candidate in self._working_state_candidates(state):
-            complete = self._working_state_is_complete(candidate)
+        for candidate in _working_state_candidates(state):
+            complete = _working_state_is_complete(candidate)
             dismissed = (
                 str(candidate.get("status", "") or "").strip().lower()
                 == "dismissed"
@@ -1285,10 +1280,10 @@ class ContextManager:
         tasks = snapshot.state.get("tasks")
         if isinstance(tasks, list):
             return any(
-                isinstance(task, dict) and not self._working_state_is_complete(task)
+                isinstance(task, dict) and not _working_state_is_complete(task)
                 for task in tasks
             )
-        return not self._working_state_is_complete(snapshot.state)
+        return not _working_state_is_complete(snapshot.state)
 
 
     def save_provider_checkpoint(
@@ -1356,22 +1351,6 @@ class ContextManager:
         return load(self.staging.session_id)
 
 
-    @staticmethod
-    def _merge_artifacts(*groups: Any, limit: int = 12) -> list[str]:
-        merged: list[str] = []
-        seen: set[str] = set()
-        for group in groups:
-            if not isinstance(group, list):
-                continue
-            for item in group:
-                value = str(item or "").strip()
-                if not value or value in seen:
-                    continue
-                seen.add(value)
-                merged.append(value)
-                if len(merged) >= limit:
-                    return merged
-        return merged
 
     @property
     def session_log(self) -> Any:
@@ -1441,7 +1420,7 @@ class ContextManager:
 
         prior_tasks = [
             dict(task)
-            for task in self._working_state_candidates(prior_state)
+            for task in _working_state_candidates(prior_state)
             if isinstance(task, dict) and task
         ]
         if (
@@ -1456,7 +1435,7 @@ class ContextManager:
             scored_matches = [
                 (self._working_state_relevance_score(task, clean_user), task)
                 for task in prior_tasks
-                if not self._working_state_is_complete(task)
+                if not _working_state_is_complete(task)
             ]
             scored_matches = [
                 (score, task) for score, task in scored_matches if score >= 2.0
@@ -1473,7 +1452,7 @@ class ContextManager:
                 matched_task = dict(scored_matches[0][1])
         elif prior_tasks:
             open_tasks = [
-                task for task in prior_tasks if not self._working_state_is_complete(task)
+                task for task in prior_tasks if not _working_state_is_complete(task)
             ]
             if open_tasks:
                 matched_task = dict(open_tasks[-1])
@@ -1503,7 +1482,7 @@ class ContextManager:
         elif clean_assistant:
             next_action = "Use this working context only when it is relevant to the user's next message."
 
-        artifacts = self._merge_artifacts(
+        artifacts = _merge_artifacts(
             payload.get("artifacts"),
             (matched_task or {}).get("artifacts"),
         )
