@@ -44,17 +44,78 @@ plan calls out by name:
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from agent.kernel.service import (
     MissingServiceError,
-    ServiceRegistry,
+    ReservedServiceError,
     ServiceScope,
+    UndeclaredServiceError,
 )
 
 _MISSING = object()
 
 __all__ = ["Context"]
+
+
+class _DeclaredServices(Mapping[str, Any]):
+    """The registry as a plugin may see it: read-only, and only for declared names.
+
+    Handed out by :attr:`Context.services`.  It replaces the raw
+    :class:`~agent.kernel.service.ServiceRegistry`, which was writable and
+    unrestricted: a plugin could ``ctx.services.provide("x", v)`` and register
+    without an undo -- breaking "every registration is an effect" in one line --
+    or resolve any name the composition happened to leave in the mapping, which
+    made ``inject`` advisory rather than the dependency declaration the
+    unload/replace cascade relies on.
+
+    A ``Mapping`` so the three shapes :func:`~agent.kernel.service.resolve` and
+    :func:`~agent.kernel.service.require_service` accept keep working, and with
+    ``require``/``lookup`` spelled out because those two helpers prefer them.
+    """
+
+    __slots__ = ("_ctx",)
+
+    def __init__(self, ctx: "Context") -> None:
+        self._ctx = ctx
+
+    def _read(self, name: str) -> Any:
+        self._ctx.require_declared(name)
+        self._ctx.require_allowed(name, "read")
+        return self._ctx._host.services.get(name)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._read(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self._ctx.require_declared(key)
+        self._ctx.require_allowed(key, "read")
+        return self._ctx._host.services.get(key, default)
+
+    #: The names :func:`resolve` / :func:`require_service` look for first.
+    def lookup(self, key: str, default: Any = None) -> Any:
+        return self.get(key, default)
+
+    def require(self, key: str) -> Any:
+        return self._read(key)
+
+    def has(self, key: str) -> bool:
+        """Membership, deliberately **not** declaration-checked.
+
+        Asking whether a name exists is how a plugin or a diagnostic decides what
+        to report; it is not a read of the value, and refusing it would make
+        ``pending_report``-style code unable to say what the composition holds.
+        """
+        return self._ctx._host.services.has(key)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and self.has(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._ctx._host.services.names())
+
+    def __len__(self) -> int:
+        return len(self._ctx._host.services.names())
 
 
 class Context:
@@ -64,7 +125,7 @@ class Context:
     registration goes, and its name is what a diagnostic reports.
     """
 
-    __slots__ = ("_host", "_install", "_extra", "_views", "_bus_lookup")
+    __slots__ = ("_host", "_install", "_extra", "_views", "_bus_lookup", "_services_view")
 
     def __init__(self, *, host: Any, install: Any) -> None:
         self._host = host
@@ -72,6 +133,8 @@ class Context:
         #: ``name -> (service, view)``, so a scoped view is built once and is only
         #: reused while the underlying service is the same object.
         self._views: dict[str, tuple[Any, Any]] = {}
+        #: The read-only view handed out by :attr:`services`, built on first ask.
+        self._services_view: Any = None
         #: Names the injectable-attribute shortcut should not shadow.  A service
         #: called ``get`` would otherwise replace this class's own method.
         self._extra = frozenset(Context.__slots__) | frozenset(
@@ -93,9 +156,63 @@ class Context:
         return self._install.name
 
     @property
-    def services(self) -> ServiceRegistry:
-        """The registry behind ``get``, for a caller that needs membership tests."""
-        return self._host.services
+    def services(self) -> "_DeclaredServices":
+        """The registry as **reads of declared names**: read-only, check-enforced.
+
+        Cached so a caller that holds it keeps one object, and so the identity
+        comparison a test may make does not depend on how many times it asked.
+        """
+        if self._services_view is None:
+            self._services_view = _DeclaredServices(self)
+        return self._services_view
+
+    def require_declared(self, name: str, action: str = "read") -> None:
+        """Refuse a name this plugin never declared.
+
+        The declaration (``inject`` for required, ``optional`` for tolerated) is
+        what ``unload`` and ``replace`` walk; a read outside it is a dependency the
+        kernel cannot see, which is how a replaced service leaves its reader
+        holding the object whose owner is gone.  Enforced here rather than trusted
+        because the failure is silent and delayed.
+
+        A name this plugin *provided* counts as declared: offering it and reading
+        it back is one act, and the second half cannot be a dependency on somebody
+        else.  That is also what lets a plugin offer a default and honour an
+        incumbent -- provide if absent, then read what the composition now holds.
+        """
+        install = self._install
+        if (
+            name in install.inject
+            or name in install.optional
+            or name in install.provided_names
+        ):
+            return
+        raise UndeclaredServiceError(
+            install.name,
+            name,
+            action=action,
+            declared=tuple(install.inject),
+            optional=tuple(install.optional),
+        )
+
+    def require_allowed(self, name: str, action: str = "read") -> None:
+        """Refuse a name that is not part of the composition's plugin vocabulary.
+
+        Declaration and vocabulary are two different questions, and a closed
+        vocabulary needs both: ``inject`` says *this plugin* may depend on a name,
+        and this says the name is a plugin's to depend on at all.  Composition
+        internals share the adopted mapping with real services, so without the
+        second check a plugin can resolve ``mcp_task`` or a session's staged
+        components -- values with no contract and no lifetime a plugin can reason
+        about.
+
+        No policy wired means no vocabulary, which is the permissive behaviour an
+        embedder that provides nothing already has.
+        """
+        policy = getattr(self._host, "service_policy", None)
+        if policy is None or policy(name, action):
+            return
+        raise ReservedServiceError(self._install.name, name, action=action)
 
     # -- services ------------------------------------------------------------
 
@@ -105,6 +222,7 @@ class Context:
         Recorded on the scope, so unloading removes it and dependents waiting on it
         are taken down with it.
         """
+        self.require_allowed(name, "provide")
         self._install.scope.provide(name, value, replace=replace)
         # Told, not inferred: only a *newly* offered service can unblock a waiter,
         # so the host re-checks pending plugins after a setup that provided one --
@@ -126,12 +244,37 @@ class Context:
         A service that does not expose ``scoped`` is returned as-is, so a plain
         read-only service needs no ceremony and keeps its identity for an
         ``is`` check or an ``isinstance`` test.
+
+        *name* must be declared (``inject`` or ``optional``); see
+        :meth:`require_declared`.  For the service **itself** rather than this
+        plugin's view of it, use :meth:`raw`.
         """
+        self.require_declared(name)
+        self.require_allowed(name, "read")
         service = (
-            self.services.get(name) if default is _MISSING
-            else self.services.get(name, default)
+            self._host.services.get(name) if default is _MISSING
+            else self._host.services.get(name, default)
         )
         return self._scoped(name, service)
+
+    def raw(self, name: str, default: Any = _MISSING) -> Any:
+        """The service **itself**, not this plugin's scoped view.
+
+        The counterpart of :meth:`get` for a plugin that *configures* a service
+        rather than contributing to it.  ``ToolRegistry`` is the worked example:
+        every plugin that adds a tool wants the view (attribution plus undo), and
+        the one plugin that sets the registry's turn context wants the registry --
+        given the view it raised ``'ScopedTools' object has no attribute
+        'set_context'``, before any model call.
+
+        Declared exactly like ``get``, so the dependency graph is unaffected by the
+        choice of view.
+        """
+        self.require_declared(name)
+        self.require_allowed(name, "read")
+        if default is _MISSING:
+            return self._host.services.get(name)
+        return self._host.services.get(name, default)
 
     def _scoped(self, name: str, service: Any) -> Any:
         """A per-plugin view of *service*, cached, or the service itself.
@@ -157,7 +300,8 @@ class Context:
         return view
 
     def has(self, name: str) -> bool:
-        return self.services.has(name)
+        """Whether the composition holds *name*.  Not a read; see the view."""
+        return self._host.services.has(name)
 
     @property
     def bus(self) -> Any:
@@ -290,7 +434,11 @@ class Context:
         """
         if item.startswith("_") or item in self._extra:
             raise AttributeError(item)
-        if item in self._install.inject:
+        if (
+            item in self._install.inject
+            or item in self._install.optional
+            or item in self._install.provided_names
+        ):
             try:
                 # Through ``get``, not the registry, so an injected attribute is
                 # the same scoped view a ``ctx.get(name)`` would return.  Reading
@@ -299,10 +447,10 @@ class Context:
                 return self.get(item)
             except MissingServiceError as exc:
                 raise AttributeError(
-                    f"{self._install.name!r} injected {item!r} but it is not "
+                    f"{self._install.name!r} declared {item!r} but it is not "
                     f"available; the plugin should not have activated"
                 ) from exc
         raise AttributeError(
             f"{item!r} is not a method of Context and {self._install.name!r} did "
-            f"not declare it in inject; add it to inject to use it as an attribute"
+            f"not declare it in inject or optional; add it to use it as an attribute"
         )

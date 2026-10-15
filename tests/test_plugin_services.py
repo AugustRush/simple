@@ -49,6 +49,7 @@ CONSUMER = '''
     def register():
         class Consumer:
             name = "consumer"
+            inject = ("greeter",)
 
             def setup(self, ctx):
                 self.ctx = ctx
@@ -58,7 +59,11 @@ CONSUMER = '''
         return Consumer()
 '''
 
-CONSUMER_BEFORE_PROVIDER = '''
+#: Declares nothing and reads ``greeter`` anyway.  This is the case the enforced
+#: contract refuses: the read is a dependency the kernel cannot see, so it is
+#: refused at setup rather than allowed to hold a name whose owner it cannot be
+#: told about when that owner is replaced or unloaded.
+CONSUMER_WITHOUT_DECLARATION = '''
     def register():
         class Early:
             name = "consumer"
@@ -148,11 +153,21 @@ def test_unloading_the_provider_removes_the_service(plugins: Path) -> None:
         catalog.close()
 
 
-def test_the_consumer_is_untouched_by_the_provider_unloading(plugins: Path) -> None:
+def test_unloading_the_provider_takes_the_dependent_consumer_with_it(plugins: Path) -> None:
+    """A declared dependency is a real edge, so the cascade follows it.
+
+    This is the *reason* to declare: ``inject`` is what ``unload``/``replace`` walk
+    to find the plugins holding a service that is going away.  Before the
+    declaration was enforced, the consumer below had no edge and was left holding
+    ``greeter`` -- which is the failure this asserts against.
+    """
     catalog, _ = _load(plugins)
     try:
-        catalog.unload_plugin("provider")
         assert "consumer" in catalog._plugins
+        catalog.unload_plugin("provider")
+        assert "consumer" not in catalog._plugins, (
+            "the consumer declared the dependency, so it goes with its provider"
+        )
     finally:
         catalog.close()
 
@@ -160,27 +175,25 @@ def test_the_consumer_is_untouched_by_the_provider_unloading(plugins: Path) -> N
 # ── Ordering, stated rather than assumed ─────────────────────────────────────
 
 
-def test_without_inject_a_consumer_loaded_first_sees_nothing(tmp_path: Path) -> None:
-    """``ctx.resolve`` at setup time is eager: no declaration, no ordering help.
+def test_reading_without_declaring_is_refused(tmp_path: Path) -> None:
+    """The contract is enforced, not merely documented.
 
-    This is the counterpart to ``tests/test_plugin_inject.py``, and it is the
-    reason ``inject`` exists rather than being a convenience.  A plugin that
-    declares nothing is activated when it is reached, in name order, and reads
-    whatever exists at that moment -- so a consumer sorted before its provider
-    resolves the absent default.
-
-    Declaring ``inject = ("greeter",)`` is what buys the wait.  Asserting the
-    undeclared behaviour keeps the contrast visible: the mechanism is opt-in, and
-    a plugin author who omits it gets exactly what they asked for.
+    ``ctx.resolve`` at setup time used to be eager and forgiving: a plugin that
+    declared nothing read whatever happened to exist, got the absent default, and
+    held a service nobody could take away from it.  The declaration is now what
+    makes the dependency graph complete, so an undeclared read is a *refusal*, and
+    the refusal names the plugin and the fix.
     """
     root = tmp_path / "plugins"
-    _write_plugin(root / "aaa-consumer", CONSUMER_BEFORE_PROVIDER)
+    _write_plugin(root / "aaa-consumer", CONSUMER_WITHOUT_DECLARATION)
     _write_plugin(root / "zzz-provider", PROVIDER)
 
     catalog, loaded = _load(root)
     try:
-        assert loaded == ["consumer", "provider"], "loaded in directory order"
-        assert _plugin(catalog, "consumer").seen == "absent"
+        assert loaded == ["provider"], "the consumer was refused, so it never loaded"
+        failures = catalog.failed_report()
+        assert "consumer" in failures
+        assert "without declaring it" in failures["consumer"]
     finally:
         catalog.close()
 

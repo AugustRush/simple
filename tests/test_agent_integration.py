@@ -10521,8 +10521,13 @@ def test_body_composition_noise_no_longer_shrinks_the_input_budget(tmp_path):
     assert abs(budget_third - budget_first) <= 4
 
 
-def test_observed_input_tokens_reads_either_provider_field():
-    import agent as agent_module
+def test_observed_usage_reads_either_provider_field():
+    """Both wire formats report the input count, under different names.
+
+    This used to call a separate ``ModelTransport.observed_input_tokens``.  That
+    helper was removed: nothing in ``agent/`` called it, so the same assertions now
+    go through ``observed_usage``, which is the member the turn loop actually uses.
+    """
 
     class _AnthropicUsage:
         input_tokens = 123
@@ -10536,11 +10541,11 @@ def test_observed_input_tokens_reads_either_provider_field():
 
     from agent.core.transport import ModelTransport
 
-    read = ModelTransport.observed_input_tokens
-    assert read(_Resp(_AnthropicUsage())) == 123
-    assert read(_Resp(_OpenAIUsage())) == 456
-    assert read(_Resp(None)) is None
-    assert read(object()) is None
+    read = ModelTransport.observed_usage
+    assert read(_Resp(_AnthropicUsage())).input_tokens == 123
+    assert read(_Resp(_OpenAIUsage())).input_tokens == 456
+    assert read(_Resp(None)).input_tokens == 0
+    assert read(object()).input_tokens == 0
 
 
 def test_observed_usage_reads_output_and_cache_fields():

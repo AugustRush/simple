@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from agent.kernel.service import ScopedContribution
+
 __all__ = ["CommandRegistry", "ScopedCommands"]
 
 
@@ -60,15 +62,24 @@ class CommandRegistry:
         differs per source: a Python contribution gets a description parsed from the
         handler's docstring, a markdown file gets the file's front matter.  Computing
         it here would mean this class knowing both conventions.
+
+        The undo removes the record **only while it is still this one**.  A name-keyed
+        undo -- what this used to return -- let the first contributor's unload remove
+        the second contributor's command: A registers ``x``, B overwrites ``x``, A
+        unloads, and B's command and owner record are gone.  Identity is what makes
+        two contributors touching one name independent, and it is the rule the
+        channel, MCP-server and agent registries already follow.
         """
-        self._commands[name] = {
+        record = {
             "handler": handler,
             "metadata": dict(metadata or {}),
             "owner": owner,
         }
+        self._commands[name] = record
 
         def forget() -> None:
-            self._commands.pop(name, None)
+            if self._commands.get(name) is record:
+                self._commands.pop(name, None)
 
         return forget
 
@@ -138,22 +149,14 @@ class CommandRegistry:
         return ScopedCommands(self, ctx)
 
 
-class ScopedCommands:
+class ScopedCommands(ScopedContribution):
     """One plugin's handle on the command registry.
 
     Reached as ``ctx.<service>`` when the registry is provided under a name the plugin
     injects.  Every ``add`` records its own removal on the plugin's lifetime.
     """
 
-    __slots__ = ("_registry", "_ctx")
-
-    def __init__(self, registry: CommandRegistry, ctx: Any) -> None:
-        self._registry = registry
-        self._ctx = ctx
-
-    @property
-    def owner(self) -> str:
-        return str(getattr(self._ctx, "name", "") or "")
+    __slots__ = ()
 
     def add(
         self, name: str, handler: Callable[..., Any], *, metadata: dict | None = None
@@ -162,8 +165,7 @@ class ScopedCommands:
 
         Returns the name, so a caller can log it without repeating the string.
         """
-        undo = self._registry.add(
-            name, handler, metadata=metadata, owner=self.owner
+        self._contribute(
+            self._registry.add(name, handler, metadata=metadata, owner=self.owner)
         )
-        self._ctx.on_unwind(undo)
         return name

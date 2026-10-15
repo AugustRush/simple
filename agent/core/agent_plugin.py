@@ -70,6 +70,16 @@ class AgentPlugin:
         "plugin_catalog",
     )
 
+    #: Read but not required.  The three buses are absent in a minimal composition
+    #: (the agent then constructs its own), so they must not gate activation --
+    #: but they are still reads, and an undeclared read is invisible to the
+    #: replace/unload cascade.
+    optional = (
+        "event_bus.turn",
+        "event_bus.llm",
+        "event_bus.tool",
+    )
+
     def setup(self, ctx: Any) -> None:
         cfg = ctx.get("cfg", None) or {}
 
@@ -88,7 +98,9 @@ class AgentPlugin:
         #
         # ``inject`` still names ``registry``: this plugin must not activate before the
         # service exists, and that is a separate statement from which object it is handed.
-        registry = ctx.services.get("registry")
+        # ``raw`` is that second statement, spelled out: the registry itself, not the
+        # per-plugin view ``ctx.get`` would hand back.
+        registry = ctx.raw("registry")
 
         agent = self._agent_class(
             ctx.get("client"),

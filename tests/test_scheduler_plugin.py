@@ -93,8 +93,26 @@ def test_a_composition_without_a_runtime_factory_leaves_it_pending() -> None:
 
 
 def test_it_declares_the_two_things_it_cannot_work_without() -> None:
-    assert set(SchedulerPlugin.inject) == {"memory", "runtime_factory"}
+    assert set(SchedulerPlugin.inject) == {"memory", "runtime_factory", "cfg"}
     assert SchedulerPlugin.name == "scheduler"
+
+
+def test_it_declares_what_it_reads_without_requiring() -> None:
+    """Every tolerated read is named, so the replace/unload cascade can see it.
+
+    A settings override, the output directory, the workspace root, the tool
+    registry and a named bundle's loader are all optional for the *builder* -- it
+    falls back to its own default.  They are not optional for the *declaration*:
+    an undeclared read is a dependency the kernel cannot see, which is how a
+    replaced service leaves its reader holding the old one.
+    """
+    assert set(SchedulerPlugin.optional) == {
+        "scheduler_settings",
+        "output_dir",
+        "workspace_root",
+        "registry",
+        "scheduler_config_loader",
+    }
 
 
 # ── What it owns ─────────────────────────────────────────────────────────────

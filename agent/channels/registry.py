@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.kernel.service import ScopedContribution
+
 __all__ = ["ChannelRegistry", "ScopedChannels"]
 
 
@@ -89,21 +91,16 @@ class ChannelRegistry:
         return ScopedChannels(self, ctx)
 
 
-class ScopedChannels:
-    """One plugin's handle on the registry."""
+class ScopedChannels(ScopedContribution):
+    """One plugin's handle on the registry.
 
-    __slots__ = ("_registry", "_ctx")
+    The shared base owns the two fields, ``owner`` and the undo registration; this
+    class owns only what a channel contribution *is*.
+    """
 
-    def __init__(self, registry: ChannelRegistry, ctx: Any) -> None:
-        self._registry = registry
-        self._ctx = ctx
-
-    @property
-    def owner(self) -> str:
-        return str(getattr(self._ctx, "name", "") or "")
+    __slots__ = ()
 
     def add(self, channel: Any) -> Any:
         """Contribute one channel, removed when this plugin unloads."""
-        undo = self._registry.add(channel, owner=self.owner)
-        self._ctx.on_unwind(undo)
+        self._contribute(self._registry.add(channel, owner=self.owner))
         return channel

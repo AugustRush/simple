@@ -38,12 +38,25 @@ larger idea and this codebase has not earned it yet.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Iterator, Mapping, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 
 __all__ = [
     "resolve",
     "require_service",
     "MissingServiceError",
+    "UndeclaredServiceError",
+    "ReservedServiceError",
+    "ScopedService",
+    "ScopedContribution",
     "ServiceRegistry",
     "ServiceScope",
     "ServiceView",
@@ -61,6 +74,71 @@ class MissingServiceError(LookupError):
     def __init__(self, name: str) -> None:
         super().__init__(f"missing service: {name!r}")
         self.name = name
+
+
+class UndeclaredServiceError(LookupError):
+    """Raised when a plugin reaches a service it never declared.
+
+    ``inject`` is what the kernel gates activation on and what ``unload`` /
+    ``replace`` walk to find dependents.  A plugin that resolves a name it did
+    not declare therefore *breaks the dependency graph it is part of*: replacing
+    that service takes the plugin down only if it declared the dependency, so an
+    undeclared read leaves the plugin holding an object whose owner is gone --
+    silently, and only at the moment somebody replaces a service.
+
+    Deliberately **not** a subclass of :class:`MissingServiceError`: the two are
+    different facts (nothing provides the name vs. you never asked for it), and
+    callers that tolerate absence must not swallow a declaration error.
+
+    ``optional`` is the escape for a read that may legitimately find nothing: it
+    permits the read without gating activation on it.
+    """
+
+    def __init__(
+        self,
+        plugin: str,
+        name: str,
+        *,
+        action: str = "read",
+        declared: tuple[str, ...] = (),
+        optional: tuple[str, ...] = (),
+    ) -> None:
+        self.plugin = plugin
+        self.name = name
+        self.action = action
+        super().__init__(
+            f"plugin {plugin!r} tried to {action} service {name!r} without "
+            f"declaring it; add {name!r} to `inject` (required, gates activation) "
+            f"or `optional` (may legitimately be absent). "
+            f"Declared: inject={declared!r} optional={optional!r}"
+        )
+
+
+class ReservedServiceError(LookupError):
+    """Raised when a plugin touches a name that is not part of its vocabulary.
+
+    The sibling of :class:`UndeclaredServiceError`, for the other half of a closed
+    vocabulary.  Declaration answers "did *this plugin* ask for it"; it cannot answer
+    "is it a plugin's to ask for at all".  Composition internals -- a background task
+    handle, a session's staged components, a config revision counter -- live in the
+    same adopted mapping as real services, so without a second check any plugin could
+    resolve them by name and depend on a value whose lifetime and shape no contract
+    describes.
+
+    **The vocabulary is the composition's, not the kernel's.**  The kernel asks a
+    wired policy (``PluginHost.service_policy``) and has no opinion of its own; an
+    embedder that wires none keeps the permissive behaviour it already had.
+    """
+
+    def __init__(self, plugin: str, name: str, *, action: str) -> None:
+        self.plugin = plugin
+        self.name = name
+        self.action = action
+        super().__init__(
+            f"plugin {plugin!r} tried to {action} service {name!r}, which is not part "
+            f"of the plugin vocabulary: it is reserved to the composition. Touch only "
+            f"names declared in the composition's service vocabulary."
+        )
 
 
 class ServiceScope:
@@ -328,6 +406,64 @@ class ServiceView(Mapping[str, Any]):
     @property
     def registry(self) -> ServiceRegistry:
         return self._registry
+
+
+@runtime_checkable
+class ScopedService(Protocol):
+    """A service that can hand a plugin a **view of itself** for that plugin's lifetime.
+
+    The kernel's only capability convention, and until now an undeclared one:
+    :meth:`Context.get <agent.kernel.context.Context.get>` looks for ``scoped`` with
+    ``getattr`` and silently hands over the raw service when it is missing.  Silent
+    is the problem -- a service that forgets it still *works*, so ``ctx.tools.register``
+    would mutate the shared registry with no attribution and no undo, and the
+    contribution would outlive the plugin that made it.  Declared here so the six
+    implementations can be checked together, and so a new capability service has
+    something to satisfy rather than a convention to overhear.
+
+    The view is the service **plus** attribution, not a narrower service: reads must
+    keep working through it (see the six ``scoped`` views), because every existing
+    reader already holds ``ctx.<service>``.
+    """
+
+    def scoped(self, ctx: Any) -> Any:
+        """Return this plugin's view of the service, bound to ``ctx``'s lifetime."""
+
+
+class ScopedContribution:
+    """Base for "one plugin's view of a capability registry".
+
+    Six views wrote this by hand -- the same two fields, the same ``owner`` property,
+    the same "record the undo on the plugin's scope" step.  That made the shape a
+    convention a reader had to reconstruct from four files, and it made every copy a
+    place to get attribution subtly wrong: two of the six recorded a *name*- or
+    *prefix*-keyed undo, which let one plugin's unload remove another plugin's
+    contribution.
+
+    What stays in a subclass is only what differs: which registry it holds, and what
+    a contribution is.  ``_contribute`` is the one step that must not be
+    re-implemented, because it is the whole of "attributed and reversible".
+    """
+
+    __slots__ = ("_registry", "_ctx")
+
+    def __init__(self, registry: Any, ctx: Any) -> None:
+        self._registry = registry
+        self._ctx = ctx
+
+    @property
+    def owner(self) -> str:
+        """The plugin this view belongs to; the ``source``/``owner`` a record carries."""
+        return str(getattr(self._ctx, "name", "") or "")
+
+    def _contribute(self, undo: Callable[[], None]) -> None:
+        """Record *undo* on this plugin's lifetime, and hand it back.
+
+        Called by every ``add``-shaped method with the registry's own undo, so a
+        contribution and its reversal are one act rather than two that have to agree.
+        """
+        self._ctx.on_unwind(undo)
+        return undo
 
 
 def resolve(components: Any, name: str, default: Any = None) -> Any:

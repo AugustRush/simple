@@ -602,6 +602,10 @@ def register():
         # The service is called ``registry`` in this codebase; the plan's ``ctx.tools``
         # is the same shape under a different name.
         inject = ("registry",)
+        # ``ctx.on(TurnCompleted, ...)`` routes through ``bus_for_type`` ->
+        # ``ctx.get("event_bus.turn", None)``: a read of the turn bus, which a
+        # composition need not provide, so it is declared ``optional``.
+        optional = ("event_bus.turn",)
 
         def setup(self, ctx):
             from agent.core.event_domains import TurnCompleted
@@ -1554,6 +1558,10 @@ def _note(kind, **fields):
 def register():
     class SessionRecorder:
         name = "session_recorder"
+        # Both `ctx.on` subscriptions resolve the owning domain's bus through
+        # ``ctx.get("event_bus.<domain>", None)`` -- reads a composition need not
+        # satisfy, since the domain table falls back to the process bus.
+        optional = ("event_bus.turn", "event_bus.session")
 
         def setup(self, ctx):
             from agent.core.event_domains import SessionFinished, TurnCompleted

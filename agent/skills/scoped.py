@@ -13,21 +13,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from agent.kernel.service import ScopedContribution
+
 __all__ = ["ScopedSkillCatalog"]
 
 
-class ScopedSkillCatalog:
-    """One plugin's handle on the skill catalog."""
+class ScopedSkillCatalog(ScopedContribution):
+    """One plugin's handle on the skill catalog.
 
-    __slots__ = ("_catalog", "_ctx")
+    ``_registry`` (the base's field) holds the catalog; the base supplies ``owner``
+    and ``_contribute``.
+    """
 
-    def __init__(self, catalog: Any, ctx: Any) -> None:
-        self._catalog = catalog
-        self._ctx = ctx
-
-    @property
-    def owner(self) -> str:
-        return str(getattr(self._ctx, "name", "") or "")
+    __slots__ = ()
 
     def __getattr__(self, item: str) -> Any:
         """Reads pass through to the catalog.
@@ -39,7 +37,7 @@ class ScopedSkillCatalog:
         service: reading is not a contribution and needs no accounting, while the calls
         this view owns (``add_root``) stay attributed and unwound.
         """
-        return getattr(self._catalog, item)
+        return getattr(self._registry, item)
 
     def add_root(
         self,
@@ -59,12 +57,12 @@ class ScopedSkillCatalog:
         a contributor that has to remember to name itself is a contributor that can
         forget.
         """
-        before = self._catalog.skill_count()
-        undo = self._catalog.add_root(
+        before = self._registry.skill_count()
+        undo = self._registry.add_root(
             Path(root),
             source=source or f"plugin:{self.owner}",
             keep_existing=keep_existing,
             skip_dirs=skip_dirs,
         )
-        self._ctx.on_unwind(undo)
-        return self._catalog.skill_count() - before
+        self._contribute(undo)
+        return self._registry.skill_count() - before

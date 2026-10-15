@@ -80,6 +80,17 @@ class EvolutionPlugin:
     # that owns entries, and ``memory.store`` was an attribute no contract declared.
     inject = ("cfg", "agent", "model", "memory", "ltm_store")
 
+    #: A composition may hand in an engine of its own, which is why the read is
+    #: tolerated rather than required -- but it is still a read, and this plugin is
+    #: the one that provides the name when nobody did.  The two buses are read by
+    #: ``ctx.on``/``SESSION.attach`` below: the composition decides where a domain is
+    #: published (``bus_for``), and the answer is a service this plugin then holds.
+    optional = (
+        "evolution",
+        "event_bus.turn",
+        "event_bus.session",
+    )
+
     def __init__(self) -> None:
         # Heavy resources are populated in setup(), once the composition says
         # whether there is an engine at all.

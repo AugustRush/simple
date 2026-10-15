@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.kernel.service import ScopedContribution
+
 __all__ = ["MCPServerRegistry", "MCPServersPlugin", "ScopedMCPServers"]
 
 
@@ -60,22 +62,14 @@ class MCPServerRegistry:
         return ScopedMCPServers(self, ctx)
 
 
-class ScopedMCPServers:
+class ScopedMCPServers(ScopedContribution):
     """One plugin's handle on the registry."""
 
-    __slots__ = ("_registry", "_ctx")
-
-    def __init__(self, registry: MCPServerRegistry, ctx: Any) -> None:
-        self._registry = registry
-        self._ctx = ctx
-
-    @property
-    def owner(self) -> str:
-        return str(getattr(self._ctx, "name", "") or "")
+    __slots__ = ()
 
     def add(self, config: dict) -> dict:
         """Contribute one server config; it leaves when this plugin unloads."""
-        self._ctx.on_unwind(self._registry.add(config, owner=self.owner))
+        self._contribute(self._registry.add(config, owner=self.owner))
         return config
 
     def __getattr__(self, item: str) -> Any:

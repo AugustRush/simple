@@ -283,10 +283,11 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                     # of ``get`` in that respect, and a second helper for it would
                     # have been a duplicate carrying a wrong explanation.
                     note(writers, _string_key(node), rel)
-                elif attr in ("get", "pop", "require", "lookup", "resolve"):
+                elif attr in ("get", "pop", "require", "lookup", "resolve", "raw"):
                     # ``lookup``/``resolve`` tolerate absence, ``require`` does
-                    # not; all are container-mediated reads, which is the property
-                    # being checked.  Two receivers are excluded because they carry
+                    # not; ``raw`` is ``get`` without the per-plugin view; all are
+                    # container-mediated reads, which is the property being
+                    # checked.  Two receivers are excluded because they carry
                     # some of the same names without being component mappings:
                     # per-turn metadata (:func:`_is_metadata_receiver`) and the
                     # configuration, whose ``memory``/``sandbox`` keys are

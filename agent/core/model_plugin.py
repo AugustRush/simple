@@ -45,6 +45,9 @@ class ModelPlugin:
     #: config the rest of the routing table is read from.
     inject = ("cfg", "client", "api_format")
 
+    #: A hand-built mapping may omit it; absence means "trust the inherited client".
+    optional = ("client_cache_key",)
+
     def setup(self, ctx: Any) -> None:
         from agent import shared
         from agent.core.providers import provider_client_factory

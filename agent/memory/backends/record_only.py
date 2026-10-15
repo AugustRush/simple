@@ -334,6 +334,10 @@ class RecordOnlyContextPlugin:
 
     inject = ("cfg", "ltm_store")
 
+    #: A hand-built composition may not name one; absent means a single shared
+    #: record-only context.
+    optional = ("session_id",)
+
     def setup(self, ctx: Any) -> None:
         store = ctx.get("ltm_store")
         session_id = str(ctx.get("session_id", "") or "")

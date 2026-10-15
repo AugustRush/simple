@@ -52,7 +52,19 @@ class SchedulerPlugin:
     #: inside a run.  ``runtime_factory`` because a run that finds a changed config on
     #: disk builds its own runtime, and the factory's default would reach for the
     #: composition root, which is what this plugin exists to avoid.
-    inject = ("memory", "runtime_factory")
+    inject = ("memory", "runtime_factory", "cfg")
+
+    #: Everything the builder tolerates being absent: a settings override resolved by
+    #: the caller, the output directory, the workspace root, the tool registry, and a
+    #: named bundle's config loader.  Each is a read, so each is declared -- the
+    #: builder falls back to its own default when the composition has none.
+    optional = (
+        "scheduler_settings",
+        "output_dir",
+        "workspace_root",
+        "registry",
+        "scheduler_config_loader",
+    )
 
     def setup(self, ctx: Any) -> None:
         cfg = ctx.get("cfg", None) or {}

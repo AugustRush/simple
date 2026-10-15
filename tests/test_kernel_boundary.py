@@ -79,6 +79,11 @@ def _stdlib_names(tree: ast.AST) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
+            if node.level:
+                # Relative: the names came from inside this package.  Classifying
+                # them as external is how the identifier rule went blind to the
+                # same relative import the module rule used to miss.
+                continue
             if (node.module or "").split(".")[0] == "agent":
                 continue
             names.update(alias.asname or alias.name for alias in node.names)
@@ -131,6 +136,40 @@ def _kernel_modules() -> list[pathlib.Path]:
     return modules
 
 
+def _import_offenders(tree: ast.AST, filename: str = "module.py") -> list[str]:
+    """Every import in *tree* that reaches outside ``agent.kernel``.
+
+    One function, used by both the rule and its control.  When the control restated
+    the rule it could not catch the rule's own blind spot -- which is exactly what
+    happened: ``from ..core.agent import X`` parses as ``module="core.agent",
+    level=2``, so a rule that only looked for a leading ``agent`` passed it, and a
+    control written the same way passed it too.
+    """
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        modules: list[str] = []
+        if isinstance(node, ast.ImportFrom):
+            # A relative import resolves against the *kernel package*, so the module
+            # name alone cannot be judged.  The level decides: one dot stays inside
+            # ``agent.kernel``; two or more leave it.
+            if node.level and node.level > 1:
+                offenders.append(
+                    f"{filename}:{node.lineno} relative import escapes the kernel "
+                    f"(level={node.level}, module={node.module!r})"
+                )
+                continue
+            if node.level == 1:
+                continue
+            if node.module:
+                modules.append(node.module)
+        elif isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        for module in modules:
+            if module.split(".")[0] == "agent" and not module.startswith("agent.kernel"):
+                offenders.append(f"{filename}:{node.lineno} imports {module}")
+    return offenders
+
+
 def test_the_kernel_imports_nothing_from_the_rest_of_the_project() -> None:
     """The exact rule.  ``agent.kernel`` may use itself, the stdlib and ``typing``.
 
@@ -138,17 +177,13 @@ def test_the_kernel_imports_nothing_from_the_rest_of_the_project() -> None:
     ``agent.core.agent`` or ``agent.tools.runtime`` would be the kernel reaching for a
     participant, whichever words it happened to use.
     """
-    offenders = []
+    offenders: list[str] = []
     for path in _kernel_modules():
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            modules: list[str] = []
-            if isinstance(node, ast.ImportFrom) and node.module:
-                modules.append(node.module)
-            elif isinstance(node, ast.Import):
-                modules.extend(alias.name for alias in node.names)
-            for module in modules:
-                if module.split(".")[0] == "agent" and not module.startswith("agent.kernel"):
-                    offenders.append(f"{path.name}:{node.lineno} imports {module}")
+        offenders.extend(
+            _import_offenders(
+                ast.parse(path.read_text(encoding="utf-8")), path.name
+            )
+        )
     assert not offenders, (
         "the kernel must not import the rest of the project:\n  " + "\n  ".join(offenders)
     )
@@ -193,20 +228,21 @@ def test_the_vocabulary_rule_is_not_vacuous() -> None:
 
 
 def test_the_import_rule_is_not_vacuous() -> None:
-    """Control: an import of a domain module is caught, and a kernel one is not."""
-    def offenders(source: str) -> list[str]:
-        out = []
-        for node in ast.walk(ast.parse(source)):
-            modules = []
-            if isinstance(node, ast.ImportFrom) and node.module:
-                modules.append(node.module)
-            elif isinstance(node, ast.Import):
-                modules.extend(alias.name for alias in node.names)
-            for module in modules:
-                if module.split(".")[0] == "agent" and not module.startswith("agent.kernel"):
-                    out.append(module)
-        return out
+    """Control: the rule is exercised through the function the rule itself uses.
 
-    assert offenders("from agent.core.agent import BaseAgent") == ["agent.core.agent"]
+    Including the relative form, which is the case the first version missed: a
+    ``from ..core.agent import X`` inside ``agent/kernel/`` reaches a participant
+    while its parsed module name starts with "core", not "agent".
+    """
+    def offenders(source: str) -> list[str]:
+        return _import_offenders(ast.parse(source))
+
+    assert any("agent.core.agent" in o for o in offenders("from agent.core.agent import BaseAgent"))
     assert offenders("from agent.kernel.service import ServiceRegistry") == []
-    assert offenders("import agent.tools.runtime") == ["agent.tools.runtime"]
+    assert any("agent.tools.runtime" in o for o in offenders("import agent.tools.runtime"))
+    # Inside the package: one dot is fine.
+    assert offenders("from .service import ServiceRegistry") == []
+    assert offenders("from . import service") == []
+    # Out of it: two dots reach ``agent``, and then a participant.
+    escaped = offenders("from ..core.agent import BaseAgent")
+    assert escaped and "escapes the kernel" in escaped[0], escaped

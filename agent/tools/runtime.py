@@ -478,7 +478,14 @@ class ToolRegistry:
         authorizer: Optional[
             Callable[[dict, "ToolRegistry"], Optional[dict]]
         ] = None,
-    ):
+    ) -> "ToolDef":
+        """Register *name*, returning the definition that was installed.
+
+        The return value is the contribution's **identity**: a caller that wants its
+        registration undone only while it is still the one installed compares this
+        object.  A name-keyed undo cannot do that -- it lets the first contributor's
+        unload remove the second contributor's tool.
+        """
         if name in self._tools:
             existing = self._tools[name]
             if not replace:
@@ -491,7 +498,7 @@ class ToolRegistry:
                     f"Tool '{name}' is already registered by source '{existing.source}'. "
                     f"Only the same source may replace it; got '{source}'."
                 )
-        self._tools[name] = ToolDef(
+        definition = ToolDef(
             name=name,
             description=description,
             parameters=parameters,
@@ -500,7 +507,9 @@ class ToolRegistry:
             capabilities=self._coerce_capabilities(name, source, capabilities),
             authorizer=authorizer,
         )
+        self._tools[name] = definition
         self._prompt_generation += 1
+        return definition
 
     @classmethod
     def _coerce_capabilities(
@@ -705,11 +714,31 @@ class ToolRegistry:
         )
 
     def unregister_by_source_prefix(self, prefix: str) -> None:
+        """Remove every tool whose ``source`` *starts with* *prefix*.
+
+        A prefix, not an owner: ``plugin:foo`` also matches ``plugin:foobar``.  Kept
+        for the composition's own groupings (``user_tool:``, ``mcp:<server>``), where
+        the caller owns the whole namespace.  A **plugin's** contribution must not use
+        it -- see :meth:`unregister_contribution`, which is what the scoped view
+        records, because two plugin names may share a prefix.
+        """
         for name in [
             n for n, tool in self._tools.items() if tool.source.startswith(prefix)
         ]:
             self._tools.pop(name, None)
         self._prompt_generation += 1
+
+    def unregister_contribution(self, name: str, contributed: "ToolDef") -> None:
+        """Remove *name* only while it is still *contributed*.
+
+        The undo a scoped view records.  Identity rather than name or source, so a
+        plugin that unloads cannot take down a tool another plugin has since
+        installed under the same name -- and so ``plugin:foo`` cannot take
+        ``plugin:foobar``'s tools with it.
+        """
+        if self._tools.get(name) is contributed:
+            self._tools.pop(name, None)
+            self._prompt_generation += 1
 
 
 

@@ -6,6 +6,12 @@ A plugin is three things
     Identity.  Used for lookup, for the dependency graph, and for reporting.
 ``inject``
     A tuple of service names this plugin needs before it can activate.
+``optional``
+    A tuple of service names this plugin may *read* without gating activation on
+    them.  Together with ``inject`` it is the complete set of names the plugin is
+    allowed to touch: :meth:`~agent.kernel.context.Context.get` refuses anything
+    else, because an undeclared read is invisible to the unload/replace cascade
+    that ``inject`` drives.
 ``setup(ctx)``
     Where it registers.  Optionally ``teardown()`` for what a scope cannot own
     (a subprocess handle, a lock).
@@ -86,6 +92,13 @@ class Install:
     plugin: Any
     scope: ServiceScope
     inject: tuple[str, ...] = ()
+    #: Services this plugin may read but does **not** gate activation on.  The
+    #: declaration half that makes "which names may this plugin touch" complete:
+    #: ``inject`` alone cannot express an optional collaborator, so before this
+    #: existed a plugin that tolerated an absent service had to resolve it without
+    #: declaring it -- invisible to ``_dependents_of``, which is how a replaced
+    #: service left its reader holding the old object.
+    optional: tuple[str, ...] = ()
     #: Why this install is pending, recorded when it became pending.  See waiting_for.
     missing: tuple[str, ...] = ()
     pending: bool = False
@@ -126,6 +139,15 @@ class PluginHost:
         #: wrong bus is never called.  **Answered rather than refused** -- see
         #: ``Context.on`` and ``agent.core.event_domains.bus_for_type``.
         self.event_bus_lookup: Optional[Callable[[type, Any], Any]] = None
+        #: ``(name, action) -> bool``, or ``None`` when no vocabulary is wired.
+        #: Asked by :class:`~agent.kernel.context.Context` before a plugin reads or
+        #: provides a name.  Supplied by the composition for the same reason the bus
+        #: lookup is: the kernel cannot know that ``mcp_task`` is an internal handle
+        #: and ``registry`` is a service, and a vocabulary compiled into the kernel
+        #: would be the domain coupling this layer exists to prevent.  ``None`` means
+        #: "no vocabulary", which is the behaviour an embedder that provides nothing
+        #: already had -- and what keeps the kernel's own tests using invented names.
+        self.service_policy: Optional[Callable[[str, str], bool]] = None
         self._installs: dict[str, Install] = {}
         #: Plugins waiting for a dependency, keyed by name.
         self._pending: dict[str, Install] = {}
@@ -275,6 +297,7 @@ class PluginHost:
             plugin=plugin,
             scope=scope,
             inject=tuple(str(d) for d in (getattr(plugin, "inject", ()) or ())),
+            optional=tuple(str(d) for d in (getattr(plugin, "optional", ()) or ())),
             parent=parent,
         )
         if parent is not None:
@@ -587,14 +610,22 @@ class PluginHost:
         return set(install.provided_names) if install is not None else set()
 
     def _dependents_of(self, name: str) -> list[str]:
-        """Active plugins whose ``inject`` names something this one provides."""
+        """Active plugins that declared a dependency on something this one provides.
+
+        ``inject`` **and** ``optional``, because both are reads: a plugin that
+        tolerated a service being absent still captured the object when it was
+        present, so replacing the provider leaves it holding a stale one.  Reading
+        without declaring is refused by the context, so this set is complete.
+        """
         offered = self._provides(name)
         if not offered:
             return []
-        return sorted(
-            other
-            for other, install in self._installs.items()
-            if other != name
-            and not install.unloaded
-            and offered.intersection(install.inject)
-        )
+        declared: list[str] = []
+        for other, install in self._installs.items():
+            if other == name or install.unloaded:
+                continue
+            if offered.intersection(install.inject) or offered.intersection(
+                install.optional
+            ):
+                declared.append(other)
+        return sorted(declared)

@@ -265,7 +265,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/tools/plugin.py",  # the memory tools
         ),
         summary="The long-term store behind the context manager.",
-        contract="agent/memory/contracts.py:MemoryStore",
+        contract="agent/memory/contracts.py:MemoryService",
     ),
     CoreService(
         name="contributed_mcp_servers",

@@ -734,8 +734,17 @@ def test_a_service_without_scoped_keeps_its_identity() -> None:
     """A plain service is handed over as-is, so ``is`` and ``isinstance`` work."""
     host = PluginHost()
     host.services.provide("plain", registry := {"a": 1})
-    install = host.load(Leaf())
-    assert install.ctx.get("plain") is registry
+
+    class Reader:
+        name = "reader"
+        inject = ("plain",)
+
+        def setup(self, ctx):
+            self.seen = ctx.get("plain")
+
+    plugin = Reader()
+    host.load(plugin)
+    assert plugin.seen is registry
 
 
 def test_the_scoped_view_is_rebuilt_when_the_service_is_replaced() -> None:
@@ -988,6 +997,9 @@ def _host_with_domains():
 
 class _Subscriber:
     name = "subscriber"
+    #: A typed subscription resolves the domain's bus through the context, so the bus
+    #: is a read and has to be declared like any other.
+    optional = ("event_bus.turn",)
 
     def __init__(self) -> None:
         self.seen: list = []
@@ -1592,3 +1604,158 @@ def test_flush_pending_is_empty_when_nothing_can_activate() -> None:
     host.load(_WaitsForX())
     assert host.flush_pending() == ()
     assert host.pending() == ("waits_for_x",)
+
+
+# ── The declaration is enforced, not advisory ────────────────────────────────
+#
+# ``inject`` is what the unload/replace cascade walks to find the plugins holding
+# a service whose owner is going away.  A read outside the declaration is
+# therefore a dependency the kernel cannot see -- and the failure it produces is
+# silent and delayed, which is why the context refuses it rather than trusting
+# the plugin author to have been complete.
+
+
+class _Reader:
+    """Reads *name* at setup and remembers it, for the declaration tests."""
+
+    def __init__(self, name: str, *, optional: tuple[str, ...] = ()) -> None:
+        self.name = "reader"
+        self.inject = ()
+        self.optional = optional
+        self._read = name
+        self.seen = "not read"
+
+    def setup(self, ctx):
+        self.seen = ctx.get(self._read, None)
+
+
+def test_an_undeclared_read_is_refused() -> None:
+    host = PluginHost()
+    host.services.provide("loose", 1)
+    plugin = _Reader("loose")
+
+    host.load(plugin)
+
+    assert host.loaded() == (), "a refused setup registers nothing"
+    failure = host.failed()["reader"]
+    assert "without declaring it" in failure
+    assert "'loose'" in failure, "the message names the name that was not declared"
+    assert "inject" in failure and "optional" in failure, "and the fix"
+
+
+def test_an_optional_read_is_allowed_without_gating_activation() -> None:
+    """``optional`` is the escape for a collaborator that may legitimately be absent."""
+    host = PluginHost()
+    host.services.provide("loose", 1)
+    plugin = _Reader("loose", optional=("loose",))
+
+    host.load(plugin)
+
+    assert host.loaded() == ("reader",)
+    assert plugin.seen == 1
+
+
+def test_optional_does_not_hold_a_plugin_pending() -> None:
+    host = PluginHost()
+    plugin = _Reader("never.provided", optional=("never.provided",))
+
+    host.load(plugin)
+
+    assert host.loaded() == ("reader",)
+    assert plugin.seen is None
+
+
+def test_a_provided_name_may_be_read_back() -> None:
+    """Offering a service and reading it is one act, so the read is declared by it."""
+    host = PluginHost()
+
+    class OffersAndReads:
+        name = "offers"
+        inject: tuple[str, ...] = ()
+
+        def setup(self, ctx):
+            ctx.provide("mine", 7)
+            self.seen = ctx.get("mine")
+
+    plugin = OffersAndReads()
+    host.load(plugin)
+
+    assert host.loaded() == ("offers",)
+    assert plugin.seen == 7
+
+
+def test_optional_dependency_is_taken_down_by_its_provider() -> None:
+    """A tolerated read still holds the object, so the cascade has to include it."""
+    host = PluginHost()
+
+    class Provides:
+        name = "provides"
+        inject: tuple[str, ...] = ()
+
+        def setup(self, ctx):
+            ctx.provide("thing", object())
+
+    host.load(Provides())
+    host.load(_Reader("thing", optional=("thing",)))
+    assert set(host.loaded()) == {"provides", "reader"}
+
+    host.unload("provides")
+    assert host.loaded() == (), "the optional reader went with the provider it holds"
+
+
+def test_the_services_view_does_not_write() -> None:
+    """The raw registry used to be handed over; a write through it had no undo."""
+    host = PluginHost()
+
+    class Writer:
+        name = "writer"
+        inject = ("thing",)
+
+        def setup(self, ctx):
+            self.view = ctx.services
+            self.has_provide = hasattr(ctx.services, "provide")
+
+    plugin = Writer()
+    host.services.provide("thing", 1)
+    host.load(plugin)
+
+    assert plugin.has_provide is False
+    assert plugin.view["thing"] == 1
+
+
+def test_the_services_view_enforces_the_declaration_too() -> None:
+    """Otherwise ``ctx.services`` would be the undeclared-read hole, one line wide."""
+    host = PluginHost()
+
+    class Sneak:
+        name = "sneak"
+        inject = ("declared",)
+
+        def setup(self, ctx):
+            self.seen = ctx.services["loose"]
+
+    host.services.provide("declared", 1)
+    host.services.provide("loose", 1)
+    host.load(Sneak())
+
+    assert host.loaded() == ()
+    assert "without declaring it" in host.failed()["sneak"]
+
+
+def test_raw_returns_the_service_not_its_view() -> None:
+    """A plugin that configures a service wants the object, not the contribution view."""
+    host, registry = _host_with_registry()
+
+    class Configurer:
+        name = "configurer"
+        inject = ("things",)
+
+        def setup(self, ctx):
+            self.raw = ctx.raw("things")
+            self.scoped = ctx.get("things")
+
+    plugin = Configurer()
+    host.load(plugin)
+
+    assert plugin.raw is registry
+    assert plugin.scoped is not registry, "the contribution view is not the service"

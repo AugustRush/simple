@@ -56,7 +56,10 @@ def test_two_compositions_do_not_share_a_tool_bus() -> None:
             seen.append(event)
 
         class _Subscriber:
-            pass
+            # ``_domain("tool").attach`` resolves the composition's tool bus through
+            # ``ctx.get("event_bus.tool", None)``; absence is legal (the process bus
+            # is the fallback), so the read is declared ``optional``.
+            optional = ("event_bus.tool",)
 
         _Subscriber.name = name
 
@@ -262,6 +265,9 @@ def test_session_finished_reaches_a_plugin_subscribed_through_the_domain(tmp_pat
 
     class _Scorer:
         name = "scorer"
+        # ``SESSION.attach`` routes to ``ctx.get("event_bus.session", None)``: a read
+        # of the session bus, which a composition may legitimately not provide.
+        optional = ("event_bus.session",)
 
         def __init__(self) -> None:
             self.seen: list = []

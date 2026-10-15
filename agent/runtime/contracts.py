@@ -391,6 +391,12 @@ class TurnRunner:
     #: minimal composition impossible to express.
     inject = ("agent", "system_prompt")
 
+    #: The optional collaborators, named.  They may legitimately be absent in a
+    #: minimal composition, so they must not gate activation -- but the loop does
+    #: resolve them through ``ctx.services``, and a name it reads without declaring
+    #: would be a dependency the replace/unload cascade cannot see.
+    optional = ("plugin_catalog", "post_turn_maintenance")
+
     def __init__(self) -> None:
         self._ctx: Any = None
         self._services: Any = None
@@ -422,13 +428,19 @@ class TurnRunner:
         self._services = None
 
     @property
-    def _components(self) -> RuntimeComponents:
+    def _components(self) -> Any:
         """The composition, as a container.
 
         Kept as a property because every read below is a *service* read: the loop
         resolves collaborators by name, and a plugin that held the raw mapping would
         be a second way to reach services -- the coupling ``inject`` exists to make
         visible.
+
+        Mounted, ``ctx.services`` is the kernel's **declaration-enforced, read-only**
+        view: every name read below has to be declared in ``inject`` or ``optional``,
+        so the loop's dependency set and the cascade that replaces a service agree.
+        Bound by hand (``bind``), there is no plugin and therefore nothing to
+        declare, and the container is the runtime's own.
         """
         if self._ctx is not None:
             return self._ctx.services

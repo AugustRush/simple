@@ -29,6 +29,10 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: "The contract declares no default for this name", distinguished from a default of
+#: ``None`` -- which some contracts use deliberately as a sentinel.
+_UNSET = object()
+
 #: Attribute peeks that remain, each a decision rather than a blanket exclusion.
 #:
 #: The rule the guard enforces is "an out-of-package reader must not depend on a
@@ -164,7 +168,14 @@ def _assert_conforms(protocol: Any, implementation: Any, label: str) -> None:
         if not hasattr(cls, name):
             continue
         value = getattr(cls, name)
-        assert value is not None, f"{label}.{name} is None"
+        # ``None`` is only a failure when the *contract* does not also declare it.
+        # The rule used to be unconditional, which is wrong for a documented sentinel:
+        # ``ModelTransport.thinking_effort = None`` means "the config never said, keep
+        # the provider's default", and an implementation inheriting exactly that is
+        # conforming, not unset.
+        contract_default = getattr(protocol, name, _UNSET)
+        if contract_default is _UNSET or contract_default is not None:
+            assert value is not None, f"{label}.{name} is None"
         if declared is int or declared == "int":
             assert isinstance(value, int), f"{label}.{name} should be an int"
         if "Path" in str(declared):

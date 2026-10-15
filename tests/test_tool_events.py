@@ -346,6 +346,10 @@ def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
             def register():
                 class Gate:
                     name = "gate"
+                    # ``TOOL.attach(ctx, ...)`` resolves the composition's tool bus
+                    # through ``ctx.get("event_bus.tool", None)`` -- absence is legal
+                    # (the process bus is the fallback), so it is ``optional``.
+                    optional = ("event_bus.tool",)
 
                     def setup(self, ctx):
                         TOOL.attach(ctx, self.gate)
@@ -437,6 +441,9 @@ def test_closing_a_catalog_releases_the_plugins_it_loaded(tmp_path) -> None:
             def register():
                 class P:
                     name = "sub"
+                    # ``TOOL.attach`` reads ``ctx.get("event_bus.tool", None)``; the
+                    # composition may not provide one, so declare it ``optional``.
+                    optional = ("event_bus.tool",)
 
                     def setup(self, ctx):
                         TOOL.attach(ctx, lambda event: "blocked by the plugin")

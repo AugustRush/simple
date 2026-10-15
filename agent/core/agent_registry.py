@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.kernel.service import ScopedContribution
+
 __all__ = ["AgentRegistry", "ScopedAgentDefs"]
 
 
@@ -49,11 +51,18 @@ class AgentRegistry:
     # -- writing -------------------------------------------------------------
 
     def add(self, key: str, definition: dict) -> "Any":
-        """Register *key*, returning the undo that removes it."""
-        self._defs[key] = dict(definition)
+        """Register *key*, returning the undo that removes it.
+
+        By identity, like the command registry: a name-keyed undo lets the first
+        contributor's unload remove the record a later one installed under the same
+        key, and a contributor re-adding a key leaves its older undo stale.
+        """
+        record = dict(definition)
+        self._defs[key] = record
 
         def forget() -> None:
-            self._defs.pop(key, None)
+            if self._defs.get(key) is record:
+                self._defs.pop(key, None)
 
         return forget
 
@@ -90,18 +99,10 @@ class AgentRegistry:
         return ScopedAgentDefs(self, ctx)
 
 
-class ScopedAgentDefs:
+class ScopedAgentDefs(ScopedContribution):
     """One plugin's handle on the role registry."""
 
-    __slots__ = ("_registry", "_ctx")
-
-    def __init__(self, registry: AgentRegistry, ctx: Any) -> None:
-        self._registry = registry
-        self._ctx = ctx
-
-    @property
-    def owner(self) -> str:
-        return str(getattr(self._ctx, "name", "") or "")
+    __slots__ = ()
 
     def add(self, name: str, definition: dict) -> str:
         """Contribute one role, removed when this plugin unloads.
@@ -111,6 +112,5 @@ class ScopedAgentDefs:
         a fact you had when you wrote it is how the two come to disagree.
         """
         key = role_key(self.owner, name)
-        undo = self._registry.add(key, {**definition, "plugin": self.owner})
-        self._ctx.on_unwind(undo)
+        self._contribute(self._registry.add(key, {**definition, "plugin": self.owner}))
         return key

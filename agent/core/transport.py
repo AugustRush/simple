@@ -319,18 +319,18 @@ class ModelTransport(abc.ABC):
         return False
 
     @staticmethod
-    def observed_input_tokens(response: Any) -> Optional[int]:
-        """The provider's exact input-token count for the call, if reported.
-
-        This is the only ground truth available for what a payload actually
-        cost.  Both supported providers report it on every response, under
-        different names, so the base implementation reads either.
-        """
-        value = extract_provider_usage(response).input_tokens
-        return value or None
-
-    @staticmethod
     def observed_usage(response: Any) -> ProviderUsage:
+        """What the provider reported for this call, in this project's vocabulary.
+
+        The only ground truth available for what a payload actually cost.  Both
+        supported providers report it on every response, under different names, and
+        :func:`extract_provider_usage` reads either.
+
+        This replaces a separate ``observed_input_tokens`` helper that read the same
+        field through the same function.  It was called by nothing in ``agent/`` --
+        only by its own test -- which is the shape the contract guard exists to
+        notice: two members where one is the answer and one was a guess.
+        """
         return extract_provider_usage(response)
 
     # ── Message-history shaping ────────────────────────────────────────
@@ -1271,10 +1271,10 @@ class RoutingTransport(ModelTransport):
     ) -> int:
         return self._for(model).tool_result_rollback_count(tool_calls, results)
 
-    def image_content_block(self, mime_type: str, data: str) -> dict:
+    def image_content_block(self, mime_type: str, base64_data: str) -> dict:
         # Attachment blocks are built from agent-local state before a
         # transport is chosen; use the default provider's shape.
-        return self.default.image_content_block(mime_type, data)
+        return self.default.image_content_block(mime_type, base64_data)
 
 
 def provider_model_ids(provider_cfg: dict) -> list[str]:

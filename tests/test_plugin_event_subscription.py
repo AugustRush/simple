@@ -47,6 +47,11 @@ SUBSCRIBER = '''
     def register():
         class Watcher:
             name = "watcher"
+            # ``TURN.attach`` / ``LLM.attach`` resolve each domain's bus through
+            # ``ctx.get("event_bus.<domain>", None)``, and a composition need not
+            # provide one -- the domain table falls back to the process bus -- so
+            # both reads are declared ``optional`` rather than gating activation.
+            optional = ("event_bus.turn", "event_bus.llm")
 
             def __init__(self):
                 self.turns = []
@@ -139,6 +144,10 @@ ONE_TYPE = '''
     def register():
         class OneType:
             name = "one-type"
+            # ``ctx.on(TurnCompleted, ...)`` routes through ``bus_for_type`` ->
+            # ``ctx.get("event_bus.turn", None)``: a read of the turn bus, which a
+            # composition may legitimately not provide, hence ``optional``.
+            optional = ("event_bus.turn",)
 
             def __init__(self):
                 self.seen = []

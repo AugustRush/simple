@@ -9,12 +9,14 @@ out".
 
 Why the view is bound to a context
 ----------------------------------
-``ToolRegistry.register`` takes a ``source`` string, and removal is
-``unregister_by_source_prefix(source)``.  That works, and it requires every caller to
-invent a source name and remember to unregister -- which is the bookkeeping a scope
-exists to remove.  Reached through ``ctx.tools``, the source is the plugin's name,
-derived rather than invented, and the removal is registered on the plugin's own
-lifetime at the moment of registration.
+``ToolRegistry.register`` takes a ``source`` string and returns the definition it
+installed, and removal is ``unregister_contribution(name, definition)`` -- identity,
+so the undo cannot reach a tool somebody else has since put under the same name.
+That works, and it requires every caller to keep the definition and remember to
+unregister -- which is the bookkeeping a scope exists to remove.  Reached through
+``ctx.tools``, the source is the plugin's name, derived rather than invented, and
+the removal is registered on the plugin's own lifetime at the moment of
+registration.
 
 So the two halves cannot drift: there is no path that adds a tool without also
 recording how to take it away, because both happen in one function.
@@ -32,27 +34,31 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from agent.kernel.service import ScopedContribution
+
 __all__ = ["ScopedTools"]
 
 
-class ScopedTools:
+class ScopedTools(ScopedContribution):
     """One plugin's handle on the tool registry.
 
     Built by :meth:`agent.tools.runtime.ToolRegistry.scoped`, which the kernel calls
     when a plugin reaches ``ctx.tools``.  Not constructed directly.
     """
 
-    __slots__ = ("_registry", "_ctx")
-
-    def __init__(self, registry: Any, ctx: Any) -> None:
-        self._registry = registry
-        self._ctx = ctx
+    __slots__ = ()
 
     # -- identity ------------------------------------------------------------
 
     @property
     def owner(self) -> str:
-        """The plugin these tools belong to; also the registry's ``source``."""
+        """The plugin these tools belong to; also the registry's ``source``.
+
+        Overridden because a tool's ``source`` is part of the tool *schema* the model
+        sees and the ``/tools`` listing shows: the namespaced ``plugin:<name>`` is what
+        keeps two plugins' tools distinguishable, where the plain plugin name is what
+        the other five registries record.
+        """
         return f"plugin:{self._ctx.name}"
 
     @property
@@ -162,7 +168,7 @@ class ScopedTools:
         # time discovered by a plugin failing to load rather than by a test.  The guard in
         # `tests/test_tool_capabilities.py` compares the two signatures so the third one is
         # a test failure instead.
-        self._registry.register(
+        contributed = self._registry.register(
             name,
             description or "",
             parameters or {"type": "object", "properties": {}},
@@ -172,11 +178,15 @@ class ScopedTools:
             replace=replace,
             authorizer=authorizer,
         )
-        # By source prefix rather than by name: one plugin may contribute several tools,
-        # and the prefix is what identifies them as a group.  An explicit `source` is that
-        # prefix too, so a caller that tagged its own tools gets them removed together.
+        # By **identity of the contribution**, not by name and not by source prefix.
+        #
+        # By name would let a plugin's unload remove a tool another plugin has since
+        # installed under the same name.  By prefix (`plugin:<name>`) would take a
+        # *different* plugin's tools with it, because `plugin:foo` is a prefix of
+        # `plugin:foobar` -- measured, and the reason `unregister_by_source_prefix`
+        # stays a composition-level grouping rather than a plugin's undo.
         self._ctx.on_unwind(
-            lambda: self._registry.unregister_by_source_prefix(source or self.owner)
+            lambda: self._registry.unregister_contribution(name, contributed)
         )
         return name
 

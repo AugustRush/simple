@@ -114,13 +114,23 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "AgentService",
         "agent",
     ),
+    (
+        "agent.core.transport",
+        "RoutingTransport",
+        "agent.core.transport",
+        "ModelTransport",
+        "llm",
+    ),
 )
 
 #: Contracts checked by another file, so the map below can still insist that every
-#: declared contract is checked *somewhere*.
+#: declared contract is checked *somewhere*.  The target is verified, not trusted:
+#: ``test_every_declared_contract_is_checked_somewhere`` asserts the named file
+#: actually mentions the symbol.  It did not, once -- ``agent/core/transport.py``
+#: was waived to a file with zero mentions of ``ModelTransport``, so the ``llm``
+#: contract was checked nowhere while the ledger said otherwise.
 CHECKED_ELSEWHERE: dict[str, str] = {
     "agent/memory/contracts.py": "tests/test_memory_contract.py",
-    "agent/core/transport.py": "tests/test_model_plugin.py",
 }
 
 
@@ -211,6 +221,11 @@ def test_every_declared_contract_is_checked_somewhere() -> None:
 
     A pointer at a protocol nobody checks is a claim, not a contract -- and adding a
     contract without a check is exactly the drift this file exists to notice.
+
+    A waiver in :data:`CHECKED_ELSEWHERE` is verified too: the named file has to
+    *mention* the symbol.  Without that, the map's escape hatch is where a contract
+    silently stops being checked -- measured once, when ``llm`` was waived to a file
+    containing no mention of ``ModelTransport`` at all.
     """
     from agent.runtime.core_services import CORE_SERVICES
 
@@ -223,8 +238,148 @@ def test_every_declared_contract_is_checked_somewhere() -> None:
             f"{entry.name} points at a missing file: {relative}"
         )
         if relative in CHECKED_ELSEWHERE:
+            checker = CHECKED_ELSEWHERE[relative]
+            checked_in = (REPO_ROOT / checker).read_text(encoding="utf-8")
+            assert symbol in checked_in, (
+                f"{entry.name} waives its contract to {checker}, which never mentions "
+                f"{symbol} -- the waiver points at a check that does not exist"
+            )
             continue
         assert (entry.name, symbol) in rows, (
             f"{entry.name} declares {symbol}; add a row here (or to "
             "CHECKED_ELSEWHERE) so it is actually checked"
         )
+
+
+def test_no_waiver_outlives_the_row_it_replaces() -> None:
+    """Control: a contract checked here must not *also* be waived elsewhere.
+
+    The two mechanisms are alternatives, and a stale waiver is worse than a stale
+    comment: it silently re-opens the gap the row just closed.
+    """
+    row_paths = {row[2].replace(".", "/") + ".py" for row in SERVICE_CONTRACTS}
+    stale = sorted(row_paths & set(CHECKED_ELSEWHERE))
+    assert not stale, (
+        f"these contracts have a row here *and* are waived to another test file: {stale}"
+    )
+
+
+# ── The contribution-view shape, checked as one thing ────────────────────────
+#
+# Six capability services hand a plugin a per-plugin view of themselves.  The shape
+# was written by hand each time -- the same two fields, the same `owner`, the same
+# "record the undo on the plugin's scope" step -- and two of the six got the undo
+# subtly wrong (a name- or prefix-keyed removal, which let one plugin's unload take
+# another plugin's contribution).  The shared base is what makes that step exist
+# once; these tests are what keep a seventh hand-written copy from appearing.
+
+#: ``(registry module, registry class, view module, view class)`` for every
+#: capability service that offers a contribution view.
+SCOPED_VIEWS: tuple[tuple[str, str, str, str], ...] = (
+    ("agent.tools.runtime", "ToolRegistry", "agent.tools.scoped", "ScopedTools"),
+    (
+        "agent.skills.catalog",
+        "SkillCatalog",
+        "agent.skills.scoped",
+        "ScopedSkillCatalog",
+    ),
+    (
+        "agent.channels.registry",
+        "ChannelRegistry",
+        "agent.channels.registry",
+        "ScopedChannels",
+    ),
+    (
+        "agent.tools.mcp_servers",
+        "MCPServerRegistry",
+        "agent.tools.mcp_servers",
+        "ScopedMCPServers",
+    ),
+    (
+        "agent.commands.registry",
+        "CommandRegistry",
+        "agent.commands.registry",
+        "ScopedCommands",
+    ),
+    (
+        "agent.core.agent_registry",
+        "AgentRegistry",
+        "agent.core.agent_registry",
+        "ScopedAgentDefs",
+    ),
+)
+
+
+@pytest.mark.parametrize("row", SCOPED_VIEWS, ids=lambda row: row[1])
+def test_a_capability_service_satisfies_the_scoped_protocol(row) -> None:
+    """``scoped(ctx)`` is declared, not overheard through ``getattr``.
+
+    The kernel resolves it by duck-typing (it must: the service is the composition's,
+    not the kernel's), so the only place the convention can be *checked* is here.
+    """
+    from agent.kernel.service import ScopedService
+
+    registry_module, registry_name, view_module, view_name = row
+    registry = _implementation(registry_module, registry_name)
+    view = _implementation(view_module, view_name)
+
+    assert hasattr(registry, "scoped"), f"{registry_name} has no scoped()"
+    assert isinstance(registry(), ScopedService) or callable(
+        getattr(registry, "scoped", None)
+    )
+
+    class _Ctx:
+        name = "probe"
+
+        def on_unwind(self, handler):  # pragma: no cover - not exercised here
+            self.handler = handler
+
+    built = registry().scoped(_Ctx())
+    assert isinstance(built, view), (
+        f"{registry_name}.scoped() returned {type(built).__name__}, not {view_name}"
+    )
+
+
+@pytest.mark.parametrize("row", SCOPED_VIEWS, ids=lambda row: row[3])
+def test_a_contribution_view_uses_the_shared_base(row) -> None:
+    """The undo step exists once, so attribution cannot be re-implemented wrongly."""
+    from agent.kernel.service import ScopedContribution
+
+    view = _implementation(row[2], row[3])
+    assert issubclass(view, ScopedContribution), (
+        f"{row[3]} hand-writes the view shape instead of using ScopedContribution"
+    )
+
+
+def test_no_scoped_view_escapes_the_scan() -> None:
+    """Derived, not listed: a new ``Scoped*`` class must use the base.
+
+    The tuple above is a list somebody maintains; this is the check that the list is
+    complete.  A seventh capability service that writes its own view class fails here
+    the moment it is named the way the other six are -- and if it is *not* named that
+    way, the parametrized rows above still cover the ones that are declared.
+    """
+    import ast
+
+    from agent.kernel.service import ScopedContribution
+
+    offenders: list[str] = []
+    for path in sorted((REPO_ROOT / "agent").rglob("*.py")):
+        if "__pycache__" in str(path):
+            continue
+        # The kernel defines the base and the protocol; neither is a *view*, and
+        # requiring the base to subclass itself is not a rule anybody wants.
+        if path.name == "service.py" and path.parent.name == "kernel":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not node.name.startswith("Scoped"):
+                continue
+            bases = {ast.unparse(base) for base in node.bases}
+            if "ScopedContribution" not in bases:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.name} -> {bases}")
+    assert not offenders, (
+        "these scoped views do not use the shared base, so each one re-implements "
+        "attribution and its undo:\n  " + "\n  ".join(offenders)
+    )
+    assert ScopedContribution is not None

@@ -302,8 +302,15 @@ class SkillCatalog:
         self._rebuild_contributed()
 
         def undo() -> None:
-            if record in self._roots:
-                self._roots.remove(record)
+            # By **identity**, not equality.  Two contributors may attach records that
+            # compare equal -- same root, same source, same flags -- and ``remove()``
+            # takes the first equal one, so the second contributor's undo would detach
+            # the first contributor's root.  Identity answers the only question the undo
+            # can answer exactly: which record did *this* contribution attach?
+            for index, item in enumerate(self._roots):
+                if item is record:
+                    del self._roots[index]
+                    break
             self._rebuild_contributed()
 
         return undo
