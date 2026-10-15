@@ -22,7 +22,7 @@ recording" below.
 
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
-| `agent/scheduler/store.py` | 4086 | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
+| `agent/scheduler/store.py` | 3828 (was 4086) | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
 | `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
 | `agent/memory/context.py` | 1972 (was 2484) | `ContextManager` | 66 | 1624 | **8 / 106 lines** |
@@ -189,24 +189,23 @@ The four schema steps (`_ensure_transcript_indexes` 15, `_add_missing_columns` 2
 
 ### Shape
 
-`SchedulerStore` is 3514 of them: 86 methods, 3256 lines.  The file also has **14 top-level
+`SchedulerStore` is 3514 of them: 86 methods, 3256 lines.  The file also had **14 top-level
 `_migrate_to_*` functions totalling 259 lines** — already outside the class, and the cheapest
 thing in this whole survey.
 
-### The `self`-free cluster (11 methods, 261 lines) — measured
+### `scheduler/migrations.py` — **moved**, 4086 → 3828 lines
 
-`_step_task_spec` (55), `_step_workspaces` (45), `_identity_values` (36), `_task_from_row` (29),
-`_run_from_row` (25), `_attention_clause` (20), `_check_products` (15), `_check_acceptance`
-(14), and three more.
+The 14 migrations went first, exactly as the order named: they were top-level functions needing
+only `sqlite3`, so this was a *move*, not an extraction.  The store imports the names back into
+its own namespace, because the migration **table** — version number to function — is what says
+what order they run in, and that belongs to the store.  No call sites changed.
 
-### Extraction order
+### What remains here
 
-1. **`scheduler/migrations.py`** — the 14 `_migrate_to_*` functions (259 lines).  They are
-   top-level already: this is a *move*, and the only question is which of them the class still
-   calls (measured: `_ensure_schema` is the one, 135 lines, 2 refs).
-2. **`scheduler/rows.py`** — `_task_from_row`, `_run_from_row`, and the step/identity helpers
-   (`_step_task_spec`, `_step_workspaces`, `_identity_values`, `_check_products`,
-   `_check_acceptance`, `_live_workflow_step`, `workflow_blocked_steps`).
+1. **`scheduler/rows.py`** — `_task_from_row` (29), `_run_from_row` (25), `_step_task_spec`
+   (55), `_step_workspaces` (45), `_identity_values` (36), `_check_products` (15),
+   `_check_acceptance` (14), `_live_workflow_step`, `workflow_blocked_steps` (21) — the
+   row/step translation half, all `self`-free.
 3. **The cheapest coupled methods** — `_upstream_reports_in_transaction` (64 lines, 1 ref),
    `_insert_emission` (52, 1), `renew_lease` (35, 1), `disable_duplicate_enabled_tasks` (32, 1),
    `_join_arrivals` (28, 1).  Each needs the connection passed and nothing else.
