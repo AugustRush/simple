@@ -11,66 +11,36 @@ never to accommodate a regression.
 ## Current baseline — re-measured 2026-10-15, after the pluginization round
 
 ```
-20 failed, 4108 passed, 2 skipped, 333 warnings in 113.21s (0:01:53)
+19 failed, 4116 passed, 2 skipped, 333 warnings in 118.44s (0:01:58)
 ```
 
-Reasons, and this set is **one entry smaller** than the previous one:
+**Every entry is now a thing this machine cannot do.**  That is the property worth keeping:
+a baseline is a list of environment limits, and a real bug hiding in one is how the MCP
+cross-loop teardown survived here unnoticed.  Two entries have been removed by fixes
+rather than by an environment change, and both are recorded below.
 
-* `sandbox_apply` — `sandbox-exec: sandbox_apply: Operation not permitted`
-  (12 tests). This run's file policy is `workspace-write`; the sandbox set
-  disappears under `danger-full-access` and comes back here. Compare against the
-  baseline captured under the *same* policy.
+Reasons:
+
+* `sandbox_apply` — `sandbox-exec: sandbox_apply: Operation not permitted` (12 tests).
+  This run's file policy is `workspace-write`; the sandbox set disappears under
+  `danger-full-access` and comes back here.  Compare against the baseline captured under
+  the *same* policy.
 * `console width` (3 tests) — terminal-size probing in a non-interactive harness.
-* `output-dir sandbox write`, `user tool isolation` (3 tests) — the same sandbox
-  cause.
-* `tests/test_agent_integration.py::test_build_components_loads_user_tool_plugins`
-  — a user tool's subprocess is refused by the sandbox, so the tool returns
+* `output-dir sandbox write`, `user tool isolation` (3 tests) — the same sandbox cause.
+* `tests/test_agent_integration.py::test_build_components_loads_user_tool_plugins` — a user
+  tool's subprocess is refused by the sandbox, so the tool returns
   `{'error': ... 'sandbox_apply: Operation not permitted'}`.
-* `tests/test_web_channel.py::test_the_artifact_listing_skips_a_file_that_vanishes_mid_listing`
-  — a Python-3.14 harness issue: the test monkeypatches `Path.stat` to model a file
-  vanishing mid-listing, and the listing no longer goes through it, so the race the
-  test stages never happens. Not a product failure; needs the test to model the race
-  through whatever the listing now uses.
 
-**One entry was removed by a fix, not by an environment change.**
-`tests/test_mcp_plugin.py::test_the_real_composition_gets_mcp_client_from_the_plugin`
-had been in this list since it was first recorded, and it was not an environment
-failure: `MCPClient.close()` gathered tasks belonging to another event loop and
-raised `ValueError: The future belongs to a different loop`, so a composition built
-on one loop could not be closed on another. That is recorded in
-[`2026-10-15-pluginization-hard-enforcement-closing-report.md`](2026-10-15-pluginization-hard-enforcement-closing-report.md)
-and fixed in `4dc7ddf`. A baseline is a list of things the *environment* cannot do;
-a real bug hiding in it is exactly what this file's own instruction warns against.
+**Removed by a fix:**
+``tests/test_mcp_plugin.py::test_the_real_composition_gets_mcp_client_from_the_plugin``
+was not an environment failure but a real one -- `MCPClient.close()` gathered tasks
+belonging to another event loop -- fixed in `4dc7ddf`.
+``tests/test_web_channel.py::test_the_artifact_listing_skips_a_file_that_vanishes_mid_listing``
+was a *test* that stopped staging its own race under Python 3.14 (`Path.is_file` does not go
+through the monkeypatched `Path.stat`), so it reported a product bug that was not there; the
+fixture now stages through `os.stat`.
 
 ---
-
-## Current baseline — re-measured 2026-10-01 after the sandbox policy change
-
-```
-3 failed, 2687 passed, 1 skipped, 2 warnings in 66.54s
-```
-
-```
-tests/test_cli_ui.py::test_console_width_check_is_throttled
-tests/test_cli_ui.py::test_console_width_follows_terminal_resize
-tests/test_cli_ui.py::test_console_width_survives_a_failing_terminal_probe
-```
-
-All three probe the terminal size of the invoking shell. They fail because this
-suite is run from a non-interactive harness, not because of anything in the
-tree. They were failing identically in the previous baseline.
-
-**The other 16 entries in the previous baseline disappeared on their own.**
-They were all sandbox tests, and the run environment's file policy changed from
-`workspace-write` to `danger-full-access` between the two measurements;
-`sandbox-exec` can now apply its profile, where before every one of them failed
-with `sandbox-exec: sandbox_apply: Operation not permitted`. No source change
-produced this, which is exactly why the two baselines are recorded separately
-rather than the number being quietly adjusted.
-
-Consequence for verification: on a machine where the sandbox cannot be
-applied, the sandbox set is expected to fail again and must not be treated as a
-regression. Compare against the baseline captured under the *same* policy.
 
 ---
 

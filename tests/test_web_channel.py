@@ -2572,11 +2572,17 @@ def test_web_schedule_run_history_and_output(tmp_path, monkeypatch):
         assert missing.status_code == 404
 
 
-def test_the_artifact_listing_skips_a_file_that_vanishes_mid_listing(tmp_path, monkeypatch):
-    """A run may still be writing; an entry that disappears between the walk and
-    the size lookup is not a reason to fail the whole listing for the browser.
+def _listing_with_a_vanishing_file(tmp_path, monkeypatch, *, fail_on):
+    """List artifacts while ``gone.txt`` disappears on its *fail_on*-th stat.
+
+    Staged through ``os.stat`` rather than ``Path.stat``, because that is the call the
+    code actually makes: on 3.14 ``Path.is_file`` goes straight to ``os.stat``, so the
+    monkeypatched ``Path.stat`` this test used to install never saw the existence check
+    at all.  The race never happened, ``gone.txt`` was listed, and the test looked like a
+    product bug for a year of Python releases.  ``os.stat`` is underneath both calls, so
+    the staging survives whichever one the platform routes through.
     """
-    from pathlib import Path
+    import os
 
     from agent.channels.web import _list_run_artifacts
 
@@ -2585,24 +2591,48 @@ def test_the_artifact_listing_skips_a_file_that_vanishes_mid_listing(tmp_path, m
     (root / "kept.txt").write_text("kept", encoding="utf-8")
     (root / "gone.txt").write_text("gone", encoding="utf-8")
 
-    real_stat = Path.stat
+    real_stat = os.stat
     calls = {"gone": 0}
 
-    def flaky_stat(self, *args, **kwargs):
-        # The race, exactly: the walk sees the file (``is_file`` stats it), and
-        # by the time its size is wanted it has been removed.
-        if self.name == "gone.txt":
+    def flaky_stat(path, *args, **kwargs):
+        if str(path).endswith("gone.txt"):
             calls["gone"] += 1
-            if calls["gone"] > 1:
+            if calls["gone"] > fail_on:
                 raise OSError("vanished")
-        return real_stat(self, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", flaky_stat)
+    monkeypatch.setattr(os, "stat", flaky_stat)
+    return _list_run_artifacts(root, "task", "run"), calls
 
-    listed = _list_run_artifacts(root, "task", "run")
+
+def test_the_artifact_listing_skips_a_file_that_vanishes_at_its_size_lookup(
+    tmp_path, monkeypatch
+):
+    """A run may still be writing: gone between the walk and the size lookup."""
+    listed, calls = _listing_with_a_vanishing_file(tmp_path, monkeypatch, fail_on=1)
 
     assert [item["name"] for item in listed] == ["kept.txt"]
     assert calls["gone"] > 1, "the guard was never reached"
+
+
+def test_the_artifact_listing_skips_a_file_that_vanishes_at_its_existence_check(
+    tmp_path, monkeypatch
+):
+    """The other half of the race, pinned as a **contract** rather than as a fix.
+
+    Written first as a bug: ``is_file()`` sits outside the ``try``, so a file that
+    vanished one step earlier looked like it would raise out of the listing.  It does
+    not -- ``Path.is_file()`` returns ``False`` when ``stat`` fails (documented pathlib
+    behaviour), so this half was always handled, by the standard library rather than
+    here.  What the test is worth keeping for is that the *contract* holds either way:
+    a run may still be writing, and an entry that disappears at any point in the listing
+    is skipped rather than fatal.  A future refactor that replaced ``is_file()`` with a
+    raising call would fail here.
+    """
+    listed, calls = _listing_with_a_vanishing_file(tmp_path, monkeypatch, fail_on=0)
+
+    assert [item["name"] for item in listed] == ["kept.txt"]
+    assert calls["gone"] > 0, "the file was never stat-ed, so nothing was staged"
 
 
 def test_the_artifact_listing_returns_at_most_the_response_limit(tmp_path):
