@@ -17,6 +17,7 @@ from agent.lexical import LATIN_TOKEN_RE
 from .retrieval import CorpusStats
 
 from . import facts
+from . import usage
 from . import migrations
 from . import rows as _row_mappers
 from ._helpers import (
@@ -1618,64 +1619,26 @@ class LTMStore:
         created_at: Optional[str] = None,
     ) -> None:
         """Persist one provider call so foreground and background cost is visible."""
-
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO usage_events (
-                    session_id, turn_id, phase, model, input_tokens,
-                    output_tokens, cached_input_tokens, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(session_id or "").strip() or "default",
-                    str(turn_id or ""),
-                    str(phase or "foreground").strip() or "foreground",
-                    str(model or ""),
-                    max(0, int(input_tokens or 0)),
-                    max(0, int(output_tokens or 0)),
-                    max(0, int(cached_input_tokens or 0)),
-                    json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
-                    created_at or _now(),
-                ),
+            usage.append_usage_event(
+                conn,
+                session_id=session_id,
+                phase=phase,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                turn_id=turn_id,
+                metadata=metadata,
+                created_at=created_at,
             )
+
 
     def usage_summary(self, session_id: str) -> dict[str, Any]:
         """Return bounded aggregate usage for one session, grouped by phase."""
-
-        clean = str(session_id or "").strip()
-        if not clean:
-            return {"calls": 0, "input_tokens": 0, "output_tokens": 0,
-                    "cached_input_tokens": 0, "by_phase": {}}
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT phase, COUNT(*) AS calls,
-                       SUM(input_tokens) AS input_tokens,
-                       SUM(output_tokens) AS output_tokens,
-                       SUM(cached_input_tokens) AS cached_input_tokens
-                FROM usage_events WHERE session_id = ? GROUP BY phase
-                """,
-                (clean,),
-            ).fetchall()
-        by_phase = {
-            str(row["phase"]): {
-                "calls": int(row["calls"] or 0),
-                "input_tokens": int(row["input_tokens"] or 0),
-                "output_tokens": int(row["output_tokens"] or 0),
-                "cached_input_tokens": int(row["cached_input_tokens"] or 0),
-            }
-            for row in rows
-        }
-        return {
-            "calls": sum(item["calls"] for item in by_phase.values()),
-            "input_tokens": sum(item["input_tokens"] for item in by_phase.values()),
-            "output_tokens": sum(item["output_tokens"] for item in by_phase.values()),
-            "cached_input_tokens": sum(
-                item["cached_input_tokens"] for item in by_phase.values()
-            ),
-            "by_phase": by_phase,
-        }
+            return usage.usage_summary(conn, session_id)
+
 
     def append_agent_event(
         self,
