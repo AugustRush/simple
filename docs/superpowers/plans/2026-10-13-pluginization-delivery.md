@@ -142,7 +142,7 @@ Contribution kinds that are **not** services, with the reason:
 | `tests/test_core_services.py` | a declared name the source never writes; a name the source uses that is not declared; a reserved entry with no reason; a declaration that has grown back a second copy of the names |
 | `tests/test_service_ownership.py` | a service that is neither plugin-provided nor a written floor |
 | `tests/test_service_contracts.py` | an implementation that does not satisfy its protocol (signatures, async-ness, data members), a protocol member nobody calls, a ledger pointer no file checks, a waiver pointing at a check that does not exist, a hand-written `Scoped*` view |
-| `tests/test_memory_contract.py` | a backend that fails the behavioural suites; a reader that reaches past the contract (an allowlist of 4 documented soft reads remains) |
+| `tests/test_memory_contract.py` | a backend that fails the behavioural suites; a reader that reaches past the contract (an allowlist of 2 documented soft reads remains, each keyed to its protocol) |
 | `tests/test_kernel.py` | a plugin that reads or provides a name it never declared; an `optional` read that does not join the unload cascade |
 | `tests/test_contribution_attribution.py` | an undo that reaches past its own contribution (a name- or prefix-keyed removal) |
 | `tests/test_service_vocabulary.py` | a plugin touching a name outside the vocabulary; a vocabulary entry no plugin uses; a wired policy that does not refuse |
@@ -153,15 +153,42 @@ Contribution kinds that are **not** services, with the reason:
 | `scripts/plugin_ecosystem_probe.py` | an ecosystem whose assets the loader does not find, or an inert hook that is reported as working |
 | `scripts/functional_smoke.py` | a composition that cannot answer a turn end to end |
 
-**Measured on the delivered tree (2026-10-15):** full suite **19 failed / 4116 passed /
-2 skipped / 0 errors**, and **every one of the 19 is a thing this machine cannot do** --
-12 `sandbox-exec` refusals under this file policy, 3 console-width probes in a
-non-interactive harness, and 4 more from the same sandbox cause.  That property is the
-point: a baseline is a list of environment limits, and two entries were removed from it by
-fixes rather than by an environment change (a real cross-loop teardown bug in
-`MCPClient.close`, and a test that had stopped staging its own race under Python 3.14).
-Smoke **6 ok / 0 failed**; ecosystem probe **0 failure(s)**; declaration **67 names, 43
-public / 24 reserved, 15 with contracts**.
+### When a guard may read source
+
+Several guards above parse `agent/` with `ast` rather than exercising it.  That is the right
+tool for one kind of question, and the line is worth stating so that reading source does not
+become the default way to check something a type or a refusal could check:
+
+* **An absence, where nothing runs.**  "The loader does not know this shape", "no module
+  imports the deleted module", "nothing reaches past the contract" are claims about code that
+  is *not there*.  No runtime assertion can see a call nobody makes; a scan can.
+* **A vocabulary a type cannot express.**  "Every declared name is written by someone" is a
+  claim about facts spread across the tree, not about one object.
+* **Names, where types are unavailable.**  `inject` tuples, manifest keys, configuration keys.
+
+It is the wrong tool when a refusal can answer instead: "the implementation satisfies the
+protocol" is `isinstance` at `provide` time, "this plugin may not touch that name" is a policy
+that raises, "this service is replaceable" is a container that resolves it.  The test is
+whether the guard would survive a rewrite that keeps the behaviour and changes the shape: a
+scan that breaks then was testing the shape.
+
+The corollary is the discipline for the exceptions such scans need.  An allowlist entry is a
+*decision* and carries its reason; it is keyed narrowly enough that it cannot over-apply --
+`tests/test_memory_contract.py` keys its waivers by protocol as well as file and attribute,
+because keying them by file alone let one protocol's waiver cover another's real read for
+long enough that the backlog described it as a name collision.
+
+**Measured on the delivered tree (2026-10-15):** full suite **3 failed / 4188 passed /
+2 skipped / 0 errors** under `danger-full-access`, and **every one of the 3 is a thing this
+machine cannot do** (console-width probes in a non-interactive harness).  Under
+`workspace-write` the same tree reports **19 failed**, sixteen of them `sandbox-exec`
+refusals -- measured both ways, because a baseline is only comparable against a run under the
+same policy, and "19 failures" was read for a while as nineteen problems rather than as one
+policy.  Three entries have been removed from the baseline by *fixes* rather than by an
+environment change: a real cross-loop teardown bug in `MCPClient.close`, a test that had
+stopped staging its own race under Python 3.14, and a plugin provider that offered `None`
+where the contract wanted an implementation.  Smoke **6 ok / 0 failed**; ecosystem probe
+**0 failure(s)**; declaration **67 names, 43 public / 24 reserved, 15 with contracts**.
 
 ## Backlog (recorded, not blocking)
 
