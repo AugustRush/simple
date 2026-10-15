@@ -643,7 +643,7 @@ def test_corpus_stats_estimates_cjk_df_from_a_bounded_sample(tmp_path, monkeypat
     Exactness is not the goal — IDF is a logarithm, so a df/N ratio good to a
     few percent is indistinguishable from an exact count in the score.
     """
-    from agent.memory import store as store_mod
+    from agent.memory import queries as queries_mod
 
     store = make_store(tmp_path)
     # 200 entries; "用户" in exactly half.
@@ -651,7 +651,7 @@ def test_corpus_stats_estimates_cjk_df_from_a_bounded_sample(tmp_path, monkeypat
         text = "用户偏好记录" if i % 2 == 0 else "项目部署记录"
         store.add_entry(make_entry(cid=f"zh-{i:04d}", content=text))
 
-    monkeypatch.setattr(store_mod, "_CJK_DF_SAMPLE_SIZE", 50)
+    monkeypatch.setattr(queries_mod, "_CJK_DF_SAMPLE_SIZE", 50)
     stats = store.corpus_stats(["用户"])
 
     assert stats.total_documents == 200
