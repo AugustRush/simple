@@ -19,6 +19,12 @@ if TYPE_CHECKING:
 
 from .session_log import SessionLog
 from . import fitting
+from . import query_terms
+from .query_terms import (
+    _has_multi_intent_marker,
+    _matched_fact_alias_terms,
+    _weighted_term_overlap,
+)
 from . import text as _render
 from ._helpers import (
     _FACT_QUERY_PREDICATE_ALIASES,
@@ -321,25 +327,6 @@ class ContextManager:
             self._last_activity = time.time()
             self._needs_consolidation = True
 
-    @staticmethod
-    def _matched_fact_alias_terms(
-        lowered_query: str,
-        aliases: dict[str, tuple[str, ...]],
-    ) -> tuple[list[str], set[str]]:
-        targets: list[str] = []
-        matched_terms: set[str] = set()
-        for key, variants in aliases.items():
-            hits = [variant for variant in variants if variant in lowered_query]
-            if not hits:
-                continue
-            targets.append(key)
-            for hit in hits:
-                terms = _lexical_terms(hit)
-                if terms:
-                    matched_terms.update(terms)
-                else:
-                    matched_terms.add(hit)
-        return targets, matched_terms
 
     def _plan_query(self, query: str) -> QueryPlan:
         lexical_terms = tuple(_lexical_terms(query))
@@ -352,11 +339,11 @@ class ContextManager:
             )
 
         lowered_query = str(query or "").strip().lower()
-        subjects, subject_terms = self._matched_fact_alias_terms(
+        subjects, subject_terms = _matched_fact_alias_terms(
             lowered_query,
             _FACT_QUERY_SUBJECT_ALIASES,
         )
-        predicates, predicate_terms = self._matched_fact_alias_terms(
+        predicates, predicate_terms = _matched_fact_alias_terms(
             lowered_query,
             _FACT_QUERY_PREDICATE_ALIASES,
         )
@@ -741,22 +728,6 @@ class ContextManager:
                     return True
         return False
 
-    @staticmethod
-    def _has_multi_intent_marker(query: str) -> bool:
-        lowered = str(query or "").lower()
-        return any(
-            marker in lowered
-            for marker in (
-                " and ",
-                " also ",
-                " plus ",
-                "另外",
-                "还有",
-                "以及",
-                "顺便",
-                "并且",
-            )
-        )
 
     def _should_include_freeform_context(
         self,
@@ -774,7 +745,7 @@ class ContextManager:
         if plan.query_type == "mixed":
             if not has_fact_hits:
                 return True
-            return self._has_multi_intent_marker(query)
+            return _has_multi_intent_marker(query)
         return True
 
     def _resolved_fact_candidates(
@@ -1125,17 +1096,6 @@ class ContextManager:
         return "\n".join(lines) if len(lines) > 1 else ""
 
 
-    @staticmethod
-    def _weighted_term_overlap(
-        query_terms: set[str],
-        value: Any,
-        *,
-        weight: float,
-    ) -> float:
-        terms = set(_lexical_terms(str(value or "")))
-        if not terms:
-            return 0.0
-        return len(query_terms & terms) * weight
 
     def _working_state_relevance_score(self, state: dict[str, Any], query: str) -> float:
         query_terms = set(_lexical_terms(query))
@@ -1143,19 +1103,19 @@ class ContextManager:
             return 0.0
 
         score = 0.0
-        score += self._weighted_term_overlap(
+        score += _weighted_term_overlap(
             query_terms, state.get("active_goal"), weight=2.0
         )
-        score += self._weighted_term_overlap(
+        score += _weighted_term_overlap(
             query_terms, state.get("progress"), weight=1.0
         )
-        score += self._weighted_term_overlap(
+        score += _weighted_term_overlap(
             query_terms, state.get("last_error"), weight=0.35
         )
         artifacts = state.get("artifacts")
         if isinstance(artifacts, list):
             for artifact in artifacts:
-                score += self._weighted_term_overlap(query_terms, artifact, weight=2.5)
+                score += _weighted_term_overlap(query_terms, artifact, weight=2.5)
         recent_turns = state.get("recent_turns")
         if isinstance(recent_turns, list):
             for turn in recent_turns:
@@ -1163,7 +1123,7 @@ class ContextManager:
                     continue
                 role = str(turn.get("role", "") or "").strip().lower()
                 weight = 1.5 if role == "user" else 0.75
-                score += self._weighted_term_overlap(
+                score += _weighted_term_overlap(
                     query_terms,
                     turn.get("content", ""),
                     weight=weight,

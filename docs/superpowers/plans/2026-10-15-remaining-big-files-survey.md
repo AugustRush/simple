@@ -25,7 +25,7 @@ recording" below.
 | `agent/scheduler/store.py` | 3575 (was 4086) | `SchedulerStore` | 78 | 3004 | **3 / ~60 lines** |
 | `agent/memory/store.py` | 2531 (was 2835) | `LTMStore` | 75 | 2281 | **5 / ~190 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
-| `agent/memory/context.py` | 1972 (was 2484) | `ContextManager` | 66 | 1624 | **8 / 106 lines** |
+| `agent/memory/context.py` | 1932 (was 2484) | `ContextManager` | 63 | 1584 | **5 / 43 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
 the headline, and it is why the extraction orders below start there.
@@ -98,12 +98,26 @@ One candidate was **excluded by the closure check rather than by taste**: `_merg
 looked self-free but reads a free name the bound-name scan missed, so it stays in the class
 until someone gives it a home deliberately.
 
+### `memory/query_terms.py` — **extracted**, 1972 → 1932 lines
+
+Three `self`-free predicates over text (`_matched_fact_alias_terms`, `_has_multi_intent_marker`,
+`_weighted_term_overlap`, 40 lines): given a query, say what it names.  None of them ever took
+`self`, so the signatures crossed over unchanged -- only the call sites lost their `self.`
+prefix.
+
+Worth recording: `_merge_artifacts`, which an earlier pass excluded for a free name it did not
+have.  The name was its own `*groups` parameter -- the checker did not look at `vararg`/`kwarg`.
+A false negative in the *checker* costs the same as one in the metric: a function wrongly
+believed uncoupled gets moved, or in this case wrongly believed coupled gets left behind.
+
 ### What remains here
 
 1. **The 0-data / 1-call group** (`record_usage_event`, `observe_token_usage`,
    `_is_episode_recall_query`, `_working_state_relevance_score`, …) — cheap, but each needs the
    one collaborator it calls passed in.
-2. Only then the coupled core (`_project_working_state_from_event` 140 lines / 5 refs,
+2. `_working_state_candidates`, `_working_state_is_complete`, `_merge_artifacts` (22 lines) —
+   pure, waiting for a coherent home rather than a third tiny module.
+3. Only then the coupled core (`_project_working_state_from_event` 140 lines / 5 refs,
    `process_one_job` 107/5, `retrieve_implicit_context` 73).
 
 ## 2. `agent/core/agent.py` — 2536 lines
