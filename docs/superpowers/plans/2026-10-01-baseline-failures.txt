@@ -8,6 +8,42 @@ never to accommodate a regression.
 
 ---
 
+## Current baseline — re-measured 2026-10-15, after the pluginization round
+
+```
+20 failed, 4108 passed, 2 skipped, 333 warnings in 113.21s (0:01:53)
+```
+
+Reasons, and this set is **one entry smaller** than the previous one:
+
+* `sandbox_apply` — `sandbox-exec: sandbox_apply: Operation not permitted`
+  (12 tests). This run's file policy is `workspace-write`; the sandbox set
+  disappears under `danger-full-access` and comes back here. Compare against the
+  baseline captured under the *same* policy.
+* `console width` (3 tests) — terminal-size probing in a non-interactive harness.
+* `output-dir sandbox write`, `user tool isolation` (3 tests) — the same sandbox
+  cause.
+* `tests/test_agent_integration.py::test_build_components_loads_user_tool_plugins`
+  — a user tool's subprocess is refused by the sandbox, so the tool returns
+  `{'error': ... 'sandbox_apply: Operation not permitted'}`.
+* `tests/test_web_channel.py::test_the_artifact_listing_skips_a_file_that_vanishes_mid_listing`
+  — a Python-3.14 harness issue: the test monkeypatches `Path.stat` to model a file
+  vanishing mid-listing, and the listing no longer goes through it, so the race the
+  test stages never happens. Not a product failure; needs the test to model the race
+  through whatever the listing now uses.
+
+**One entry was removed by a fix, not by an environment change.**
+`tests/test_mcp_plugin.py::test_the_real_composition_gets_mcp_client_from_the_plugin`
+had been in this list since it was first recorded, and it was not an environment
+failure: `MCPClient.close()` gathered tasks belonging to another event loop and
+raised `ValueError: The future belongs to a different loop`, so a composition built
+on one loop could not be closed on another. That is recorded in
+[`2026-10-15-pluginization-hard-enforcement-closing-report.md`](2026-10-15-pluginization-hard-enforcement-closing-report.md)
+and fixed in `4dc7ddf`. A baseline is a list of things the *environment* cannot do;
+a real bug hiding in it is exactly what this file's own instruction warns against.
+
+---
+
 ## Current baseline — re-measured 2026-10-01 after the sandbox policy change
 
 ```
