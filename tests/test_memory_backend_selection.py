@@ -244,3 +244,32 @@ def test_the_replacement_survives_a_turn_shaped_write(memory_home) -> None:
         "assistant",
     ]
     assert Path(store.memory_dir) == memory_home / "memory"
+
+
+def test_the_read_only_memory_commands_see_a_replaced_service(monkeypatch, tmp_path) -> None:
+    """The four ``memory`` subcommands resolve the **service**, so a swap reaches them.
+
+    ``memory ls`` / ``show`` / ``search`` / ``index`` used to construct ``MemoryPalace()``
+    themselves, with no composition in scope -- so a profile that pointed ``memory`` at
+    another store was invisible to them: ``/memory ls`` reported the built-in palace while
+    the agent was reading something else.  They now go through
+    ``agent.bootstrap.memory_service``, which mounts the composition's own declaration of
+    that name (and only that name -- no provider, no API key, no session).
+    """
+    from agent import shared
+    from agent.bootstrap import memory_service
+    from agent.memory.backends.sqlite_fts import SqliteFtsStore
+    from test_agent_integration import _minimal_cfg
+
+    cfg = _minimal_cfg()
+    cfg["plugins"] = {"_profile": SQLITE_FTS_PROFILE_NAME}
+    # ``shared`` is what the plugins read their directories from; patching the ``agent``
+    # module's mirror names would leave the store writing to the real home.
+    for name in ("CONTEXT_DIR", "MEMORY_DIR", "PROMPTS_DIR", "SKILLS_DIR", "USER_PLUGINS_DIR"):
+        monkeypatch.setattr(shared, name, tmp_path / name.lower())
+
+    with memory_service(cfg) as memory:
+        assert isinstance(memory.store, SqliteFtsStore), (
+            "the profile names sqlite-fts-memory; the commands got the built-in palace"
+        )
+        assert isinstance(memory.read_index(), str)

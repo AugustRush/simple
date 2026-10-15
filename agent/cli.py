@@ -1674,15 +1674,21 @@ def scheduler(
 
 @memory_app.command("ls")
 def memory_ls():
-    """Show memory export summary."""
-    memory = MemoryPalace()
-    lines = [line for line in memory.read_index().splitlines() if line.strip()]
-    table = Table(title="Memory Export")
-    table.add_column("Metric")
-    table.add_column("Value")
-    table.add_row("Projection", "memory/memory.jsonl")
-    table.add_row("Entries", str(len(lines)))
-    shared.CONSOLE.print(table)
+    """Show memory export summary.
+
+    Through the composition's ``memory`` service, not a palace built here: these commands
+    used to construct one directly, so a composition that replaced the service -- a
+    profile pointing ``memory`` at another store -- was invisible to them.
+    """
+    cfg, _ = agent_module.load_config()
+    with agent_module.memory_service(cfg) as memory:
+        lines = [line for line in memory.read_index().splitlines() if line.strip()]
+        table = Table(title="Memory Export")
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Projection", "memory/memory.jsonl")
+        table.add_row("Entries", str(len(lines)))
+        shared.CONSOLE.print(table)
 
 
 @memory_app.command("show")
@@ -1695,8 +1701,9 @@ def memory_show(
         shared.CONSOLE.print("[red]Path must be chapter/name[/red]")
         raise typer.Exit(1)
     chapter, name = parts
-    memory = MemoryPalace()
-    content = memory.read(chapter, name)
+    cfg, _ = agent_module.load_config()
+    with agent_module.memory_service(cfg) as memory:
+        content = memory.read(chapter, name)
     if content:
         shared.CONSOLE.print(Markdown(content))
     else:
@@ -1706,8 +1713,9 @@ def memory_show(
 @memory_app.command("search")
 def memory_search(query: str = typer.Argument(..., help="Search query")):
     """Search across all memory files."""
-    memory = MemoryPalace()
-    results = memory.search(query)
+    cfg, _ = agent_module.load_config()
+    with agent_module.memory_service(cfg) as memory:
+        results = memory.search(query)
     if not results:
         shared.CONSOLE.print(f"[yellow]No results for '{query}'[/yellow]")
         return
@@ -1739,8 +1747,9 @@ def memory_tidy():
 @memory_app.command("index")
 def memory_index():
     """Show the memory JSONL export."""
-    memory = MemoryPalace()
-    shared.CONSOLE.print(Markdown(memory.read_index()))
+    cfg, _ = agent_module.load_config()
+    with agent_module.memory_service(cfg) as memory:
+        shared.CONSOLE.print(Markdown(memory.read_index()))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

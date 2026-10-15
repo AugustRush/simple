@@ -37,6 +37,8 @@ from agent.core.agent_plugin import AgentPlugin
 from agent.tools.plugin import ToolsPlugin
 from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
+from contextlib import contextmanager
+
 from agent.runtime.factory import RuntimeFactory
 from agent.runtime.service_contracts import validator_for, violations
 from agent.runtime.services import plugin_service_policy
@@ -124,6 +126,50 @@ def build_gateway_channels(cfg: dict) -> list[Channel]:
     # here is exactly the duplication this function used to be.
     registry = host.services.get("channels")
     return list(registry.all()) if registry is not None else []
+
+
+@contextmanager
+def memory_service(cfg: dict):
+    """The composition's ``memory`` service, without building a runtime.
+
+    The same shape as :func:`build_gateway_channels`, for the same reason: a caller that
+    wants *one* service and not a runtime should get the composition's answer rather than
+    construct its own.  The four read-only ``memory`` commands (``ls``/``show``/
+    ``search``/``index``) used to build ``MemoryPalace()`` directly, which made a
+    composition that **replaced** the service unreachable from them -- ``/memory ls``
+    reported the built-in palace while the agent was reading something else.
+
+    Only the plugins that provide the name are mounted, so this needs no provider, no API
+    key and no session: the memory plugins declare ``cfg`` and nothing else.  The profile
+    still decides *which* plugin -- a ``service_replacements`` pointing ``memory`` at
+    another store is honoured, because the selection goes through the catalog.
+    """
+    from agent.plugins.catalog import PluginCatalog
+    from agent.kernel.service import require_service
+
+    # The store opens its files in ``setup``, so the session directories have to exist
+    # before the plugin runs -- on a fresh home they do not, and the failure surfaces as
+    # "unable to open database file" from inside sqlite rather than as "no memory dir".
+    shared.CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    shared.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+    catalog = PluginCatalog(
+        builtin_dir=shared.PLUGINS_DIR,
+        user_dir=shared.USER_PLUGINS_DIR,
+        plugin_config=cfg.get("plugins", {}),
+    )
+    try:
+        catalog._host.services.provide("cfg", cfg)
+        wanted = {"memory", "ltm_store"}
+        for entry in core_plugins(
+            enabled=catalog.core_plugin_selection(),
+            replacements=catalog.service_replacements(),
+        ):
+            if wanted.intersection(entry.provides):
+                catalog.mount(entry.build(CoreContext()))
+        yield require_service(catalog._host.services, "memory")
+    finally:
+        catalog.close()
 
 
 def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
