@@ -1,4 +1,4 @@
-# Pluginization hard-enforcement round — closing report
+# Pluginization: enforcement, then cleanup — closing report
 
 **Scope:** the work that followed a first-principles review of the pluginization
 implementation, asking one question of each claim in
@@ -7,21 +7,24 @@ enforced, or is it a convention the author has to overhear?*  The review's findi
 that the kernel was genuinely pluginized and the layer above it was **documented rather
 than enforced** — the declarations existed, and none of them refused anything.
 
-**Result:** three commits. Every claim in the delivery document is now refused by
-something: a declaration the kernel rejects, a policy that closes the vocabulary, a
-strategy the format owns, a base class the guards insist on. The full-suite FAILED set
-was byte-identical to the baseline after each commit — and one entry was then **removed**
-from that baseline because it turned out to be a real bug wearing an environment
-failure's clothes.
+**Result:** eleven commits, three passes. Every claim in the delivery document is now
+refused by something: a declaration the kernel rejects, a policy that closes the
+vocabulary, a strategy the format owns, a base class the guards insist on, a contract
+checked at composition time. The full-suite FAILED set was byte-identical to the baseline
+after each commit — and two entries were then **removed** from that baseline: one real bug
+wearing an environment failure's clothes, and one test that had stopped staging its own
+race. What is left is nineteen failures, every one a thing this machine cannot do.
 
 | Measure | Before | After |
 | --- | --- | --- |
-| Full suite | 21 failed / 4011 passed / 2 skipped | **20 failed / 4108 passed / 2 skipped** |
-| FAILED set | — | identical, **minus one real fix** (`4dc7ddf`) |
-| `agent/plugins/catalog.py` | 2432 lines / 75 methods | **2145 / 39** |
+| Full suite | 21 failed / 4011 passed / 2 skipped | **19 failed / 4116 passed / 2 skipped** |
+| FAILED set | — | **minus two fixes** (`4dc7ddf`, `0798d4c`); nothing added |
+| `agent/plugins/catalog.py` | 2432 lines / 75 methods | **2052 / 39** |
+| Service declarations | 2 modules, 15 + 44 names | **1 module, 67 names** |
 | `agent/kernel/{service,context}.py` | 381 + 308 | **517 + 456** |
-| New modules | — | **3** (`hook_dispatch`, `hook_types`, `service_vocabulary`) |
-| New test files | — | **3** (672 lines) + guards added to 9 existing files |
+| New modules | — | **5** (`hook_dispatch`, `hook_types`, `reload`, `service_contracts`, `services`) |
+| Test files touched | — | **25** (3 new, guards added or fixtures corrected in the rest) |
+| Baseline entries that are environment limits | 18 of 21 | **19 of 19** |
 | Smoke / ecosystem probe | 6 ok / 0 failed; 0 failures | **unchanged** |
 
 ---
@@ -104,28 +107,68 @@ when they were taken.
 
 ---
 
+## The second round: what the first round's own claims made visible
+
+Four items, each of which only became *askable* once the first round had made a claim
+refusable (`1e06a3a`, `a5def2a`, `fc4f67f`, `c86e2a3`, `7e55b65`):
+
+1. **A contract nobody checks is documentation.** The first round made the *declaration*
+  refusable; it did not make the *implementation* checkable. Measured: zero `isinstance`
+  calls against any capability protocol in the tree — the `memory` ledger entry had pointed
+  at `MemoryStore` while the service held a *palace*, and nothing asked. There is now a
+  runtime audit (`agent/runtime/service_contracts.py`) plus a `service_validator` hook the
+  kernel consults **before** recording a plugin's `provide`. It refused four things on its
+  first run, three of them real: the MCP plugin offering `None` as `mcp_client` ("absent"
+  expressed as "here is a None"), a test double answering 8 of 13 protocol members, and two
+  agent doubles that were not `AgentService`s.
+2. **Owners and consumers were a hand-maintained mirror of the source.** The two
+  declarations merged into `agent/runtime/services.py` — and the fields were *deleted*
+  rather than merged, because a fact derivable from the code does not belong in a
+  declaration. The scan then found four names that had been **invented** (config keys and a
+  local dict, not component keys) and two scanner blind spots.
+3. **A floor is about the registry, not about the contribution.** `commands` and `agents`
+  were floors *and* had their contributions written to the raw registry, which is why both
+  names sat in a "published for third parties, used by nobody" waiver. The markdown adapter
+  now contributes through `ctx.commands`/`ctx.agents`, and the waiver is gone. The coupling
+  this exposed is worth recording: the `inject` requirement and the registration were two
+  separate predicates, and when they disagreed **every Python-only plugin failed to load**.
+4. **A published name that cannot be substituted knowingly is not an extension point.**
+  `post_turn_maintenance` was resolvable, substitutable, undocumented and provided by
+  nobody: a replacement had to reproduce eleven keyword-only parameters from a private
+  method, and got a `TypeError` at the end of a turn. Removed (`7f20228`); if a composition
+  wants the step, it comes back with a contract and a provider together.
+
+Splitting the reload transaction produced the round's most useful negative result: a reload
+is **atomic about the registries the loader owns and not about plugin activation**, and the
+rollback must **mutate in place** — it used to rebind the plugin table, which the hook
+dispatcher holds by reference, so a rolled-back catalog kept firing hooks at the tree it had
+just abandoned while reporting success.
+
 ## What remains
 
-Recorded rather than fixed, in the delivery document's backlog:
+Recorded rather than fixed:
 
-1. ~~**`PluginCatalog` still owns the reload transaction and the two registries.**~~ --
-   **done** (next round): the transaction is `agent/plugins/reload.py`, and it owns the
-   snapshot and the rollback.  Deciding "who owns the rollback" produced the useful part:
-   a reload is atomic about the registries the loader owns and not about plugin
-   activation, and the rollback must **mutate in place** -- it used to rebind the plugin
-   table, which the hook dispatcher holds by reference.
-2. **Two overlapping declarations** — `CORE_SERVICES` (15, with contracts) and
-   `PUBLIC_SERVICES` (44, what a plugin may touch). Their relationship is prose; only
-   `agent_core` is in the first and not the second.
-3. **`commands` and `agents` have no in-tree user** through the view: bundles go through
-   the loader's markdown adapter, which registers on the raw registry. Moving that adapter
-   onto the view is the same edit that would let a plugin replace the loader's registry.
-4. **Source-scanning guards.** Several new guards read source, because they check an
-   *absence* — "the loader does not know this shape" — which no runtime assertion can see.
-   The line is worth stating so that reading source does not become the default way to
-   check something a type or a refusal could check.
-
-And two things this round did **not** touch, still true from the review: the four
-remaining god classes (`SchedulerStore` 4085 lines, `WebChannel` 3319, `LTMStore` 2834,
-`BaseAgent` 2535), and the `MemoryPalace()` construction at four CLI sites, which makes a
-*replaced* memory service unreachable from those commands.
+1. **Provenance and consent for third-party code.**  This is the one part of the
+   pluginization goal still unmet, and it is not a maintainability gap: a Python plugin in
+   `~/.agent/plugins/` is `exec_module`-ed at startup with the process's full privileges,
+   and `plugin_approval` gates *installation*, not *loading*.  The design is written
+   (`2026-10-12-capability-provenance-and-adapter-translators-design.md`) and nothing is
+   implemented.  The first-principles criterion it fails is the fifth one — "the boundary
+   is provable: a third party extends this by depending only on a published interface" —
+   which now holds for the *mechanism* and not for *trust*.
+2. **The four god classes.**  `SchedulerStore` 4085 lines, `WebChannel` 3319, `LTMStore`
+   2834, `BaseAgent` 2535.  Orthogonal to pluginization, and the repository has an
+   established method for them (survey → extract → closing report, FAILED set compared
+   byte-for-byte after every step).
+3. **The 4 remaining soft reads** in `tests/test_memory_contract.py` — a designed fallback,
+   a decision about `SessionService`, and two name collisions the scan cannot tell apart.
+4. **DSH profile import** — reading is done (`agent/plugins/dsh.py`, read-only); importing
+   needs the consent machinery item 1 describes.
+5. **Source-scanning guards.**  Several guards read source because they check an *absence*
+   ("the loader does not know this shape"), which no runtime assertion can see.  The line is
+   worth stating so that reading source does not become the default way to check something a
+   type or a refusal could check.
+6. **The god classes' smaller cousin:** `agent/memory/context.py` at 2483 lines, and the
+   four remaining `MemoryPalace`-adjacent direct constructions in `agent/cli.py` that are
+   *not* on the read-only path — `memory tidy` builds a full composition, which is correct
+   but heavier than the rest.

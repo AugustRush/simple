@@ -149,18 +149,19 @@ Contribution kinds that are **not** services, with the reason:
 | `tests/test_plugin_format_strategy.py` | an ecosystem's shapes back in the loader; a format whose strategy is declared but never called |
 | `tests/test_plugin_catalog.py` | a declarative kind whose `inject` requirement and registration disagree; a registration body that names a kind instead of the table |
 | `tests/test_plugin_hook_dispatch.py` | a dispatcher missing from `LOADER_HOOK_BOUNDARY`; a boundary entry naming a typed event that does not exist |
+| `tests/test_plugin_catalog.py` | a rolled-back reload that rebinds the plugin table instead of mutating it |
 | `scripts/plugin_ecosystem_probe.py` | an ecosystem whose assets the loader does not find, or an inert hook that is reported as working |
 | `scripts/functional_smoke.py` | a composition that cannot answer a turn end to end |
 
-**Measured on the delivered tree (2026-10-15):** full suite **20 failed / 4108 passed /
-2 skipped / 0 errors**.  Of the 20, nineteen are the frozen baseline of environment
-failures (`sandbox-exec` is not permitted under this file policy; console-width probes in
-a non-interactive harness) and one is a Python-3.14 harness issue in
-`tests/test_web_channel.py` -- the round below (see its closing report) *removed* the
-twentieth-baseline entry, a real cross-loop teardown bug in `MCPClient.close`, which had
-been sitting inside the baseline and read as an environment failure.  Smoke **6 ok /
-0 failed**; ecosystem probe **0 failure(s)**; ledger **15/15 contracts**; vocabulary
-**44 public / 27 reserved**.
+**Measured on the delivered tree (2026-10-15):** full suite **19 failed / 4116 passed /
+2 skipped / 0 errors**, and **every one of the 19 is a thing this machine cannot do** --
+12 `sandbox-exec` refusals under this file policy, 3 console-width probes in a
+non-interactive harness, and 4 more from the same sandbox cause.  That property is the
+point: a baseline is a list of environment limits, and two entries were removed from it by
+fixes rather than by an environment change (a real cross-loop teardown bug in
+`MCPClient.close`, and a test that had stopped staging its own race under Python 3.14).
+Smoke **6 ok / 0 failed**; ecosystem probe **0 failure(s)**; declaration **67 names, 43
+public / 24 reserved, 15 with contracts**.
 
 ## Backlog (recorded, not blocking)
 
@@ -172,9 +173,11 @@ been sitting inside the baseline and read as an environment failure.  Smoke **6 
    estimator reads (a designed fallback, not a hole), the web's session-service store
    (a decision about `SessionService`), and two name collisions the scan cannot tell
    apart from `LTMStore` members.
-3. **`MemoryPalace()` at 4 CLI sites** (`agent/cli.py`) -- those commands build a palace
-   directly with no composition in scope, so a *replaced* memory service is unreachable
-   from them.
+3. ~~**`MemoryPalace()` at 4 CLI sites**~~ -- **done**: the read-only `memory` commands go
+   through `agent.bootstrap.memory_service(cfg)`, which mounts the composition's own
+   declaration of that name (and only that name -- no provider, no API key, no session), so
+   a `service_replacements` pointing `memory` elsewhere reaches them.  Pinned by
+   `tests/test_memory_backend_selection.py`.
 4. **DSH profile import** -- reading is done (`agent/plugins/dsh.py`, read-only); importing
    needs the consent machinery item 1 describes.
 5. ~~**A kind table for declarative assets**~~ -- **done**: `DECLARATIVE_KINDS` is the
@@ -189,12 +192,17 @@ been sitting inside the baseline and read as an environment failure.  Smoke **6 
    than re-discovering from a disk that is usually what broke.  The old rollback rebound
    the plugin table, which the hook dispatcher holds by reference; that is fixed and
    `tests/test_plugin_catalog.py` pins it.
-7. **Two overlapping declarations.**  `CORE_SERVICES` (15, with contracts) and
-   `PUBLIC_SERVICES` (44, what a plugin may touch) are maintained separately and their
-   relationship is only prose.  Only `agent_core` is in the first and not the second, which
-   suggests they could be one record with two fields -- or that the ledger should be
-   derived from the vocabulary.
-8. ~~**Two vocabulary entries have no in-tree user.**~~ -- **done**: the markdown adapter
+7. ~~**Two overlapping declarations.**~~ -- **done**: `agent/runtime/services.py` is one
+   table, and `owners`/`consumers` were **deleted** from it rather than merged, because both
+   are derivable from the source -- declaring them is what made the old ledger a
+   hand-maintained mirror.  The scan that computes them also found four names that had been
+   invented (config keys and a local variable, not component keys) and two scanner blind
+   spots (an annotated dict literal, and a key computed by `bus_name`).
+9. **`post_turn_maintenance` was removed, not fixed.**  It was a published name with no
+   contract and no provider, so a replacement had to reproduce eleven keyword-only
+   parameters from reading a private method.  If a composition ever wants to own the
+   post-turn step, it should come back with a contract and a provider together.
+10. ~~**Two vocabulary entries have no in-tree user.**~~ -- **done**: the markdown adapter
    contributes through `ctx.commands` / `ctx.agents`, so `FOR_THIRD_PARTIES` is empty and
    the last raw-registry bypass on the contribution path is gone.  (The registries are
    still floors *and still provided by the loader*; only the writing moved.)

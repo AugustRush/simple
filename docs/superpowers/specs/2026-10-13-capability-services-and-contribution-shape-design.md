@@ -2,6 +2,16 @@
 
 **Status:** the shape is implemented for `channels`, `registry`, `skill_catalog` and
 `contributed_mcp_servers`; `hooks`/`commands`/`agents` are analysed below.
+
+> **Read this as the reasoning, not as the current module map.**  Two later rounds changed
+> what is named here: `agent/runtime/core_services.py` and `service_vocabulary.py` merged
+> into `agent/runtime/services.py` (which no longer declares `owners`/`consumers` — they are
+> derived), the six views share a `ScopedContribution` base, `commands` and `agents` are
+> reached as **services** whose contributions go through `ctx.commands`/`ctx.agents` (the
+> registries are still floors), and the hook dispatch and the reload transaction left the
+> loader for `agent/plugins/hook_dispatch.py` and `agent/plugins/reload.py`.  The
+> [delivery document](../plans/2026-10-13-pluginization-delivery.md) is the entry point and
+> carries the current numbers.
 **Context:** the plugin refactor's goal is that adding an ecosystem or replacing an
 implementation is an *adapter* or a *contribution*, never an edit to the loader or the
 composition root.  This note writes down the layering that makes that true, and the one
