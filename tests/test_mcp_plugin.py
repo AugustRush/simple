@@ -145,3 +145,59 @@ def test_the_declaration_says_what_the_plugin_provides(service: str) -> None:
     entry = next(plugin for plugin in core_plugins() if plugin.name == "mcp")
 
     assert service in entry.provides
+
+
+# ── close() is loop-safe ─────────────────────────────────────────────────────
+#
+# A task belongs to the loop that created it and ``asyncio.gather`` refuses one from
+# another.  ``close`` used to gather whatever was in the list, so the composition that
+# ``_build_components_async`` builds (background connect started on its loop) and
+# ``_close_components`` tears down (another loop) raised
+# ``ValueError: The future belongs to a different loop`` -- the composition could be
+# built and never closed.  These pin both halves: the foreign case must not raise, and
+# the same-loop case must still *wait* rather than degrade into a no-op.
+
+
+def _client():
+    from agent.tools.runtime import MCPClient, ToolRegistry
+
+    return MCPClient(ToolRegistry())
+
+
+def test_closing_a_client_from_another_loop_does_not_raise() -> None:
+    import asyncio
+
+    client = _client()
+
+    async def build() -> None:
+        # The task belongs to this loop, which ``asyncio.run`` closes underneath it.
+        client._server_tasks.append(asyncio.create_task(asyncio.sleep(3600)))
+
+    asyncio.run(build())
+    assert client._server_tasks, "the task was recorded on the first loop"
+
+    asyncio.run(client.close())
+
+    assert client._server_tasks == [], "the references are dropped, not leaked"
+
+
+def test_close_still_waits_for_the_tasks_this_loop_owns() -> None:
+    """Control: loop-safety must not turn close into "signal and return"."""
+    import asyncio
+
+    client = _client()
+    cleaned: list[str] = []
+
+    async def run() -> None:
+        async def server() -> None:
+            await client._shutdown.wait()
+            cleaned.append("cleaned")
+
+        client._server_tasks.append(asyncio.create_task(server()))
+        await asyncio.sleep(0)  # let it reach the wait
+        await client.close()
+
+    asyncio.run(run())
+
+    assert cleaned == ["cleaned"], "close must wait for its own tasks to finish"
+    assert client._server_tasks == []

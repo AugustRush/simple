@@ -925,10 +925,47 @@ class MCPClient:
         }
 
     async def close(self) -> None:
+        """Signal shutdown, then wait for the server tasks **this loop** owns.
+
+        A task belongs to the loop that created it, and ``asyncio.gather`` refuses a
+        task from another one -- ``ValueError: The future belongs to a different
+        loop``.  This used to gather whatever was in the list, so a composition built
+        on one loop and torn down on another raised instead of closing, and every such
+        call site is a real one: a gateway restart, a session rebuilt after a config
+        change, a test that builds with ``asyncio.run`` and closes with a second one.
+        Measured on ``tests/test_mcp_plugin.py``, which does exactly that.
+
+        A foreign task cannot be awaited from here, and does not need to be:
+
+        * if its loop is **closed**, asyncio already cancelled it while closing -- the
+          cleanup the task owed has been requested, and there is nothing left to wait
+          for;
+        * if its loop is still **running** (another thread's), ``_shutdown`` has been
+          set, which is the signal that task is waiting on, and cancelling it is that
+          loop's business, so we ask it to.
+        """
         self._shutdown.set()
-        if self._server_tasks:
-            await asyncio.gather(*self._server_tasks, return_exceptions=True)
-            self._server_tasks.clear()
+        if not self._server_tasks:
+            return
+        loop = asyncio.get_running_loop()
+        mine: list[asyncio.Task[None]] = []
+        foreign: list[asyncio.Task[None]] = []
+        for task in self._server_tasks:
+            (mine if task.get_loop() is loop else foreign).append(task)
+        self._server_tasks.clear()
+        if mine:
+            await asyncio.gather(*mine, return_exceptions=True)
+        for task in foreign:
+            if task.done():
+                continue
+            owner = task.get_loop()
+            if owner.is_running():
+                try:
+                    owner.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    # The loop stopped between the check and the call; its own
+                    # close has already cancelled the task.
+                    pass
 
 
 class UserToolCatalog:
