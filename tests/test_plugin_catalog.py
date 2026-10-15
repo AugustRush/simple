@@ -4177,13 +4177,28 @@ def test_a_bundle_declaring_mcp_servers_waits_for_the_registry(tmp_path) -> None
     assert "contributed_mcp_servers" in _adapter(meta, tmp_path).inject
 
 
-def test_every_service_backed_kind_is_declared_by_some_test() -> None:
-    """The table is the list; this is the check that the list is what runs."""
+def test_every_service_backed_kind_names_a_published_service() -> None:
+    """The table's services are the vocabulary's, and each one is exercised somewhere.
+
+    Four kinds go through a capability service now: `skills` and `mcp_servers` (tested
+    above), and `commands` / `agents` -- which used to be registered on the *raw*
+    registry by the loader, and now contribute through ``ctx.commands`` / ``ctx.agents``
+    like every other kind.  The view half is exercised in
+    ``tests/test_service_vocabulary.py``; what this asserts is that the table has not
+    invented a fifth name that nothing publishes.
+    """
     from agent.plugins.catalog import DECLARATIVE_KINDS
+    from agent.runtime.service_vocabulary import PUBLIC_SERVICES
 
     backed = {kind.service for kind in DECLARATIVE_KINDS if kind.service}
-    assert backed == {"skill_catalog", "contributed_mcp_servers"}, (
-        "a new service-backed kind needs a test above, and this list updated"
+    assert backed == {
+        "skill_catalog",
+        "contributed_mcp_servers",
+        "commands",
+        "agents",
+    }, "a new service-backed kind needs a test, and this list updated"
+    assert backed <= PUBLIC_SERVICES, (
+        "a kind contributes through a service the vocabulary does not publish"
     )
 
 

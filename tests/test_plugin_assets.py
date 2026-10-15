@@ -88,48 +88,79 @@ def _catalog_paths(tmp_path):
     )
     return tmp_path
 
-def test_command_files_return_an_undo_each(tmp_path) -> None:
-    """The loader can reverse what it registered, without knowing the plugin name."""
+class _Ctx:
+    """The two things a contribution view needs: a name, and an undo sink.
+
+    The loader methods take the **view** now.  Their undo used to be returned to the
+    caller, who had to remember to register it -- which is the bookkeeping a scope
+    exists to remove, and it made these two kinds the only ones that did not contribute
+    the way every other kind does.  The view records the undo on the ctx it was built
+    with, so these tests hold the ctx instead of an undo list.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.undos: list = []
+
+    def on_unwind(self, handler) -> None:
+        self.undos.append(handler)
+
+    def unwind(self) -> None:
+        for undo in reversed(self.undos):
+            undo()
+
+
+def test_command_files_are_contributed_through_the_view(tmp_path) -> None:
+    """The loader registers through the plugin's view, and the view owns the undo."""
+    from agent.commands.registry import ScopedCommands
     from agent.plugins.catalog import PluginCatalog
 
     root = _catalog_paths(tmp_path)
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    ctx = _Ctx("p")
     try:
-        # The owners map is gone as a parameter: the registry records the owner with
-        # the handler, so there is no second structure to keep in step.
-        undos = catalog._load_command_files(root, "p")
-        assert len(undos) == 1
-        assert catalog._commands.has("p:review")
-        assert catalog._commands.owner("p:review") == "p"
+        keys = catalog._load_command_files(
+            root, "p", None, ScopedCommands(catalog._commands, ctx)
+        )
 
-        undos[0]()
+        assert keys == ["p:review"], "it reports what it registered"
+        assert catalog._commands.has("p:review")
+        assert catalog._commands.owner("p:review") == "p", "attributed to the contributor"
+
+        ctx.unwind()
+
         assert not catalog._commands.has("p:review")
         assert "p:review" not in catalog._commands.metadata()
         assert catalog._commands.owner("p:review") == "", "attribution went with it"
     finally:
         catalog.close()
 
-def test_agent_files_return_an_undo_each(tmp_path) -> None:
+
+def test_agent_files_are_contributed_through_the_view(tmp_path) -> None:
+    from agent.core.agent_registry import ScopedAgentDefs
     from agent.plugins.catalog import PluginCatalog
 
     root = _catalog_paths(tmp_path)
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    ctx = _Ctx("p")
     try:
-        undos = catalog._load_agent_files(root, "p")
-        assert len(undos) == 1
+        keys = catalog._load_agent_files(
+            root, "p", None, ScopedAgentDefs(catalog._agent_defs, ctx)
+        )
+
+        assert keys == ["plugin:p:auditor"], "the view namespaces and reports the key"
         assert catalog._agent_defs.get("plugin:p:auditor") is not None
 
-        undos[0]()
+        ctx.unwind()
+
         assert catalog._agent_defs.get("plugin:p:auditor") is None
     finally:
         catalog.close()
 
-def test_two_agent_files_get_independent_undos(tmp_path) -> None:
-    """The closure must bind per iteration, not share the loop variable.
 
-    A late-bound key removes only the last definition, which stays invisible until
-    a plugin contributes two agents -- so it is asserted with two.
-    """
+def test_two_agent_files_are_removed_independently(tmp_path) -> None:
+    """Two contributions under one view unwind one record at a time."""
+    from agent.core.agent_registry import ScopedAgentDefs
     from agent.plugins.catalog import PluginCatalog
 
     agents = tmp_path / "agents"
@@ -139,24 +170,47 @@ def test_two_agent_files_get_independent_undos(tmp_path) -> None:
             f"---\nname: {stem}\n---\nbody\n", encoding="utf-8"
         )
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    ctx = _Ctx("p")
     try:
-        undos = catalog._load_agent_files(tmp_path, "p")
-        assert len(undos) == 2
-        undos[0]()
+        keys = catalog._load_agent_files(
+            tmp_path, "p", None, ScopedAgentDefs(catalog._agent_defs, ctx)
+        )
+        assert len(keys) == 2
+
+        # One record at a time: the first undo removes its own record and no other.
+        ctx.undos[0]()
         remaining = set(catalog._agent_defs.keys())
         assert len(remaining) == 1, f"exactly one should remain, got {remaining}"
+
+        ctx.undos[1]()
+        assert set(catalog._agent_defs.keys()) == set()
     finally:
         catalog.close()
 
-def test_no_files_returns_no_undos(tmp_path) -> None:
-    """A plugin with no declarative assets contributes nothing to undo."""
+
+def test_no_files_contributes_nothing(tmp_path) -> None:
+    """A plugin with no declarative assets registers no key and records no undo."""
+    from agent.commands.registry import ScopedCommands
+    from agent.core.agent_registry import ScopedAgentDefs
     from agent.plugins.catalog import PluginCatalog
 
     empty = tmp_path / "empty"
     empty.mkdir()
     catalog = PluginCatalog(builtin_dir=tmp_path)
+    ctx = _Ctx("p")
     try:
-        assert catalog._load_command_files(empty, "p", {}) == []
-        assert catalog._load_agent_files(empty, "p") == []
+        assert (
+            catalog._load_command_files(
+                empty, "p", None, ScopedCommands(catalog._commands, ctx)
+            )
+            == []
+        )
+        assert (
+            catalog._load_agent_files(
+                empty, "p", None, ScopedAgentDefs(catalog._agent_defs, ctx)
+            )
+            == []
+        )
+        assert ctx.undos == []
     finally:
         catalog.close()

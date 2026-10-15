@@ -178,22 +178,11 @@ def plugin_service_policy(name: str, action: str) -> bool:
 RESERVED_COMPONENT_KEYS: frozenset[str] = frozenset(RESERVED_REASONS)
 
 
-#: Vocabulary a **third-party** plugin is documented to use, with no in-tree user
-#: yet.  Kept apart from :data:`PUBLIC_SERVICES`'s evidence base so the guard can be
-#: strict about both directions: every other entry has to be used by a plugin in this
-#: tree, and these two have to carry a reason instead.  Without the separation, the
-#: "no dead vocabulary" half would either be dropped (and the list could grow
-#: unchecked) or would force deleting a documented extension path.
-FOR_THIRD_PARTIES: dict[str, str] = {
-    "commands": (
-        "the documented way for a plugin to add a slash command: "
-        "`inject = (\"commands\",)` then `ctx.commands.add(name, handler)`.  In-tree "
-        "bundles go through the loader's markdown adapter instead, so nothing here "
-        "reads it yet -- tests/test_service_vocabulary.py exercises the view."
-    ),
-    "agents": (
-        "the same shape for sub-agent roles: `inject = (\"agents\",)` then "
-        "`ctx.agents.add(...)`.  Roles shipped with a bundle are registered by the "
-        "loader, so no in-tree plugin uses the view yet."
-    ),
-}
+#: Vocabulary with no in-tree user yet, each with a reason.  The guard requires a
+#: reason, so "published but unused" cannot quietly become the norm.
+#:
+#: Empty, and that is the point: ``commands`` and ``agents`` used to be here -- published
+#: for third parties while every in-tree bundle went through the loader's markdown
+#: adapter, which wrote to the **raw** registry.  The adapter now contributes through the
+#: views, so both names have a user and the waiver is gone.
+FOR_THIRD_PARTIES: dict[str, str] = {}

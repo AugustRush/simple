@@ -51,6 +51,13 @@ A **floor** is a service that cannot be provided by a plugin, and each one says 
 loads; the registries it writes into *while loading* must exist before the first plugin
 activates and are restored by the reload rollback).  A floor still has a protocol.
 
+**A floor is about the registry, not about the contribution.**  `commands` and `agents`
+are floors because the *loader* has to own those two registries -- but the things that go
+*into* them are contributed by the plugin whose files declare them, through
+`ctx.commands` / `ctx.agents`, exactly like a skill root or an MCP config.  Conflating the
+two is what left the markdown adapter writing to the raw registry, and therefore left
+these two names published with no in-tree user; they now have one.
+
 Contribution kinds that are **not** services, with the reason:
 
 * **hooks** -- the config sits on the contributing plugin's own `PluginMeta` (there is no
@@ -174,12 +181,10 @@ been sitting inside the baseline and read as an environment failure.  Smoke **6 
    relationship is only prose.  Only `agent_core` is in the first and not the second, which
    suggests they could be one record with two fields -- or that the ledger should be
    derived from the vocabulary.
-8. **Two vocabulary entries have no in-tree user.**  `commands` and `agents` are published
-   for third parties (`FOR_THIRD_PARTIES`, each with a reason) and exercised by
-   `tests/test_service_vocabulary.py`, but no plugin in this tree contributes through the
-   *view*: bundles go through the loader's markdown adapter, which registers on the raw
-   registry.  Closing it means moving that adapter onto the view, which is the same edit
-   that would let a plugin replace the loader's command registry.
+8. ~~**Two vocabulary entries have no in-tree user.**~~ -- **done**: the markdown adapter
+   contributes through `ctx.commands` / `ctx.agents`, so `FOR_THIRD_PARTIES` is empty and
+   the last raw-registry bypass on the contribution path is gone.  (The registries are
+   still floors *and still provided by the loader*; only the writing moved.)
 9. **Source-scanning guards, and when that is right.**  Several new guards assert on
    source (`DECLARATIVE_KINDS`'s "the body only loops", the loader's "no ecosystem shape
    literals").  They are checking an **absence**, which no runtime assertion can see -- but

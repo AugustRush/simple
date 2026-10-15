@@ -877,18 +877,38 @@ def _register_mcp_servers(adapter: Any, ctx: Any) -> None:
         ctx.contributed_mcp_servers.add(mcp_cfg)
 
 
+def _declared_paths(manifest: list[str] | None, plugin_dir: Path, convention: str) -> list[str]:
+    """Where this bundle's files of one kind are: the manifest, or the convention.
+
+    **One predicate, two uses.**  ``present`` needs it to decide the ``inject``
+    requirement, and ``register`` needs it to decide whether there is anything to do --
+    and those two must agree, or a bundle that declares nothing still evaluates
+    ``ctx.<service>`` and is refused by the kernel for touching a service it never
+    declared.  Measured: every Python-only plugin failed to load the moment the
+    command kind became service-backed, because registration ran unconditionally while
+    ``inject`` was conditional.
+    """
+    if manifest:
+        return list(manifest)
+    return [convention] if (plugin_dir / convention).is_dir() else []
+
+
 def _register_command_files(adapter: Any, ctx: Any) -> None:
-    for undo in adapter._catalog._load_command_files(
-        adapter._plugin_dir, adapter.name, adapter._meta.commands
-    ):
-        ctx.on_unwind(undo)
+    paths = _declared_paths(adapter._meta.commands, adapter._plugin_dir, "commands")
+    if not paths:
+        return
+    adapter._catalog._load_command_files(
+        adapter._plugin_dir, adapter.name, paths, ctx.commands
+    )
 
 
 def _register_agent_files(adapter: Any, ctx: Any) -> None:
-    for undo in adapter._catalog._load_agent_files(
-        adapter._plugin_dir, adapter.name, adapter._meta.agents
-    ):
-        ctx.on_unwind(undo)
+    paths = _declared_paths(adapter._meta.agents, adapter._plugin_dir, "agents")
+    if not paths:
+        return
+    adapter._catalog._load_agent_files(
+        adapter._plugin_dir, adapter.name, paths, ctx.agents
+    )
 
 
 def _merge_hook_files(adapter: Any, ctx: Any) -> None:
@@ -957,24 +977,23 @@ DECLARATIVE_KINDS: tuple[DeclarativeKind, ...] = (
     ),
     DeclarativeKind(
         key="commands",
-        service=None,
-        present=lambda adapter: bool(adapter._meta.commands),
-        register=_register_command_files,
-        reason=(
-            "the loader's markdown adapter registers a bundle's slash commands while "
-            "loading that bundle, and the reload rollback restores the registry from a "
-            "snapshot -- so `commands` is a floor and this kind has no inject entry"
+        # The *registry* is a floor (the loader provides it, because it must exist
+        # before the first plugin activates and the reload rollback restores it) --
+        # but the **contribution** is the plugin's, so it goes through the view like
+        # every other kind.  Conflating the two is what kept this on the raw registry.
+        service="commands",
+        present=lambda adapter: bool(
+            _declared_paths(adapter._meta.commands, adapter._plugin_dir, "commands")
         ),
+        register=_register_command_files,
     ),
     DeclarativeKind(
         key="agents",
-        service=None,
-        present=lambda adapter: bool(adapter._meta.agents),
-        register=_register_agent_files,
-        reason=(
-            "the same floor as `commands`: roles are registered during the load and "
-            "restored by the reload rollback"
+        service="agents",
+        present=lambda adapter: bool(
+            _declared_paths(adapter._meta.agents, adapter._plugin_dir, "agents")
         ),
+        register=_register_agent_files,
     ),
     DeclarativeKind(
         key="hooks",
@@ -1771,15 +1790,24 @@ class PluginCatalog:
         self,
         plugin_dir: Path,
         plugin_name: str,
-        command_paths: list[str] | None = None,
-    ) -> list[Callable[[], None]]:
+        command_paths: list[str] | None,
+        view: Any,
+    ) -> list[str]:
         """Register every ``commands/*.md`` as a namespaced slash command.
 
-        Returns the undo for each registration rather than removing them later by
-        plugin name: a caller that can reverse what it just did does not need to be
-        told which plugin it was acting for, and a sixth kind of contribution
-        cannot be added without its undo (the failure the name-filtering version
-        had: a registration with no matching filter outlives its plugin).
+        Writes through *view* -- the plugin's own contribution view -- rather than
+        through ``self._commands``.  The registry is still provided by the loader
+        (that is a *floor*: it has to exist before the first plugin activates and the
+        reload rollback restores it), but the **contribution** is the plugin's, so it
+        is attributed and unwound the same way a channel or a tool is.  The raw path
+        existed because the loader was the only thing that registered here; the moment
+        a bundle's files are the contributor, routing them around the view is exactly
+        the bypass the capability services were introduced to close.
+
+        Returns the keys it registered, for reporting.  The undo is the view's job --
+        a caller that can reverse what it just did does not need to be told which
+        plugin it was acting for, and a seventh kind of contribution cannot be added
+        without its undo.
 
         The command key is always ``<plugin>:<stem>`` (matches Claude Code's
         ``/plugin:command`` namespace).  The handler returns a string built
@@ -1790,9 +1818,9 @@ class PluginCatalog:
         paths = command_paths if command_paths else (
             ["commands"] if (plugin_dir / "commands").is_dir() else []
         )
-        undos: list[Callable[[], None]] = []
+        registered: list[str] = []
         if not paths:
-            return undos
+            return registered
         from agent.skills.catalog import parse_skill_markdown
 
         cmd_files: list[Path] = []
@@ -1835,30 +1863,36 @@ class PluginCatalog:
                     f"'/{cmd_key}' conflicts with plugin "
                     f"'{existing_owner}' — overriding[/yellow]"
                 )
-            # One write, one undo, both from the registry: the three parallel dicts
-            # this used to touch by hand are one record there.
-            undos.append(
-                self._commands.add(
+            # One write, one undo, both from the view: the three parallel dicts this
+            # used to touch by hand are one record in the registry, and the view adds
+            # the attribution and records the removal on the plugin's lifetime.
+            registered.append(
+                view.add(
                     cmd_key,
                     handler,
                     metadata=_command_metadata(handler, explicit=metadata),
-                    owner=plugin_name,
                 )
             )
-        return undos
+        return registered
 
     def _load_agent_files(
         self,
         plugin_dir: Path,
         plugin_name: str,
-        agent_paths: list[str] | None = None,
-    ) -> list[Callable[[], None]]:
-        undos: list[Callable[[], None]] = []
+        agent_paths: list[str] | None,
+        view: Any,
+    ) -> list[str]:
+        """Register every ``agents/*.md`` as a namespaced role, through *view*.
+
+        The same move as :meth:`_load_command_files`: the registry is the loader's (a
+        floor, for the rollback reason), the contribution is the plugin's.
+        """
+        registered: list[str] = []
         paths = agent_paths if agent_paths else (
             ["agents"] if (plugin_dir / "agents").is_dir() else []
         )
         if not paths:
-            return undos
+            return registered
         from agent.skills.catalog import parse_skill_markdown
 
         agent_files: list[Path] = []
@@ -1881,15 +1915,14 @@ class PluginCatalog:
                 )
                 continue
             metadata, body = parse_skill_markdown(raw)
-            key = role_key(plugin_name, stem)
-            # One write and one undo from the registry, so the ``k=key`` closure bug
-            # the hand-written version had to guard against cannot be written here:
-            # there is no loop variable captured by a lambda.
-            undos.append(
-                self._agent_defs.add(
-                    key,
+            # The view namespaces the key and stamps the owner, so the ``k=key``
+            # closure bug the hand-written version had to guard against cannot be
+            # written here: there is no loop variable captured by a lambda, and no
+            # key for this function to get wrong.
+            registered.append(
+                view.add(
+                    stem,
                     {
-                        "plugin": plugin_name,
                         "name": str(metadata.get("name", "") or stem),
                         "description": str(metadata.get("description", "") or ""),
                         "body": body,
@@ -1897,7 +1930,7 @@ class PluginCatalog:
                     },
                 )
             )
-        return undos
+        return registered
 
     def get_agent_definition(self, ref: str) -> Optional[dict]:
         """Lookup an agent definition by ``plugin:<plugin>:<agent>`` key.
