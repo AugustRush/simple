@@ -52,7 +52,7 @@ FLOORS: dict[str, str] = {
     ),
     "agent_core": (
         "A facade over the composition itself: it resolves `agent_loop`, "
-        "`skill_catalog`, `plugin_catalog`, `post_turn_maintenance` and `output_dir` at "
+        "`skill_catalog`, `plugin_catalog` and `output_dir` at "
         "call time through the container, and it publishes the system prompt by handing "
         "the whole mapping to the publisher. A plugin cannot be handed the container "
         "without making \"which services does this plugin need\" unanswerable, which is "

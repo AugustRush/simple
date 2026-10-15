@@ -526,7 +526,7 @@ def test_runtime_session_state_accepts_legacy_keywords(
     assert state.turn_in_progress is turn_in_progress
 
 
-def test_turn_runner_complete_turn_records_state_and_maintenance():
+def test_turn_runner_complete_turn_records_state_and_maintenance(monkeypatch):
     class _PluginCatalog:
         def __init__(self):
             self.events = []
@@ -535,6 +535,11 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
             self.events.append(event)
 
     maintenance_calls = []
+    from agent.core.agent import BaseAgent
+
+    monkeypatch.setattr(
+        BaseAgent, "_post_turn_maintenance", lambda **kw: maintenance_calls.append(kw)
+    )
     plugin_catalog = _PluginCatalog()
     state = RuntimeSessionState(
         ctx=object(),
@@ -548,7 +553,6 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
             "agent": agent,
             "plugin_catalog": plugin_catalog,
             "system_prompt": "system",
-            "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
         }
     )
     runner = TurnRunner.bind(components)
@@ -594,13 +598,17 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
     ]
 
 
-def test_turn_runner_uses_turn_id_as_the_journal_identity():
+def test_turn_runner_uses_turn_id_as_the_journal_identity(monkeypatch):
     maintenance_calls = []
+    from agent.core.agent import BaseAgent
+
+    monkeypatch.setattr(
+        BaseAgent, "_post_turn_maintenance", lambda **kw: maintenance_calls.append(kw)
+    )
     runner = TurnRunner.bind(
         {
             "agent": object(),
             "system_prompt": "system",
-            "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
         }
     )
     state = RuntimeSessionState(ctx=object())
@@ -627,13 +635,17 @@ def test_turn_runner_uses_turn_id_as_the_journal_identity():
     )
 
 
-def test_turn_runner_complete_turn_passes_error_to_maintenance():
+def test_turn_runner_complete_turn_passes_error_to_maintenance(monkeypatch):
     maintenance_calls = []
+    from agent.core.agent import BaseAgent
+
+    monkeypatch.setattr(
+        BaseAgent, "_post_turn_maintenance", lambda **kw: maintenance_calls.append(kw)
+    )
     runner = TurnRunner.bind(
         {
             "agent": object(),
             "system_prompt": "system",
-            "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
         }
     )
     state = RuntimeSessionState(ctx=object())
@@ -924,7 +936,6 @@ def test_agent_core_journals_user_input_before_model_completion(tmp_path):
             {
                 "agent": _Agent(),
                 "system_prompt": "system",
-                "post_turn_maintenance": lambda **kwargs: None,
             }
         )
         state = RuntimeSessionState(
@@ -956,12 +967,21 @@ def test_agent_core_journals_user_input_before_model_completion(tmp_path):
     assert turns[0].message_id
 
 
-def test_turn_runner_complete_turn_uses_live_component_updates():
+def test_turn_runner_complete_turn_uses_live_component_updates(monkeypatch):
+    from agent.core.agent import BaseAgent
+
     maintenance_calls = []
+    # A spy on the step itself, not on a published name: `post_turn_maintenance` was a
+    # resolvable service for a while, and this is what it was for -- observing what
+    # ``complete_turn`` passes.  The name is gone (nothing provided it, and its signature
+    # was undeclared); patching the method it defaults to is the honest way to observe
+    # the same thing.
+    monkeypatch.setattr(
+        BaseAgent, "_post_turn_maintenance", lambda **kw: maintenance_calls.append(kw)
+    )
     values = {
         "agent": object(),
         "system_prompt": "old",
-        "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
     }
     runner = TurnRunner.bind(values)
     state = RuntimeSessionState(ctx=object())

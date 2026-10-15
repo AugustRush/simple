@@ -385,17 +385,16 @@ class TurnRunner:
 
     #: What must exist before a turn can run.  ``agent`` because a turn is run *on*
     #: an agent, and ``system_prompt`` because the request is assembled through it.
-    #: The optional collaborators (``plugin_catalog``, ``post_turn_maintenance``) are
-    #: deliberately *not* injected: they may legitimately be absent in a minimal
-    #: composition, and a loop that refused to load without them would make the
-    #: minimal composition impossible to express.
+    #: The optional collaborator is deliberately *not* injected: a minimal composition
+    #: may have no plugin catalog, and a loop that refused to load without one would make
+    #: that composition impossible to express.
     inject = ("agent", "system_prompt")
 
-    #: The optional collaborators, named.  They may legitimately be absent in a
-    #: minimal composition, so they must not gate activation -- but the loop does
-    #: resolve them through ``ctx.services``, and a name it reads without declaring
-    #: would be a dependency the replace/unload cascade cannot see.
-    optional = ("plugin_catalog", "post_turn_maintenance")
+    #: The optional collaborator, named.  It may legitimately be absent, so it must not
+    #: gate activation -- but the loop does resolve it through ``ctx.services``, and a
+    #: name it reads without declaring would be a dependency the replace/unload cascade
+    #: cannot see.
+    optional = ("plugin_catalog",)
 
     def __init__(self) -> None:
         self._ctx: Any = None
@@ -502,9 +501,15 @@ class TurnRunner:
                 )
             )
 
-        maintenance = resolve(self._components, "post_turn_maintenance")
-        if maintenance is None:
-            maintenance = agent_module.BaseAgent._post_turn_maintenance
+        # Called directly, not through a service.  ``post_turn_maintenance`` was a
+        # resolvable name for a while: substitutable, undocumented, and provided by
+        # nobody -- a replacement had to reproduce eleven keyword-only parameters from
+        # reading a private method, and a mistake surfaced as a ``TypeError`` at the end
+        # of a turn.  A name that cannot be substituted knowingly is not an extension
+        # point, and the vocabulary guard (rightly) refuses to publish one.  If a
+        # composition ever wants to own this step, it comes back with a contract and a
+        # provider together.
+        maintenance = agent_module.BaseAgent._post_turn_maintenance
 
         record_kwargs = {
             "message_id": str(

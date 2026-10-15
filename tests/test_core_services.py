@@ -472,18 +472,11 @@ def test_providing_through_the_container_reaches_the_mapping() -> None:
 #: * a key computed at runtime (the composition's buses are written under
 #:   ``bus_name(domain)`` for domains it reads from ``default_buses()``, so the literal
 #:   never appears in the source);
-#: * an extension point published for replacement with a built-in fallback -- which is
-#:   why nothing in this tree provides it, and why the name is still read.
 _UNWRITTEN_BY_DESIGN: dict[str, str] = {
     "event_bus.tool": "written under a computed key: `bus_name(domain)` in bootstrap",
     "event_bus.turn": "written under a computed key: `bus_name(domain)` in bootstrap",
     "event_bus.session": "written under a computed key: `bus_name(domain)` in bootstrap",
     "event_bus.llm": "written under a computed key: `bus_name(domain)` in bootstrap",
-    "post_turn_maintenance": (
-        "a published extension point with a built-in fallback "
-        "(`contracts.py` falls back to `BaseAgent._post_turn_maintenance`), so nothing in "
-        "this tree provides it -- and the read is what makes it replaceable"
-    ),
 }
 
 

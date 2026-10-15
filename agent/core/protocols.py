@@ -110,3 +110,4 @@ class AgentRegistryService(Protocol):
 
     def scoped(self, ctx: Any) -> AgentContributionView:
         """The per-plugin view (the kernel calls this by name for ``ctx.agents``)."""
+

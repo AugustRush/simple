@@ -311,11 +311,6 @@ SERVICES: tuple[ServiceDeclaration, ...] = (
         summary="The composed system prompt every participant contributed to.",
     ),
     ServiceDeclaration(
-        name="post_turn_maintenance",
-        plugin_visible=True,
-        summary="The work the composition owes after a turn (consolidation, compaction).",
-    ),
-    ServiceDeclaration(
         name="runtime_factory",
         plugin_visible=True,
         summary="Builds a runtime for a run that found a changed config on disk.",

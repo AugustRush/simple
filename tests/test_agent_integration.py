@@ -8141,7 +8141,6 @@ def test_agent_core_isolates_concurrent_session_model_overrides():
             {
                 "agent": agent,
                 "system_prompt": "system",
-                "post_turn_maintenance": lambda **kwargs: None,
             }
         )
         states = [
