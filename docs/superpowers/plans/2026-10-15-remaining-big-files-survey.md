@@ -23,7 +23,7 @@ recording" below.
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 4086 | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
-| `agent/memory/store.py` | 2835 | `LTMStore` | 89 | 2578 | **19 / 317 lines** |
+| `agent/memory/store.py` | 2738 (was 2835) | `LTMStore` | 83 | 2489 | **13 / 228 lines** |
 | `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
 | `agent/memory/context.py` | 2098 (was 2484) | `ContextManager` | 72 | 1756 | **11 / 114 lines** |
 
@@ -141,23 +141,29 @@ was about the name, and did not keep the code in the class.
 `LTMStore` is the whole file but for a dataclass: 89 methods, 2578 lines of body.  It is the
 SQLite layer, so most methods are one query plus one mapper.
 
-### The `self`-free cluster (20 methods, 320 lines) — measured
+### `memory/rows.py` — **extracted**, 2835 → 2738 lines
 
-| lines | method | what it is |
-|---|---|---|
-| 50 | `_backfill_transcript_seq` | a migration step |
-| 30 | `_insert_fact_assertion` | row writer |
-| 26 | `_retract_inferred_identity_facts` | row writer |
-| 22 | `_fact_assertion_core_score` | scoring a row |
-| 21 | `_add_missing_columns` | a migration step |
-| 19 | `_next_transcript_seq` | pure arithmetic over a value |
-| 18 | `_row_to_fact_assertion` | row → object |
-| 18 | `_row_to_conversation_turn` | row → object |
+The six `_row_to_*` mappers (89 lines) went first, as the order named.  Two things the move
+surfaced, both worth recording:
 
-### Extraction order
+* Two of the six were `@staticmethod` and four were plain methods taking `self` they never
+  used; the extract keeps one signature per function (the row), and the two *callable
+  references* — `self._row_to_fact_assertion` passed into a list rather than called — are the
+  ones the first rewrite missed, because it only matched calls.
+* The module is imported as `_row_mappers`, not `rows`: this file has **22 local variables
+  named `rows`** (a cursor fetch is the most natural name in the world here), and an import
+  called `rows` is shadowed by the first of them, which turned six mappers into attribute
+  lookups on a list.  The survey cannot warn about that kind of thing; the first full run can.
 
-1. **`memory/rows.py`** — the `_row_to_*` mappers (6 methods).  Pure functions of a row; they
-   are also the ones a second backend would want.
+### What remains here (19 methods / 317 lines measured)
+
+1. **`memory/migrations.py`** — `_backfill_transcript_seq` (50), `_add_missing_columns` (21),
+   `_ensure_transcript_indexes` (15), `_next_transcript_seq` (19).
+2. **`memory/facts.py`** — `_insert_fact_assertion` (30), `_fact_assertion_core_score` (22),
+   `_retract_inferred_identity_facts` (26), `_turn_keys` (13).
+3. The 0-data / 1-call readers (`corpus_stats` 105, `list_session_ids` 47, `usage_summary` 35,
+   `append_usage_event` 34) — each needs the connection passed.
+4. The write paths (`write_conversation_exchange` 201, `apply_retention` 86) last.
 2. **`memory/migrations.py`** — `_add_missing_columns`, `_backfill_transcript_seq`,
    `_next_transcript_seq`, `_ensure_fts_index`-adjacent schema work.
 3. **`memory/facts.py`** — `_insert_fact_assertion`, `_fact_assertion_core_score`,

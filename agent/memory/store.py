@@ -16,6 +16,7 @@ from agent.lexical import LATIN_TOKEN_RE
 
 from .retrieval import CorpusStats
 
+from . import rows as _row_mappers
 from ._helpers import (
     SQLITE_BUSY_TIMEOUT_MS,
     _ASSISTANT_IDENTITY_ENTITIES,
@@ -168,7 +169,7 @@ class LTMStore:
         }
         touched: set[tuple[str, str]] = set()
         for row in rows:
-            entry = self._row_to_entry(row)
+            entry = _row_mappers._row_to_entry(row)
             for fact in self._fact_assertions_from_entry(entry):
                 if (str(fact.source_id), fact.predicate) in known:
                     continue
@@ -576,108 +577,11 @@ class LTMStore:
             )
         return self.normalize_category_name(category)
 
-    def _row_to_entry(self, row: sqlite3.Row) -> LTMEntry:
-        return LTMEntry(
-            id=row["id"],
-            content=row["content"],
-            importance=row["importance"],
-            category=row["category"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            entity=row["entity"],
-            memory_type=row["memory_type"],
-            scope=row["scope"],
-            status=row["status"],
-            source_session=row["source_session"],
-            confidence=row["confidence"],
-        )
 
-    def _row_to_conversation_turn(self, row: sqlite3.Row) -> ConversationTurn:
-        try:
-            metadata = json.loads(row["metadata_json"] or "{}")
-        except Exception:
-            metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        return ConversationTurn(
-            id=int(row["id"]),
-            session_id=row["session_id"],
-            role=row["role"],
-            content=row["content"],
-            channel=row["channel"],
-            message_id=row["message_id"],
-            reply_to_id=row["reply_to_id"],
-            metadata=metadata,
-            created_at=row["created_at"],
-            seq=int(row["seq"] or 0),
-        )
 
-    @staticmethod
-    def _row_to_session_working_state(row: sqlite3.Row) -> SessionWorkingState:
-        try:
-            state = json.loads(row["state_json"] or "{}")
-        except Exception:
-            state = {}
-        if not isinstance(state, dict):
-            state = {}
-        return SessionWorkingState(
-            session_id=row["session_id"],
-            state=state,
-            updated_at=row["updated_at"],
-        )
 
-    @staticmethod
-    def _row_to_agent_runtime_event(row: sqlite3.Row) -> AgentRuntimeEvent:
-        try:
-            payload = json.loads(row["payload_json"] or "{}")
-        except Exception:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {"value": payload}
-        return AgentRuntimeEvent(
-            id=int(row["id"]),
-            session_id=row["session_id"],
-            turn_id=row["turn_id"],
-            event_type=row["event_type"],
-            payload=payload,
-            created_at=row["created_at"],
-            seq=int(row["seq"] or 0),
-        )
 
-    def _row_to_fact_assertion(self, row: sqlite3.Row) -> FactAssertion:
-        return FactAssertion(
-            id=row["id"],
-            subject=row["subject"],
-            predicate=row["predicate"],
-            value=_load_fact_value(row["value_json"]),
-            value_type=row["value_type"],
-            scope=row["scope"],
-            source_kind=row["source_kind"],
-            source_id=row["source_id"],
-            source_session=row["source_session"],
-            channel=row["channel"],
-            confidence=float(row["confidence"] or 1.0),
-            status=row["status"],
-            valid_from=row["valid_from"],
-            valid_to=row["valid_to"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
 
-    def _row_to_resolved_fact(self, row: sqlite3.Row) -> ResolvedFact:
-        return ResolvedFact(
-            fact_key=row["fact_key"],
-            subject=row["subject"],
-            predicate=row["predicate"],
-            value=_load_fact_value(row["value_json"]),
-            value_type=row["value_type"],
-            scope=row["scope"],
-            winning_assertion_id=row["winning_assertion_id"],
-            resolution_reason=row["resolution_reason"],
-            confidence=float(row["confidence"] or 1.0),
-            resolved_at=row["resolved_at"],
-            updated_at=row["updated_at"],
-        )
 
     @staticmethod
     def _normalize_content_key(content: str) -> str:
@@ -950,7 +854,7 @@ class LTMStore:
                 params.extend(str(scope) for scope in scopes)
             sql += " ORDER BY importance DESC, updated_at DESC, id ASC"
             rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_entry(row) for row in rows]
+        return [_row_mappers._row_to_entry(row) for row in rows]
 
     def read_entries_for_entity(self, category: str, entity: str) -> list[LTMEntry]:
         category = self.normalize_category_name(category)
@@ -965,7 +869,7 @@ class LTMStore:
                 """,
                 (category, entity),
             ).fetchall()
-        return [self._row_to_entry(row) for row in rows]
+        return [_row_mappers._row_to_entry(row) for row in rows]
 
     def read_manual_note(self, category: str, entity: str) -> Optional[LTMEntry]:
         category = self.normalize_category_name(category)
@@ -981,7 +885,7 @@ class LTMStore:
                 """,
                 (category, entity),
             ).fetchone()
-        return self._row_to_entry(row) if row else None
+        return _row_mappers._row_to_entry(row) if row else None
 
     def _fact_assertions_from_entry(self, entry: LTMEntry) -> list[FactAssertion]:
         """Derive the identity *prose* an identity entry states, and only that.
@@ -1126,7 +1030,7 @@ class LTMStore:
                 "SELECT * FROM conversation_turns WHERE id = ?",
                 (cur.lastrowid,),
             ).fetchone()
-        return self._row_to_conversation_turn(row) if row else None
+        return _row_mappers._row_to_conversation_turn(row) if row else None
 
     @staticmethod
     def _json_object(raw: Any) -> dict[str, Any]:
@@ -1405,7 +1309,7 @@ class LTMStore:
             sql += " ORDER BY seq DESC, id DESC LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_conversation_turn(row) for row in reversed(rows)]
+        return [_row_mappers._row_to_conversation_turn(row) for row in reversed(rows)]
 
     @staticmethod
     def _turn_keys(rows: Any) -> list[str]:
@@ -1542,13 +1446,13 @@ class LTMStore:
         # query could pick up rows written since this one was taken.
         return (
             [
-                self._row_to_conversation_turn(row)
+                _row_mappers._row_to_conversation_turn(row)
                 for row in self._rows_at_seqs(
                     clean_session_id, "conversation_turns", turn_seqs
                 )
             ],
             [
-                self._row_to_agent_runtime_event(row)
+                _row_mappers._row_to_agent_runtime_event(row)
                 for row in self._rows_at_seqs(
                     clean_session_id, "agent_events", event_seqs
                 )
@@ -1759,7 +1663,7 @@ class LTMStore:
                     continue
                 rows_by_id[int(neighbor["id"])] = neighbor
         ordered = sorted(rows_by_id.values(), key=lambda row: int(row["id"]))
-        return [self._row_to_conversation_turn(row) for row in ordered[-limit * 2 :]]
+        return [_row_mappers._row_to_conversation_turn(row) for row in ordered[-limit * 2 :]]
 
     def load_session_working_state(
         self,
@@ -1773,7 +1677,7 @@ class LTMStore:
                 "SELECT * FROM session_working_state WHERE session_id = ?",
                 (clean_session_id,),
             ).fetchone()
-        return self._row_to_session_working_state(row) if row else None
+        return _row_mappers._row_to_session_working_state(row) if row else None
 
     def save_session_working_state(
         self,
@@ -1801,7 +1705,7 @@ class LTMStore:
                 "SELECT * FROM session_working_state WHERE session_id = ?",
                 (clean_session_id,),
             ).fetchone()
-        return self._row_to_session_working_state(row)
+        return _row_mappers._row_to_session_working_state(row)
 
     def save_provider_checkpoint(
         self,
@@ -1959,7 +1863,7 @@ class LTMStore:
                 "SELECT * FROM agent_events WHERE id = ?",
                 (cur.lastrowid,),
             ).fetchone()
-        return self._row_to_agent_runtime_event(row)
+        return _row_mappers._row_to_agent_runtime_event(row)
 
     def recent_agent_events(
         self,
@@ -1983,7 +1887,7 @@ class LTMStore:
                 """,
                 (clean_session_id, limit),
             ).fetchall()
-        return [self._row_to_agent_runtime_event(row) for row in reversed(rows)]
+        return [_row_mappers._row_to_agent_runtime_event(row) for row in reversed(rows)]
 
     def recent_agent_events_for_turns(
         self,
@@ -2014,7 +1918,7 @@ class LTMStore:
                 """,
                 (*ids, limit),
             ).fetchall()
-        return [self._row_to_agent_runtime_event(row) for row in reversed(rows)]
+        return [_row_mappers._row_to_agent_runtime_event(row) for row in reversed(rows)]
 
     @staticmethod
     def _fact_assertion_core_score(
@@ -2159,7 +2063,7 @@ class LTMStore:
         return self._read_facts(
             "fact_assertions",
             "created_at ASC, id ASC",
-            self._row_to_fact_assertion,
+            _row_mappers._row_to_fact_assertion,
             subject=subject,
             predicate=predicate,
             scope=scope,
@@ -2192,7 +2096,7 @@ class LTMStore:
                 """,
                 (normalized_subject, normalized_predicate, normalized_scope),
             ).fetchall()
-            assertions = [self._row_to_fact_assertion(row) for row in rows]
+            assertions = [_row_mappers._row_to_fact_assertion(row) for row in rows]
             if not assertions:
                 conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
                 return None
@@ -2293,7 +2197,7 @@ class LTMStore:
         return self._read_facts(
             "resolved_facts",
             "subject ASC, predicate ASC, scope ASC",
-            self._row_to_resolved_fact,
+            _row_mappers._row_to_resolved_fact,
             subject=subject,
             predicate=predicate,
             scope=scope,
@@ -2418,7 +2322,7 @@ class LTMStore:
                     (category, entity),
                 ).fetchone()
                 if row:
-                    entry = self._row_to_entry(row)
+                    entry = _row_mappers._row_to_entry(row)
                     entry.content = (
                         f"{entry.content.rstrip()}\n{clean_content}"
                         if append
@@ -2464,7 +2368,7 @@ class LTMStore:
                 ORDER BY importance DESC, updated_at DESC, id ASC
                 """
             ).fetchall()
-        return [self._row_to_entry(row) for row in rows]
+        return [_row_mappers._row_to_entry(row) for row in rows]
 
     def search_entries(
         self,
@@ -2493,7 +2397,7 @@ class LTMStore:
                 sql += " ORDER BY importance DESC, updated_at DESC, id ASC LIMIT ?"
                 params.append(limit)
                 rows = conn.execute(sql, params).fetchall()
-            return [self._row_to_entry(row) for row in rows]
+            return [_row_mappers._row_to_entry(row) for row in rows]
 
         latin_terms = [term for term in query_terms if LATIN_TOKEN_RE.fullmatch(term)]
         cjk_terms = [term for term in query_terms if term not in latin_terms]
@@ -2501,7 +2405,7 @@ class LTMStore:
 
         def _merge(rows: list[sqlite3.Row]) -> None:
             for row in rows:
-                entry = self._row_to_entry(row)
+                entry = _row_mappers._row_to_entry(row)
                 results_by_id.setdefault(entry.id, entry)
 
         normalized_categories = (
