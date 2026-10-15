@@ -3028,7 +3028,7 @@ def test_post_turn_maintenance_leaves_a_mid_turn_payload_alone(tmp_path):
     from types import SimpleNamespace
 
     from agent import BaseAgent
-    from agent.core.agent import _TURN_IN_PROGRESS_KEY
+    from agent.core.turn_context import TURN_IN_PROGRESS_KEY as _TURN_IN_PROGRESS_KEY
 
     manager = make_ctx_manager(tmp_path)
     manager.mark_activity()

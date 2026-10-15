@@ -24,8 +24,8 @@ recording" below.
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 4086 | `SchedulerStore` | 86 | 3256 | **11 / 261 lines** |
 | `agent/memory/store.py` | 2835 | `LTMStore` | 89 | 2578 | **19 / 317 lines** |
-| `agent/core/agent.py` | 2536 | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
-| `agent/memory/context.py` | 2484 | `ContextManager` | 83 | 2140 | **16 / 240 lines** |
+| `agent/core/agent.py` | 2366 (was 2536) | `BaseAgent` | 79 | 1940 | **35 / 358 lines** |
+| `agent/memory/context.py` | 2098 (was 2484) | `ContextManager` | 72 | 1756 | **11 / 114 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
 the headline, and it is why the extraction orders below start there.
@@ -101,23 +101,29 @@ repointed rather than aliased, so the names have one home.
 
 ### Shape
 
-`BaseAgent` is 2181 of them: 79 methods, 1940 lines.  Six small top-level things share the
+`BaseAgent` was 2181 of them: 79 methods, 1940 lines.  Six small top-level things share the
 file — `AgentContext`, `AgentResult`, `SubAgentProgressEvent`, `_TaskLocalContextStack`,
 `_ContentFilterRecovery`, `_TurnLoopState`, `_execute_regular_tool_calls` — the largest of them
 35 lines.
 
-### The `self`-free cluster (35 methods, 358 lines) — measured
+### `core/post_turn.py` — **extracted**, 2536 → 2366 lines
 
-`_post_turn_maintenance` alone is **201 of those 358 lines**, and it is already a
-`@staticmethod`: staging, compaction and consolidation after a turn, taking everything it needs
-as arguments and returning nothing.
+`_post_turn_maintenance` alone was **201 lines** of the `self`-free cluster, and it was already
+a `@staticmethod`: staging, compaction and consolidation after a turn, taking everything it
+needs as keyword arguments and reading nothing off the instance.  Verified faithful by diff
+before committing: the moved body is byte-identical apart from the three intended
+replacements (the function's name, its constant's local alias, and
+`agent_module._with_task_context` → `shared._with_task_context`, which is the same function the
+package root re-exports).
+
+It stays callable as `BaseAgent._post_turn_maintenance` — the turn loop, the CLI and several
+tests call it there — through a one-line staticmethod delegate.  Note the *service* that used
+to sit in front of it was removed earlier as an unenforceable extension point; that decision
+was about the name, and did not keep the code in the class.
 
 ### Extraction order
 
-1. **`core/post_turn.py`** — `_post_turn_maintenance` (201 lines).  A pure function in all but
-   its syntax; the only reason it is a method is history.  Note the seam that used to sit in
-   front of it (`post_turn_maintenance` as a *service*) was removed as an unenforceable
-   extension point — that decision was about the *name*, and does not keep the *code* here.
+1. ~~**`core/post_turn.py`** — `_post_turn_maintenance` (201 lines).~~ **Done.**
 2. **`core/turn_state.py`** — the small top-level classes (`AgentContext`, `AgentResult`,
    `_TurnLoopState`, `_TaskLocalContextStack`, `_ContentFilterRecovery`), which are data
    holders for the turn loop.
