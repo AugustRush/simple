@@ -352,15 +352,20 @@ def main(argv: list[str] | None = None) -> int:
         # actually needs.  The store work always needed a connection; the HTTP and channel
         # work never does.
         positional = [a.arg for a in list(fn.args.posonlyargs) + list(fn.args.args)]
-        takes_param = bool(args.param) and args.param in positional
+        # Two different questions, and conflating them cost a lock bug: `had_connection_param`
+        # asks whether the *original method* was handed a connection (the wrapper must pass that
+        # one on); `takes_param` asks whether the *moved function* now takes one (true after any
+        # insertion here).
+        had_connection_param = bool(args.param) and args.param in positional
+        takes_param = had_connection_param
         if args.conn_expr:
             # The body reads the connection off the object (`self._conn`); the functions here
             # take it, so the expression becomes the parameter and the wrapper passes its own.
             text = text.replace(args.conn_expr, args.param)
-            if not takes_param:
+            if not had_connection_param:
                 text = with_first_param(text, method.name, args.param)
                 takes_param = True
-        elif args.param and not takes_param:
+        elif args.param and not had_connection_param:
             text = with_first_param(text, method.name, args.param)
             # Drop the local connection acquisition.  The dedent must be relative to the `with`
             # line: a fixed four-space cut also eats the statement that follows the block (which
@@ -407,12 +412,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not args.param:
                 continue
+            # `(?!{param}\b)` and not `(?!{param},)`: a sibling that already took the
+            # connection was called with it, so inserting another produced `f(conn, conn)`.
             text = re.sub(
-                rf"(?<![\w.])(?<!def ){sibling}\(\n(\s+)(?!{args.param},)",
+                rf"(?<![\w.])(?<!def ){sibling}\(\n(\s+)(?!{args.param}\b)",
                 lambda m: f"{sibling}(\n{m.group(1)}{args.param}, ", text,
             )
             text = re.sub(
-                rf"(?<![\w.])(?<!def ){sibling}\((?!\n)(?!{args.param},)(?!\s*\))",
+                rf"(?<![\w.])(?<!def ){sibling}\((?!\n)(?!{args.param}\b)(?!\s*\))",
                 f"{sibling}({args.param}, ", text,
             )
         try:
@@ -452,17 +459,28 @@ def main(argv: list[str] | None = None) -> int:
         uses_connect = bool(args.param) and not args.conn_expr and any(
             line.strip() == f"with self._connect() as {args.param}:" for line in original.splitlines()
         )
+        # A body that opened nothing but hands the connection to a sibling needs one too, and it
+        # must be opened with `with`: without the commit-on-exit the write stays pending on the
+        # thread-local connection and the next statement meets "database is locked".  For a read
+        # the `with` commits an empty transaction, which costs nothing.
+        delegates_connection = (
+            bool(args.param) and not args.conn_expr
+            and not had_connection_param and not uses_connect
+        )
+        opens_connection = uses_connect or delegates_connection
         stem = pathlib.Path(args.module).stem
-        pad = " " * (12 if uses_connect else 8)
+        pad = " " * (12 if opens_connection else 8)
+        # Three different ways a wrapper can come by a connection, and mixing them up costs a
+        # TypeError: (a) the method already received one, (b) it opened its own, (c) it opened
+        # nothing and merely delegated to a sibling that now needs one.
         if args.conn_expr:
-            first = args.conn_expr                       # the caller's own connection
-        elif uses_connect:
-            first = args.param                           # opened by the `with` below
-        elif args.param and not args.conn_expr:
-            # The method opened nothing itself -- it delegated to a sibling that now takes a
-            # connection.  Supply one, or the moved function is called with a parameter nobody
-            # filled.  No `with`: the original managed no transaction here, so neither does this.
-            first = "self._connect()"
+            first = args.conn_expr
+        elif had_connection_param:
+            first = args.param                           # (a) pass on what it was given
+        elif opens_connection:
+            first = args.param                           # (b)/(c) opened by the `with` below
+        elif args.param:
+            first = "self._connect()"                    # fallback: no `with`
         else:
             first = ""
         call_args = ([first] if first else []) + [f"{n}={n}" for n in names if n != first]
@@ -481,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         wrapper_lines.append(textwrap.indent(head + ":", "    "))
         if doc:
             wrapper_lines.append(f'        """{doc}"""')
-        if uses_connect:
+        if opens_connection:
             wrapper_lines.append(f"        with self._connect() as {args.param}:")
         wrapper_lines.append(f"{pad}{prefix}{call}")
         wrapper = "\n".join(wrapper_lines) + "\n"

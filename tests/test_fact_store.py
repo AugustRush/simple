@@ -57,7 +57,11 @@ def test_add_fact_assertion_rolls_back_when_resolution_fails(tmp_path, monkeypat
     def fail_resolution(*args, **kwargs):
         raise RuntimeError("resolution failed")
 
-    monkeypatch.setattr(store, "resolve_fact", fail_resolution)
+    # The call now resolves inside agent.memory.facts, so patching the instance would
+    # intercept nothing and the test would pass without testing the rollback.
+    from agent.memory import facts as facts_module
+
+    monkeypatch.setattr(facts_module, "resolve_fact", fail_resolution)
 
     with pytest.raises(RuntimeError, match="resolution failed"):
         store.add_fact_assertion(

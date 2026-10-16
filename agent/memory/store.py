@@ -94,67 +94,20 @@ class LTMStore:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _repair_assistant_identity_facts(self) -> None:
-        """Reconcile stored identity facts with the writers that exist today.
+        """Reconcile stored identity facts with the writers that exist today."""
+        with self._connect() as conn:
+            facts._repair_assistant_identity_facts(
+                conn,
+            )
 
-        Two kinds of damage accumulate in an existing store and neither heals
-        on its own, because a fact is only ever written — never revisited.
-
-        The pattern-matching extractor that used to read names out of chat is
-        gone.  Everything it asserted was a guess made by code that no longer
-        exists, and some of those guesses ("你叫什么" → name "什么") were
-        recorded at the highest authority the store has, so nothing later could
-        dislodge them.  Retract the lot by provenance rather than by inspecting
-        values: which rows are unsound is a question about where they came
-        from, and answering it by re-judging the text would just reinstate the
-        guessing this removed.
-
-        An identity note written by hand produced no fact at all, so the last
-        machine-extracted note stayed current long after the user replaced it.
-        Derive the missing facts now, keyed on the entry they came from so a
-        second run adds nothing.
-
-        Best-effort by construction: a store that cannot be repaired is still a
-        store that works, and refusing to start over stale identity would be a
-        far worse failure than carrying it.
-        """
-        try:
-            with self._connect() as conn:
-                retracted = facts._retract_inferred_identity_facts(conn)
-                derived = self._derive_missing_identity_facts(conn)
-            for subject, predicate in retracted | derived:
-                self.resolve_fact(subject, predicate)
-        except sqlite3.Error:
-            return
 
     def _derive_missing_identity_facts(
         self, conn: sqlite3.Connection
     ) -> set[tuple[str, str]]:
-        entity_slots = ",".join("?" * len(_ASSISTANT_IDENTITY_ENTITIES))
-        rows = conn.execute(
-            f"""
-            SELECT * FROM memory_items
-            WHERE category = 'identity' AND entity IN ({entity_slots})
-              AND status NOT IN ('archived', 'superseded')
-            """,
-            tuple(sorted(_ASSISTANT_IDENTITY_ENTITIES)),
-        ).fetchall()
-        if not rows:
-            return set()
-        known = {
-            (str(row["source_id"]), str(row["predicate"]))
-            for row in conn.execute(
-                "SELECT source_id, predicate FROM fact_assertions WHERE subject = 'assistant'"
-            ).fetchall()
-        }
-        touched: set[tuple[str, str]] = set()
-        for row in rows:
-            entry = _row_mappers._row_to_entry(row)
-            for fact in self._fact_assertions_from_entry(entry):
-                if (str(fact.source_id), fact.predicate) in known:
-                    continue
-                facts._insert_fact_assertion(conn, fact)
-                touched.add((fact.subject, fact.predicate))
-        return touched
+        return facts._derive_missing_identity_facts(
+            conn,
+        )
+
 
     def _connect(self) -> sqlite3.Connection:
         """Return a thread-local singleton connection with WAL mode enabled.
@@ -1133,40 +1086,12 @@ class LTMStore:
 
 
     def add_fact_assertion(self, assertion: FactAssertion) -> FactAssertion:
-        subject = _normalize_fact_part(assertion.subject)
-        predicate = _normalize_fact_part(assertion.predicate)
-        scope = _normalize_fact_part(assertion.scope, "global")
-        if not subject or not predicate:
-            raise ValueError("fact assertions require non-empty subject and predicate")
-
-        normalized = FactAssertion(
-            id=assertion.id or _new_id(),
-            subject=subject,
-            predicate=predicate,
-            value=assertion.value,
-            value_type=assertion.value_type or _fact_value_type(assertion.value),
-            scope=scope,
-            source_kind=_normalize_fact_part(assertion.source_kind, "manual_write"),
-            source_id=str(assertion.source_id or "").strip(),
-            source_session=str(assertion.source_session or "").strip(),
-            channel=str(assertion.channel or "").strip(),
-            confidence=float(assertion.confidence or 0.0),
-            status=_normalize_fact_part(assertion.status, "active"),
-            valid_from=str(assertion.valid_from or "").strip(),
-            valid_to=str(assertion.valid_to or "").strip(),
-            created_at=assertion.created_at or _now(),
-            updated_at=assertion.updated_at or _now(),
-        )
-
         with self._connect() as conn:
-            facts._insert_fact_assertion(conn, normalized)
-            self.resolve_fact(
-                normalized.subject,
-                normalized.predicate,
-                normalized.scope,
-                _conn=conn,
+            return facts.add_fact_assertion(
+                conn,
+                assertion=assertion,
             )
-        return normalized
+
 
     def _read_facts(
         self,
@@ -1215,115 +1140,19 @@ class LTMStore:
         *,
         _conn: Optional[sqlite3.Connection] = None,
     ) -> Optional[ResolvedFact]:
-        normalized_subject = _normalize_fact_part(subject)
-        normalized_predicate = _normalize_fact_part(predicate)
-        normalized_scope = _normalize_fact_part(scope, "global")
-        key = _fact_key(normalized_subject, normalized_predicate, normalized_scope)
+        """Resolve a fact; the transaction boundary depends on who supplied the connection.
 
-        connection_context = (
-            contextlib.nullcontext(_conn) if _conn is not None else self._connect()
-        )
-        with connection_context as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM fact_assertions
-                WHERE subject = ? AND predicate = ? AND scope = ?
-                  AND status != 'archived'
-                ORDER BY created_at ASC, id ASC
-                """,
-                (normalized_subject, normalized_predicate, normalized_scope),
-            ).fetchall()
-            assertions = [_row_mappers._row_to_fact_assertion(row) for row in rows]
-            if not assertions:
-                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
-                return None
+        The implementation is :func:`agent.memory.facts.resolve_fact`, which writes -- so the
+        distinction matters.  With ``_conn`` the caller owns the transaction and nothing is
+        committed here (it used to be ``contextlib.nullcontext``); without it this opens the
+        thread-local connection, and leaving the ``with`` block commits.
+        """
+        if _conn is not None:
+            return facts.resolve_fact(_conn, subject, predicate, scope=scope)
+        with self._connect() as conn:
+            return facts.resolve_fact(conn, subject, predicate, scope=scope)
 
-            active = [assertion for assertion in assertions if not assertion.valid_to]
-            if not active:
-                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
-                return None
 
-            best_core_score = max(
-                facts._fact_assertion_core_score(assertion) for assertion in active
-            )
-            top_assertions = [
-                assertion
-                for assertion in active
-                if facts._fact_assertion_core_score(assertion) == best_core_score
-            ]
-            top_values = {
-                _dump_fact_value(assertion.value) for assertion in top_assertions
-            }
-
-            if len(top_values) > 1:
-                now = _now()
-                conn.execute(
-                    """
-                    UPDATE fact_assertions
-                    SET status = 'conflicted',
-                        updated_at = ?
-                    WHERE subject = ? AND predicate = ? AND scope = ?
-                      AND status != 'archived'
-                    """,
-                    (now, normalized_subject, normalized_predicate, normalized_scope),
-                )
-                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
-                return None
-
-            winning_value_json = next(iter(top_values))
-            winner = max(
-                [
-                    assertion
-                    for assertion in active
-                    if _dump_fact_value(assertion.value) == winning_value_json
-                ],
-                key=self._fact_assertion_total_score,
-            )
-            now = _now()
-            for assertion in assertions:
-                status = "active" if assertion.id == winner.id else "superseded"
-                conn.execute(
-                    "UPDATE fact_assertions SET status = ?, updated_at = ? WHERE id = ?",
-                    (status, now, assertion.id),
-                )
-
-            resolved = ResolvedFact(
-                fact_key=key,
-                subject=normalized_subject,
-                predicate=normalized_predicate,
-                value=winner.value,
-                value_type=winner.value_type or _fact_value_type(winner.value),
-                scope=normalized_scope,
-                winning_assertion_id=winner.id,
-                resolution_reason="resolved",
-                confidence=float(winner.confidence or 0.0),
-                resolved_at=now,
-                updated_at=now,
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO resolved_facts (
-                    fact_key, subject, predicate, value_json, value_type, scope,
-                    winning_assertion_id, resolution_reason, confidence,
-                    resolved_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    resolved.fact_key,
-                    resolved.subject,
-                    resolved.predicate,
-                    _dump_fact_value(resolved.value),
-                    resolved.value_type,
-                    resolved.scope,
-                    resolved.winning_assertion_id,
-                    resolved.resolution_reason,
-                    resolved.confidence,
-                    resolved.resolved_at,
-                    resolved.updated_at,
-                ),
-            )
-        return resolved
 
     def read_resolved_facts(
         self,
@@ -1364,47 +1193,16 @@ class LTMStore:
         role: Optional[str] = None,
         persona: Optional[str] = None,
     ) -> dict[str, str]:
-        """Record identity as a deliberate setting, last write wins.
-
-        This is the only way ``name`` and ``role`` enter the store apart from
-        config bootstrap.  Identity is something the user *sets*, not something
-        the system infers from prose, so the caller states the value outright
-        and it supersedes whatever was there — no pattern matching, no scoring
-        an old value against a new one.
-
-        Fields left as ``None`` are untouched; passing an empty string clears
-        that field by superseding it with nothing.
-        """
-        normalized_subject = _normalize_fact_part(subject, "assistant")
-        if normalized_subject not in _IDENTITY_SUBJECTS:
-            raise ValueError(
-                f"identity subject must be one of {sorted(_IDENTITY_SUBJECTS)}"
+        """Record identity as a deliberate setting, last write wins."""
+        with self._connect() as conn:
+            return facts.set_identity(
+                conn,
+                subject=subject,
+                name=name,
+                role=role,
+                persona=persona,
             )
-        updates = {"name": name, "role": role, "identity_note": persona}
-        applied: dict[str, str] = {}
-        for predicate, raw in updates.items():
-            if raw is None:
-                continue
-            value = str(raw).strip()
-            if predicate == "identity_note":
-                value = _identity_note_value(value)
-            if not value:
-                self.retract_facts(normalized_subject, predicate)
-                applied[predicate] = ""
-                continue
-            self.add_fact_assertion(
-                FactAssertion(
-                    id=_new_id(),
-                    subject=normalized_subject,
-                    predicate=predicate,
-                    value=value,
-                    source_kind="identity_directive",
-                    source_session="set_identity",
-                    confidence=1.0,
-                )
-            )
-            applied[predicate] = value
-        return applied
+
 
     def retract_facts(self, subject: str, predicate: str, scope: str = "global") -> int:
         """Archive every assertion behind one fact and drop the resolved row."""
