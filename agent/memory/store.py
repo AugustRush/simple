@@ -1198,12 +1198,13 @@ class LTMStore:
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
     ) -> list[FactAssertion]:
-        return facts.read_fact_assertions(
-            self._connect(),
-            subject=subject,
-            predicate=predicate,
-            scope=scope,
-        )
+        with self._connect() as conn:
+            return facts.read_fact_assertions(
+                conn,
+                subject=subject,
+                predicate=predicate,
+                scope=scope,
+            )
 
 
     def resolve_fact(
@@ -1331,12 +1332,13 @@ class LTMStore:
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
     ) -> list[ResolvedFact]:
-        return facts.read_resolved_facts(
-            self._connect(),
-            subject=subject,
-            predicate=predicate,
-            scope=scope,
-        )
+        with self._connect() as conn:
+            return facts.read_resolved_facts(
+                conn,
+                subject=subject,
+                predicate=predicate,
+                scope=scope,
+            )
 
 
     def has_conflicted_fact(
