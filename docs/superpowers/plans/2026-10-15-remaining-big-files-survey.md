@@ -23,7 +23,7 @@ recording" below.
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 1534 (was 4086) | `SchedulerStore` | 74 | 2783 | **0 lines** |
-| `agent/memory/store.py` | 990 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
+| `agent/memory/store.py` | 1009 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1266 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
 
@@ -194,6 +194,13 @@ that), so no call site changed.
 4. The 0-data / 1-call group (`_runtime_progress_message` 85, `_format_agent_error` 59, …).
 5. `__init__` (132 lines, 17 refs) and `register_spawn_capability` (157) last: they are the
    object's identity and are supposed to know everything.
+
+## 2a. A number I got wrong
+
+The commit that moved the entry writers (`a153472`) and this survey both said
+`agent/memory/store.py` came out at **990** lines.  It is **1009** (`git show a153472:... | wc -l`).
+The pre-move figure (1130) was right, so the delta was over-reported by 19 lines.  The commit
+message cannot be amended without rewriting history; this note is the correction.
 
 ## 2b. `agent/memory/context.py` — the job/consolidation cluster is **not** mechanically extractable
 
