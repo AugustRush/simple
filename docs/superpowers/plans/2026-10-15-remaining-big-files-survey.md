@@ -246,11 +246,30 @@ Done, in order: `rows.py`, `migrations.py`, `facts.py` (the four writers/scorers
 `queries.py`, `schema.py`, `fts.py`, `journal.py`, `append_conversation_turn`, `normalize.py`.
 Left:
 
-1. **Extending `facts.py`** — the twelve fact-ledger readers and writers that close over each other
-   (`read_fact_assertions`, `read_resolved_facts`, `has_conflicted_fact`, `retract_facts`,
-   `_read_facts`, `_fact_assertions_from_entry`, `add_fact_assertion`, `resolve_fact` 117,
-   `set_identity`, `_derive_missing_identity_facts`, `_repair_assistant_identity_facts`,
-   `_fact_assertion_total_score`) -- ~415 lines, and unblocked now that `normalize.py` exists.
+1. **Extending `facts.py`** — **seven of twelve are in** (`read_fact_assertions`,
+   `read_resolved_facts`, `has_conflicted_fact`, `retract_facts`, `_read_facts`,
+   `_fact_assertions_from_entry`, `_fact_assertion_total_score`; 1795 -> 1761 lines).  Five are
+   left, and they are **not mechanical**:
+   * `resolve_fact` (117 lines) takes an **optional** `_conn` and only opens one when it is absent.
+     It also writes (INSERT/UPDATE/DELETE), so the distinction matters: with `_conn` the caller owns
+     the transaction and nothing is committed on exit (`contextlib.nullcontext`), without it the
+     `with self._connect()` block commits. `--conn-expr` cannot express that -- it would open
+     eagerly and ignore `_conn`. The honest shape is a transaction-agnostic function plus a wrapper
+     that decides:
+     ```python
+     def resolve_fact(self, subject, predicate, scope="global", *, _conn=None):
+         if _conn is not None:
+             return facts.resolve_fact(_conn, subject, predicate, scope=scope)
+         with self._connect() as conn:
+             return facts.resolve_fact(conn, subject, predicate, scope=scope)
+     ```
+   * `add_fact_assertion`, `set_identity`, `_derive_missing_identity_facts`,
+     `_repair_assistant_identity_facts` (145 lines together) move once `resolve_fact` has, because
+     they call it.
+   And one test has to move with them: `tests/test_fact_store.py` patches the **instance**
+   `store.resolve_fact` to prove `add_fact_assertion` rolls back.  After the move the internal call
+   resolves in `facts.py`, so the patch must target `agent.memory.facts.resolve_fact` -- otherwise
+   the test keeps passing while intercepting nothing.
 2. **`memory/entries.py`** then `memory/search.py` (`search_entries` 99).
 3. **`memory/conversations.py`** (`write_conversation_exchange` 202 + `_json_object`).
 4. **`memory/maintenance.py`** (`apply_retention`, `apply_decay`, `clear_persistent_memory`,
