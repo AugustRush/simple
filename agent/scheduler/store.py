@@ -41,6 +41,8 @@ import threading
 from typing import Any, Callable, Optional, TypeVar
 
 from agent import shared
+from . import workflow_editing
+from . import retries
 from . import attention
 from . import workflow_engine
 from . import schema
@@ -960,87 +962,17 @@ class SchedulerStore:
         snapshot: dict,
         attempt: int = 1,
     ) -> Optional[ClaimedTask]:
-        run_id = _new_id()
-        lease_until = now + timedelta(seconds=lease_seconds)
-        # A run started by hand or by a retry is owed the same picture of the
-        # steps above it as one a signal woke.  Only filled when nothing else
-        # has: a snapshot that already carries ``signals`` came from the
-        # emission that queued this run and describes that round exactly,
-        # which is more faithful than re-deriving it here.  ``signal`` is
-        # deliberately left unset -- that key means "the emission that woke
-        # this run" and is where cascade depth is inherited from, and nothing
-        # woke this one.
-        snapshot = dict(snapshot or {})
-        if "signals" not in snapshot:
-            arrivals = self._upstream_reports_in_transaction(task)
-            if arrivals:
-                snapshot["signals"] = [
-                    {"name": name, "payload": payload}
-                    for name, payload in sorted(arrivals.items())
-                ]
-        snapshot, workflow_run_id = self._prepare_workflow_run(
-            task,
-            run_id,
-            snapshot,
+        return retries._claim_task_in_transaction(
+            self._conn,
+            task=task,
             now=now,
+            lease_seconds=lease_seconds,
+            scheduled_for=scheduled_for,
             trigger_source=trigger_source,
+            snapshot=snapshot,
+            attempt=attempt,
         )
-        self._conn.execute(
-            """
-            INSERT INTO scheduled_task_runs (
-                id, task_id, scheduled_for, started_at, finished_at, status,
-                summary, error, output_path, delivery_status,
-                config_snapshot_json, trigger_source, attempt,
-                workflow_run_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                task.id,
-                _iso(scheduled_for),
-                _iso(now),
-                json.dumps(snapshot, ensure_ascii=False),
-                trigger_source,
-                max(1, int(attempt)),
-                workflow_run_id,
-                _iso(now),
-                _iso(now),
-            ),
-        )
-        cursor = self._conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET lease_until = ?, active_run_id = ?, updated_at = ?
-            WHERE id = ? AND active_run_id IS NULL
-            """,
-            (_iso(lease_until), run_id, _iso(now), task.id),
-        )
-        if cursor.rowcount != 1:
-            self._conn.execute(
-                "DELETE FROM scheduled_task_runs WHERE id = ?", (run_id,)
-            )
-            return None
-        refreshed = self._conn.execute(
-            "SELECT * FROM scheduled_tasks WHERE id = ?", (task.id,)
-        ).fetchone()
-        claimed_task = _task_from_row(refreshed) if refreshed else task
-        return ClaimedTask(
-            task=claimed_task,
-            run=TaskRun(
-                id=run_id,
-                task_id=task.id,
-                scheduled_for=scheduled_for,
-                started_at=now,
-                finished_at=None,
-                status="running",
-                config_snapshot=snapshot,
-                trigger_source=trigger_source,
-                attempt=max(1, int(attempt)),
-                workflow_run_id=workflow_run_id,
-                created_at=now,
-                updated_at=now,
-            ),
-        )
+
 
     @_synchronized
     def claim_task_now(
@@ -1081,40 +1013,15 @@ class SchedulerStore:
         now: Optional[datetime] = None,
         lease_seconds: int = 300,
     ) -> Optional[ClaimedTask]:
-        if lease_seconds < 3:
-            raise ValueError("lease_seconds must be at least 3")
-        current = (now or datetime.now(UTC)).astimezone(UTC)
-        with self._immediate_transaction():
-            self._recover_stale_runs_in_transaction(current)
-            task_row = self._conn.execute(
-                "SELECT * FROM scheduled_tasks WHERE id = ? AND active_run_id IS NULL",
-                (task_id,),
-            ).fetchone()
-            source_row = self._conn.execute(
-                """
-                SELECT * FROM scheduled_task_runs
-                WHERE id = ? AND task_id = ? AND status <> 'running'
-                """,
-                (run_id, task_id),
-            ).fetchone()
-            if task_row is None or source_row is None:
-                return None
-            task = _task_from_row(task_row)
-            source = _run_from_row(source_row)
-            snapshot = (
-                execution_snapshot(task) if use_latest else source.config_snapshot
-            )
-            if not snapshot:
-                snapshot = execution_snapshot(task)
-            return self._claim_task_in_transaction(
-                task,
-                now=current,
-                lease_seconds=lease_seconds,
-                scheduled_for=source.scheduled_for,
-                trigger_source="retry_latest" if use_latest else "retry_snapshot",
-                snapshot=snapshot,
-                attempt=source.attempt + 1,
-            )
+        return retries.claim_retry(
+            self._conn,
+            task_id=task_id,
+            run_id=run_id,
+            use_latest=use_latest,
+            now=now,
+            lease_seconds=lease_seconds,
+        )
+
 
     @_synchronized
     def request_cancel(
@@ -1153,57 +1060,13 @@ class SchedulerStore:
         *,
         retry_at: datetime,
     ) -> Optional[TaskRun]:
-        retry_at = retry_at.astimezone(UTC)
-        with self._immediate_transaction():
-            source_row = self._conn.execute(
-                """
-                SELECT * FROM scheduled_task_runs
-                WHERE id = ? AND task_id = ? AND status = 'failed'
-                """,
-                (source_run_id, task_id),
-            ).fetchone()
-            if source_row is None:
-                return None
-            existing = self._conn.execute(
-                """
-                SELECT * FROM scheduled_task_runs
-                WHERE task_id = ? AND retry_of_run_id = ? AND status IN ('queued', 'running')
-                LIMIT 1
-                """,
-                (task_id, source_run_id),
-            ).fetchone()
-            if existing is not None:
-                return _run_from_row(existing)
-            source = _run_from_row(source_row)
-            run_id = _new_id()
-            self._conn.execute(
-                """
-                INSERT INTO scheduled_task_runs (
-                    id, task_id, scheduled_for, started_at, finished_at, status,
-                    summary, error, output_path, delivery_status,
-                    config_snapshot_json, trigger_source, attempt,
-                    cancel_requested_at, retry_of_run_id, workflow_run_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, 'queued', '', '', '', '', ?,
-                          'automatic_retry', ?, NULL, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    task_id,
-                    _iso(source.scheduled_for),
-                    _iso(retry_at),
-                    json.dumps(source.config_snapshot, ensure_ascii=False),
-                    source.attempt + 1,
-                    source_run_id,
-                    source.workflow_run_id,
-                    _iso(datetime.now(UTC)),
-                    _iso(datetime.now(UTC)),
-                ),
-            )
-            row = self._conn.execute(
-                "SELECT * FROM scheduled_task_runs WHERE id = ?", (run_id,)
-            ).fetchone()
-        return _run_from_row(row) if row else None
+        return retries.enqueue_retry(
+            self._conn,
+            task_id=task_id,
+            source_run_id=source_run_id,
+            retry_at=retry_at,
+        )
+
 
     @_synchronized
     def claim_due_tasks(
@@ -1278,45 +1141,14 @@ class SchedulerStore:
         reason: str,
     ) -> bool:
         """Release an unexecuted claim without consuming its scheduled occurrence."""
-        now = now.astimezone(UTC)
-        with self._immediate_transaction():
-            row = self._conn.execute(
-                """
-                SELECT r.scheduled_for
-                FROM scheduled_tasks t
-                JOIN scheduled_task_runs r
-                  ON r.id = t.active_run_id AND r.task_id = t.id
-                WHERE t.id = ? AND t.active_run_id = ? AND r.status = 'running'
-                """,
-                (task_id, run_id),
-            ).fetchone()
-            if row is None:
-                return False
-            task_cursor = self._conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET next_run_at = ?, lease_until = NULL, active_run_id = NULL,
-                    updated_at = ?
-                WHERE id = ? AND active_run_id = ?
-                """,
-                (row["scheduled_for"], _iso(now), task_id, run_id),
-            )
-            if task_cursor.rowcount != 1:
-                return False
-            self._conn.execute(
-                """
-                UPDATE scheduled_task_runs
-                SET status = 'interrupted', error = ?, finished_at = ?, updated_at = ?
-                WHERE id = ? AND task_id = ? AND status = 'running'
-                """,
-                (reason, _iso(now), _iso(now), run_id, task_id),
-            )
-            # A released claim is over: nothing completes it afterwards, so if
-            # it was the only live work of its workflow round, the round is
-            # rolled up here.  Same reasoning as the stale-lease recovery
-            # above -- every way a run ends has to close the round it ends.
-            self._settle_workflow_run_of_run(run_id, now)
-        return True
+        return retries.release_claim(
+            self._conn,
+            task_id=task_id,
+            run_id=run_id,
+            now=now,
+            reason=reason,
+        )
+
 
     @_synchronized
     def owns_unexpired_lease(self, task_id: str, run_id: str, *, now: datetime) -> bool:
@@ -1386,60 +1218,13 @@ class SchedulerStore:
 
 
     def _close_rounds_before_edit(self, workflow_id: str, now: datetime) -> None:
-        """End every round that is not executing something.  Caller owns txn.
+        """End every round that is not executing something.  Caller owns txn."""
+        workflow_editing._close_rounds_before_edit(
+            self._conn,
+            workflow_id=workflow_id,
+            now=now,
+        )
 
-        An edit may proceed while a round is ``running`` only if that round has
-        no queued or running work: work in flight is executing the definition
-        being replaced, and refusing there is the point of the check.  A round
-        whose remaining steps are simply not coming -- the second clock entry
-        of a dual-entry workflow, a join waiting on an upstream nobody will
-        run -- has nothing in flight and can never complete on its own, so
-        leaving it ``running`` turned one manual run into an edit lock that
-        only deleting the workflow could open.  It is closed here, interrupted,
-        because that is what it is: an execution the scheduler stopped being
-        able to finish.
-
-        Deliberately not a periodic sweep.  A round with nothing in flight is
-        still rescuable -- manually running the upstream its join waits on
-        joins that round (see :meth:`_round_waiting_on`) -- so closing it on a
-        timer would take that away.  It is closed when somebody edits the
-        definition, which is the moment the old round is declared over.
-        """
-        rounds = self._conn.execute(
-            "SELECT id FROM workflow_runs WHERE workflow_id = ? AND status = 'running'",
-            (workflow_id,),
-        ).fetchall()
-        for row in rounds:
-            round_id = str(row["id"])
-            self._settle_workflow_run(round_id, now)
-            live = self._conn.execute(
-                """
-                SELECT 1 FROM scheduled_task_runs
-                WHERE workflow_run_id = ? AND status IN ('queued', 'running')
-                LIMIT 1
-                """,
-                (round_id,),
-            ).fetchone()
-            if live is not None:
-                raise ValueError(
-                    "workflow 仍有执行中的轮次，需等待完成或取消后再修改定义"
-                )
-            self._conn.execute(
-                """
-                UPDATE workflow_runs
-                SET status = 'interrupted', updated_at = ?, finished_at = ?
-                WHERE id = ? AND status = 'running'
-                """,
-                (_iso(now), _iso(now), round_id),
-            )
-            # Half-collected arrivals belong to the round that just ended, and
-            # the graph they were waiting on is about to be replaced.  Left
-            # behind they would complete a round nobody opened, on a report
-            # from before the edit.
-            self._conn.execute(
-                "DELETE FROM workflow_signal_joins WHERE workflow_run_id = ?",
-                (round_id,),
-            )
 
     @_synchronized
     def complete_run(
@@ -1633,131 +1418,36 @@ class SchedulerStore:
         now: Optional[datetime] = None,
         materialize: bool = True,
     ) -> Optional[Workflow]:
-        """Store a new graph, and by default rebuild the tasks behind it.
+        """Store a new graph, and by default rebuild the tasks behind it."""
+        return workflow_editing.update_workflow(
+            self._conn,
+            workflow_id=workflow_id,
+            workflow=workflow,
+            now=now,
+            materialize=materialize,
+        )
 
-        ``materialize=False`` is for the one caller that has just written a
-        step's *task* and is copying that change back into the graph: the task
-        is the newer of the two, and rebuilding it from the step that was
-        copied from it would be a round trip that only risks losing something.
-
-        The new graph and the tasks rebuilt from it are one transaction, so an
-        edit that fails halfway leaves the previous version running rather than
-        a graph whose steps disagree with the tasks behind them.
-        """
-        if self.get_workflow(workflow_id) is None:
-            return None
-        _validate_graph(workflow.steps)
-        updated_at = (now or datetime.now(UTC)).astimezone(UTC)
-        with self._immediate_transaction():
-            self._close_rounds_before_edit(workflow_id, updated_at)
-            # `request_quote` is deliberately absent here.  It records who asked
-            # for the chain, and editing a step does not change that -- while a
-            # caller that rebuilds the graph from an edit form has no quote to
-            # send, so writing the column from `workflow` would blank the one
-            # piece of evidence the row holds about its own origin.
-            self._conn.execute(
-                """
-                UPDATE workflows
-                SET name = ?, description = ?, enabled = ?, graph_json = ?,
-                    version = version + 1, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    workflow.name,
-                    workflow.description,
-                    1 if workflow.enabled else 0,
-                    json.dumps(workflow.to_graph(), ensure_ascii=False),
-                    _iso(updated_at),
-                    workflow_id,
-                ),
-            )
-            if materialize:
-                self._materialize_workflow_in_transaction(workflow_id, now=updated_at)
-        return self.get_workflow(workflow_id)
 
     @_synchronized
     def delete_workflow(
         self, workflow_id: str, *, now: Optional[datetime] = None
     ) -> list[str]:
-        """Drop the graph and disable the tasks it built.  Returns their ids.
+        """Drop the graph and disable the tasks it built.  Returns their ids."""
+        return workflow_editing.delete_workflow(
+            self._conn,
+            workflow_id=workflow_id,
+            now=now,
+        )
 
-        The tasks are disabled rather than deleted, and their run history is
-        left where it is.  Deleting them would take the record of what the
-        workflow did with it, and a workflow is exactly the kind of thing
-        somebody deletes in order to stop it -- not in order to forget that it
-        ran.  Disabling also stops any subscription they hold from firing.
-
-        A join that was part-way through its round does *not* keep that
-        progress.  Unlike the run history, a half-satisfied round is not a
-        record of something that happened -- it is an expectation about what
-        happens next, and the graph it was waiting on no longer exists.  Left
-        behind, it survives until somebody switches one of these orphaned
-        steps back on (which they may, since a step whose workflow is gone is
-        an ordinary task again), and then the first report from any one arm
-        finds the set already full and closes a round whose other arms are
-        still disabled and can never report.
-        """
-        now_dt = (now or datetime.now(UTC)).astimezone(UTC)
-        disabled = [task.id for task in self.step_tasks(workflow_id).values()]
-        with self._immediate_transaction():
-            if disabled:
-                placeholders = ", ".join("?" for _ in disabled)
-                self._conn.execute(
-                    f"""
-                    UPDATE scheduled_task_runs
-                    SET status = 'cancelled', finished_at = ?, updated_at = ?,
-                        error = CASE WHEN error = '' THEN 'workflow deleted' ELSE error END
-                    WHERE task_id IN ({placeholders}) AND status = 'queued'
-                    """,
-                    (_iso(now_dt), _iso(now_dt), *disabled),
-                )
-                self._conn.execute(
-                    f"""
-                    UPDATE scheduled_task_runs
-                    SET cancel_requested_at = COALESCE(cancel_requested_at, ?),
-                        updated_at = ?
-                    WHERE task_id IN ({placeholders}) AND status = 'running'
-                    """,
-                    (_iso(now_dt), _iso(now_dt), *disabled),
-                )
-            self._conn.execute(
-                """
-                UPDATE workflow_runs
-                SET status = 'cancelled', updated_at = ?, finished_at = ?
-                WHERE workflow_id = ? AND status = 'running'
-                """,
-                (_iso(now_dt), _iso(now_dt), workflow_id),
-            )
-            for task_id in disabled:
-                self._conn.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET enabled = 0, next_run_at = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (_iso(now_dt), task_id),
-                )
-                self._conn.execute(
-                    "DELETE FROM signal_joins WHERE task_id = ?", (task_id,)
-                )
-                self._conn.execute(
-                    "DELETE FROM workflow_signal_joins WHERE task_id = ?", (task_id,)
-                )
-            self._conn.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
-        return sorted(disabled)
 
     @_synchronized
     def step_tasks(self, workflow_id: str) -> dict[str, ScheduledTask]:
         """The tasks behind a workflow's steps, keyed by step key."""
-        rows = self._conn.execute(
-            """
-            SELECT * FROM scheduled_tasks
-            WHERE workflow_id = ? AND step_key != ''
-            ORDER BY created_at ASC
-            """,
-            (workflow_id,),
-        ).fetchall()
-        return {row["step_key"]: _task_from_row(row) for row in rows}
+        return workflow_editing.step_tasks(
+            self._conn,
+            workflow_id=workflow_id,
+        )
+
 
 
 
@@ -1786,83 +1476,13 @@ class SchedulerStore:
     def _materialize_workflow_in_transaction(
         self, workflow_id: str, *, now: Optional[datetime] = None
     ) -> dict[str, Any]:
-        """Body of :meth:`materialize_workflow`.  Caller owns the transaction.
+        """Body of :meth:`materialize_workflow`.  Caller owns the transaction."""
+        return workflow_editing._materialize_workflow_in_transaction(
+            self._conn,
+            workflow_id=workflow_id,
+            now=now,
+        )
 
-        Split out so that storing a graph and building the tasks behind it can
-        be one transaction rather than two.  The graph row is what makes a
-        workflow visible; committing it before its tasks exist leaves, for as
-        long as the build takes and forever if the build fails, exactly the
-        drawing that :meth:`create_workflow` exists to avoid.
-        """
-        workflow = self.get_workflow(workflow_id)
-        if workflow is None:
-            raise ValueError(f"找不到 workflow：{workflow_id}")
-        order = validate_workflow_graph(workflow.steps)
-        now_dt = (now or datetime.now(UTC)).astimezone(UTC)
-        by_key = {str(step.key).strip(): step for step in workflow.steps}
-        existing = self.step_tasks(workflow_id)
-        workspaces, took_inherited = _step_workspaces(workflow.steps, order)
-
-        created: list[str] = []
-        updated: list[str] = []
-        inherited: list[str] = []
-        task_id_by_key: dict[str, str] = {}
-        removed: list[str] = []
-        # One transaction for the whole graph.  The workflow row is written
-        # before any of its tasks exist, so a failure partway through this loop
-        # would leave a graph whose later steps have nothing to run them, while
-        # the steps that did get built are already subscribed to task ids the
-        # rest of the graph will never be told about.  A half-materialized
-        # workflow looks enabled and fires its head, then stops silently.
-        for key in order:
-            step = by_key[key]
-            upstream_ids = [task_id_by_key[dep] for dep in step.depends_on]
-            trigger = step_trigger_spec(step, upstream_ids)
-            spec = _step_task_spec(
-                step,
-                trigger,
-                workflow_id=workflow_id,
-                enabled=bool(workflow.enabled),
-                workspace=workspaces.get(key) or str(Path.cwd().resolve()),
-                request_quote=str(getattr(workflow, "request_quote", "") or ""),
-            )
-            if key in took_inherited:
-                inherited.append(key)
-            current = existing.get(key)
-            if current is None:
-                task_id = self._create_task_in_transaction(spec, now=now_dt)
-                created.append(task_id)
-            else:
-                self._update_task_in_transaction(current.id, spec, now=now_dt)
-                task_id = current.id
-                updated.append(task_id)
-            task_id_by_key[key] = task_id
-
-        # A step that is no longer in the graph must stop running.  Its task
-        # and its history stay; what goes is its ability to fire.
-        for key, task in existing.items():
-            if key in task_id_by_key:
-                continue
-            if task.enabled:
-                self._conn.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET enabled = 0, next_run_at = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (_iso(now_dt), task.id),
-                )
-            removed.append(key)
-
-        return {
-            "workflow_id": workflow_id,
-            "order": order,
-            "created": created,
-            "updated": updated,
-            "removed": sorted(removed),
-            "inherited_workspace": sorted(inherited),
-            "tasks_by_step": dict(task_id_by_key),
-        }
 
     @_synchronized
     def workflow_blocked_steps(

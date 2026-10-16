@@ -594,7 +594,10 @@ def test_a_build_that_fails_partway_leaves_no_workflow(tmp_path, monkeypatch):
                 raise RuntimeError("建任务时炸了")
             return real(step_obj, trigger, **kwargs)
 
-        monkeypatch.setattr("agent.scheduler.store._step_task_spec", explode)
+        # Patch the module that *reads* it: the graph materializer moved into
+        # `agent.scheduler.workflow_editing`, and a `from ... import name` binds a copy, so
+        # rebinding the name in `store` (or in its definition module) intercepts nothing.
+        monkeypatch.setattr("agent.scheduler.workflow_editing._step_task_spec", explode)
         with pytest.raises(RuntimeError):
             store.create_workflow(linear_workflow())
         assert len(calls) == 2, "第一步应该已经建过了，失败才有意义"
@@ -615,7 +618,10 @@ def test_an_edit_that_fails_partway_leaves_the_old_graph_running(tmp_path, monke
         def explode(step_obj, trigger, **kwargs):
             raise RuntimeError("改任务时炸了")
 
-        monkeypatch.setattr("agent.scheduler.store._step_task_spec", explode)
+        # Patch the module that *reads* it: the graph materializer moved into
+        # `agent.scheduler.workflow_editing`, and a `from ... import name` binds a copy, so
+        # rebinding the name in `store` (or in its definition module) intercepts nothing.
+        monkeypatch.setattr("agent.scheduler.workflow_editing._step_task_spec", explode)
         with pytest.raises(RuntimeError):
             store.update_workflow(
                 workflow.id,

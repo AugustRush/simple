@@ -779,9 +779,33 @@ def main(argv: list[str] | None = None) -> int:
                 if positional and positional[0] == args.param:
                     earlier_run_callees.add(node.name)
     blocks = [add_kwargs_to_calls(block, kwargs_for) for block in blocks]
+    # A `--rewrite self.x=mod.x` produces `mod.x(...)` calls, and those are outside both the
+    # target module and the moving set -- so nothing inserted the connection they now need.  The
+    # callee's own file is on disk next to the source module; read its signature.
+    dotted_callees: set[str] = set()
+    if args.param:
+        source_dir = pathlib.Path(args.file).parent
+        for block_item in blocks:
+            for match in re.finditer(r"(?<![\w.])(\w+)\.(\w+)\(", block_item):
+                module_name, func_name = match.group(1), match.group(2)
+                candidate = source_dir / f"{module_name}.py"
+                if not candidate.exists():
+                    continue
+                try:
+                    callee_tree = ast.parse(candidate.read_text(encoding="utf-8"))
+                except SyntaxError:
+                    continue
+                for node in callee_tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+                        positional = [a.arg for a in list(node.args.posonlyargs) + list(node.args.args)]
+                        if positional and positional[0] == args.param:
+                            dotted_callees.add(f"{module_name}.{func_name}")
+                        break
+        if dotted_callees:
+            print(f"passing the connection at cross-module calls: {sorted(dotted_callees)}")
     if args.param:
         blocks = [
-            add_conn_to_calls(block, earlier_run_callees - set(moving), args.param)
+            add_conn_to_calls(block, (earlier_run_callees | dotted_callees) - set(moving), args.param)
             for block in blocks
         ]
     # The wrapper calls the module function, so it must pass the *declared expression*
