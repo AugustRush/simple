@@ -23,7 +23,7 @@ recording" below.
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 3307 (was 4086) | `SchedulerStore` | 74 | 2783 | **0 lines** |
-| `agent/memory/store.py` | 1827 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
+| `agent/memory/store.py` | 1388 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1911 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
 
@@ -246,7 +246,13 @@ Done, in order: `rows.py`, `migrations.py`, `facts.py` (the four writers/scorers
 `queries.py`, `schema.py`, `fts.py`, `journal.py`, `append_conversation_turn`, `normalize.py`.
 Left:
 
-1. **Extending `facts.py`** — **seven of twelve are in** (`read_fact_assertions`,
+1. **`facts.py` — complete** (all twelve fact-ledger methods; 1761 -> 1561 lines) and
+   **`conversations.py`** (`write_conversation_exchange` 201 + `_json_object`; 1561 -> 1388).
+   The writer taught the tool a sixth connection shape: `conn = self._connect()` with no `with`,
+   which never commits -- the *opposite* of the delegating case, and the wrapper must pass the
+   connection without opening a `with` of its own.  Two more tool defects came out of it (a bare
+   acquisition that was detected but not replaced, and refusals that did not say what they saw).
+2. ~~**Extending `facts.py`** — **seven of twelve are in** (`read_fact_assertions`,
    `read_resolved_facts`, `has_conflicted_fact`, `retract_facts`, `_read_facts`,
    `_fact_assertions_from_entry`, `_fact_assertion_total_score`; 1795 -> 1761 lines).  Five are
    left, and they are **not mechanical**:
