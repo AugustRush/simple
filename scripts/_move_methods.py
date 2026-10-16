@@ -339,8 +339,17 @@ def module_index(tree: ast.Module, lines: list[str]):
     functions: set[str] = set()
     imports: dict[str, str] = {}
     for node in tree.body:
+        # `X: dict[...] = {...}` is an AnnAssign, not an Assign: the first version of this missed
+        # annotated module constants entirely and then reported them as unresolvable free names.
+        target_name = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            constants[node.targets[0].id] = (
+            target_name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            target_name = node.target.id
+        if target_name is not None and not any(
+            node.lineno <= m.lineno <= node.end_lineno for m in ()
+        ):
+            constants[target_name] = (
                 node.lineno - 1,
                 node.end_lineno,
                 "".join(lines[node.lineno - 1:node.end_lineno]).rstrip("\n"),
@@ -492,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                 # ...and the parameter it used to create is now one it must be given
                 text = with_first_param(text, method.name, args.param)
                 takes_param = True
-        elif args.param and not had_connection_param:
+        elif args.param and not had_connection_param and not args.conn_expr:
             text = with_first_param(text, method.name, args.param)
             # Drop the local connection acquisition.  The dedent must be relative to the `with`
             # line: a fixed four-space cut also eats the statement that follows the block (which
@@ -680,6 +689,8 @@ def main(argv: list[str] | None = None) -> int:
                 target_defined.add(node.name)
             elif isinstance(node, ast.Assign):
                 target_defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target_defined.add(node.target.id)
 
     # Which collaborators each moved function must take: the ones it reads itself, plus -- by
     # fixpoint over the sibling calls -- the ones it must forward to a callee.  Taking the union of
@@ -880,6 +891,8 @@ def main(argv: list[str] | None = None) -> int:
             top.add(node.name)
         elif isinstance(node, ast.Assign):
             top |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            top.add(node.target.id)
     imported = set()
     for node in ast.walk(check):
         if isinstance(node, ast.Import):
