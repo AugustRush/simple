@@ -197,6 +197,22 @@ def already_imported(header: str) -> set[str]:
     return names
 
 
+def add_kwonly_params(text: str, name: str, extras: list[str]) -> str:
+    """Append keyword-only parameters to a signature, creating the `*` separator if needed.
+
+    A moved body sometimes needs a collaborator the class owned (`self._sync_after_mutation`).
+    The wrapper passes it as an expression, so the function takes it as a keyword-only argument and
+    the call sites inside the body are rewritten to the bare name.
+    """
+    op, i = param_span(text, name)
+    parts = [p.strip() for p in split_top_level(text[op + 1:i])]
+    if not any(p == "*" or p.startswith("*") for p in parts):
+        parts.append("*")
+    parts.extend(extras)
+    inner = "\n    " + ",\n    ".join(parts) + ",\n"
+    return text[:op + 1] + inner + text[i:]
+
+
 # ── closure ──────────────────────────────────────────────────────────────────
 
 
@@ -308,6 +324,11 @@ def main(argv: list[str] | None = None) -> int:
              "a moved body calls something that was extracted earlier: e.g. "
              "`--rewrite self.normalize_category_name=normalize.normalize_category_name`",
     )
+    ap.add_argument(
+        "--extra-param", action="append", default=[], metavar="NAME=WRAPPER_EXPR",
+        help="give the moved function one more keyword-only collaborator and have the wrapper "
+             "pass it (repeatable), e.g. `--extra-param invalidate=self._sync_after_mutation`",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -325,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     constants, imports, module_functions = module_index(tree, lines)
     blocks: list[str] = []
     wrappers: list[str] = []
+    used_rewrites: set[str] = set()
     spans: dict[str, tuple[int, int]] = {}
     needed: set[str] = set()
     problems: list[str] = []
@@ -365,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
             rf"(?m)^[ \t]*{re.escape(args.param)}[ \t]*=[ \t]*self\._connect\(\)[ \t]*$",
             original,
         ))
+        extra_params = [p.split("=", 1)[0].strip() for p in args.extra_param if "=" in p]
         takes_param = had_connection_param
         if args.conn_expr:
             # The body reads the connection off the object (`self._conn`); the functions here
@@ -390,6 +413,10 @@ def main(argv: list[str] | None = None) -> int:
             # line: a fixed four-space cut also eats the statement that follows the block (which
             # sits at the same indent as `with`), pushing it to column 0 and out of the function.
             body_lines, base = [], None
+            # Occupied lines are computed on the *whole function*: a fragment cannot always be
+            # parsed, and when that fallback fails the indexes shift and code lines escape the
+            # dedent ("unindent does not match any outer indentation level").
+            occupied = string_occupied_lines(text)
             lines_in = text.split("\n")
             out_lines, index = [], 0
             while index < len(lines_in):
@@ -397,24 +424,35 @@ def main(argv: list[str] | None = None) -> int:
                 if line.strip() == f"with self._connect() as {args.param}:":
                     base = len(line) - len(line.lstrip())
                     index += 1
-                    block = []
                     while index < len(lines_in) and (
                         not lines_in[index].strip()
                         or (len(lines_in[index]) - len(lines_in[index].lstrip())) > base
                     ):
-                        block.append(lines_in[index])
+                        out_lines.append(
+                            lines_in[index] if index in occupied else lines_in[index][4:]
+                        )
                         index += 1
-                    out_lines.extend(dedent_outside_strings("\n".join(block), 4).split("\n"))
                     continue
                 out_lines.append(line)
                 index += 1
             text = "\n".join(out_lines)
+        if extra_params:
+            text = add_kwonly_params(text, method.name, extra_params)
         for pair in args.rewrite:
-            if "=" not in pair:
+            # Split at the first `=` that is not followed by a space: an expression may itself
+            # contain `=` (`self._cache = None` -> `invalidate(set())`), and splitting on the very
+            # first one silently produced `None=invalidate(set())= None`.
+            cut = next(
+                (i for i, ch in enumerate(pair) if ch == "=" and pair[i + 1:i + 2] != " "),
+                pair.find("="),
+            )
+            if cut < 0:
                 problems.append(f"--rewrite needs FROM=TO, got {pair!r}")
                 continue
-            source_expr, target_expr = pair.split("=", 1)
-            text = text.replace(source_expr, target_expr)
+            source_expr, target_expr = pair[:cut], pair[cut + 1:]
+            if source_expr in text:
+                used_rewrites.add(pair)
+                text = text.replace(source_expr, target_expr)
         for sibling in moving:
             if sibling == method.name:
                 continue
@@ -506,6 +544,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             first = ""
         call_args = ([first] if first else []) + [f"{n}={n}" for n in names if n != first]
+        for pair in args.extra_param:
+            pname, pexpr = pair.split("=", 1)
+            call_args.append(f"{pname.strip()}={pexpr.strip()}")
         if call_args:
             call = f"{stem}.{method.name}(\n"
             call += "".join(f"{pad}    {a},\n" for a in call_args)
@@ -543,6 +584,13 @@ def main(argv: list[str] | None = None) -> int:
                 target_defined.add(node.name)
             elif isinstance(node, ast.Assign):
                 target_defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    # A rewrite that matched nothing anywhere in the batch is almost certainly a typo, and a
+    # silent no-op there was how a wrong `--rewrite` used to pass unnoticed.
+    for pair in args.rewrite:
+        cut = next((i for i, ch in enumerate(pair) if ch == "=" and pair[i + 1:i + 2] != " "), pair.find("="))
+        if cut >= 0 and pair not in used_rewrites:
+            problems.append(f"--rewrite matched nothing in any moved body: {pair!r}")
 
     consts = sorted(n for n in needed if n in constants)
     unresolved = [n for n in needed if n not in imports and n not in constants and n not in moving]

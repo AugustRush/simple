@@ -1027,14 +1027,16 @@ def test_empty_scope_filter_returns_no_memory_entries(tmp_path):
 
 
 def test_retention_bounds_active_run_scratch_entries(tmp_path, monkeypatch):
-    # Patch the module that *reads* these constants.  ``agent.memory.system`` is
-    # only a re-export façade, so rebinding a name there leaves the copy that
-    # ``apply_retention`` closes over untouched.
-    import agent.memory.store as memory_store
+    # Patch where the constants are *defined*, not where they are read.  This target has moved
+    # twice already (``agent.memory.system`` -> ``agent.memory.store`` -> ``...maintenance``): a
+    # `from ... import NAME` binds a copy, so every code move silently re-armed the patch at the
+    # wrong module.  ``apply_retention`` now reads them as ``_helpers.NAME``, which keeps this
+    # patch correct wherever the function lives next.
+    import agent.memory._helpers as memory_helpers
     from agent import LTMEntry, LTMStore
 
-    monkeypatch.setattr(memory_store, "_RUN_SCRATCH_MAX_ACTIVE", 3)
-    monkeypatch.setattr(memory_store, "_RUN_SCRATCH_RETENTION_DAYS", 3650)
+    monkeypatch.setattr(memory_helpers, "_RUN_SCRATCH_MAX_ACTIVE", 3)
+    monkeypatch.setattr(memory_helpers, "_RUN_SCRATCH_RETENTION_DAYS", 3650)
     store = LTMStore(context_dir=tmp_path / "context")
     for index in range(5):
         store.add_entry(
