@@ -22,7 +22,7 @@ recording" below.
 
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
-| `agent/scheduler/store.py` | 3544 (was 4086) | `SchedulerStore` | 74 | 2966 | **0 lines** |
+| `agent/scheduler/store.py` | 3307 (was 4086) | `SchedulerStore` | 74 | 2783 | **0 lines** |
 | `agent/memory/store.py` | 2023 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1911 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
@@ -305,11 +305,31 @@ Two capabilities closed that gap, and the first cluster through was the four sma
   call.  A module function wearing that decorator would be called as `method(self, ...)` with
   `self` bound to the connection.
 
-A note on what this buys, since the file only shrank by six lines: the four bodies total ~36 lines
-and their wrappers cost ~30.  **Extraction pays in where the logic lives, and only pays in line
-count when a body is much larger than its wrapper.**  The remaining scheduler work should be
-chosen by that ratio -- the eleven `*_in_transaction` helpers (~413 lines of body, no lock) are
-the next target, and the claim/lease core is not a target at all.
+A note on what this buys, since the four readers only shrank the file by six lines: the four
+bodies total ~36 lines and their wrappers cost ~30.  **Extraction pays in where the logic lives,
+and only pays in line count when a body is much larger than its wrapper.**  The remaining
+scheduler work should be chosen by that ratio.
+
+By that ratio the next cluster was the ten transaction helpers, and it paid: **3538 → 3307**.
+They all run inside a transaction the caller owns, so `--conn-expr` was exactly the mechanism
+they needed, and the class keeps a one-line wrapper each (with `@_synchronized` where it had one).
+Two things had to happen first, and both came out of the tool refusing rather than guessing:
+
+* `_iso`, `_new_id` and `UTC` were defined in **both** `store.py` and `models.py` (or only in
+  `store.py`).  They moved to `models.py` -- the module that already owns `UTC` and
+  `optional_datetime` -- and `store.py` imports them, with its 90 call sites untouched.
+* The tool learned to refuse deleting a module-level constant that **non-moved code still reads**.
+  It had been about to delete `UTC` from `store.py` because only the moved methods read it *in
+  that file* -- while 24 other uses remained.  `compile()` cannot see that (it is a runtime name
+  lookup) and the unbound-name check only inspects the generated module, so it would have been a
+  `NameError` at call time.  The dry run now runs every check the real run does, which is how the
+  refusal became visible before anything was written.
+
+**One method is deliberately left behind**: `_upstream_reports_in_transaction` reads the
+module-level `_run_report_payload` (59 lines, also used by `_emit_run_signal`).  The tool cannot
+carry it (it is a function, not a method) or re-import it (that would cycle), so those two report
+helpers need a home of their own -- `scheduler/reports.py` -- before that method, or
+`_emit_run_signal`, can move.
 3. **The cheapest coupled methods** — `_upstream_reports_in_transaction` (64 lines, 1 ref),
    `_insert_emission` (52, 1), `renew_lease` (35, 1), `disable_duplicate_enabled_tasks` (32, 1),
    `_join_arrivals` (28, 1).  Each needs the connection passed and nothing else.
