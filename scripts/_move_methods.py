@@ -357,12 +357,31 @@ def main(argv: list[str] | None = None) -> int:
         # one on); `takes_param` asks whether the *moved function* now takes one (true after any
         # insertion here).
         had_connection_param = bool(args.param) and args.param in positional
+        # A third acquisition shape: `conn = self._connect()` with no `with`.  Its semantics are
+        # the *opposite* of the delegating case -- the original never committed here, it left the
+        # transaction to the caller or to a later `with` on the same thread-local connection.  The
+        # wrapper must therefore pass the connection without opening a `with` of its own.
+        bare_acquire = bool(args.param) and bool(re.search(
+            rf"(?m)^[ \t]*{re.escape(args.param)}[ \t]*=[ \t]*self\._connect\(\)[ \t]*$",
+            original,
+        ))
         takes_param = had_connection_param
         if args.conn_expr:
             # The body reads the connection off the object (`self._conn`); the functions here
             # take it, so the expression becomes the parameter and the wrapper passes its own.
             text = text.replace(args.conn_expr, args.param)
             if not had_connection_param:
+                text = with_first_param(text, method.name, args.param)
+                takes_param = True
+        if bare_acquire:
+            # the parameter supplies the connection; the assignment is what opened it before
+            text, dropped = re.subn(
+                rf"(?m)^[ \t]*{re.escape(args.param)}[ \t]*=[ \t]*self\._connect\(\)[ \t]*\n",
+                "", text,
+            )
+            assert dropped, f"{method.name}: bare acquisition was detected but not removed"
+            if not had_connection_param:
+                # ...and the parameter it used to create is now one it must be given
                 text = with_first_param(text, method.name, args.param)
                 takes_param = True
         elif args.param and not had_connection_param:
@@ -427,8 +446,11 @@ def main(argv: list[str] | None = None) -> int:
         except SyntaxError as exc:
             problems.append(f"{method.name}: produced invalid syntax: {exc}")
             continue
-        if re.search(r"(?<![\w.])self\.", text):
-            problems.append(f"{method.name}: still references self after the move")
+        leftover = [ln.strip() for ln in text.split("\n") if re.search(r"(?<![\w.])self\.", ln)]
+        if leftover:
+            problems.append(
+                f"{method.name}: still references self after the move -- {leftover[0][:90]}"
+            )
             continue
         if args.param and not re.search(rf"(?<![\w.]){re.escape(args.param)}\b", text):
             problems.append(
@@ -465,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         # the `with` commits an empty transaction, which costs nothing.
         delegates_connection = (
             bool(args.param) and not args.conn_expr
-            and not had_connection_param and not uses_connect
+            and not had_connection_param and not uses_connect and not bare_acquire
         )
         opens_connection = uses_connect or delegates_connection
         stem = pathlib.Path(args.module).stem
