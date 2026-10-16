@@ -545,9 +545,16 @@ def main(argv: list[str] | None = None) -> int:
                 problems.append(f"--rewrite needs FROM=TO, got {pair!r}")
                 continue
             source_expr, target_expr = pair[:cut], pair[cut + 1:]
-            if source_expr in text:
+            # Identifier boundaries, not plain `str.replace`: `self.staging` is a prefix of
+            # `self.staging_turn_threshold`, and the plain form rewrote the longer name too --
+            # which happened to land on the right thing here, which is worse than failing,
+            # because it made a broken rewrite look like a working one.
+            pattern = re.compile(
+                rf"(?<![\w.]){re.escape(source_expr)}(?![\w])"
+            )
+            if pattern.search(text):
                 used_rewrites.add(pair)
-                text = text.replace(source_expr, target_expr)
+                text = pattern.sub(lambda _m: target_expr, text)
         for sibling in moving:
             if sibling == method.name:
                 continue

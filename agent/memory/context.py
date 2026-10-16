@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections import deque
+from .jobs import JobQueue
 import hashlib
 import json
 from pathlib import Path
 import re
-import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
@@ -17,6 +16,7 @@ from agent.lexical import lexical_terms
 if TYPE_CHECKING:
     from agent.core.transport import ModelEndpoint
 
+from . import jobs
 from . import context_telemetry
 from . import context_working_state
 from . import context_retrieval
@@ -154,10 +154,6 @@ class ContextManager:
         self.store = store
         self.retriever = retriever
         self.consolidation = consolidation
-        self.idle_seconds = idle_seconds
-        self.min_messages = min_messages
-        self.staging_turn_threshold = staging_turn_threshold
-        self.staging_token_threshold = staging_token_threshold
         self.staging: StagingBuffer = staging or StagingBuffer()
         self.project_scope = str(project_scope or "").strip()
         source_keywords = route_keywords or shared.DEFAULT_ROUTE_KEYWORDS
@@ -165,13 +161,76 @@ class ContextManager:
             category: tuple(str(keyword).lower() for keyword in keywords)
             for category, keywords in source_keywords.items()
         }
-        self._needs_consolidation: bool = False
-        self._last_activity: float = 0.0
-        self._lock = threading.RLock()
-        self._jobs: deque[dict[str, Any]] = deque()
-        self._processing_job = False
-        self._suppress_next_turn_persistence = False
+        # The queue's state and the logic that reads it live in one object; the services it
+        # needs are handed over here because none of them is reassigned after this point.
+        self._queue = JobQueue(
+            staging=self.staging,
+            consolidation=self.consolidation,
+            store=self.store,
+            project_scope=self.project_scope,
+            # the constructor's parameters, not the attributes: those are properties that
+            # would read the queue being built here
+            idle_seconds=idle_seconds,
+            min_messages=min_messages,
+            staging_turn_threshold=staging_turn_threshold,
+            staging_token_threshold=staging_token_threshold,
+        )
         self.last_working_state_recovery_trace: dict[str, Any] = {}
+
+    # Two names stay addressable on the manager itself: tests set and read
+    # `_needs_consolidation` (eight places), and one comment reasons about `_jobs`.  They
+    # forward to the queue rather than shadowing it, so there is one copy of each.
+    # The four numbers the queue logic compares against are forwarded too, for the same
+    # reason: they are assigned after construction in the tests (`ctx_mgr.idle_seconds = 0`,
+    # `ctx_mgr.staging_token_threshold = 999999`), so the queue has to see the new value
+    # rather than the one it was built with.
+    @property
+    def idle_seconds(self) -> float:
+        return self._queue.idle_seconds
+
+    @idle_seconds.setter
+    def idle_seconds(self, value: float) -> None:
+        self._queue.idle_seconds = value
+
+    @property
+    def min_messages(self) -> int:
+        return self._queue.min_messages
+
+    @min_messages.setter
+    def min_messages(self, value: int) -> None:
+        self._queue.min_messages = value
+
+    @property
+    def staging_turn_threshold(self) -> int:
+        return self._queue.staging_turn_threshold
+
+    @staging_turn_threshold.setter
+    def staging_turn_threshold(self, value: int) -> None:
+        self._queue.staging_turn_threshold = value
+
+    @property
+    def staging_token_threshold(self) -> int:
+        return self._queue.staging_token_threshold
+
+    @staging_token_threshold.setter
+    def staging_token_threshold(self, value: int) -> None:
+        self._queue.staging_token_threshold = value
+
+    @property
+    def _needs_consolidation(self) -> bool:
+        return self._queue.needs_consolidation
+
+    @_needs_consolidation.setter
+    def _needs_consolidation(self, value: bool) -> None:
+        self._queue.needs_consolidation = value
+
+    @property
+    def _jobs(self):
+        return self._queue.jobs
+
+    @_jobs.setter
+    def _jobs(self, value) -> None:
+        self._queue.jobs = value
 
     @property
     def session_id(self) -> str:
@@ -243,18 +302,12 @@ class ContextManager:
 
     def on_memory_cleared(self) -> None:
         """Drop queued extraction work and keep the clearing turn forgotten."""
-        with self._lock:
-            self._jobs.clear()
-            self._needs_consolidation = False
-            self._last_activity = 0.0
-            self._suppress_next_turn_persistence = True
-        self.staging.clear_all()
+        jobs.on_memory_cleared(queue=self._queue)
+
 
     def consume_memory_clear_suppression(self) -> bool:
-        with self._lock:
-            suppress = self._suppress_next_turn_persistence
-            self._suppress_next_turn_persistence = False
-            return suppress
+        return jobs.consume_memory_clear_suppression(queue=self._queue)
+
 
 
     def spawn_session(
@@ -324,9 +377,8 @@ class ContextManager:
 
     def mark_activity(self) -> None:
         """Call after each user message to arm consolidation and reset idle timer."""
-        with self._lock:
-            self._last_activity = time.time()
-            self._needs_consolidation = True
+        jobs.mark_activity(queue=self._queue)
+
 
 
     def _plan_query(self, query: str) -> QueryPlan:
@@ -407,65 +459,35 @@ class ContextManager:
 
     def idle_elapsed(self) -> float:
         """Seconds since last activity (0 if never active)."""
-        with self._lock:
-            if self._last_activity == 0.0:
-                return 0.0
-            return time.time() - self._last_activity
+        return jobs.idle_elapsed(queue=self._queue)
+
 
     # ── Trigger checks ────────────────────────────────────────────────────────
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
         """Token-ratio trigger: only fires when dirty and messages are sufficient."""
-        with self._lock:
-            if not self._needs_consolidation:
-                return False
-        if len(messages) < self.min_messages:
-            return False
-        return self.consolidation.should_sleep(messages, max_tokens)
+        return jobs.should_sleep(
+            messages=messages,
+            max_tokens=max_tokens, queue=self._queue
+        )
+
 
     def should_idle_sleep(self, messages: list[dict]) -> bool:
         """Idle trigger: fires when dirty, sufficient messages, and idle long enough."""
-        with self._lock:
-            if not self._needs_consolidation:
-                return False
-        if len(messages) < self.min_messages:
-            return False
-        return self.idle_elapsed() >= self.idle_seconds
+        return jobs.should_idle_sleep(
+            messages=messages, queue=self._queue
+        )
+
 
     def should_session_end_sleep(self) -> bool:
-        """Session-end trigger: fires when staging has at least one complete turn.
+        """Session-end trigger: fires when staging has at least one complete turn."""
+        return jobs.should_session_end_sleep(queue=self._queue)
 
-        Requires count >= 2 (one user + one assistant message) to ensure
-        there is a complete exchange worth extracting.  count == 1 would mean
-        a bare user message with no response was staged, which is not worth
-        an LLM extraction call.
-        """
-        with self._lock:
-            return self._needs_consolidation and self.staging.count() >= 2
 
     def should_enqueue_consolidation(self) -> bool:
         """Queue consolidation based on staged content volume, not working-memory size."""
-        with self._lock:
-            if not self._needs_consolidation:
-                return False
-            count = self.staging.count()
-        # Fast path: count() is an in-memory counter; no file I/O needed.
-        if count >= self.staging_turn_threshold:
-            return True
-        # Slow path: require at least min_messages staged entries before checking
-        # tokens.  Without this guard a single verbose response (common with CJK
-        # text, where ~1 char ≈ 1 estimated token) crosses the 2100-token threshold
-        # on every turn, causing consolidation to fire every turn even though only
-        # two entries have accumulated since the last job ran.
-        if count < self.min_messages:
-            return False
-        # Only read the file once we know there are enough entries to warrant it.
-        staged = self.staging.read_all()
-        if not staged:
-            return False
-        return (
-            self.consolidation.estimate_tokens(staged) >= self.staging_token_threshold
-        )
+        return jobs.should_enqueue_consolidation(queue=self._queue)
+
 
     def enqueue_consolidation(self, reason: str) -> None:
         """Queue one consolidation job if there is staged work pending."""
@@ -473,94 +495,31 @@ class ContextManager:
 
     def enqueue_staging_job(self, reason: str, staging: "StagingBuffer") -> None:
         """Queue consolidation for an explicit staging buffer."""
-        with self._lock:
-            if staging.count() == 0:
-                return
-            staging_path = str(staging.path.resolve())
-            session_id = staging.session_id
-            if any(
-                job.get("staging_path", str(self.staging.path.resolve()))
-                == staging_path
-                and job.get("session_id", self.staging.session_id) == session_id
-                for job in self._jobs
-            ):
-                return
-            self._jobs.append(
-                {
-                    "reason": reason,
-                    "session_id": session_id,
-                    "staging_path": staging_path,
-                    "staging_backend": (
-                        "sqlite"
-                        if getattr(staging, "_sqlite_backed", False)
-                        else "jsonl"
-                    ),
-                    "context_dir": str(
-                        getattr(staging, "context_dir", self.staging.context_dir).resolve()
-                    ),
-                    "queued_at": _now(),
-                }
-            )
+        jobs.enqueue_staging_job(
+            reason=reason,
+            staging=staging, queue=self._queue
+        )
+
 
     def next_job(self, pop: bool = False) -> Optional[dict]:
-        with self._lock:
-            if not self._jobs:
-                if self._needs_consolidation and self.staging.count() > 0:
-                    self._jobs.append(
-                        {
-                            "reason": "idle",
-                            "session_id": self.staging.session_id,
-                            "queued_at": _now(),
-                        }
-                    )
-                else:
-                    return None
-            return self._jobs.popleft() if pop else dict(self._jobs[0])
+        return jobs.next_job(
+            pop=pop, queue=self._queue
+        )
+
 
     def pending_jobs(self) -> int:
-        with self._lock:
-            return len(self._jobs)
+        return jobs.pending_jobs(queue=self._queue)
 
-    def _job_staging(self, job: dict) -> tuple["StagingBuffer", bool]:
-        backend = str(job.get("staging_backend", "jsonl"))
-        path_value = job.get("staging_path")
-        session_id = str(job.get("session_id", self.staging.session_id))
-        if backend == "sqlite":
-            context_dir = Path(
-                job.get("context_dir", str(self.staging.context_dir))
-            ).resolve()
-            if (
-                context_dir == self.staging.context_dir.resolve()
-                and session_id == self.staging.session_id
-                and getattr(self.staging, "_sqlite_backed", False)
-            ):
-                return self.staging, True
-            return StagingBuffer(context_dir=context_dir, session_id=session_id), False
-        if not path_value:
-            return self.staging, True
-        path = Path(path_value).resolve()
-        if (
-            path == self.staging.path.resolve()
-            and session_id == self.staging.session_id
-        ):
-            return self.staging, True
-        return StagingBuffer(path=path, session_id=session_id), False
+
+    def _job_staging(self, job: dict) -> tuple['StagingBuffer', bool]:
+        return jobs._job_staging(
+            job=job, queue=self._queue
+        )
+
 
     def should_process_jobs(self) -> bool:
-        with self._lock:
-            has_pending = bool(self._jobs)
-            # Require enough staged entries to be worth an LLM extraction call.
-            # count > 0 is not sufficient: the idle path would fire after any pause
-            # of idle_seconds even with a single staged turn.  Using
-            # staging_turn_threshold makes the implicit idle enqueue consistent
-            # with the explicit fast-path in should_enqueue_consolidation().
-            has_staged_work = (
-                self._needs_consolidation
-                and self.staging.count() >= self.staging_turn_threshold
-            )
-        return (
-            has_pending or has_staged_work
-        ) and self.idle_elapsed() >= self.idle_seconds
+        return jobs.should_process_jobs(queue=self._queue)
+
 
     def should_compact_messages(
         self, messages: list[dict], input_token_budget: int
@@ -1126,18 +1085,12 @@ class ContextManager:
         model: str,
     ) -> list[dict]:
         """Run one sleep cycle (uses staging as source), then clear dirty flag."""
-        try:
-            result = await self.consolidation.consolidate(
-                messages,
-                endpoint,
-                model,
-                staging=self.staging,
-                project_scope=self.project_scope,
-            )
-            return _render._coerce_consolidation_result(result).compressed_messages
-        finally:
-            with self._lock:
-                self._needs_consolidation = False
+        return await jobs.sleep(
+            messages=messages,
+            endpoint=endpoint,
+            model=model, queue=self._queue
+        )
+
 
     async def process_one_job(
         self,
@@ -1146,121 +1099,15 @@ class ContextManager:
         extractor: Optional[Callable[..., list[Any]]] = None,
     ) -> bool:
         """Process one queued consolidation job without mutating working memory."""
-        with self._lock:
-            if self._processing_job:
-                return False
-            self._processing_job = True
-        job = self.next_job(pop=True)
-        if job is None:
-            with self._lock:
-                self._processing_job = False
-            return False
+        return await jobs.process_one_job(
+            endpoint=endpoint,
+            model=model,
+            extractor=extractor, queue=self._queue
+        )
 
-        staging_buffer: Optional[StagingBuffer] = None
-        is_primary_staging = True
-        try:
-            staging_buffer, is_primary_staging = self._job_staging(job)
-            reason = str(job.get("reason", "?"))
-            session_id = staging_buffer.session_id
-            shared.CONSOLE.print(
-                f"[dim]💤 Context consolidation (sleep)... reason={reason} "
-                f"session={session_id}[/dim]"
-            )
-            with self._lock:
-                staged = staging_buffer.read_all()
-            if not staged:
-                if is_primary_staging:
-                    with self._lock:
-                        self._needs_consolidation = False
-                return False
-
-            # Emit consolidation lifecycle event
-            _emit_consolidation("started", reason=reason, staged_count=len(staged))
-
-            if extractor is not None:
-                entries = [
-                    self.consolidation._build_episode_entry(
-                        staged, staging_buffer.session_id
-                    )
-                ]
-                extracted = extractor(staged, job)
-                for item in extracted or []:
-                    if isinstance(item, LTMEntry):
-                        if not item.scope or item.scope == "global":
-                            item.scope = self.consolidation._scope_for_entry(
-                                item.category,
-                                session_id=staging_buffer.session_id,
-                                project_scope=self.project_scope,
-                            )
-                            item.source_session = staging_buffer.session_id
-                        entries.append(item)
-                    elif isinstance(item, dict):
-                        lines = json.dumps(item, ensure_ascii=False)
-                        parsed = self.consolidation._parse_entries(lines)
-                        for entry in parsed:
-                            entry.scope = self.consolidation._scope_for_entry(
-                                entry.category,
-                                session_id=staging_buffer.session_id,
-                                project_scope=self.project_scope,
-                            )
-                            entry.source_session = staging_buffer.session_id
-                        entries.extend(parsed)
-                self.store.add_entries(entries)
-                self.store.apply_retention()
-                staging_buffer.drop_prefix(len(staged))
-                if is_primary_staging:
-                    with self._lock:
-                        self._needs_consolidation = False
-                _emit_consolidation("completed", entries_extracted=len(entries))
-                return True
-
-            try:
-                result = await self.consolidation.consolidate(
-                    [],
-                    endpoint,
-                    model,
-                    staging=staging_buffer,
-                    project_scope=self.project_scope,
-                )
-            except Exception as exc:
-                _emit_consolidation("failed", reason="llm_extraction_error", error=str(exc))
-                shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")
-                return False
-            consolidated = _render._coerce_consolidation_result(result)
-            if not consolidated.success:
-                _emit_consolidation(
-                    "failed", reason="extraction_returned_failure", error=consolidated.error
-                )
-                return False
-            if is_primary_staging:
-                with self._lock:
-                    self._needs_consolidation = False
-            _emit_consolidation(
-                "completed", entries_extracted=len(getattr(consolidated, "entries", []))
-            )
-            return True
-        except Exception as exc:
-            _emit_consolidation("failed", reason="exception", error=str(exc))
-            raise
-        finally:
-            if staging_buffer is not None and not is_primary_staging:
-                staging_buffer.close()
-            with self._lock:
-                self._processing_job = False
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        cats = self.store.list_categories()
-        return {
-            "dynamic_categories": self.store.dynamic_category_count(),
-            "total_categories": len(cats),
-            "total_entries": sum(c.entry_count for c in cats),
-            "category_names": [c.name for c in cats],
-            "max_categories": self.store.max_categories,
-            "needs_consolidation": self._needs_consolidation,
-            "queued_jobs": self.pending_jobs(),
-            "staged_turns": self.staging.count(),
-            "idle_elapsed_s": round(self.idle_elapsed()),
-            "idle_threshold_s": self.idle_seconds,
-        }
+        return jobs.stats(queue=self._queue)
+
