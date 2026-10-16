@@ -148,14 +148,37 @@ just abandoned while reporting success.
 
 Recorded rather than fixed:
 
-1. **Provenance and consent for third-party code.**  This is the one part of the
-   pluginization goal still unmet, and it is not a maintainability gap: a Python plugin in
-   `~/.agent/plugins/` is `exec_module`-ed at startup with the process's full privileges,
-   and `plugin_approval` gates *installation*, not *loading*.  The design is written
-   (`2026-10-12-capability-provenance-and-adapter-translators-design.md`) and nothing is
-   implemented.  The first-principles criterion it fails is the fifth one — "the boundary
-   is provable: a third party extends this by depending only on a published interface" —
-   which now holds for the *mechanism* and not for *trust*.
+1. **Provenance and consent for third-party code — the mechanism is in; what remains is its
+   stated limit.**  This item used to say that `plugin_approval` gates *installation* and not
+   *loading*, and that nothing was implemented.  Both claims were out of date; corrected here
+   after reading the code.  The load path **is** gated: `PluginCatalog._admit_plugin`
+   (`agent/plugins/catalog.py`), called from `_load_one_plugin`, and the main composition
+   turns it on (`bootstrap.py`, `detect_plugin_changes=True`, with `consent.configure` pointing
+   the ledger at the agent's home).  What it asks is `formats.executions(plugin_dir)` —
+   "everything this plugin would run", read from the formats' own markers and including the
+   concrete command — keyed by digest: an approved or previously-seen digest loads, the
+   machine's first look records and prints what is already there, and anything else does not
+   load and is reported with what it would have run.  The author's friction is answered by
+   `plugins.trusted_paths`, a directory the user names as their own and which is trusted by
+   **path** rather than by content, wired from the real config.  Thirteen tests in
+   `tests/test_plugin_change_detection.py` pin those branches.
+
+   **One hole was real, and is fixed** (`af7c30a`): the interactive loop builds its own
+   catalog when the composition registered none, and it handed that catalog the *user's*
+   plugin directory with change detection off — so that branch loaded whatever was there,
+   including content that had changed and was never approved.  It now passes
+   `detect_plugin_changes=True`, pinned by a test that failed before the fix.
+
+   **What genuinely remains** is the boundary's own limit, and the mechanism's docstring says
+   it rather than this report: the ledger is a plain 0644 JSON file in the same home as the
+   plugin directory, so this is **change detection**, not a security boundary — it raises the
+   cost of the generic vector (a sync tool, a package install, a clone, another application's
+   profile copying files in) and does not defend against an actor who can write both the
+   plugin and the ledger.  The fifth first-principles criterion — "the boundary is provable" —
+   holds for the *mechanism*; for *trust* it holds as far as a ledger in the same trust domain
+   can, and the design note
+   (`2026-10-12-capability-provenance-and-adapter-translators-design.md`) is where the rest is
+   argued.
 2. **The four god classes — largely done.**  `SchedulerStore` 4085 → **1534**, `LTMStore`
    2834 → **1009**, `WebChannel` 3319 → **2630**, `BaseAgent` 2535 → **2032**, and the smaller
    cousin `ContextManager` 2483 → **1266**.  Twenty-nine modules now hold what they did; the

@@ -216,14 +216,21 @@ where the contract wanted an implementation.  Smoke **6 ok / 0 failed**; ecosyst
    has run here before loads; the machine's first look lists and records what is present;
    anything else does not load and is reported with what it would have run.
 
-   **Open, and a real workflow cost:** a plugin *author* editing their own plugin in
-   `~/.agent/plugins/` looks exactly like a sync tool updating files behind them, so the edit
-   does not load until it is approved or observed again.  The escape hatch -- a directory the
-   user names as their own, trusted by *path* rather than by content -- is not built.  It is a
-   decision about what "mine" means (a config list, or a ledger rule the user grants), which
-   is why it is a separate step rather than an implementation detail.  Until those
-   exist the *trust* half is not met: a plugin in `~/.agent/plugins/` is still executed at
-   startup on the strength of being there.
+   **The workflow cost is answered:** a plugin *author* editing their own plugin in
+   `~/.agent/plugins/` is, to content pinning, indistinguishable from a sync tool updating
+   files behind them -- so the escape hatch was built: `plugins.trusted_paths` names a
+   directory (or a list of them, or a single string) that is trusted by **path** rather than by
+   content, read at `agent/plugins/catalog.py` and wired from the real config.  That was the
+   decision about what "mine" means, and it is now a config list.
+
+   **Two corrections to what this item used to say.**  It said the load path was not gated
+   ("a plugin in `~/.agent/plugins/` is still executed at startup on the strength of being
+   there") -- false: `_admit_plugin` gates it, and the composition turns the gate on.  And one
+   *real* hole existed next to it, found and fixed in `af7c30a`: the interactive loop's own
+   fallback catalog was handed the user's plugin directory with change detection off.  The
+   limit that does remain is the ledger's trust domain: it is a 0644 JSON file beside the
+   plugin directory, so this is change detection rather than a boundary against an actor who
+   can write both.
 2. ~~**The 4 remaining soft reads** (`tests/test_memory_contract.py`)~~ -- **down to 2, and
    the description of them was wrong.**  Measured rather than assumed: two of the four were
    *not* name collisions but real reads of a `ContextManager`'s `store`, waived under
