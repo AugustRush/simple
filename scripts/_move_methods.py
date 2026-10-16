@@ -363,6 +363,16 @@ def main(argv: list[str] | None = None) -> int:
             if sibling == method.name:
                 continue
             text = text.replace(f"self.{sibling}(", f"{sibling}(")
+            # ...and a sibling handed over *without* being called (a sort key, a row mapper in a
+            # list) is a bare attribute reference.  Rewriting only call shapes leaves `self.` in
+            # the body, which the check below then reports as "still references self" -- and a
+            # hand-fix is what that cost the first three times it happened.
+            text = re.sub(
+                rf"(?<![\w.])self\.{re.escape(sibling)}\b(?!\s*\()", sibling, text,
+            )
+            text = re.sub(
+                rf"(?<![\w.])cls\.{re.escape(sibling)}\b(?!\s*\()", sibling, text,
+            )
             if not args.param:
                 continue
             text = re.sub(
@@ -380,6 +390,12 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if re.search(r"(?<![\w.])self\.", text):
             problems.append(f"{method.name}: still references self after the move")
+            continue
+        if args.param and not re.search(rf"(?<![\w.]){re.escape(args.param)}\b", text):
+            problems.append(
+                f"{method.name}: the moved body never reads `{args.param}`, so the parameter was "
+                f"not needed -- pass --param '' for a body that opens no connection"
+            )
             continue
         blocks.append(text)
         needed |= (free_names(text) - set(moving))
@@ -407,14 +423,17 @@ def main(argv: list[str] | None = None) -> int:
         stem = pathlib.Path(args.module).stem
         pad = " " * (12 if uses_connect else 8)
         if args.conn_expr:
-            first = args.conn_expr
-        elif uses_connect or takes_param:
-            first = args.param
+            first = args.conn_expr                       # the caller's own connection
+        elif uses_connect:
+            first = args.param                           # opened by the `with` below
+        elif args.param and not args.conn_expr:
+            # The method opened nothing itself -- it delegated to a sibling that now takes a
+            # connection.  Supply one, or the moved function is called with a parameter nobody
+            # filled.  No `with`: the original managed no transaction here, so neither does this.
+            first = "self._connect()"
         else:
             first = ""
-        call_args = ([first] if first else []) + [
-            f"{n}={n}" for n in names if n != first
-        ]
+        call_args = ([first] if first else []) + [f"{n}={n}" for n in names if n != first]
         if call_args:
             call = f"{stem}.{method.name}(\n"
             call += "".join(f"{pad}    {a},\n" for a in call_args)

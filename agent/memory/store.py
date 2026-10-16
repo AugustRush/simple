@@ -1212,28 +1212,18 @@ class LTMStore:
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
     ) -> list[Any]:
-        """Filter one fact table by the three optional keys and read it back.
-
-        Both fact tables carry the same ``subject``/``predicate``/``scope``
-        triple and normalize it the same way, so the query lives here once and
-        each caller supplies only what actually differs.  ``table`` and
-        ``order_by`` are literals from this module, never caller input.
-        """
-        sql = f"SELECT * FROM {table} WHERE 1 = 1"
-        params: list[Any] = []
-        if subject is not None:
-            sql += " AND subject = ?"
-            params.append(_normalize_fact_part(subject))
-        if predicate is not None:
-            sql += " AND predicate = ?"
-            params.append(_normalize_fact_part(predicate))
-        if scope is not None:
-            sql += " AND scope = ?"
-            params.append(_normalize_fact_part(scope, "global"))
-        sql += f" ORDER BY {order_by}"
+        """Filter one fact table by the three optional keys and read it back."""
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [to_row(row) for row in rows]
+            return facts._read_facts(
+                conn,
+                table=table,
+                order_by=order_by,
+                to_row=to_row,
+                subject=subject,
+                predicate=predicate,
+                scope=scope,
+            )
+
 
     def read_fact_assertions(
         self,
@@ -1242,14 +1232,13 @@ class LTMStore:
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
     ) -> list[FactAssertion]:
-        return self._read_facts(
-            "fact_assertions",
-            "created_at ASC, id ASC",
-            _row_mappers._row_to_fact_assertion,
+        return facts.read_fact_assertions(
+            self._connect(),
             subject=subject,
             predicate=predicate,
             scope=scope,
         )
+
 
     def resolve_fact(
         self,
@@ -1376,14 +1365,13 @@ class LTMStore:
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
     ) -> list[ResolvedFact]:
-        return self._read_facts(
-            "resolved_facts",
-            "subject ASC, predicate ASC, scope ASC",
-            _row_mappers._row_to_resolved_fact,
+        return facts.read_resolved_facts(
+            self._connect(),
             subject=subject,
             predicate=predicate,
             scope=scope,
         )
+
 
     def has_conflicted_fact(
         self,
@@ -1392,21 +1380,13 @@ class LTMStore:
         scope: str = "global",
     ) -> bool:
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM fact_assertions
-                WHERE subject = ? AND predicate = ? AND scope = ?
-                  AND status = 'conflicted'
-                LIMIT 1
-                """,
-                (
-                    _normalize_fact_part(subject),
-                    _normalize_fact_part(predicate),
-                    _normalize_fact_part(scope, "global"),
-                ),
-            ).fetchone()
-        return row is not None
+            return facts.has_conflicted_fact(
+                conn,
+                subject=subject,
+                predicate=predicate,
+                scope=scope,
+            )
+
 
     def set_identity(
         self,
@@ -1461,25 +1441,13 @@ class LTMStore:
     def retract_facts(self, subject: str, predicate: str, scope: str = "global") -> int:
         """Archive every assertion behind one fact and drop the resolved row."""
         with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE fact_assertions SET status = 'archived', updated_at = ?
-                WHERE subject = ? AND predicate = ? AND scope = ?
-                  AND status != 'archived'
-                """,
-                (
-                    _now(),
-                    _normalize_fact_part(subject),
-                    _normalize_fact_part(predicate),
-                    _normalize_fact_part(scope, "global"),
-                ),
+            return facts.retract_facts(
+                conn,
+                subject=subject,
+                predicate=predicate,
+                scope=scope,
             )
-            archived = cursor.rowcount or 0
-            conn.execute(
-                "DELETE FROM resolved_facts WHERE fact_key = ?",
-                (_fact_key(subject, predicate, scope),),
-            )
-        return archived
+
 
     def upsert_manual_note(
         self, category: str, entity: str, content: str, append: bool = False

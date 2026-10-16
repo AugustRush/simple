@@ -10,9 +10,11 @@ Imported back into ``agent/memory/store.py`` so its call sites keep their sequen
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
+from typing import Any, Callable, Optional
 
 from agent.memory.models import FactAssertion
+from . import rows as _row_mappers
+from .models import ResolvedFact
 from ._helpers import (
     _FACT_SOURCE_PRECEDENCE,
     _IDENTITY_SUBJECTS,
@@ -22,6 +24,7 @@ from ._helpers import (
     _fact_value_type,
     _normalize_fact_part,
     _now,
+    _fact_key,
 )
 
 __all__ = [
@@ -29,6 +32,11 @@ __all__ = [
     "_fact_assertion_core_score",
     "_retract_inferred_identity_facts",
     "_turn_keys",
+    "read_fact_assertions",
+    "read_resolved_facts",
+    "has_conflicted_fact",
+    "retract_facts",
+    "_read_facts",
 ]
 
 
@@ -133,3 +141,121 @@ def _insert_fact_assertion(
             assertion.updated_at or _now(),
         ),
     )
+
+
+def _read_facts(
+    conn,
+    table: str,
+    order_by: str,
+    to_row: Callable[[sqlite3.Row], Any],
+    *,
+    subject: Optional[str] = None,
+    predicate: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> list[Any]:
+    """Filter one fact table by the three optional keys and read it back.
+
+        Both fact tables carry the same ``subject``/``predicate``/``scope``
+        triple and normalize it the same way, so the query lives here once and
+        each caller supplies only what actually differs.  ``table`` and
+        ``order_by`` are literals from this module, never caller input.
+        """
+    sql = f"SELECT * FROM {table} WHERE 1 = 1"
+    params: list[Any] = []
+    if subject is not None:
+        sql += " AND subject = ?"
+        params.append(_normalize_fact_part(subject))
+    if predicate is not None:
+        sql += " AND predicate = ?"
+        params.append(_normalize_fact_part(predicate))
+    if scope is not None:
+        sql += " AND scope = ?"
+        params.append(_normalize_fact_part(scope, "global"))
+    sql += f" ORDER BY {order_by}"
+    rows = conn.execute(sql, params).fetchall()
+    return [to_row(row) for row in rows]
+
+
+def read_fact_assertions(
+    conn,
+    *,
+    subject: Optional[str] = None,
+    predicate: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> list[FactAssertion]:
+    return _read_facts(
+        conn, "fact_assertions",
+        "created_at ASC, id ASC",
+        _row_mappers._row_to_fact_assertion,
+        subject=subject,
+        predicate=predicate,
+        scope=scope,
+    )
+
+
+def read_resolved_facts(
+    conn,
+    *,
+    subject: Optional[str] = None,
+    predicate: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> list[ResolvedFact]:
+    return _read_facts(
+        conn, "resolved_facts",
+        "subject ASC, predicate ASC, scope ASC",
+        _row_mappers._row_to_resolved_fact,
+        subject=subject,
+        predicate=predicate,
+        scope=scope,
+    )
+
+
+def has_conflicted_fact(
+    conn,
+    subject: str,
+    predicate: str,
+    scope: str = "global",
+) -> bool:
+    row = conn.execute(
+        """
+                SELECT 1
+                FROM fact_assertions
+                WHERE subject = ? AND predicate = ? AND scope = ?
+                  AND status = 'conflicted'
+                LIMIT 1
+                """,
+        (
+            _normalize_fact_part(subject),
+            _normalize_fact_part(predicate),
+            _normalize_fact_part(scope, "global"),
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def retract_facts(
+    conn,
+    subject: str,
+    predicate: str,
+    scope: str = "global",
+) -> int:
+    """Archive every assertion behind one fact and drop the resolved row."""
+    cursor = conn.execute(
+        """
+                UPDATE fact_assertions SET status = 'archived', updated_at = ?
+                WHERE subject = ? AND predicate = ? AND scope = ?
+                  AND status != 'archived'
+                """,
+        (
+            _now(),
+            _normalize_fact_part(subject),
+            _normalize_fact_part(predicate),
+            _normalize_fact_part(scope, "global"),
+        ),
+    )
+    archived = cursor.rowcount or 0
+    conn.execute(
+        "DELETE FROM resolved_facts WHERE fact_key = ?",
+        (_fact_key(subject, predicate, scope),),
+    )
+    return archived
