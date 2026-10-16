@@ -426,6 +426,7 @@ def main() -> int:
 
     process = start_gateway(home, port)
     CURRENT_PROCESS = process
+    gateway_log = ""
     try:
         asyncio.run(run_checks(base, results, has_provider, home))
     except Exception as exc:  # noqa: BLE001 - the report is the point
@@ -436,10 +437,23 @@ def main() -> int:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
+        # The gateway's output is piped and, until now, thrown away unread.  A provider that
+        # refuses (an exhausted balance, a revoked key) turns into "the turn streamed nothing",
+        # which reads like a defect in the code under test -- it cost an afternoon of bisection
+        # to learn that a 402 was behind it.  On failure, show the log's tail.
+        try:
+            gateway_log = process.communicate(timeout=5)[0] or ""
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            gateway_log = ""
         if not args.keep_home:
             shutil.rmtree(home, ignore_errors=True)
 
-    return results.report()
+    code = results.report()
+    if code and gateway_log.strip():
+        print("\ngateway log (tail), for the failure above:")
+        for line in gateway_log.strip().splitlines()[-20:]:
+            print(f"    {line[:200]}")
+    return code
 
 
 if __name__ == "__main__":
