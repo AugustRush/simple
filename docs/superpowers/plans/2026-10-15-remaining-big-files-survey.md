@@ -225,6 +225,33 @@ six values, injected into `ContextManager`, with those two tests rewritten to in
 That is a behaviour-preserving redesign, not an extraction, and it should be done as its own
 change with its own verification -- not smuggled in under "move some methods".
 
+## 2c. `agent/tools/builtin_tools.py` — measured, and the split is a redesign
+
+2062 lines, 11 methods, of which `_register` is **1650**.  Measured structure: `_register` is
+`r = self.registry` followed by **43 independent `r.register(...)` statements**, each 20-40
+lines (name, description, JSON schema, handler).  Nothing in it calls another method of the
+class.
+
+So the 84%-in-one-method figure is right, and the reduction is a split, not an extraction —
+43 statements grouped by the domain their tool names already spell out (`schedule_*` 8,
+`memory_*` 6, `workflow_*` 4, `list_*` 4, then files/shell/audio/context/web/plugin/output
+and a few singles).
+
+**What makes it a redesign rather than a move:** the statements are not self-contained.  They
+reference the collaborator objects built in `__init__` — `self._file_tools` (7 uses),
+`self._schedule_tools` (12), `self._plugin_tools` (8), `self._memory_tools` (6),
+`self._web_tools` (3), `self._signal_tools` (3), `self._context_tools` (2) — as sources of
+handlers and workspace helpers.  So each extracted `register(r)` needs those passed in as
+well as the registry, and the natural shape is a per-cluster module holding
+`def register(r, *, file_tools, ...) -> None`, with `_register` reduced to the ordered calls.
+
+Two preconditions worth stating before starting, because both have bitten this file already:
+the registry is a **shared mutable object**, so the split must preserve the *order* of
+registration (any later registration can observe earlier ones); and the tool described here
+(`scripts/_move_methods.py`) moves methods, not statement runs, so this is either a
+hand-written split or a new mode for that tool — a decision to make explicitly rather than by
+improvising.
+
 ## 3. `agent/memory/store.py` — 2835 lines
 
 ### Shape
