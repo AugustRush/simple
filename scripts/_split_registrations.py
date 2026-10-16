@@ -44,6 +44,11 @@ import sys
 from collections import Counter
 
 
+def out_lines_after_removal(lines: list[str], picked: list[ast.stmt]) -> list[str]:
+    """The file's lines with the moved statements removed, for the constant check."""
+    return lines[:picked[0].lineno - 1] + lines[picked[-1].end_lineno:]
+
+
 def collect_imports(tree: ast.Module, lines: list[str]) -> tuple[dict[str, str], set[str]]:
     """name -> the import statement that binds it, and the module-level constants."""
     imports: dict[str, str] = {}
@@ -216,12 +221,55 @@ def main() -> int:
         return 1
     import_lines = sorted({imports[n] for n in needed if n in imports})
 
+    # Module-level constants the moved statements read travel with their reader -- unless the
+    # code that stays behind still reads them too, in which case copying is a duplicate and
+    # deleting is a NameError, so the only honest answer is to refuse.
+    carried = sorted(n for n in needed if n in constants)
+    if carried:
+        remaining = "".join(out_lines_after_removal(lines, picked))
+        for name in carried:
+            # the definition line is not a reader, and it stays behind by construction -- the
+            # first version of this check counted it and refused a constant that nothing else
+            # touched
+            definition = next(
+                (n for n in tree.body
+                 if (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                     and n.targets[0].id == name)
+                 or (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name)),
+                None,
+            )
+            without_definition = "".join(
+                line for number, line in enumerate(remaining.splitlines(keepends=True), 1)
+                if definition is None or not (definition.lineno <= number <= definition.end_lineno)
+            )
+            if re.search(rf"(?<![\w.]){re.escape(name)}\b", without_definition):
+                print(
+                    f"REFUSING: {name} is read by the code that stays in {args.file} as well as "
+                    f"by the statements being moved; give it a home outside both modules first",
+                    file=sys.stderr,
+                )
+                return 1
+    carried_text = ""
+    for name in carried:
+        node = next(
+            (n for n in tree.body
+             if (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                 and n.targets[0].id == name)
+             or (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name)),
+            None,
+        )
+        if node is None:
+            print(f"REFUSING: {name} is a constant but its definition was not found", file=sys.stderr)
+            return 1
+        carried_text += "".join(lines[node.lineno - 1:node.end_lineno]).rstrip("\n") + "\n\n"
+
     signature = "r" + (f",\n    *,\n    {', '.join(collaborators)}" if collaborators else "")
     doc = args.doc or f"The tools this module registers, and what each one is for."
     new_module = (
         f'"""{doc}"""\n\n'
         "from __future__ import annotations\n\n"
         + ("\n".join(import_lines) + "\n\n" if import_lines else "")
+        + (carried_text if carried_text else "")
         + f"def {args.function}(\n    {signature},\n) -> None:\n"
         + "".join(f"    {line}\n" for line in body_text.split("\n"))
     )
@@ -241,6 +289,17 @@ def main() -> int:
     out = list(lines)
     out[picked[0].lineno - 1:picked[-1].end_lineno] = [call]
     text = "".join(out)
+    for name in carried:
+        node = next(
+            (n for n in ast.parse(text).body
+             if (isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                 and n.targets[0].id == name)
+             or (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name)),
+            None,
+        )
+        if node is not None:
+            text = "".join(text.splitlines(keepends=True)[:node.lineno - 1]
+                           + text.splitlines(keepends=True)[node.end_lineno:])
     if f"from . import {stem}" not in text and f"from agent.tools import {stem}" not in text:
         anchor = re.search(r"^from \.", text, re.M)
         line_to_add = f"from . import {stem}\n"
