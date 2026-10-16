@@ -17,6 +17,7 @@ from agent.lexical import lexical_terms
 if TYPE_CHECKING:
     from agent.core.transport import ModelEndpoint
 
+from . import context_telemetry
 from . import context_working_state
 from . import context_retrieval
 from .session_log import SessionLog
@@ -369,9 +370,7 @@ class ContextManager:
         interjections: Optional[Sequence[dict[str, Any]]] = None,
     ) -> ConversationWriteResult:
         """Persist an exchange and expose which event rows were created."""
-        session_id = self.staging.session_id
-        write_result = self.store.write_conversation_exchange(
-            session_id=session_id,
+        return context_telemetry.record_turn_result(
             user_content=user_content,
             assistant_content=assistant_content,
             channel=channel,
@@ -379,9 +378,9 @@ class ContextManager:
             assistant_message_id=assistant_message_id,
             reply_to_id=reply_to_id,
             metadata=metadata,
-            interjections=interjections,
+            interjections=interjections, store=self.store, staging=self.staging
         )
-        return write_result
+
 
     def begin_turn(
         self,
@@ -912,10 +911,8 @@ class ContextManager:
         return {"messages": compacted, "summary": summary}
 
     def load_provider_checkpoint(self) -> dict[str, Any] | None:
-        load = getattr(self.store, "load_provider_checkpoint", None)
-        if not callable(load):
-            return None
-        return load(self.staging.session_id)
+        return context_telemetry.load_provider_checkpoint(store=self.store, staging=self.staging)
+
 
 
 
@@ -985,28 +982,15 @@ class ContextManager:
         head_estimate: int = 0,
         body_raw: int = 0,
     ) -> None:
-        """Feed one call's usage back to the engine that calibrates the estimator.
+        """Feed one call's usage back to the engine that calibrates the estimator."""
+        context_telemetry.observe_token_usage(
+            predicted=predicted,
+            actual=actual,
+            fingerprint=fingerprint,
+            head_estimate=head_estimate,
+            body_raw=body_raw, consolidation=self.consolidation
+        )
 
-        The choice between the split-aware observer and the plain one belongs to the
-        engine: the turn loop used to make it through two ``getattr`` calls on
-        ``manager.consolidation``, which is a consumer reading a collaborator of this
-        service rather than the service answering a question.
-        """
-        consolidation = self.consolidation
-        observe_split = getattr(consolidation, "observe_payload_usage", None)
-        if callable(observe_split) and fingerprint:
-            with shared._suppress_with_log("token calibration skipped"):
-                observe_split(
-                    fingerprint=fingerprint,
-                    head_estimate=head_estimate,
-                    body_raw=body_raw,
-                    actual=actual,
-                )
-            return
-        observe_plain = getattr(consolidation, "observe_actual_usage", None)
-        if callable(observe_plain):
-            with shared._suppress_with_log("token calibration skipped"):
-                observe_plain(predicted, actual)
 
     def record_usage_event(
         self,
@@ -1020,27 +1004,18 @@ class ContextManager:
         turn_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Persist one provider-usage row through the store, when it keeps them.
+        """Persist one provider-usage row through the store, when it keeps them."""
+        context_telemetry.record_usage_event(
+            session_id=session_id,
+            phase=phase,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            turn_id=turn_id,
+            metadata=metadata, store=self.store
+        )
 
-        The store's ``append_usage_event`` is deliberately outside ``MemoryStore`` (it is
-        accounting rather than memory), so this member is where that optional capability
-        is allowed to be *optional*: the consumer asks the service, and a service whose
-        store does not keep usage rows does nothing.
-        """
-        record = getattr(self.store, "append_usage_event", None)
-        if not callable(record):
-            return
-        with shared._suppress_with_log("provider usage persistence skipped"):
-            record(
-                session_id=session_id,
-                turn_id=turn_id,
-                phase=phase,
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
-                metadata=metadata,
-            )
 
     def retrieve_context(
         self,
