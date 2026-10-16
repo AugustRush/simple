@@ -249,13 +249,22 @@ def add_kwargs_to_calls(text: str, kwargs_for: dict[str, list[str]]) -> str:
                     depth -= 1
                     if depth == 0:
                         inner = text[start + 1:index]
-                        missing = [f"{k}={k}" for k in kwargs if f"{k}=" not in inner]
+                        missing = [
+                            spec for spec in kwargs
+                            if f"{spec.split('=', 1)[0]}=" not in inner
+                        ]
                         if missing:
-                            edits.append((index, missing))
+                            # Insert after the last argument, not before the closing paren: a call
+                            # written across lines with a trailing comma ends `...,\n    )`, and
+                            # inserting at the paren produced `...,\n    , store=store)`.
+                            trimmed = inner.rstrip()
+                            at = start + 1 + len(trimmed)
+                            lead = " " if trimmed.endswith(",") else ", "
+                            edits.append((at, [lead + ", ".join(missing)]))
                         break
                 index += 1
-    for index, missing in sorted(edits, reverse=True):
-        text = text[:index] + ", " + ", ".join(missing) + text[index:]
+    for index, pieces in sorted(edits, reverse=True):
+        text = text[:index] + "".join(pieces) + text[index:]
     return text
 
 
@@ -304,6 +313,8 @@ def free_names(text: str) -> set[str]:
             bound.add(node.name)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 bind_args(node.args)
+        elif isinstance(node, ast.Lambda):
+            bind_args(node.args)          # `key=lambda item: item[1]` binds `item`
         elif isinstance(node, ast.ExceptHandler) and node.name:
             bound.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -390,6 +401,10 @@ def main(argv: list[str] | None = None) -> int:
         "--extra-param", action="append", default=[], metavar="NAME=WRAPPER_EXPR",
         help="give the moved function one more keyword-only collaborator and have the wrapper "
              "pass it (repeatable), e.g. `--extra-param invalidate=self._sync_after_mutation`",
+    )
+    ap.add_argument(
+        "--extend", action="store_true",
+        help="the target module already exists and is being extended by this run",
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -547,15 +562,13 @@ def main(argv: list[str] | None = None) -> int:
         # A batch-level declaration, applied per function by *usage*, and only now: a rewrite may be
         # what introduces the collaborator (`..._for_storage(conn, category, max_categories=...)`),
         # so computing the usage before the rewrites added no parameter at all.
-        # Every function in the batch takes every declared collaborator and every sibling call
-        # passes them on.  Choosing per function by usage sounds tidier but breaks the moment a
-        # caller must hand a collaborator to a callee that needs it: the caller "does not use" it
-        # yet must still accept and forward it.  The cost is an occasional unused keyword-only
-        # parameter; the alternative was a cascade of "missing/unexpected keyword argument".
-        used_extras = list(extra_params)
-        if used_extras:
-            text = add_kwonly_params(text, method.name, used_extras)
-        extras_for[method.name] = used_extras
+        used_extras: list[str] = []      # decided after the batch, by the fixpoint below
+        for extra in extra_params:
+            # declaring a collaborator also re-points its uses: `self.store` -> `store`, with a
+            # word boundary so `self.store_path` is left alone.  Non-trivial cases (a call that
+            # becomes something else) still need an explicit --rewrite.
+            text = re.sub(rf"(?<![\w.])self\.{re.escape(extra)}\b", extra, text)
+            text = re.sub(rf"(?<![\w.])cls\.{re.escape(extra)}\b", extra, text)
         try:
             ast.parse(text)
         except SyntaxError as exc:
@@ -575,7 +588,6 @@ def main(argv: list[str] | None = None) -> int:
             continue
         blocks.append(text)
         block_names.append(method.name)
-        needed |= (free_names(text) - set(moving))
 
         # the wrapper that stays in the class
         op, end = param_span(original, method.name)
@@ -663,9 +675,50 @@ def main(argv: list[str] | None = None) -> int:
             elif isinstance(node, ast.Assign):
                 target_defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
 
+    # Which collaborators each moved function must take: the ones it reads itself, plus -- by
+    # fixpoint over the sibling calls -- the ones it must forward to a callee.  Taking the union of
+    # the batch instead is simpler and was what the first version did, but it gives every function
+    # every collaborator (`route_keywords`, `store`, ...) whether it can use them or not.
+    direct = {
+        name: [e for e in extra_params if re.search(rf"(?<![\w.]){re.escape(e)}\b", block)]
+        for name, block in zip(block_names, blocks)
+    }
+    needs = {name: set(v) for name, v in direct.items()}
+    changed = True
+    while changed:
+        changed = False
+        for name, block in zip(block_names, blocks):
+            for callee in moving:
+                if callee == name or callee not in needs:
+                    continue        # skipped earlier in this run
+                if re.search(rf"(?<![\w.]){re.escape(callee)}\(", block):
+                    if needs[callee] - needs[name]:
+                        needs[name] |= needs[callee]
+                        changed = True
+    for index, name in enumerate(block_names):
+        ordered = [e for e in extra_params if e in needs[name]]
+        extras_for[name] = ordered
+        if ordered:
+            blocks[index] = add_kwonly_params(blocks[index], name, ordered)
+
+    # Free names are collected only now: the collaborators became parameters just above, and
+    # collecting before that reported every one of them as unbound.
+    for name_of_block, block_item in zip(block_names, blocks):
+        try:
+            needed |= (free_names(block_item) - set(moving))
+        except SyntaxError as exc:
+            lines_of = block_item.split("\n")
+            at = (exc.lineno or 1) - 1
+            context = "\n".join(f"    {ln}" for ln in lines_of[max(0, at - 3):at + 3])
+            problems.append(
+                f"{name_of_block}: the transformed body does not parse ({exc.msg}); near:\n{context}"
+            )
+
     # Second pass: now that every moved function's own needs are known, fill in the collaborators
     # at the sibling call sites -- per callee, so nobody is handed a parameter it cannot take.
-    kwargs_for = {name: list(extra_params) for name in moving}
+    kwargs_for = {
+        name: [f"{e}={e}" for e in extras_for.get(name, [])] for name in moving
+    }
     earlier_run_callees: set[str] = set()
     # A function moved by an *earlier* run lives in the target module and takes the same kind of
     # collaborator; its callers in this batch must pass it.  Read the target's signatures rather
@@ -690,6 +743,18 @@ def main(argv: list[str] | None = None) -> int:
             add_conn_to_calls(block, earlier_run_callees - set(moving), args.param)
             for block in blocks
         ]
+    # The wrapper calls the module function, so it must pass the *declared expression*
+    # (`store=self.store`), not the bare local name the in-module calls use.
+    expr_for = {
+        pair.split("=", 1)[0].strip(): pair.split("=", 1)[1].strip()
+        for pair in args.extra_param if "=" in pair
+    }
+    for index, name in enumerate(block_names):
+        wanted = [f"{e}={expr_for[e]}" for e in extras_for.get(name, []) if e in expr_for]
+        if wanted and index < len(wrappers):
+            wrappers[index] = add_kwargs_to_calls(
+                wrappers[index], {f"{pathlib.Path(args.module).stem}.{name}": wanted}
+            )
 
     # A rewrite that matched nothing anywhere in the batch is almost certainly a typo, and a
     # silent no-op there was how a wrong `--rewrite` used to pass unnoticed.
@@ -766,6 +831,22 @@ def main(argv: list[str] | None = None) -> int:
         merged = existing + [m for m in moving if m not in existing]
         block = "__all__ = [\n" + "".join(f'    "{m}",\n' for m in merged) + "]"
         header = header[:listed.start()] + block + header[listed.end():]
+    # `agent/memory/retrieval.py` already existed -- BM25 retrieval over entries -- and a move
+    # into that name silently replaced it.  Writing into an existing module is how this tool
+    # appends to one it made earlier, so the check is not "does it exist" but "was that meant".
+    if target.exists() and not args.extend:
+        existing = sorted(
+            n.name for n in ast.parse(target.read_text(encoding="utf-8")).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        print(
+            f"REFUSING: {target} already exists and this run would replace it.  Pass --extend to "
+            f"append to a module this tool created earlier.  It currently defines: "
+            f"{existing[:8]}{' ...' if len(existing) > 8 else ''}",
+            file=sys.stderr,
+        )
+        return 1
+
     const_text = "\n\n".join(constants[n][2] for n in consts)
     new_module = header.rstrip("\n") + "\n\n\n"
     if const_text:
@@ -773,7 +854,20 @@ def main(argv: list[str] | None = None) -> int:
     new_module += "\n\n\n".join(blocks) + "\n"
 
     # the unbound-name check, before any test run
-    check = ast.parse(new_module)
+    try:
+        check = ast.parse(new_module)
+    except SyntaxError as exc:
+        lines_of = new_module.split("\n")
+        at = (exc.lineno or 1) - 1
+        context = "\n".join(
+            f"  {n + 1}: {ln}" for n, ln in enumerate(lines_of[max(0, at - 4):at + 4], max(0, at - 4))
+        )
+        print(
+            f"REFUSING to keep this: the generated module does not parse ({exc.msg}); "
+            f"near line {exc.lineno}:\n{context}",
+            file=sys.stderr,
+        )
+        return 1
     top = set()
     for node in check.body:
         if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
