@@ -254,9 +254,10 @@ Left:
 2. **`memory/entries.py`** then `memory/search.py` (`search_entries` 99).
 3. **`memory/conversations.py`** (`write_conversation_exchange` 202 + `_json_object`).
 4. **`memory/maintenance.py`** (`apply_retention`, `apply_decay`, `clear_persistent_memory`,
-   `maintenance_snapshot`) -- **blocked** on the cache seam: nine methods assign or clear
-   `self._category_stats_cache`, and `_sync_after_mutation` can never be a free function.  They
-   need an `invalidate_category_stats()` collaborator first (section 6).
+   `maintenance_snapshot`) -- **blocked** on the cache seam: seven methods call
+   `_sync_after_mutation`, which writes `self._category_stats_cache`, and `apply_decay` /
+   `clear_persistent_memory` write that cache directly.  They need an `invalidate_category_stats()`
+   collaborator first (section 6).
 
 ## 4. `agent/scheduler/store.py` — 4086 lines
 
@@ -486,13 +487,17 @@ so they are recorded here rather than silently acted on.
    method out of that file** -- it refuses every one.  Before any scheduler work the tool needs a
    connection-expression option and wrapper-side decorator retention.  By contrast the 14
    non-decorated `*_in_transaction` helpers have no lock problem and are the right first move.
-5. **The cache seam is one designed collaborator, not nine small moves.**  `apply_retention`,
-   `apply_decay`, `clear_persistent_memory`, `_remove_category`, `merge_categories`,
-   `write_entries`, `add_entry`, `add_entries` and `upsert_manual_note` all assign or clear
-   `self._category_stats_cache`; `_sync_after_mutation` writes instance state and can never be a
-   free function.  They need an `invalidate_category_stats()` callable (or the new function
-   returning the touched categories for the class wrapper to invalidate).  Until that exists,
-   the write path and the maintenance group are not mechanical moves.
+5. **The cache seam is one designed collaborator, not nine small moves.**  Only five methods
+   write `self._category_stats_cache` directly (`__init__`, `_meta`, `_sync_after_mutation`,
+   `apply_decay`, `clear_persistent_memory`), and only `_meta` reads it.  The real seam is
+   `_sync_after_mutation`: **seven** methods call it (`_remove_category`, `write_entries`,
+   `add_entry`, `add_entries`, `upsert_manual_note`, `apply_retention`, `merge_categories`), and it
+   writes instance state, so it can never be a free function.  Those seven need an
+   `invalidate_category_stats()` callable (or the moved function returns the touched categories and
+   the class wrapper invalidates).  Until that exists, the write path and the maintenance group are
+   not mechanical moves.  (An earlier version of this note said "nine methods assign or clear
+   `self._category_stats_cache`"; the count and the mechanism were both wrong -- corrected by
+   counting, not by memory.)
 
 One more trap worth its own line, because it inverts a rule this survey states:
 **`_TASK_IDENTITY_COLUMNS` is imported by `tests/test_scheduler_products.py` *from
