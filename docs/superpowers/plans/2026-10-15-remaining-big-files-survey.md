@@ -23,7 +23,7 @@ recording" below.
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 3307 (was 4086) | `SchedulerStore` | 74 | 2783 | **0 lines** |
-| `agent/memory/store.py` | 2023 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
+| `agent/memory/store.py` | 1827 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1911 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
 
@@ -222,20 +222,41 @@ The four schema steps (`_ensure_transcript_indexes` 15, `_add_missing_columns` 2
 `_backfill_transcript_seq` 50, `_next_transcript_seq` 19) take a connection and nothing else.
 `_ensure_schema` (the only caller) keeps its sequence; the on-disk format does not change.
 
-### What remains here (9 methods / ~212 lines measured)
+### `memory/normalize.py` — **extracted**, 1837 → 1827 lines
 
-1. **`memory/facts.py`** — `_insert_fact_assertion` (30), `_fact_assertion_core_score` (22),
-   `_retract_inferred_identity_facts` (26), `_turn_keys` (13).
-3. The 0-data / 1-call readers (`corpus_stats` 105, `list_session_ids` 47, `usage_summary` 35,
-   `append_usage_event` 34) — each needs the connection passed.
-4. The write paths (`write_conversation_exchange` 201, `apply_retention` 86) last.
-2. **`memory/migrations.py`** — `_add_missing_columns`, `_backfill_transcript_seq`,
-   `_next_transcript_seq`, `_ensure_fts_index`-adjacent schema work.
-3. **`memory/facts.py`** — `_insert_fact_assertion`, `_fact_assertion_core_score`,
-   `_retract_inferred_identity_facts`, `_read_facts`.
-4. The 0-data / 1-call readers (`corpus_stats` 105, `usage_summary` 35, `list_session_ids` 47,
-   `append_usage_event` 34) — each needs the connection passed, so after the pure ones.
-5. The write paths (`write_conversation_exchange` 201, `apply_retention` 86) last.
+Five pure functions of their arguments (`normalize_category_name`, `_normalize_content_key`,
+`_is_palace_locus`, `_normalize_entity`, `_stable_merge_key`, 33 lines).  They are called all over
+the store, so the class keeps a thin wrapper for each and every `self._normalize_entity(...)` call
+site survives untouched.  The file shrank by ten lines, because 33 lines of body cost ~40 lines of
+wrappers -- the ratio rule again.
+
+The reason to do this small, unglamorous move first is the next one: the fact-ledger cluster's
+`_fact_assertions_from_entry` reads `_normalize_entity` and `normalize_category_name`, so **415
+lines were blocked on 33**.
+
+The tool grew a capability that this exposed: rewriting `self.sibling(` to `sibling(` only handles
+a sibling that is *called*.  A sibling handed over as a value -- `resolve_fact` passes
+`key=self._fact_assertion_total_score` -- is a bare attribute reference, and leaving it alone makes
+the tool refuse with "still references self".  Both shapes are rewritten now; it is the fifth time
+this class of miss has cost a hand-fix.
+
+### What remains here
+
+Done, in order: `rows.py`, `migrations.py`, `facts.py` (the four writers/scorers), `usage.py`,
+`queries.py`, `schema.py`, `fts.py`, `journal.py`, `append_conversation_turn`, `normalize.py`.
+Left:
+
+1. **Extending `facts.py`** — the twelve fact-ledger readers and writers that close over each other
+   (`read_fact_assertions`, `read_resolved_facts`, `has_conflicted_fact`, `retract_facts`,
+   `_read_facts`, `_fact_assertions_from_entry`, `add_fact_assertion`, `resolve_fact` 117,
+   `set_identity`, `_derive_missing_identity_facts`, `_repair_assistant_identity_facts`,
+   `_fact_assertion_total_score`) -- ~415 lines, and unblocked now that `normalize.py` exists.
+2. **`memory/entries.py`** then `memory/search.py` (`search_entries` 99).
+3. **`memory/conversations.py`** (`write_conversation_exchange` 202 + `_json_object`).
+4. **`memory/maintenance.py`** (`apply_retention`, `apply_decay`, `clear_persistent_memory`,
+   `maintenance_snapshot`) -- **blocked** on the cache seam: nine methods assign or clear
+   `self._category_stats_cache`, and `_sync_after_mutation` can never be a free function.  They
+   need an `invalidate_category_stats()` collaborator first (section 6).
 
 ## 4. `agent/scheduler/store.py` — 4086 lines
 
@@ -320,7 +341,7 @@ Two things had to happen first, and both came out of the tool refusing rather th
   `optional_datetime` -- and `store.py` imports them, with its 90 call sites untouched.
 * The tool learned to refuse deleting a module-level constant that **non-moved code still reads**.
   It had been about to delete `UTC` from `store.py` because only the moved methods read it *in
-  that file* -- while 24 other uses remained.  `compile()` cannot see that (it is a runtime name
+  that file* -- while 24 other *lines* (36 references) still read it.  `compile()` cannot see that (it is a runtime name
   lookup) and the unbound-name check only inspects the generated module, so it would have been a
   `NameError` at call time.  The dry run now runs every check the real run does, which is how the
   refusal became visible before anything was written.
