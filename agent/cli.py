@@ -774,6 +774,40 @@ async def _run_cli_turn(
     )
 
 
+def _fallback_plugin_catalog(cfg: dict, components: dict) -> PluginCatalog:
+    """The catalog the interactive loop builds when the composition did not register one.
+
+    Extracted so this branch is testable at all: it is the one place the CLI hands the
+    *user's* plugin directory to a catalog, and a catalog without change detection loads
+    whatever it finds there -- see the test that names the fallback.
+    """
+    plugin_catalog = PluginCatalog(
+        builtin_dir=shared.PLUGINS_DIR,
+        user_dir=shared.USER_PLUGINS_DIR,
+        plugin_config=cfg.get("plugins", {}),
+        # Change detection, because this catalog is handed the *user's* directory.  bootstrap
+        # turns it on for the composition and notes that it is "off elsewhere (a bare catalog
+        # loads what it is handed)" -- true of a catalog handed only the runtime's own plugins,
+        # and not true here: a bare catalog pointed at ``~/.agent/plugins`` runs whatever is in
+        # it, which is the one thing the gate exists to notice.  Turning it on costs nothing
+        # when the directory is empty, and asks the same questions the composition asks.
+        detect_plugin_changes=True,
+        # The composition the plugins run in.  Without it the catalog's host has an
+        # empty registry, so a plugin that declares what it needs stays *pending* --
+        # which is what the hook protocol's `on_session_start(components)` was a
+        # workaround for: it handed the mapping to a plugin the host could not
+        # resolve it for.  bootstrap has always passed its mapping here; the
+        # interactive loop did not, because nothing had asked until now.
+        components=components,
+        turn_hook_timeout_seconds=cfg.get("orchestration", {}).get(
+            "turn_hook_timeout_seconds",
+            shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
+        ),
+    )
+    plugin_catalog.discover_and_load()
+    return plugin_catalog
+
+
 async def _interactive_loop_body(
     components: dict,
     cfg: dict,
@@ -792,23 +826,7 @@ async def _interactive_loop_body(
     agent: BaseAgent = require_service(components, "agent")
     plugin_catalog: PluginCatalog = resolve(components, "plugin_catalog")  # type: ignore[assignment]
     if plugin_catalog is None:
-        plugin_catalog = PluginCatalog(
-            builtin_dir=shared.PLUGINS_DIR,
-            user_dir=shared.USER_PLUGINS_DIR,
-            plugin_config=cfg.get("plugins", {}),
-            # The composition the plugins run in.  Without it the catalog's host has an
-            # empty registry, so a plugin that declares what it needs stays *pending* --
-            # which is what the hook protocol's `on_session_start(components)` was a
-            # workaround for: it handed the mapping to a plugin the host could not
-            # resolve it for.  bootstrap has always passed its mapping here; the
-            # interactive loop did not, because nothing had asked until now.
-            components=components,
-            turn_hook_timeout_seconds=cfg.get("orchestration", {}).get(
-                "turn_hook_timeout_seconds",
-                shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
-            ),
-        )
-        plugin_catalog.discover_and_load()
+        plugin_catalog = _fallback_plugin_catalog(cfg, components)
         components["plugin_catalog"] = plugin_catalog
     system_prompt = components["system_prompt"]
     ctx_mgr = _build_cli_context_manager(components)

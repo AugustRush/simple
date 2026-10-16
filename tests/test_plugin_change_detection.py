@@ -199,6 +199,41 @@ def test_editing_a_plugin_that_was_already_seen_blocks_it_again(tmp_path, ledger
         catalog.close()
 
 
+def test_the_interactive_fallback_gates_the_user_s_plugin_directory(
+    tmp_path, ledger, monkeypatch, capsys
+) -> None:
+    """The one catalog the CLI builds itself must ask what the composition asks.
+
+    ``_interactive_loop_body`` builds its own catalog when the composition registered none,
+    and it hands that catalog the **user's** plugin directory.  Built without change
+    detection it loads whatever is there, which is the gate's whole subject.
+    """
+    from agent import cli
+
+    user = tmp_path / "user"
+    plugin = _code_plugin(user, "alpha", body="v1")
+    first = _catalog(tmp_path, user_dir=user)
+    try:
+        first.discover_and_load()
+        assert _ran(plugin)
+    finally:
+        first.close()
+    (plugin / "ran.txt").unlink()
+    capsys.readouterr()
+    (plugin / "__init__.py").write_text(
+        (plugin / "__init__.py").read_text(encoding="utf-8").replace("v1", "v2"),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli.shared, "USER_PLUGINS_DIR", user)
+    monkeypatch.setattr(cli.shared, "PLUGINS_DIR", tmp_path / "builtin")
+    catalog = cli._fallback_plugin_catalog({}, {})
+    try:
+        assert not _ran(plugin), "the fallback ran a plugin the gate would have refused"
+    finally:
+        catalog.close()
+
+
 # ── what is deliberately out of scope ───────────────────────────────────────
 
 
