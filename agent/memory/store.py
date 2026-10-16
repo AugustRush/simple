@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, Sequence
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
 
+from . import normalize
 from . import journal
 from . import fts
 from .retrieval import CorpusStats
@@ -244,26 +245,23 @@ class LTMStore:
     @staticmethod
     def normalize_category_name(name: str) -> str:
         """Collapse external category input into a safe, stable storage key."""
-        normalized = re.sub(r"[\\/]+", " ", str(name).strip().lower())
-        normalized = normalized.replace("..", " ")
-        normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "_", normalized)
-        normalized = re.sub(r"_+", "_", normalized).strip("._")
-        return normalized or "general"
+        return normalize.normalize_category_name(
+            name=name,
+        )
+
 
     def _is_palace_locus(self, category: str) -> bool:
-        return self.normalize_category_name(category) in shared.PALACE_LOCI
+        return normalize._is_palace_locus(
+            category=category,
+        )
+
 
     def _normalize_entity(self, entity: str, category: str) -> str:
-        raw = str(entity).strip()
-        if raw:
-            return self.normalize_category_name(raw)
-        if self._is_palace_locus(category):
-            return (
-                "user"
-                if self.normalize_category_name(category) == "identity"
-                else "general"
-            )
-        return self.normalize_category_name(category)
+        return normalize._normalize_entity(
+            entity=entity,
+            category=category,
+        )
+
 
 
 
@@ -273,24 +271,16 @@ class LTMStore:
 
     @staticmethod
     def _normalize_content_key(content: str) -> str:
-        normalized = re.sub(r"\s+", " ", content.strip().lower())
-        return normalized
+        return normalize._normalize_content_key(
+            content=content,
+        )
+
 
     def _stable_merge_key(self, entry: LTMEntry) -> Optional[str]:
-        category = self.normalize_category_name(entry.category)
-        entity = self._normalize_entity(entry.entity, category)
-        memory_type = (entry.memory_type or "fact").strip().lower()
+        return normalize._stable_merge_key(
+            entry=entry,
+        )
 
-        if category in {"episodes", "archive", "concepts"}:
-            return None
-        if category == "tasks":
-            normalized_content = self._normalize_content_key(entry.content)
-            return f"{category}|{entity}|{memory_type}|{normalized_content}"
-        if category not in {"identity", "projects", "people", "procedures"}:
-            return None
-
-        normalized_content = self._normalize_content_key(entry.content)
-        return f"{category}|{entity}|{memory_type}|{normalized_content}"
 
     def _match_existing_entry_id(
         self, conn: sqlite3.Connection, entry: LTMEntry
