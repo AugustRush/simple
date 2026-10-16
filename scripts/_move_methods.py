@@ -230,7 +230,7 @@ def add_kwargs_to_calls(text: str, kwargs_for: dict[str, list[str]]) -> str:
     for sibling, kwargs in kwargs_for.items():
         if not kwargs:
             continue
-        for match in re.finditer(rf"(?<![\w.])(?<!def ){re.escape(sibling)}\((?!\s*\))", text):
+        for match in re.finditer(rf"(?<![\w.])(?<!def ){re.escape(sibling)}\(", text):
             start = match.end() - 1
             depth, index, quote = 0, start, None
             while index < len(text):
@@ -254,13 +254,19 @@ def add_kwargs_to_calls(text: str, kwargs_for: dict[str, list[str]]) -> str:
                             if f"{spec.split('=', 1)[0]}=" not in inner
                         ]
                         if missing:
-                            # Insert after the last argument, not before the closing paren: a call
-                            # written across lines with a trailing comma ends `...,\n    )`, and
-                            # inserting at the paren produced `...,\n    , store=store)`.
                             trimmed = inner.rstrip()
-                            at = start + 1 + len(trimmed)
-                            lead = " " if trimmed.endswith(",") else ", "
-                            edits.append((at, [lead + ", ".join(missing)]))
+                            if not trimmed:
+                                # An empty call `f()` -- skipping it left a wrapper calling a
+                                # function whose collaborators were never passed, and the caller
+                                # swallowed the TypeError (`getattr(..., None)` probe).
+                                edits.append((start + 1, [", ".join(missing)]))
+                            else:
+                                # Insert after the last argument, not before the closing paren: a
+                                # call across lines with a trailing comma ends `...,\n    )`, and
+                                # inserting at the paren produced `...,\n    , store=store)`.
+                                at = start + 1 + len(trimmed)
+                                lead = " " if trimmed.endswith(",") else ", "
+                                edits.append((at, [lead + ", ".join(missing)]))
                         break
                 index += 1
     for index, pieces in sorted(edits, reverse=True):
