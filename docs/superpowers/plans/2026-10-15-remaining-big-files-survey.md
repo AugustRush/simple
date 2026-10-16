@@ -195,6 +195,29 @@ that), so no call site changed.
 5. `__init__` (132 lines, 17 refs) and `register_spawn_capability` (157) last: they are the
    object's identity and are supposed to know everything.
 
+## 2b. `agent/memory/context.py` — the job/consolidation cluster is **not** mechanically extractable
+
+Fifteen methods (~290 lines: `process_one_job` 107, `enqueue_staging_job` 29,
+`should_enqueue_consolidation` 22, `sleep` 18, `next_job`, `pending_jobs`, `stats`,
+`mark_activity`, `idle_elapsed`, `on_memory_cleared`, `consume_memory_clear_suppression`,
+`should_process_jobs`, `should_sleep`, `should_idle_sleep`, `should_session_end_sleep`) share six
+pieces of mutable state: `_jobs`, `_lock`, `_processing_job`, `_needs_consolidation`,
+`_last_activity`, `_suppress_next_turn_persistence`.
+
+Two things block a move rather than a redesign:
+
+1. `tests/test_background_memory.py:224` monkeypatches **the instance attribute** —
+   `ctx_mgr.process_one_job = fake_process_one_job` **on a real `ContextManager`**, and
+   `:455` reads `ctx_mgr._needs_consolidation`.  A moved function called by bare name would never
+   see that patch, so the test would keep passing while exercising nothing.
+2. The state is the *point* of the cluster (a queue plus a lock).  Passing it in as parameters
+   means threading six mutable values through fifteen signatures.
+
+The honest path is a deliberate refactor: a `JobQueue` (or `SessionRuntime`) object that owns the
+six values, injected into `ContextManager`, with those two tests rewritten to inject a fake queue.
+That is a behaviour-preserving redesign, not an extraction, and it should be done as its own
+change with its own verification -- not smuggled in under "move some methods".
+
 ## 3. `agent/memory/store.py` — 2835 lines
 
 ### Shape
