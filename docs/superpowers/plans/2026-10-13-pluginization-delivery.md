@@ -247,6 +247,19 @@ where the contract wanted an implementation.  Smoke **6 ok / 0 failed**; ecosyst
    `tests/test_memory_backend_selection.py`.
 4. **DSH profile import** -- reading is done (`agent/plugins/dsh.py`, read-only); importing
    needs the consent machinery item 1 describes.
+4b. ~~**The god classes.**~~ -- **largely done** (`SchedulerStore` 4085 → 1534, `LTMStore`
+   2834 → 1009, `WebChannel` 3319 → 2630, `BaseAgent` 2535 → 2032, `ContextManager` 2483 →
+   1266), one cluster per commit, with the FAILED set byte-compared to a frozen baseline and
+   every moved function's string literals compared as a multiset after each.  Written up in
+   [`2026-10-16-god-class-extraction-closing-report.md`](2026-10-16-god-class-extraction-closing-report.md).
+   **Three clusters were deliberately not moved**, each for a stated reason rather than for
+   lack of time: `context.py`'s job/consolidation queue (six pieces of shared mutable state
+   plus two tests that monkeypatch the instance -- it needs a `JobQueue` injected into
+   `ContextManager`, with those tests rewritten to inject a fake queue), `BaseAgent`'s
+   orchestration core (each method needs 14-18 instance attributes as collaborators, so the
+   signatures would be heavier than what they replace), and `builtin_tools.py` (84% is one
+   `_register` method; its reduction is per-cluster self-registration, a different change).
+
 5. ~~**A kind table for declarative assets**~~ -- **done**: `DECLARATIVE_KINDS` is the
    table, and `_register_declarative_assets` only iterates it.
 6. ~~**`PluginCatalog` still owns two concerns it should not.**~~ -- **done**: the hook

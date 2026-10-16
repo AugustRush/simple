@@ -156,10 +156,17 @@ Recorded rather than fixed:
    implemented.  The first-principles criterion it fails is the fifth one — "the boundary
    is provable: a third party extends this by depending only on a published interface" —
    which now holds for the *mechanism* and not for *trust*.
-2. **The four god classes.**  `SchedulerStore` 4085 lines, `WebChannel` 3319, `LTMStore`
-   2834, `BaseAgent` 2535.  Orthogonal to pluginization, and the repository has an
-   established method for them (survey → extract → closing report, FAILED set compared
-   byte-for-byte after every step).
+2. **The four god classes — largely done.**  `SchedulerStore` 4085 → **1534**, `LTMStore`
+   2834 → **1009**, `WebChannel` 3319 → **2630**, `BaseAgent` 2535 → **2032**, and the smaller
+   cousin `ContextManager` 2483 → **1266**.  Twenty-nine modules now hold what they did; the
+   method was survey → extract-a-whole-closure → verify (FAILED set byte-compared, string
+   literals compared as a multiset) → one commit per cluster.  See
+   [`2026-10-16-god-class-extraction-closing-report.md`](2026-10-16-god-class-extraction-closing-report.md)
+   for what moved, the six connection shapes that made it delicate, the three classes of
+   test seam it broke, and the three clusters left alone **on purpose**: `context.py`'s job
+   queue (it needs a `JobQueue` refactor, not a move), `BaseAgent`'s orchestration core (14–18
+   collaborators each), and `builtin_tools.py` (84% is one `_register` method).  Orthogonal to
+   pluginization throughout.
 3. **The 4 remaining soft reads** in `tests/test_memory_contract.py` — a designed fallback,
    a decision about `SessionService`, and two name collisions the scan cannot tell apart.
 4. **DSH profile import** — reading is done (`agent/plugins/dsh.py`, read-only); importing
