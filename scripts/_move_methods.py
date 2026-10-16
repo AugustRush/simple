@@ -605,7 +605,22 @@ def main(argv: list[str] | None = None) -> int:
         except SyntaxError as exc:
             problems.append(f"{method.name}: produced invalid syntax: {exc}")
             continue
-        leftover = [ln.strip() for ln in text.split("\n") if re.search(r"(?<![\w.])self\.", ln)]
+        # Authority is the AST, not the text: a mention inside a docstring is not a reference
+        # (`_token_budget` has one and was refused for it), while an f-string expression *is* one
+        # and a line-based "is this line inside a string" test hides it -- the f-string's literal
+        # parts are Constants covering the same line.
+        leftover: list[str] = []
+        try:
+            for node in ast.walk(ast.parse(text)):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in ("self", "cls")
+                ):
+                    segment = ast.get_source_segment(text, node) or node.attr
+                    leftover.append(f"line {node.lineno}: {segment[:80]}")
+        except SyntaxError:
+            leftover = ["the body does not parse"]
         if leftover:
             problems.append(
                 f"{method.name}: still references self after the move -- {leftover[0][:90]}"

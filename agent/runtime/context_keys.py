@@ -86,7 +86,7 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     ContextKey(
         key="output_dir",
         writers=("agent/bootstrap.py",),
-        readers=("agent/core/agent.py", "agent/skills/catalog.py", "agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
+        readers=("agent/core/agent_facades.py", "agent/skills/catalog.py", "agent/tools/builtin_tools.py", "agent/tools/user_tool_runner.py",),
     ),
     ContextKey(
         key="resource_home",

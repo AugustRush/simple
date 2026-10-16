@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent.core import agent_facades
 from agent.core import loop_messages
 from agent.core import provider_errors
 # aliased: `from agent.core.bounded_text import bounded_text` below binds the *function* of
@@ -394,25 +395,16 @@ class BaseAgent:
         self,
         ctx: Optional["AgentContext"] = None,
     ) -> Optional[ContextManager]:
-        request_ctx = ctx or self.current_context()
-        if request_ctx is not None:
-            scoped = request_ctx.metadata.get("context_manager")
-            if scoped is not None:
-                return scoped
-        return self.context_manager
+        return agent_facades._context_manager_for(
+            ctx=ctx, context_manager=self.context_manager, current_context=self.current_context
+        )
+
 
     def _effective_model(self, ctx: Optional["AgentContext"] = None) -> str:
-        request_ctx = ctx or self.current_context()
-        override = (
-            request_ctx.metadata.get("model_override") if request_ctx else None
+        return agent_facades._effective_model(
+            ctx=ctx, model=self.model, current_context=self.current_context
         )
-        if override is None:
-            return self.model
-        if not isinstance(override, str):
-            raise TypeError("model override must be a nonblank string or None")
-        if not override.strip():
-            raise ValueError("model override must not be blank")
-        return override
+
 
     def endpoint_for(self, model: Optional[str] = None) -> "ModelEndpoint":
         """The client — and the wire format — that owns *model*.
@@ -501,13 +493,8 @@ class BaseAgent:
         return bounded_text(value, limit)
 
     def _result_content_limit(self) -> int:
-        return min(
-            shared.MAX_RESULT_CONTENT_CHARS,
-            max(
-                shared.MIN_RESULT_CONTENT_CHARS,
-                int(self.result_content_max_chars or 0),
-            ),
-        )
+        return agent_facades._result_content_limit(result_content_max_chars=self.result_content_max_chars)
+
 
     @classmethod
     def _bounded_structured(cls, value: Any, limit: int = 2400) -> Any:
@@ -660,11 +647,8 @@ class BaseAgent:
 
     def _output_contract_path_resolver(self):
         """A resolver bound to this agent's output dir and workspace root."""
-        output_dir_str = self.registry.get_context("output_dir")
-        return output_contract_path_resolver(
-            output_dir=Path(output_dir_str) if output_dir_str else None,
-            workspace_root=self.workspace_root,
-        )
+        return agent_facades._output_contract_path_resolver(registry=self.registry, workspace_root=self.workspace_root)
+
 
     @staticmethod
     def _string_list(value: Any) -> list[str]:
@@ -683,9 +667,13 @@ class BaseAgent:
         *,
         orchestration_mode: str,
     ) -> str:
-        return self._spawn_planner.default_capability_profile(
-            role, task, explicit, orchestration_mode=orchestration_mode
+        return agent_facades._default_capability_profile(
+            role=role,
+            task=task,
+            explicit=explicit,
+            orchestration_mode=orchestration_mode, spawn_planner=self._spawn_planner
         )
+
 
     def _spawn_tool_use_to_spec(
         self,
@@ -695,13 +683,17 @@ class BaseAgent:
         orchestration_decision: OrchestrationDecision,
     ) -> SubtaskSpec:
         """See :meth:`agent.core.spawn_planning.SpawnPlanner.spawn_tool_use_to_spec`."""
-        return self._spawn_planner.spawn_tool_use_to_spec(
-            tool_use, index=index, orchestration_decision=orchestration_decision
+        return agent_facades._spawn_tool_use_to_spec(
+            tool_use=tool_use,
+            index=index,
+            orchestration_decision=orchestration_decision, spawn_planner=self._spawn_planner
         )
+
 
     def _max_agents_per_turn(self) -> int:
         """Total sub-agents one turn may run, independent of concurrency."""
-        return self._spawn_planner.max_agents_per_turn()
+        return agent_facades._max_agents_per_turn(spawn_planner=self._spawn_planner)
+
 
     def _spawn_result_payload(
         self,
@@ -711,7 +703,12 @@ class BaseAgent:
         extra: dict[str, Any] | None = None,
     ) -> str:
         """See :meth:`agent.core.spawn_planning.SpawnPlanner.spawn_result_payload`."""
-        return self._spawn_planner.spawn_result_payload(spec, result, extra=extra)
+        return agent_facades._spawn_result_payload(
+            spec=spec,
+            result=result,
+            extra=extra, spawn_planner=self._spawn_planner
+        )
+
 
     async def _run_orchestrated_spawn_calls(
         self,
@@ -834,7 +831,10 @@ class BaseAgent:
         spawn_calls: list[tuple[int, dict]],
     ) -> str:
         """See :meth:`agent.core.spawn_planning.SpawnPlanner.execution_mode_from_spawn_calls`."""
-        return self._spawn_planner.execution_mode_from_spawn_calls(spawn_calls)
+        return agent_facades._derive_execution_mode_from_spawn_calls(
+            spawn_calls=spawn_calls, spawn_planner=self._spawn_planner
+        )
+
 
     @staticmethod
     async def _call_with_optional_telemetry(
@@ -849,12 +849,10 @@ class BaseAgent:
 
     def _canonicalize_write_scope(self, raw_scope: str) -> Path:
         """See :func:`agent.core.subagent_context.canonicalize_write_scope`."""
-        output_dir_str = self.registry.get_context("output_dir")
-        return canonicalize_write_scope(
-            raw_scope,
-            workspace_root=self.workspace_root,
-            output_dir=Path(output_dir_str) if output_dir_str else None,
+        return agent_facades._canonicalize_write_scope(
+            raw_scope=raw_scope, registry=self.registry, workspace_root=self.workspace_root
         )
+
 
     async def run_parallel_subtasks(
         self,
@@ -1110,19 +1108,9 @@ class BaseAgent:
         )
 
     def _retry_policy(self) -> RetryPolicy:
-        """This agent's retry policy, in the shape the retry leg takes.
+        """This agent's retry policy, in the shape the retry leg takes."""
+        return agent_facades._retry_policy(llm_event_bus=self._llm_event_bus, llm_max_retries=self.llm_max_retries, llm_retry_base_delay=self.llm_retry_base_delay, is_llm_retryable=self._is_llm_retryable)
 
-        The policy is an object rather than three arguments because the retry leg is
-        a module function now: ``agent/core/llm_attempt.py`` calls it and documents
-        that it does not import ``agent.core.agent``, so handing it an agent would
-        have undone that.  Three values keep the promise.
-        """
-        return RetryPolicy(
-            max_retries=self.llm_max_retries,
-            base_delay=self.llm_retry_base_delay,
-            event_bus=self._llm_event_bus,
-            is_retryable=self._is_llm_retryable,
-        )
 
 
 
@@ -1561,44 +1549,13 @@ class BaseAgent:
         self,
         capability_profile: str = "full",
         write_scope: list[str] | None = None,
-    ) -> "ToolRegistry":
-        """The registry a sub-agent sees: one declared view of the parent's.
-
-        This used to build a fresh registry and filter by hand, so the session
-        scope and the sub-agent scope implemented the same copy twice and a
-        rule could live in only one of them.  It is now the parent's own
-        ``derive`` call, and the profile is what chooses the view.
-        """
-        normalized_profile = str(capability_profile or "").strip().lower()
-        if normalized_profile not in CAPABILITY_PROFILES:
-            raise ValueError(
-                f"unsupported capability_profile: {capability_profile!r}"
-            )
-        allowed_capabilities: set[str] | None = None
-        if normalized_profile in {"read_only", "research"}:
-            allowed_capabilities = {"read", "output_write"}
-        elif normalized_profile == "implementation":
-            allowed_capabilities = {"read", "output_write"}
-            if write_scope:
-                allowed_capabilities.add("workspace_write")
-
-        context: dict[str, Any] = {"capability_profile": normalized_profile}
-        if write_scope:
-            context["write_scope"] = list(write_scope)
-        return self.registry.derive(
-            ToolView(
-                capabilities_include=(
-                    None
-                    if allowed_capabilities is None
-                    else frozenset(allowed_capabilities)
-                ),
-                # Sub-agents must never spawn further sub-agents -- excluded by
-                # capability rather than by name, so a differently-named
-                # spawner falls under the same rule.
-                capabilities_exclude=frozenset({"orchestration"}),
-            ),
-            context=context,
+    ) -> 'ToolRegistry':
+        """The registry a sub-agent sees: one declared view of the parent's."""
+        return agent_facades._create_sub_registry(
+            capability_profile=capability_profile,
+            write_scope=write_scope, registry=self.registry
         )
+
 
     def _compose_sub_system_prompt(
         self,
@@ -1606,15 +1563,11 @@ class BaseAgent:
         system_suffix: str = "",
     ) -> tuple[str, Optional[AgentContext]]:
         """See :func:`agent.core.subagent_context.compose_sub_system_prompt`."""
-        return compose_sub_system_prompt(
-            sub_registry,
-            base_system_prompt=self._base_system_prompt,
-            workspace_root=self.workspace_root,
-            active_context=self.current_context(),
-            system_suffix=system_suffix,
-            compose=_compose_system_prompt,
-            skill_catalog_type=SkillCatalog,
+        return agent_facades._compose_sub_system_prompt(
+            sub_registry=sub_registry,
+            system_suffix=system_suffix, workspace_root=self.workspace_root, base_system_prompt=self._base_system_prompt, current_context=self.current_context
         )
+
 
     @staticmethod
     def _propagate_sub_metadata(
@@ -1654,18 +1607,13 @@ class BaseAgent:
         system: str,
         max_tokens: int = 1024,
     ) -> str | None:
-        """Make a lightweight, tool-free LLM call.
-
-        Returns the response text, or None if the call fails.  Used by
-        _summarize_text and _summarize_rendezvous_round.  Dispatch lives
-        in the transport — provider-specific dispatch is not the agent's job.
-        """
-        return await self._transport.simple_chat(
-            model=self._effective_model(),
-            max_tokens=max_tokens,
-            system=system,
+        """Make a lightweight, tool-free LLM call."""
+        return await agent_facades._call_llm(
             prompt=prompt,
+            system=system,
+            max_tokens=max_tokens, transport=self._transport, model=self.model, current_context=self.current_context
         )
+
 
     async def _summarize_text(
         self, text: str, role: str, task: str
