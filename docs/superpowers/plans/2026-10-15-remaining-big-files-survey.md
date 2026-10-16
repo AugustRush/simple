@@ -225,7 +225,7 @@ six values, injected into `ContextManager`, with those two tests rewritten to in
 That is a behaviour-preserving redesign, not an extraction, and it should be done as its own
 change with its own verification -- not smuggled in under "move some methods".
 
-## 2c. `agent/tools/builtin_tools.py` — measured, and the split is a redesign
+## 2c. `agent/tools/builtin_tools.py` — **done**: 2062 → 339, `_register` 1650 → 59
 
 2062 lines, 11 methods, of which `_register` is **1650**.  Measured structure: `_register` is
 `r = self.registry` followed by **43 independent `r.register(...)` statements**, each 20-40
@@ -251,6 +251,24 @@ registration (any later registration can observe earlier ones); and the tool des
 (`scripts/_move_methods.py`) moves methods, not statement runs, so this is either a
 hand-written split or a new mode for that tool — a decision to make explicitly rather than by
 improvising.
+
+**What it took:** `scripts/_split_registrations.py`, written for this shape (a contiguous run of
+`r.register(...)` statements -> a module-level `register_<cluster>(r, *, <collaborators>)`), and
+seven batches in descending index order so earlier indices never shift: file/shell/audio (272
+string literals, verified identical), memory+context, schedule+workflow (729 lines, 524
+literals), plugin/tool authoring, web, signals+step output, clear_context.  Every batch's string
+literals were compared as a multiset against the original before it was written.
+
+`_register` is now a readable ordered list: seven calls plus the one conditional registration
+(`clean_output`, under `if self._output_dir is not None:`) that stayed because the tool moves
+call statements and 23 lines did not justify a new mode.
+
+Two defects came out of the tool itself, both from checking text where the question was "who
+reads this": it first passed the collaborators as **bare parameter names** (which `_register`
+does not have -- they are `self._file_tools`), which registered nothing at all; and its constant
+check counted a constant's **own definition line** as a reader and refused a constant nothing
+else touched.  Both are the same lesson as the rest of this work: a guard that answers a
+different question than the one asked fails in the direction that looks like success.
 
 ## 3. `agent/memory/store.py` — 2835 lines
 
