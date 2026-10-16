@@ -213,6 +213,9 @@ def add_conn_to_calls(text: str, names: set[str], param: str) -> str:
             rf"(?<![\w.])(?<!def ){re.escape(name)}\((?!\n)(?!{param}\b)(?!\s*\))",
             f"{name}({param}, ", text,
         )
+        text = re.sub(
+            rf"(?<![\w.])(?<!def ){re.escape(name)}\(\s*\)", f"{name}({param})", text,
+        )
     return text
 
 
@@ -571,6 +574,12 @@ def main(argv: list[str] | None = None) -> int:
                 rf"(?<![\w.])(?<!def ){sibling}\((?!\n)(?!{args.param}\b)(?!\s*\))",
                 f"{sibling}({args.param}, ", text,
             )
+            # a call with no arguments at all (`with _immediate_transaction():`) needs it with no
+            # comma -- the pattern above deliberately skips empty calls
+            text = re.sub(
+                rf"(?<![\w.])(?<!def ){sibling}\(\s*\)",
+                f"{sibling}({args.param})", text,
+            )
         # after the sibling rewriting: before it the calls still read `self.sibling(` and the
         # pattern (which refuses a `.` before the name) matched nothing
         pass  # sibling kwargs are added in a second pass, once every callee's needs are known
@@ -608,6 +617,18 @@ def main(argv: list[str] | None = None) -> int:
         op, end = param_span(original, method.name)
         is_async = isinstance(method, ast.AsyncFunctionDef)
         decorators = [ast.unparse(d) for d in method.decorator_list]
+        # `@contextmanager` is not a marker on the caller's side: it wraps a generator, and the
+        # generator is the body.  Leaving it on the wrapper produced a plain function decorated as
+        # a context manager, whose `gen` was None -- `next(self.gen)` then raised
+        # "'NoneType' object is not an iterator" far away from the move.
+        carried_decorators = [
+            d for d in decorators if d.split("(")[0].strip().endswith("contextmanager")
+        ]
+        if carried_decorators:
+            decorators = [d for d in decorators if d not in carried_decorators]
+            # `text` was already appended to `blocks` above; decorate the block itself, or the
+            # change is made to a string nobody reads again.
+            blocks[-1] = "\n".join("@" + d for d in carried_decorators) + "\n" + blocks[-1]
         head = f"def {method.name}({original[op + 1:end]})"
         if fn.returns is not None:
             head += " -> " + ast.unparse(fn.returns)
@@ -659,7 +680,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             call = f"{stem}.{method.name}()"
         returns_none = fn.returns is not None and ast.unparse(fn.returns) == "None"
-        prefix = "" if returns_none else ("return " if fn.returns is not None else "")
+        # Only an explicit `-> None` justifies dropping the return: an unannotated method may well
+        # return something (`_immediate_transaction` is a @contextmanager with no annotation, and a
+        # wrapper without `return` handed the caller None).
+        prefix = "" if returns_none else "return "
         if is_async:
             prefix = "await " if not prefix else "return await "
         doc = ast.get_docstring(fn).strip().split("\n")[0] if ast.get_docstring(fn) else ""
