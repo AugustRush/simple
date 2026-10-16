@@ -40,6 +40,7 @@ import threading
 from typing import Any, Callable, Optional, TypeVar
 
 from agent import shared
+from . import reads
 from .models import (
     optional_datetime,
     ATTENTION_STATUSES,
@@ -627,42 +628,35 @@ class SchedulerStore:
 
     @_synchronized
     def list_tasks(self) -> list[ScheduledTask]:
-        rows = self._conn.execute(
-            "SELECT * FROM scheduled_tasks ORDER BY created_at ASC"
-        ).fetchall()
-        return [_task_from_row(row) for row in rows]
+        return reads.list_tasks(
+            self._conn,
+        )
+
 
     @_synchronized
     def get_task(self, task_id: str) -> Optional[ScheduledTask]:
-        row = self._conn.execute(
-            "SELECT * FROM scheduled_tasks WHERE id = ? LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        return _task_from_row(row) if row else None
+        return reads.get_task(
+            self._conn,
+            task_id=task_id,
+        )
+
 
     @_synchronized
     def list_runs(self, task_id: str) -> list[TaskRun]:
-        rows = self._conn.execute(
-            """
-            SELECT * FROM scheduled_task_runs
-            WHERE task_id = ?
-            ORDER BY created_at ASC, id ASC
-            """,
-            (task_id,),
-        ).fetchall()
-        return [_run_from_row(row) for row in rows]
+        return reads.list_runs(
+            self._conn,
+            task_id=task_id,
+        )
+
 
     @_synchronized
     def get_run(self, task_id: str, run_id: str) -> Optional[TaskRun]:
-        row = self._conn.execute(
-            """
-            SELECT * FROM scheduled_task_runs
-            WHERE task_id = ? AND id = ?
-            LIMIT 1
-            """,
-            (task_id, run_id),
-        ).fetchone()
-        return _run_from_row(row) if row else None
+        return reads.get_run(
+            self._conn,
+            task_id=task_id,
+            run_id=run_id,
+        )
+
 
     # ── Signals: what happened, and who was waiting for it ───────────────
     #

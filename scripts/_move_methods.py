@@ -276,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--module", required=True, help="new module: a path, e.g. agent/memory/usage.py")
     ap.add_argument("--methods", required=True, help="comma-separated method names")
     ap.add_argument("--param", default="conn", help="new first parameter (default: conn)")
+    ap.add_argument(
+        "--conn-expr", default="",
+        help="expression the body reads the connection from instead of opening one, "
+             "e.g. `self._conn` for a store whose callers own the transaction",
+    )
     ap.add_argument("--doc", default="", help="docstring for a module that does not exist yet")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -322,7 +327,14 @@ def main(argv: list[str] | None = None) -> int:
         # work never does.
         positional = [a.arg for a in list(fn.args.posonlyargs) + list(fn.args.args)]
         takes_param = bool(args.param) and args.param in positional
-        if args.param and not takes_param:
+        if args.conn_expr:
+            # The body reads the connection off the object (`self._conn`); the functions here
+            # take it, so the expression becomes the parameter and the wrapper passes its own.
+            text = text.replace(args.conn_expr, args.param)
+            if not takes_param:
+                text = with_first_param(text, method.name, args.param)
+                takes_param = True
+        elif args.param and not takes_param:
             text = with_first_param(text, method.name, args.param)
             # Drop the local connection acquisition.  The dedent must be relative to the `with`
             # line: a fixed four-space cut also eats the statement that follows the block (which
@@ -389,12 +401,17 @@ def main(argv: list[str] | None = None) -> int:
         # first version of this emitted `with self._connect()` unconditionally, which is right
         # for the store classes it was written against and wrong for every other class -- the
         # wrapper then raises AttributeError at call time rather than at import time.
-        uses_connect = bool(args.param) and any(
+        uses_connect = bool(args.param) and not args.conn_expr and any(
             line.strip() == f"with self._connect() as {args.param}:" for line in original.splitlines()
         )
         stem = pathlib.Path(args.module).stem
         pad = " " * (12 if uses_connect else 8)
-        first = args.param if (uses_connect or takes_param) else ""
+        if args.conn_expr:
+            first = args.conn_expr
+        elif uses_connect or takes_param:
+            first = args.param
+        else:
+            first = ""
         call_args = ([first] if first else []) + [
             f"{n}={n}" for n in names if n != first
         ]
