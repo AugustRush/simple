@@ -27,6 +27,7 @@ from agent.core.output import _active_sink
 from agent.scheduler.models import LOCAL_TIMEZONE
 from agent.tools.files import FileProvider
 
+from . import builtin_context_tools
 from . import builtin_signal_tools
 from . import builtin_web_tools
 from . import builtin_plugin_tools
@@ -223,27 +224,7 @@ class BuiltinTools:
                 source="builtin",
             )
 
-        r.register(
-            "clear_context",
-            "Reset the conversation context to just the current user request. "
-            "Use this when the conversation history has grown too large or "
-            "triggered a content policy filter. The current task will be "
-            "preserved as a summary, and the agent will restart with a clean "
-            "context.",
-            {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "A brief summary of the original request and what has been done so far (optional, auto-generated if empty).",
-                        "default": "",
-                    },
-                },
-                "required": [],
-            },
-            self._context_tools.clear,
-            source="builtin",
-        )
+        builtin_context_tools.register_context_tools(r, context_tools=self._context_tools)
 
         builtin_plugin_tools.register_plugin_tools(r, plugin_tools=self._plugin_tools)
 
