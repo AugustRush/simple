@@ -177,6 +177,26 @@ def dedent_uniform(text: str, width: int = 4) -> str:
     return "\n".join(out)
 
 
+def already_imported(header: str) -> set[str]:
+    """Names the header's *import statements* bind -- not words that merely appear in it.
+
+    A regex over the whole header counts a module named in a docstring as already imported, which
+    silently skips the `from . import x` line and leaves the generated module with an unbound name.
+    That is exactly what happened with `normalize`.
+    """
+    try:
+        tree = ast.parse(header)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            names |= {a.asname or a.name for a in node.names}
+    return names
+
+
 # ── closure ──────────────────────────────────────────────────────────────────
 
 
@@ -282,6 +302,12 @@ def main(argv: list[str] | None = None) -> int:
              "e.g. `self._conn` for a store whose callers own the transaction",
     )
     ap.add_argument("--doc", default="", help="docstring for a module that does not exist yet")
+    ap.add_argument(
+        "--rewrite", action="append", default=[], metavar="FROM=TO",
+        help="rewrite one reference the tool cannot resolve on its own (repeatable).  Use it when "
+             "a moved body calls something that was extracted earlier: e.g. "
+             "`--rewrite self.normalize_category_name=normalize.normalize_category_name`",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -359,6 +385,12 @@ def main(argv: list[str] | None = None) -> int:
                 out_lines.append(line)
                 index += 1
             text = "\n".join(out_lines)
+        for pair in args.rewrite:
+            if "=" not in pair:
+                problems.append(f"--rewrite needs FROM=TO, got {pair!r}")
+                continue
+            source_expr, target_expr = pair.split("=", 1)
+            text = text.replace(source_expr, target_expr)
         for sibling in moving:
             if sibling == method.name:
                 continue
@@ -460,9 +492,21 @@ def main(argv: list[str] | None = None) -> int:
             continue
         wrappers.append(wrapper)
 
+    # Names the target module already defines are resolvable too: a moved body may call a function
+    # that was extracted into it earlier.  Without this the tool treats such a name as unbound and
+    # refuses -- which is how `_fact_assertion_core_score` looked from `_fact_assertion_total_score`.
+    target_module = pathlib.Path(args.module)
+    target_defined: set[str] = set()
+    if target_module.exists():
+        for node in ast.parse(target_module.read_text(encoding="utf-8")).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                target_defined.add(node.name)
+            elif isinstance(node, ast.Assign):
+                target_defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
     consts = sorted(n for n in needed if n in constants)
     unresolved = [n for n in needed if n not in imports and n not in constants and n not in moving]
-    unresolved = [n for n in unresolved if n not in MODULE_GLOBALS]
+    unresolved = [n for n in unresolved if n not in MODULE_GLOBALS and n not in target_defined]
     # A module-level function cannot be re-imported (the old module imports the new one, so that
     # is a cycle) and should not be carried silently.  Refuse with the name, so the operator
     # moves it deliberately -- as its own `--methods` entry it does not qualify, since it is not
@@ -491,12 +535,11 @@ def main(argv: list[str] | None = None) -> int:
     header = f'"""{args.doc}"""\n\n' if not target.exists() else target.read_text(encoding="utf-8")
     if not target.exists():
         header += "from __future__ import annotations\n\n__all__ = []\n"
+    present = already_imported(header)
     for name in sorted(needed):
-        if name in consts or name not in imports:
+        if name in consts or name in target_defined or name not in imports or name in present:
             continue
         statement = imports[name]
-        if re.search(rf"\b{re.escape(name)}\b", header):
-            continue
         if statement.startswith("from "):
             module = statement.split(" import ")[0]
             block = re.search(rf"^{re.escape(module)} import \(([^)]*)\)$", header, re.M | re.S)

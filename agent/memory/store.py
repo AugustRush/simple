@@ -545,49 +545,12 @@ class LTMStore:
         return _row_mappers._row_to_entry(row) if row else None
 
     def _fact_assertions_from_entry(self, entry: LTMEntry) -> list[FactAssertion]:
-        """Derive the identity *prose* an identity entry states, and only that.
+        """Derive the identity *prose* an identity entry states, and only that."""
+        return facts._fact_assertions_from_entry(
+            self._connect(),
+            entry=entry,
+        )
 
-        An entry is free text — a paragraph the user or consolidation wrote.
-        Reading a name out of it means deciding what a sentence means, which is
-        the model's job, not this module's; the extractor that used to try
-        renamed the agent "什么" the first time somebody asked it its name.  So
-        an entry contributes ``identity_note`` verbatim and nothing else.
-        ``name`` and ``role`` come only from deliberate settings: config
-        bootstrap and :meth:`set_identity`.
-        """
-        facts: list[FactAssertion] = []
-        category = self.normalize_category_name(entry.category)
-        entity = self._normalize_entity(entry.entity, category)
-        # The assistant's identity is filed under several entities depending on
-        # who wrote it: consolidation uses "assistant", a deliberate memory
-        # write uses whatever name the caller passed.  Missing the latter meant
-        # every hand-written identity update produced no fact at all, so the
-        # first machine-extracted one stayed authoritative forever.
-        if category != "identity" or entity not in _ASSISTANT_IDENTITY_ENTITIES:
-            return facts
-        note = _identity_note_value(entry.content)
-        if not note:
-            return facts
-        source_kind = (
-            "manual_write"
-            if str(entry.source_session or "").strip() == "manual_memory_write"
-            else "consolidation_extract"
-        )
-        facts.append(
-            FactAssertion(
-                id=_new_id(),
-                subject="assistant",
-                predicate="identity_note",
-                value=note,
-                source_kind=source_kind,
-                source_id=entry.id,
-                source_session=entry.source_session,
-                confidence=float(entry.confidence or 1.0),
-                created_at=entry.created_at or _now(),
-                updated_at=entry.updated_at or _now(),
-            )
-        )
-        return facts
 
     def write_entries(self, category: str, entries: list[LTMEntry]) -> None:
         category = self.normalize_category_name(category)
@@ -1164,7 +1127,10 @@ class LTMStore:
     def _fact_assertion_total_score(
         cls, assertion: FactAssertion
     ) -> tuple[str, int, float, str, str]:
-        return (*facts._fact_assertion_core_score(assertion), assertion.id)
+        return facts._fact_assertion_total_score(
+            assertion=assertion,
+        )
+
 
     def add_fact_assertion(self, assertion: FactAssertion) -> FactAssertion:
         subject = _normalize_fact_part(assertion.subject)

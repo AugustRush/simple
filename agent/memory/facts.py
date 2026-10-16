@@ -13,8 +13,8 @@ import sqlite3
 from typing import Any, Callable, Optional
 
 from agent.memory.models import FactAssertion
-from . import rows as _row_mappers
-from .models import ResolvedFact
+from . import rows as _row_mappers, normalize
+from .models import ResolvedFact, LTMEntry
 from ._helpers import (
     _FACT_SOURCE_PRECEDENCE,
     _IDENTITY_SUBJECTS,
@@ -25,6 +25,9 @@ from ._helpers import (
     _normalize_fact_part,
     _now,
     _fact_key,
+    _ASSISTANT_IDENTITY_ENTITIES,
+    _identity_note_value,
+    _new_id,
 )
 
 __all__ = [
@@ -37,6 +40,8 @@ __all__ = [
     "has_conflicted_fact",
     "retract_facts",
     "_read_facts",
+    "_fact_assertion_total_score",
+    "_fact_assertions_from_entry",
 ]
 
 
@@ -259,3 +264,58 @@ def retract_facts(
         (_fact_key(subject, predicate, scope),),
     )
     return archived
+
+
+def _fact_assertion_total_score(
+    assertion: FactAssertion,
+) -> tuple[str, int, float, str, str]:
+    return (*_fact_assertion_core_score(assertion), assertion.id)
+
+
+def _fact_assertions_from_entry(
+    conn,
+    entry: LTMEntry,
+) -> list[FactAssertion]:
+    """Derive the identity *prose* an identity entry states, and only that.
+
+        An entry is free text — a paragraph the user or consolidation wrote.
+        Reading a name out of it means deciding what a sentence means, which is
+        the model's job, not this module's; the extractor that used to try
+        renamed the agent "什么" the first time somebody asked it its name.  So
+        an entry contributes ``identity_note`` verbatim and nothing else.
+        ``name`` and ``role`` come only from deliberate settings: config
+        bootstrap and :meth:`set_identity`.
+        """
+    facts: list[FactAssertion] = []
+    category = normalize.normalize_category_name(entry.category)
+    entity = normalize._normalize_entity(entry.entity, category)
+    # The assistant's identity is filed under several entities depending on
+    # who wrote it: consolidation uses "assistant", a deliberate memory
+    # write uses whatever name the caller passed.  Missing the latter meant
+    # every hand-written identity update produced no fact at all, so the
+    # first machine-extracted one stayed authoritative forever.
+    if category != "identity" or entity not in _ASSISTANT_IDENTITY_ENTITIES:
+        return facts
+    note = _identity_note_value(entry.content)
+    if not note:
+        return facts
+    source_kind = (
+        "manual_write"
+        if str(entry.source_session or "").strip() == "manual_memory_write"
+        else "consolidation_extract"
+    )
+    facts.append(
+        FactAssertion(
+            id=_new_id(),
+            subject="assistant",
+            predicate="identity_note",
+            value=note,
+            source_kind=source_kind,
+            source_id=entry.id,
+            source_session=entry.source_session,
+            confidence=float(entry.confidence or 1.0),
+            created_at=entry.created_at or _now(),
+            updated_at=entry.updated_at or _now(),
+        )
+    )
+    return facts
