@@ -287,6 +287,29 @@ mechanical move.
 transactional core -- `create_workflow`, `create_task`, `apply_retention`,
 `workflow_blocked_steps` (which carries the store's own `@_synchronized`) -- and those need a
 collaborator design, not a move.
+
+### The store moves at all now — 3544 → 3538, and what that buys
+
+`SchedulerStore` was, until this week, the one big class `scripts/_move_methods.py` could not
+touch: 66 methods read `self._conn` (they run inside a transaction the *caller* owns) and 43
+carry `@_synchronized`, whose own wrapper is `with self._lock` -- so every method has a hidden
+`self._lock` dependency, and **zero** methods call `self._connect()`.  Both facts were verified
+directly rather than taken from a report.
+
+Two capabilities closed that gap, and the first cluster through was the four smallest readers
+(`get_task`, `list_tasks`, `get_run`, `list_runs` → `scheduler/reads.py`):
+
+* `--conn-expr self._conn`: the body's connection expression becomes the function's first
+  parameter, and the class wrapper passes *its own* `self._conn` instead of opening one;
+* decorators stay on the **wrapper**, so `@_synchronized` still holds the lock for the whole
+  call.  A module function wearing that decorator would be called as `method(self, ...)` with
+  `self` bound to the connection.
+
+A note on what this buys, since the file only shrank by six lines: the four bodies total ~36 lines
+and their wrappers cost ~30.  **Extraction pays in where the logic lives, and only pays in line
+count when a body is much larger than its wrapper.**  The remaining scheduler work should be
+chosen by that ratio -- the eleven `*_in_transaction` helpers (~413 lines of body, no lock) are
+the next target, and the claim/lease core is not a target at all.
 3. **The cheapest coupled methods** — `_upstream_reports_in_transaction` (64 lines, 1 ref),
    `_insert_emission` (52, 1), `renew_lease` (35, 1), `disable_duplicate_enabled_tasks` (32, 1),
    `_join_arrivals` (28, 1).  Each needs the connection passed and nothing else.
