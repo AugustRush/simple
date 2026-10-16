@@ -40,6 +40,7 @@ import threading
 from typing import Any, Callable, Optional, TypeVar
 
 from agent import shared
+from . import txn_helpers
 from . import reads
 from .models import (
     optional_datetime,
@@ -500,63 +501,13 @@ class SchedulerStore:
     def _create_task_in_transaction(
         self, task: NewScheduledTask, *, now: Optional[datetime] = None
     ) -> str:
-        """Insert one task and return its id.  Caller owns the transaction.
-
-        Split out so that building the several tasks of a workflow can be one
-        transaction: a graph is stored together with the tasks behind it, and a
-        failure partway through must leave neither rather than a graph whose
-        last steps have nothing to run them.
-        """
-        _check_acceptance(task)
-        _check_products(task)
-        created_at = (now or datetime.now(UTC)).astimezone(UTC)
-        task_id = _new_id()
-        next_run_at = task.trigger.initial_run_at(created_at)
-        self._conn.execute(
-            """
-            INSERT INTO scheduled_tasks (
-                id, name, kind, enabled, trigger_json, payload_json,
-                delivery_mode, delivery_target_json, model_override,
-                overlap_policy, missed_run_policy, workspace_root,
-                context_policy, timeout_seconds, retry_policy_json,
-                selected_skills_json,
-                permission_profile,
-                acceptance_json,
-                produces_json,
-                next_run_at, lease_until,
-                active_run_id, last_run_at, last_success_at, created_at, updated_at,
-                workflow_id, step_key, request_quote
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                task.name,
-                task.kind,
-                1 if task.enabled else 0,
-                task.trigger.to_json(),
-                json.dumps(task.payload, ensure_ascii=False),
-                task.delivery_mode,
-                task.delivery_target.to_json(),
-                task.model_override,
-                "forbid_overlap",
-                "coalesce",
-                task.workspace_root,
-                task.context_policy,
-                int(task.timeout_seconds),
-                json.dumps(task.retry_policy, ensure_ascii=False),
-                json.dumps(task.selected_skills, ensure_ascii=False),
-                task.permission_profile,
-                task.acceptance.to_json(),
-                json.dumps(declared_products(task), ensure_ascii=False),
-                _iso(next_run_at),
-                _iso(created_at),
-                _iso(created_at),
-                task.workflow_id,
-                task.step_key,
-                str(getattr(task, "request_quote", "") or ""),
-            ),
+        """Insert one task and return its id.  Caller owns the transaction."""
+        return txn_helpers._create_task_in_transaction(
+            self._conn,
+            task=task,
+            now=now,
         )
-        return task_id
+
 
 
     @_synchronized
@@ -705,49 +656,17 @@ class SchedulerStore:
         origin_id: str = "",
         now: datetime,
     ) -> SignalEmission:
-        """Insert one pending emission.  The caller owns the transaction.
+        """Insert one pending emission.  The caller owns the transaction."""
+        return txn_helpers._insert_emission(
+            self._conn,
+            name=name,
+            payload=payload,
+            source=source,
+            depth=depth,
+            origin_id=origin_id,
+            now=now,
+        )
 
-        Split out of :meth:`emit_signal` so that a run reaching a terminal
-        state can record its emission inside the transaction that records the
-        status.  A run recorded as finished and a signal recorded as emitted
-        then commit together, which is what makes "it succeeded and nothing
-        downstream ever heard about it" impossible rather than merely unlikely.
-        """
-        normalized = str(name or "").strip()
-        if not normalized:
-            raise ValueError("signal name cannot be empty")
-        emission_id = _new_id()
-        # A root emission is its own origin, so every cascade has exactly one
-        # id to group by without a second column meaning "no parent".
-        root = str(origin_id or "").strip() or emission_id
-        settled_depth = max(0, int(depth))
-        self._conn.execute(
-            """
-            INSERT INTO signal_emissions (
-                id, name, payload_json, source, depth, origin_id,
-                state, reason, delivered_run_id, created_at, delivered_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', '', ?, NULL)
-            """,
-            (
-                emission_id,
-                normalized,
-                json.dumps(payload or {}, ensure_ascii=False),
-                str(source or "manual"),
-                settled_depth,
-                root,
-                _iso(now),
-            ),
-        )
-        return SignalEmission(
-            id=emission_id,
-            name=normalized,
-            payload=dict(payload or {}),
-            source=str(source or "manual"),
-            depth=settled_depth,
-            origin_id=root,
-            state="pending",
-            created_at=now,
-        )
 
     @_synchronized
     def get_emission(self, emission_id: str) -> Optional[SignalEmission]:
@@ -834,54 +753,21 @@ class SchedulerStore:
         return ""
 
     def _signal_subscribers(self, name: str) -> list[ScheduledTask]:
-        """Enabled tasks waiting on this exact name.
+        """Enabled tasks waiting on this exact name."""
+        return txn_helpers._signal_subscribers(
+            self._conn,
+            name=name,
+        )
 
-        Read by scanning the enabled tasks rather than by an index on the
-        trigger, because the subscription lives inside ``trigger_json``.  At
-        the scale this runs at -- the tasks of one person -- that is a handful
-        of rows per delivery.  A repository with thousands of tasks would want
-        subscriptions broken out into their own table; that is a change worth
-        making when the row count says so, not before.
-
-        A join (``mode="all"``) is a subscriber too, but it is *not* run by
-        this emission alone: the caller has to accumulate, which is what
-        :meth:`_advance_join` is for.  Returning it here keeps "who is
-        listening" a single question with a single answer, and the delivery
-        loop decides what each answer means.
-        """
-        subscribers: list[ScheduledTask] = []
-        rows = self._conn.execute(
-            "SELECT * FROM scheduled_tasks WHERE enabled = 1"
-        ).fetchall()
-        for row in rows:
-            task = _task_from_row(row)
-            if subscribes_to(task.trigger, name):
-                subscribers.append(task)
-        return subscribers
 
 
     def _satisfied_joins(self, task_id: str, workflow_run_id: str = "") -> set[str]:
-        if workflow_run_id:
-            row = self._conn.execute(
-                """
-                SELECT satisfied_json FROM workflow_signal_joins
-                WHERE task_id = ? AND workflow_run_id = ?
-                """,
-                (task_id, workflow_run_id),
-            ).fetchone()
-        else:
-            row = self._conn.execute(
-                "SELECT satisfied_json FROM signal_joins WHERE task_id = ?", (task_id,)
-            ).fetchone()
-        if row is None:
-            return set()
-        try:
-            decoded = json.loads(row["satisfied_json"] or "[]")
-        except (TypeError, ValueError):
-            return set()
-        if not isinstance(decoded, list):
-            return set()
-        return {str(item) for item in decoded if str(item).strip()}
+        return txn_helpers._satisfied_joins(
+            self._conn,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+        )
+
 
     def _advance_join(
         self, task: ScheduledTask, emission: SignalEmission, now: datetime
@@ -977,31 +863,12 @@ class SchedulerStore:
         self, task_id: str, workflow_run_id: str = ""
     ) -> dict[str, dict[str, Any]]:
         """The payloads a join has collected since its last completed round."""
-        if workflow_run_id:
-            row = self._conn.execute(
-                """
-                SELECT arrivals_json FROM workflow_signal_joins
-                WHERE task_id = ? AND workflow_run_id = ?
-                """,
-                (task_id, workflow_run_id),
-            ).fetchone()
-        else:
-            row = self._conn.execute(
-                "SELECT arrivals_json FROM signal_joins WHERE task_id = ?", (task_id,)
-            ).fetchone()
-        if row is None:
-            return {}
-        try:
-            decoded = json.loads(row["arrivals_json"] or "{}")
-        except (TypeError, ValueError):
-            return {}
-        if not isinstance(decoded, dict):
-            return {}
-        return {
-            str(name): dict(payload)
-            for name, payload in decoded.items()
-            if isinstance(payload, dict)
-        }
+        return txn_helpers._join_arrivals(
+            self._conn,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+        )
+
 
     def join_progress(self, task_id: str) -> dict[str, Any]:
         """What a join has heard from so far, so the interface can show it.
@@ -1083,35 +950,27 @@ class SchedulerStore:
         reason: str = "",
         now: datetime,
     ) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO signal_deliveries (
-                id, emission_id, task_id, run_id, outcome, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (_new_id(), emission_id, task_id, run_id, outcome, reason, _iso(now)),
+        txn_helpers._record_delivery(
+            self._conn,
+            emission_id=emission_id,
+            task_id=task_id,
+            outcome=outcome,
+            run_id=run_id,
+            reason=reason,
+            now=now,
         )
+
 
     def _pending_run_for(
         self, task_id: str, workflow_run_id: str = ""
     ) -> Optional[str]:
         """The run already waiting for, or running, this task, if any."""
-        workflow_clause = ""
-        params: list[Any] = [task_id]
-        if workflow_run_id:
-            workflow_clause = " AND workflow_run_id = ?"
-            params.append(workflow_run_id)
-        row = self._conn.execute(
-            f"""
-            SELECT id FROM scheduled_task_runs
-            WHERE task_id = ? AND status IN ('queued', 'running')
-              {workflow_clause}
-            ORDER BY created_at ASC
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-        return row["id"] if row else None
+        return txn_helpers._pending_run_for(
+            self._conn,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+        )
+
 
     def _round_waiting_on(self, task: ScheduledTask) -> str:
         """The open round whose join is still short this task's success report.
@@ -1518,14 +1377,15 @@ class SchedulerStore:
         now: datetime,
         run_id: str = "",
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE signal_emissions
-            SET state = ?, reason = ?, delivered_run_id = ?, delivered_at = ?
-            WHERE id = ? AND state = 'pending'
-            """,
-            (state, reason, run_id, _iso(now), emission.id),
+        txn_helpers._settle_emission(
+            self._conn,
+            emission=emission,
+            state=state,
+            reason=reason,
+            now=now,
+            run_id=run_id,
         )
+
 
     @_synchronized
     def signal_deliveries(self, emission_id: str) -> list[dict[str, Any]]:
@@ -1858,90 +1718,14 @@ class SchedulerStore:
         *,
         now: Optional[datetime] = None,
     ) -> bool:
-        """Rewrite one task.  False when there was no such row.
+        """Rewrite one task.  False when there was no such row."""
+        return txn_helpers._update_task_in_transaction(
+            self._conn,
+            task_id=task_id,
+            task=task,
+            now=now,
+        )
 
-        Caller owns the transaction, for the same reason
-        :meth:`_create_task_in_transaction` exists: refreshing a workflow
-        rewrites every one of its steps, and half a refresh is a graph whose
-        steps disagree with each other about what the graph says.
-        """
-        _check_acceptance(task)
-        _check_products(task)
-        updated_at = (now or datetime.now(UTC)).astimezone(UTC)
-        trigger_json = task.trigger.to_json()
-        # Only a changed trigger gets a new schedule.  Recomputing it on every
-        # edit would make renaming a task -- or saving the workflow it is a
-        # step of, which rewrites every step -- push its next occurrence into
-        # the future, silently swallowing one that was already due.  What goes
-        # with it is worse than the run: an occurrence missed while the gateway
-        # was down is reported through ``missed_count``, and
-        # ``_attention_clause`` counts that as the *only* way such a gap is
-        # ever mentioned -- the run that resumes the schedule reports success.
-        # So an unrelated rename could erase the single trace of a daily report
-        # that has been missing for a week.
-        #
-        # A stored ``NULL`` is the exception: that is what disabling writes, so
-        # a task coming back on has no schedule to keep and needs one computed
-        # even though its trigger never changed.  Keeping the ``NULL`` would
-        # re-enable a task that can never fire again.
-        current = self._conn.execute(
-            "SELECT trigger_json, next_run_at FROM scheduled_tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        keeps_schedule = (
-            current is not None
-            and str(current["trigger_json"] or "") == trigger_json
-            and (current["next_run_at"] is not None or not task.enabled)
-        )
-        if keeps_schedule:
-            next_run_at = optional_datetime(current["next_run_at"])
-        else:
-            next_run_at = task.trigger.initial_run_at(updated_at)
-        cursor = self._conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET name = ?, kind = ?, enabled = ?, trigger_json = ?,
-                payload_json = ?, delivery_mode = ?, delivery_target_json = ?,
-                model_override = ?, overlap_policy = ?, missed_run_policy = ?,
-                workspace_root = ?, context_policy = ?, timeout_seconds = ?,
-                retry_policy_json = ?, next_run_at = ?, updated_at = ?
-                , selected_skills_json = ?, permission_profile = ?
-                , acceptance_json = ?
-                , produces_json = ?
-                , workflow_id = ?, step_key = ?
-            WHERE id = ?
-            """,
-            (
-                task.name,
-                task.kind,
-                1 if task.enabled else 0,
-                trigger_json,
-                json.dumps(task.payload, ensure_ascii=False),
-                task.delivery_mode,
-                task.delivery_target.to_json(),
-                task.model_override,
-                "forbid_overlap",
-                "coalesce",
-                task.workspace_root,
-                task.context_policy,
-                int(task.timeout_seconds),
-                json.dumps(task.retry_policy, ensure_ascii=False),
-                _iso(next_run_at),
-                _iso(updated_at),
-                json.dumps(task.selected_skills, ensure_ascii=False),
-                task.permission_profile,
-                task.acceptance.to_json(),
-                # Rewritten with the definition, so a step whose promised
-                # products were edited starts promising the new ones -- and,
-                # because the contract travels on the run's snapshot, whatever
-                # is already in flight keeps the promise it was started with.
-                json.dumps(declared_products(task), ensure_ascii=False),
-                task.workflow_id,
-                task.step_key,
-                task_id,
-            ),
-        )
-        return bool(cursor.rowcount)
 
     def _upstream_reports_in_transaction(
         self, task: ScheduledTask
@@ -2743,18 +2527,11 @@ class SchedulerStore:
         return skipped
 
     def _workflow_run_steps(self, workflow_run_id: str) -> list[WorkflowStep]:
-        if not workflow_run_id:
-            return []
-        row = self._conn.execute(
-            "SELECT definition_snapshot_json FROM workflow_runs WHERE id = ?",
-            (workflow_run_id,),
-        ).fetchone()
-        if row is None:
-            return []
-        try:
-            return Workflow.from_graph(row["definition_snapshot_json"]).steps
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return []
+        return txn_helpers._workflow_run_steps(
+            self._conn,
+            workflow_run_id=workflow_run_id,
+        )
+
 
     def _settle_workflow_run(self, workflow_run_id: str, now: datetime) -> None:
         """Roll up a workflow execution once nothing of it is still in flight.
