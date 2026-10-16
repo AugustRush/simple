@@ -14,6 +14,8 @@ from typing import Any, Callable, Optional, Sequence
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
 
+from . import search
+from . import entries
 from . import conversations
 from . import normalize
 from . import journal
@@ -239,28 +241,11 @@ class LTMStore:
     def _match_existing_entry_id(
         self, conn: sqlite3.Connection, entry: LTMEntry
     ) -> Optional[str]:
-        merge_key = self._stable_merge_key(entry)
-        if not merge_key:
-            return None
+        return entries._match_existing_entry_id(
+            conn,
+            entry=entry,
+        )
 
-        category = self.normalize_category_name(entry.category)
-        entity = self._normalize_entity(entry.entity, category)
-        memory_type = (entry.memory_type or "fact").strip().lower()
-
-        normalized_content = self._normalize_content_key(entry.content)
-        rows = conn.execute(
-            """
-            SELECT * FROM memory_items
-            WHERE category = ? AND entity = ? AND memory_type = ?
-              AND status NOT IN ('archived', 'superseded')
-            ORDER BY updated_at DESC, id ASC
-            """,
-            (category, entity, memory_type),
-        ).fetchall()
-        for row in rows:
-            if self._normalize_content_key(row["content"]) == normalized_content:
-                return row["id"]
-        return None
 
     def _delete_fts_rows(
         self,
@@ -333,19 +318,11 @@ class LTMStore:
     def _find_existing_entry_row(
         self, conn: sqlite3.Connection, entry: LTMEntry
     ) -> Optional[sqlite3.Row]:
-        row = conn.execute(
-            "SELECT * FROM memory_items WHERE id = ? LIMIT 1",
-            (entry.id,),
-        ).fetchone()
-        if row:
-            return row
-        existing_id = self._match_existing_entry_id(conn, entry)
-        if not existing_id:
-            return None
-        return conn.execute(
-            "SELECT * FROM memory_items WHERE id = ? LIMIT 1",
-            (existing_id,),
-        ).fetchone()
+        return entries._find_existing_entry_row(
+            conn,
+            entry=entry,
+        )
+
 
     def _coerce_category_for_storage(
         self, conn: sqlite3.Connection, category: str
@@ -451,52 +428,31 @@ class LTMStore:
         *,
         scopes: Optional[list[str]] = None,
     ) -> list[LTMEntry]:
-        if scopes is not None and not scopes:
-            return []
-        category = self.normalize_category_name(category)
         with self._connect() as conn:
-            sql = """
-                SELECT * FROM memory_items
-                WHERE category = ? AND status NOT IN ('archived', 'superseded')
-            """
-            params: list[Any] = [category]
-            if scopes:
-                sql += f" AND scope IN ({','.join('?' for _ in scopes)})"
-                params.extend(str(scope) for scope in scopes)
-            sql += " ORDER BY importance DESC, updated_at DESC, id ASC"
-            rows = conn.execute(sql, params).fetchall()
-        return [_row_mappers._row_to_entry(row) for row in rows]
+            return entries.read_entries(
+                conn,
+                category=category,
+                scopes=scopes,
+            )
+
 
     def read_entries_for_entity(self, category: str, entity: str) -> list[LTMEntry]:
-        category = self.normalize_category_name(category)
-        entity = self._normalize_entity(entity, category)
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM memory_items
-                WHERE category = ? AND entity = ?
-                  AND status NOT IN ('archived', 'superseded')
-                ORDER BY importance DESC, updated_at DESC, id ASC
-                """,
-                (category, entity),
-            ).fetchall()
-        return [_row_mappers._row_to_entry(row) for row in rows]
+            return entries.read_entries_for_entity(
+                conn,
+                category=category,
+                entity=entity,
+            )
+
 
     def read_manual_note(self, category: str, entity: str) -> Optional[LTMEntry]:
-        category = self.normalize_category_name(category)
-        entity = self._normalize_entity(entity, category)
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM memory_items
-                WHERE category = ? AND entity = ? AND memory_type = 'note'
-                  AND status NOT IN ('archived', 'superseded')
-                ORDER BY updated_at DESC, id ASC
-                LIMIT 1
-                """,
-                (category, entity),
-            ).fetchone()
-        return _row_mappers._row_to_entry(row) if row else None
+            return entries.read_manual_note(
+                conn,
+                category=category,
+                entity=entity,
+            )
+
 
     def _fact_assertions_from_entry(self, entry: LTMEntry) -> list[FactAssertion]:
         """Derive the identity *prose* an identity entry states, and only that."""
@@ -1104,14 +1060,10 @@ class LTMStore:
 
     def all_entries(self) -> list[LTMEntry]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM memory_items
-                WHERE status NOT IN ('archived', 'superseded')
-                ORDER BY importance DESC, updated_at DESC, id ASC
-                """
-            ).fetchall()
-        return [_row_mappers._row_to_entry(row) for row in rows]
+            return entries.all_entries(
+                conn,
+            )
+
 
     def search_entries(
         self,
@@ -1120,98 +1072,15 @@ class LTMStore:
         limit: int = shared.RETRIEVAL_TOP_K,
         scopes: Optional[list[str]] = None,
     ) -> list[LTMEntry]:
-        if scopes is not None and not scopes:
-            return []
-        query_terms = _lexical_terms(query)
-        if not query_terms:
-            with self._connect() as conn:
-                sql = """
-                    SELECT * FROM memory_items
-                    WHERE status NOT IN ('archived', 'superseded')
-                """
-                params: list[Any] = []
-                if categories:
-                    cats = [self.normalize_category_name(c) for c in categories]
-                    sql += f" AND category IN ({','.join('?' for _ in cats)})"
-                    params.extend(cats)
-                if scopes:
-                    sql += f" AND scope IN ({','.join('?' for _ in scopes)})"
-                    params.extend(str(scope) for scope in scopes)
-                sql += " ORDER BY importance DESC, updated_at DESC, id ASC LIMIT ?"
-                params.append(limit)
-                rows = conn.execute(sql, params).fetchall()
-            return [_row_mappers._row_to_entry(row) for row in rows]
-
-        latin_terms = [term for term in query_terms if LATIN_TOKEN_RE.fullmatch(term)]
-        cjk_terms = [term for term in query_terms if term not in latin_terms]
-        results_by_id: dict[str, LTMEntry] = {}
-
-        def _merge(rows: list[sqlite3.Row]) -> None:
-            for row in rows:
-                entry = _row_mappers._row_to_entry(row)
-                results_by_id.setdefault(entry.id, entry)
-
-        normalized_categories = (
-            [self.normalize_category_name(c) for c in categories] if categories else []
-        )
-
         with self._connect() as conn:
-            if latin_terms:
-                escaped_tokens = [token.replace('"', '""') for token in latin_terms]
-                match_query = " OR ".join(f'"{token}"*' for token in escaped_tokens)
-                sql = """
-                    SELECT m.*
-                    FROM memory_items_fts
-                    JOIN memory_items AS m
-                      ON m.id = memory_items_fts.memory_id
-                    WHERE memory_items_fts MATCH ?
-                      AND m.status NOT IN ('archived', 'superseded')
-                """
-                params: list[Any] = [match_query]
-                if normalized_categories:
-                    sql += f" AND m.category IN ({','.join('?' for _ in normalized_categories)})"
-                    params.extend(normalized_categories)
-                if scopes:
-                    sql += f" AND m.scope IN ({','.join('?' for _ in scopes)})"
-                    params.extend(str(scope) for scope in scopes)
-                sql += """
-                    ORDER BY bm25(memory_items_fts), m.importance DESC,
-                             m.updated_at DESC, m.id ASC
-                    LIMIT ?
-                """
-                params.append(limit * 6)
-                _merge(conn.execute(sql, params).fetchall())
+            return search.search_entries(
+                conn,
+                query=query,
+                categories=categories,
+                limit=limit,
+                scopes=scopes,
+            )
 
-            if cjk_terms:
-                like_clauses = []
-                params = []
-                for term in cjk_terms[:12]:
-                    pattern = f"%{term}%"
-                    like_clauses.append(
-                        "(content LIKE ? OR entity LIKE ? OR category LIKE ?)"
-                    )
-                    params.extend([pattern, pattern, pattern])
-                sql = """
-                    SELECT *
-                    FROM memory_items
-                    WHERE status NOT IN ('archived', 'superseded')
-                """
-                if like_clauses:
-                    sql += " AND (" + " OR ".join(like_clauses) + ")"
-                if normalized_categories:
-                    sql += f" AND category IN ({','.join('?' for _ in normalized_categories)})"
-                    params.extend(normalized_categories)
-                if scopes:
-                    sql += f" AND scope IN ({','.join('?' for _ in scopes)})"
-                    params.extend(str(scope) for scope in scopes)
-                sql += """
-                    ORDER BY importance DESC, updated_at DESC, id ASC
-                    LIMIT ?
-                """
-                params.append(limit * 6)
-                _merge(conn.execute(sql, params).fetchall())
-
-        return list(results_by_id.values())[: limit * 6]
 
     def corpus_stats(
         self,

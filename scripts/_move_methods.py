@@ -628,10 +628,13 @@ def main(argv: list[str] | None = None) -> int:
         elif isinstance(node, ast.ImportFrom):
             imported |= {a.asname or a.name for a in node.names}
     bad = set()
-    for node in ast.walk(check):
+    # Only the module-level functions: a nested function closes over its enclosing scope's locals,
+    # and scanning it on its own reports those as unbound (`search_entries`' inner `_merge` reads a
+    # list the outer body built).  `free_names` on the outer function binds them.
+    for node in check.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             src = ast.get_source_segment(new_module, node)
-            if src and not src.startswith("    "):
+            if src:
                 bad |= {
                     n for n in free_names(src)
                     if n not in imported and n not in top and n not in MODULE_GLOBALS
