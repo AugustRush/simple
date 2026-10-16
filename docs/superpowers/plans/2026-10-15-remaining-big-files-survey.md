@@ -23,7 +23,7 @@ recording" below.
 | file | lines | the big class | methods | method body lines | **`self`/`cls`-free methods** |
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 3307 (was 4086) | `SchedulerStore` | 74 | 2783 | **0 lines** |
-| `agent/memory/store.py` | 1388 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
+| `agent/memory/store.py` | 990 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
 | `agent/core/agent.py` | 2235 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1911 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
 
