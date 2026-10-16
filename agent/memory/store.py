@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, Sequence
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
 
+from . import entry_writes
 from . import maintenance
 from . import search
 from . import entries
@@ -244,56 +245,13 @@ class LTMStore:
         )
 
     def _write_entry_row(self, conn: sqlite3.Connection, entry: LTMEntry) -> set[str]:
-        original_category = self.normalize_category_name(entry.category)
-        original_entity = str(entry.entity or "")
-        entry.category = self._coerce_category_for_storage(conn, original_category)
-        if entry.category == "concepts" and original_category not in shared.PALACE_LOCI:
-            entry.entity = (
-                self.normalize_category_name(original_entity)
-                if original_entity.strip()
-                else original_category
-            )
-        entry.category = self.normalize_category_name(entry.category)
-        entry.entity = self._normalize_entity(entry.entity, entry.category)
-        entry.memory_type = entry.memory_type or "fact"
-        entry.scope = entry.scope or "global"
-        entry.status = entry.status or "active"
-        entry.source_session = entry.source_session or ""
-        entry.confidence = float(entry.confidence or 1.0)
-        existing_row = self._find_existing_entry_row(conn, entry)
-        affected_categories = {entry.category}
-        if existing_row:
-            entry.id = existing_row["id"]
-            entry.created_at = existing_row["created_at"]
-            affected_categories.add(
-                self.normalize_category_name(existing_row["category"])
-            )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO memory_items (
-                id, content, importance, category, entity, memory_type, scope,
-                status, source_session, confidence, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                entry.id,
-                entry.content,
-                float(entry.importance),
-                entry.category,
-                entry.entity,
-                entry.memory_type,
-                entry.scope,
-                entry.status,
-                entry.source_session,
-                float(entry.confidence),
-                entry.created_at,
-                entry.updated_at,
-            ),
+        return entry_writes._write_entry_row(
+            conn,
+            entry=entry,
+            invalidate=self._sync_after_mutation,
+            max_categories=self.max_categories,
         )
-        self._sync_fts_row(conn, entry.id)
-        return {
-            self.normalize_category_name(category) for category in affected_categories
-        }
+
 
     def _find_existing_entry_row(
         self, conn: sqlite3.Connection, entry: LTMEntry
@@ -307,15 +265,12 @@ class LTMStore:
     def _coerce_category_for_storage(
         self, conn: sqlite3.Connection, category: str
     ) -> str:
-        normalized = self.normalize_category_name(category)
-        if normalized in shared.PALACE_LOCI:
-            return normalized
-        dynamic_categories = self._dynamic_category_names(conn)
-        if normalized in dynamic_categories:
-            return normalized
-        if len(dynamic_categories) < self.max_categories:
-            return normalized
-        return "concepts"
+        return entry_writes._coerce_category_for_storage(
+            conn,
+            category=category,
+            max_categories=self.max_categories,
+        )
+
 
     def _dynamic_category_names(self, conn: sqlite3.Connection) -> set[str]:
         return fts._dynamic_category_names(
@@ -370,18 +325,14 @@ class LTMStore:
         self._category_stats_cache = None
 
     def _remove_category(self, category: str) -> None:
-        category = self.normalize_category_name(category)
         with self._connect() as conn:
-            row_ids = [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM memory_items WHERE category = ?",
-                    (category,),
-                ).fetchall()
-            ]
-            conn.execute("DELETE FROM memory_items WHERE category = ?", (category,))
-            self._delete_fts_rows(conn, row_ids)
-        self._sync_after_mutation({category})
+            entry_writes._remove_category(
+                conn,
+                category=category,
+                invalidate=self._sync_after_mutation,
+                max_categories=self.max_categories,
+            )
+
 
     # ── Category helpers ──────────────────────────────────────────────────────
 
@@ -443,55 +394,36 @@ class LTMStore:
 
 
     def write_entries(self, category: str, entries: list[LTMEntry]) -> None:
-        category = self.normalize_category_name(category)
-        if not entries:
-            self._remove_category(category)
-            return
-
-        affected_categories = {category}
         with self._connect() as conn:
-            row_ids = [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM memory_items WHERE category = ?",
-                    (category,),
-                ).fetchall()
-            ]
-            conn.execute("DELETE FROM memory_items WHERE category = ?", (category,))
-            self._delete_fts_rows(conn, row_ids)
-            for entry in entries:
-                entry.category = category
-                affected_categories.update(self._write_entry_row(conn, entry))
-        self._sync_after_mutation(affected_categories)
+            entry_writes.write_entries(
+                conn,
+                category=category,
+                entries=entries,
+                invalidate=self._sync_after_mutation,
+                max_categories=self.max_categories,
+            )
+
 
     def add_entry(self, entry: LTMEntry) -> None:
-        entry.category = self.normalize_category_name(entry.category)
-        entry.entity = self._normalize_entity(entry.entity, entry.category)
         with self._connect() as conn:
-            affected_categories = self._write_entry_row(conn, entry)
-        self._sync_after_mutation(affected_categories)
-        for fact in self._fact_assertions_from_entry(entry):
-            self.add_fact_assertion(fact)
+            entry_writes.add_entry(
+                conn,
+                entry=entry,
+                invalidate=self._sync_after_mutation,
+                max_categories=self.max_categories,
+            )
+
 
     def add_entries(self, entries: list[LTMEntry]) -> None:
-        """Batch-insert multiple entries in a single transaction and one sync pass.
-
-        Preferred over calling add_entry() in a loop: consolidation writes all
-        extracted facts at once, avoiding N separate SQL transactions and N
-        rounds of _meta + snapshot + projection file I/O.
-        """
-        if not entries:
-            return
-        affected_categories: set[str] = set()
+        """Batch-insert multiple entries in a single transaction and one sync pass."""
         with self._connect() as conn:
-            for entry in entries:
-                entry.category = self.normalize_category_name(entry.category)
-                entry.entity = self._normalize_entity(entry.entity, entry.category)
-                affected_categories.update(self._write_entry_row(conn, entry))
-        self._sync_after_mutation(affected_categories)
-        for entry in entries:
-            for fact in self._fact_assertions_from_entry(entry):
-                self.add_fact_assertion(fact)
+            entry_writes.add_entries(
+                conn,
+                entries=entries,
+                invalidate=self._sync_after_mutation,
+                max_categories=self.max_categories,
+            )
+
 
     def append_conversation_turn(
         self,
@@ -981,62 +913,17 @@ class LTMStore:
     def upsert_manual_note(
         self, category: str, entity: str, content: str, append: bool = False
     ) -> LTMEntry:
-        category = self.normalize_category_name(category)
-        entity = self._normalize_entity(entity, category)
-        clean_content = str(content or "").strip()
         with self._connect() as conn:
-            # Read-modify-write under one transaction: a concurrent append
-            # must not read the same base note and overwrite the other
-            # writer's update (lost update).
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute(
-                    """
-                    SELECT * FROM memory_items
-                    WHERE category = ? AND entity = ? AND memory_type = 'note'
-                      AND status NOT IN ('archived', 'superseded')
-                    ORDER BY updated_at DESC, id ASC
-                    LIMIT 1
-                    """,
-                    (category, entity),
-                ).fetchone()
-                if row:
-                    entry = _row_mappers._row_to_entry(row)
-                    entry.content = (
-                        f"{entry.content.rstrip()}\n{clean_content}"
-                        if append
-                        else clean_content
-                    ).strip()
-                    entry.updated_at = _now()
-                else:
-                    entry = LTMEntry(
-                        id=_new_id(),
-                        content=clean_content,
-                        importance=0.8,
-                        category=category,
-                        entity=entity,
-                        memory_type="note",
-                        scope="global",
-                        status="active",
-                        source_session="manual_memory_write",
-                        confidence=1.0,
-                        created_at=_now(),
-                        updated_at=_now(),
-                    )
-                affected_categories = self._write_entry_row(conn, entry)
-            except BaseException:
-                conn.rollback()
-                raise
-            else:
-                conn.commit()
-        self._sync_after_mutation(affected_categories)
-        # A hand-written identity note is the most deliberate statement of
-        # identity there is.  Skipping fact derivation here left it invisible
-        # to the startup prompt, which reads facts — the note only surfaced
-        # later, if a query happened to route to free-form memory.
-        for fact in self._fact_assertions_from_entry(entry):
-            self.add_fact_assertion(fact)
-        return entry
+            return entry_writes.upsert_manual_note(
+                conn,
+                category=category,
+                entity=entity,
+                content=content,
+                append=append,
+                invalidate=self._sync_after_mutation,
+                max_categories=self.max_categories,
+            )
+
 
     def all_entries(self) -> list[LTMEntry]:
         with self._connect() as conn:
@@ -1110,21 +997,13 @@ class LTMStore:
 
     def merge_categories(self, cat_a: str, cat_b: str, merged_name: str) -> None:
         """Merge cat_a and cat_b into merged_name, delete originals."""
-        cat_a = self.normalize_category_name(cat_a)
-        cat_b = self.normalize_category_name(cat_b)
-        merged_name = self.normalize_category_name(merged_name)
         with self._connect() as conn:
-            row_ids = [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM memory_items WHERE category IN (?, ?)",
-                    (cat_a, cat_b),
-                ).fetchall()
-            ]
-            conn.execute(
-                "UPDATE memory_items SET category = ?, updated_at = ? WHERE category IN (?, ?)",
-                (merged_name, _now(), cat_a, cat_b),
+            entry_writes.merge_categories(
+                conn,
+                cat_a=cat_a,
+                cat_b=cat_b,
+                merged_name=merged_name,
+                invalidate=self._sync_after_mutation,
+                max_categories=self.max_categories,
             )
-            for entry_id in row_ids:
-                self._sync_fts_row(conn, entry_id)
-        self._sync_after_mutation({cat_a, cat_b, merged_name})
+

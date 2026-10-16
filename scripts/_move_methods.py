@@ -197,6 +197,68 @@ def already_imported(header: str) -> set[str]:
     return names
 
 
+def add_conn_to_calls(text: str, names: set[str], param: str) -> str:
+    """Pass the connection at calls to functions that take one but were called without it.
+
+    A function moved by an *earlier* run already takes the connection; the caller in this batch
+    still calls it the old way (`facts._fact_assertions_from_entry(entry)`).  Without this the
+    failure is a TypeError in the moved module, one call site at a time.
+    """
+    for name in sorted(names):
+        text = re.sub(
+            rf"(?<![\w.])(?<!def ){re.escape(name)}\(\n(\s+)(?!{param}\b)",
+            lambda m: f"{name}(\n{m.group(1)}{param}, ", text,
+        )
+        text = re.sub(
+            rf"(?<![\w.])(?<!def ){re.escape(name)}\((?!\n)(?!{param}\b)(?!\s*\))",
+            f"{name}({param}, ", text,
+        )
+    return text
+
+
+def add_kwargs_to_calls(text: str, kwargs_for: dict[str, list[str]]) -> str:
+    """Append `name=name` to calls of the given siblings that do not already pass them.
+
+    Inserting only the connection at sibling call sites was half the job: a function that also
+    takes a collaborator was called without it ("missing 1 required keyword-only argument").  The
+    kwargs are per callee -- passing all of them everywhere made the caller ask for a parameter the
+    callee does not take ("unexpected keyword argument").  Edits run last-to-first so offsets hold.
+    """
+    if not any(kwargs_for.values()):
+        return text
+    edits: list[tuple[int, list[str]]] = []
+    for sibling, kwargs in kwargs_for.items():
+        if not kwargs:
+            continue
+        for match in re.finditer(rf"(?<![\w.])(?<!def ){re.escape(sibling)}\((?!\s*\))", text):
+            start = match.end() - 1
+            depth, index, quote = 0, start, None
+            while index < len(text):
+                ch = text[index]
+                if quote:
+                    if ch == "\\":
+                        index += 2
+                        continue
+                    if ch == quote:
+                        quote = None
+                elif ch in "\"'":
+                    quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        inner = text[start + 1:index]
+                        missing = [f"{k}={k}" for k in kwargs if f"{k}=" not in inner]
+                        if missing:
+                            edits.append((index, missing))
+                        break
+                index += 1
+    for index, missing in sorted(edits, reverse=True):
+        text = text[:index] + ", " + ", ".join(missing) + text[index:]
+    return text
+
+
 def add_kwonly_params(text: str, name: str, extras: list[str]) -> str:
     """Append keyword-only parameters to a signature, creating the `*` separator if needed.
 
@@ -347,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     blocks: list[str] = []
     wrappers: list[str] = []
     used_rewrites: set[str] = set()
+    extras_for: dict[str, list[str]] = {}
+    block_names: list[str] = []
     spans: dict[str, tuple[int, int]] = {}
     needed: set[str] = set()
     problems: list[str] = []
@@ -436,8 +500,6 @@ def main(argv: list[str] | None = None) -> int:
                 out_lines.append(line)
                 index += 1
             text = "\n".join(out_lines)
-        if extra_params:
-            text = add_kwonly_params(text, method.name, extra_params)
         for pair in args.rewrite:
             # Split at the first `=` that is not followed by a space: an expression may itself
             # contain `=` (`self._cache = None` -> `invalidate(set())`), and splitting on the very
@@ -479,6 +541,21 @@ def main(argv: list[str] | None = None) -> int:
                 rf"(?<![\w.])(?<!def ){sibling}\((?!\n)(?!{args.param}\b)(?!\s*\))",
                 f"{sibling}({args.param}, ", text,
             )
+        # after the sibling rewriting: before it the calls still read `self.sibling(` and the
+        # pattern (which refuses a `.` before the name) matched nothing
+        pass  # sibling kwargs are added in a second pass, once every callee's needs are known
+        # A batch-level declaration, applied per function by *usage*, and only now: a rewrite may be
+        # what introduces the collaborator (`..._for_storage(conn, category, max_categories=...)`),
+        # so computing the usage before the rewrites added no parameter at all.
+        # Every function in the batch takes every declared collaborator and every sibling call
+        # passes them on.  Choosing per function by usage sounds tidier but breaks the moment a
+        # caller must hand a collaborator to a callee that needs it: the caller "does not use" it
+        # yet must still accept and forward it.  The cost is an occasional unused keyword-only
+        # parameter; the alternative was a cascade of "missing/unexpected keyword argument".
+        used_extras = list(extra_params)
+        if used_extras:
+            text = add_kwonly_params(text, method.name, used_extras)
+        extras_for[method.name] = used_extras
         try:
             ast.parse(text)
         except SyntaxError as exc:
@@ -497,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
         blocks.append(text)
+        block_names.append(method.name)
         needed |= (free_names(text) - set(moving))
 
         # the wrapper that stays in the class
@@ -544,9 +622,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             first = ""
         call_args = ([first] if first else []) + [f"{n}={n}" for n in names if n != first]
-        for pair in args.extra_param:
-            pname, pexpr = pair.split("=", 1)
-            call_args.append(f"{pname.strip()}={pexpr.strip()}")
+        by_name = {p.split("=", 1)[0].strip(): p.split("=", 1)[1].strip() for p in args.extra_param}
+        for pname in used_extras:
+            call_args.append(f"{pname}={by_name[pname]}")
         if call_args:
             call = f"{stem}.{method.name}(\n"
             call += "".join(f"{pad}    {a},\n" for a in call_args)
@@ -584,6 +662,34 @@ def main(argv: list[str] | None = None) -> int:
                 target_defined.add(node.name)
             elif isinstance(node, ast.Assign):
                 target_defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    # Second pass: now that every moved function's own needs are known, fill in the collaborators
+    # at the sibling call sites -- per callee, so nobody is handed a parameter it cannot take.
+    kwargs_for = {name: list(extra_params) for name in moving}
+    earlier_run_callees: set[str] = set()
+    # A function moved by an *earlier* run lives in the target module and takes the same kind of
+    # collaborator; its callers in this batch must pass it.  Read the target's signatures rather
+    # than guessing: only what the callee actually declares as keyword-only is offered.
+    target_module = pathlib.Path(args.module)
+    if target_module.exists():
+        for node in ast.parse(target_module.read_text(encoding="utf-8")).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                declared = {a.arg for a in node.args.kwonlyargs}
+                # NOT `needed`: that name already holds the set of free names collected above,
+                # and rebinding it here made the unresolved-name report read a list of extras.
+                declared_extras = [name for name in extra_params if name in declared]
+                if declared_extras:
+                    kwargs_for[node.name] = declared_extras
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                positional = [a.arg for a in list(node.args.posonlyargs) + list(node.args.args)]
+                if positional and positional[0] == args.param:
+                    earlier_run_callees.add(node.name)
+    blocks = [add_kwargs_to_calls(block, kwargs_for) for block in blocks]
+    if args.param:
+        blocks = [
+            add_conn_to_calls(block, earlier_run_callees - set(moving), args.param)
+            for block in blocks
+        ]
 
     # A rewrite that matched nothing anywhere in the batch is almost certainly a typo, and a
     # silent no-op there was how a wrong `--rewrite` used to pass unnoticed.
@@ -630,13 +736,18 @@ def main(argv: list[str] | None = None) -> int:
         statement = imports[name]
         if statement.startswith("from "):
             module = statement.split(" import ")[0]
+            # Merge the *imported item*, not the bare name: `from . import rows as _row_mappers`
+            # merged as `_row_mappers` produced an import of a module that does not exist, and the
+            # failure surfaced as a circular-import error in an unrelated module.
+            spec = statement.split(" import ", 1)[1].strip()
             block = re.search(rf"^{re.escape(module)} import \(([^)]*)\)$", header, re.M | re.S)
             if block:
-                header = header[:block.end(1)] + f"    {name},\n" + header[block.end(1):]
+                if spec not in block.group(1):
+                    header = header[:block.end(1)] + f"    {spec},\n" + header[block.end(1):]
             else:
                 single = re.search(rf"^{re.escape(module)} import (.+)$", header, re.M)
-                if single:
-                    header = header[:single.end(1)] + f", {name}" + header[single.end(1):]
+                if single and spec not in single.group(1):
+                    header = header[:single.end(1)] + f", {spec}" + header[single.end(1):]
                 else:
                     anchor = re.search(r"^from \.", header, re.M)
                     statement += "\n"
@@ -683,10 +794,15 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             src = ast.get_source_segment(new_module, node)
             if src:
-                bad |= {
+                missing = {
                     n for n in free_names(src)
                     if n not in imported and n not in top and n not in MODULE_GLOBALS
                 }
+                if missing:
+                    print(
+                        f"  (unbound in {node.name}: {sorted(missing)})", file=sys.stderr,
+                    )
+                bad |= missing
     if bad:
         print(f"REFUSING: unbound names in {target}: {sorted(bad)}", file=sys.stderr)
         return 1
