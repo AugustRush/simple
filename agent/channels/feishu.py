@@ -34,6 +34,7 @@ Configuration in ``~/.agent/config.json``::
 """
 
 from __future__ import annotations
+from agent.channels import feishu_downloads
 
 import asyncio
 import contextlib
@@ -1488,39 +1489,11 @@ class FeishuChannel(Channel):
         msg_type: str,
         content_json: dict,
     ) -> list[tuple[str, str, str]]:
-        specs: list[tuple[str, str, str]] = []
-        if msg_type == "image":
-            key = content_json.get("image_key") or content_json.get("file_key")
-            if key:
-                filename = safe_resource_filename(
-                    content_json.get("file_name", ""),
-                    resource_fallback_filename(str(key), "image"),
-                )
-                specs.append((str(key), "image", filename))
-        elif msg_type == "post":
-            _text, image_keys = extract_post_content(content_json)
-            for key in image_keys:
-                specs.append(
-                    (
-                        str(key),
-                        "image",
-                        resource_fallback_filename(str(key), "image"),
-                    )
-                )
-        elif msg_type in ("file", "audio", "media", "video"):
-            key = (
-                content_json.get("file_key")
-                or content_json.get("media_key")
-                or content_json.get("audio_key")
-            )
-            if key:
-                resource_type = "file" if msg_type == "file" else msg_type
-                filename = safe_resource_filename(
-                    content_json.get("file_name", "") or content_json.get("name", ""),
-                    resource_fallback_filename(str(key), resource_type),
-                )
-                specs.append((str(key), resource_type, filename))
-        return specs
+        return feishu_downloads._message_attachment_specs(
+            msg_type=msg_type,
+            content_json=content_json,
+        )
+
 
     async def _download_message_attachments(
         self,
@@ -1528,34 +1501,11 @@ class FeishuChannel(Channel):
         message_id: str,
         specs: list[tuple[str, str, str]],
     ) -> tuple[MessageAttachment, ...]:
-        attachments: list[MessageAttachment] = []
-        for resource_key, resource_type, filename in specs:
-            path = await self._download_message_resource(
-                message_id,
-                resource_key,
-                resource_type,
-                filename,
-            )
-            if path is None:
-                continue
-            mime_type = attachment_mime_type(path, resource_type)
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = None
-            attachments.append(
-                MessageAttachment(
-                    kind=attachment_kind_for_mime(mime_type),
-                    mime_type=mime_type,
-                    filename=path.name,
-                    local_path=path,
-                    source="feishu",
-                    source_ref=resource_key,
-                    size_bytes=size,
-                    metadata={"message_id": message_id, "resource_type": resource_type},
-                )
-            )
-        return tuple(attachments)
+        return await feishu_downloads._download_message_attachments(
+            message_id=message_id,
+            specs=specs, download_resource=self._download_message_resource
+        )
+
 
     async def _extract_message_attachments(
         self,
@@ -1564,20 +1514,13 @@ class FeishuChannel(Channel):
         msg_type: str,
         content_json: dict,
     ) -> tuple[list[tuple[str, str, str]], tuple[MessageAttachment, ...]]:
-        """The attachments of one inbound message, and the specs they came from.
-
-        Both halves are returned because the caller needs both: the downloader
-        hands back only what it managed to fetch, and the difference is reported
-        as a download failure.  This existed as a composition whose only callers
-        were its tests, while the message path spelled the same two calls out by
-        hand -- so the tests covered a path the product did not take.
-        """
-        specs = self._message_attachment_specs(msg_type, content_json)
-        attachments = await self._download_message_attachments(
+        """The attachments of one inbound message, and the specs they came from."""
+        return await feishu_downloads._extract_message_attachments(
             message_id=message_id,
-            specs=specs,
+            msg_type=msg_type,
+            content_json=content_json, download_resource=self._download_message_resource
         )
-        return specs, attachments
+
 
     async def _download_message_resource(
         self,
