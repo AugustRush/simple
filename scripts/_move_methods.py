@@ -468,9 +468,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     target = pathlib.Path(args.module)
-    if args.dry_run:
-        print(f"dry run: would write {target} and rewrite {args.file}")
-        return 0
 
     header = f'"""{args.doc}"""\n\n' if not target.exists() else target.read_text(encoding="utf-8")
     if not target.exists():
@@ -579,6 +576,22 @@ def main(argv: list[str] | None = None) -> int:
         insert_at = import_anchor(text)
     if module_import not in text:
         text = text[:insert_at] + module_import + "\n" + text[insert_at:]
+    # A constant may only travel with its reader if it has no *other* readers.  Deleting it from
+    # the source otherwise leaves the code that stays behind with a NameError at call time --
+    # `compile()` cannot see that (it is a runtime lookup) and the unbound-name check inspects
+    # the generated module, so the first version of this check was silent about it.  A constant
+    # that both sides need cannot be re-imported from the new module (that cycles), so the only
+    # honest answer is to refuse and let the operator give it a third home.
+    for name in consts:
+        if re.search(rf"(?<![\w.]){re.escape(name)}\b", text):
+            print(
+                f"REFUSING: {name} is read by code that stays in {args.file} as well as by the "
+                f"methods being moved; give it a home outside both modules first "
+                f"(re-importing it from {target.name} would be a cycle)",
+                file=sys.stderr,
+            )
+            return 1
+
     target.parent.mkdir(parents=True, exist_ok=True)
     # Two checks, both for injuries that `ast.parse` does not report:
     #   * a statement dedented out of its function still parses (the `with`-block dedent once
@@ -607,6 +620,9 @@ def main(argv: list[str] | None = None) -> int:
         except (SyntaxError, ValueError) as exc:
             print(f"REFUSING to keep this: {label} does not compile: {exc}", file=sys.stderr)
             return 1
+    if args.dry_run:
+        print(f"dry run: would write {target} and rewrite {args.file}")
+        return 0
     target.write_text(new_module, encoding="utf-8")
     source.write_text(text, encoding="utf-8")
     print(f"wrote {target} and rewrote {args.file}")

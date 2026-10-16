@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from agent import shared
 from agent.verification import (
     VERDICT_NONE,
     VerificationResult,
@@ -58,6 +59,16 @@ def optional_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     return parse_datetime(value)
+
+
+def _new_id() -> str:
+    return shared._new_id()
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat()
 
 
 def parse_datetime(value: str | datetime) -> datetime:

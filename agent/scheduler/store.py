@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from functools import wraps
 import json
 from pathlib import Path
@@ -43,6 +43,8 @@ from agent import shared
 from . import reads
 from .models import (
     optional_datetime,
+    _iso,
+    _new_id,
     ATTENTION_STATUSES,
     DEFAULT_SIGNAL_MAX_DEPTH,
     RETRYABLE_RUN_STATUSES,
@@ -51,6 +53,7 @@ from .models import (
     RUN_UNVERIFIED_STATUS,
     SIGNAL_MODE_ALL,
     TERMINAL_RUN_STATUSES,
+    UTC,
     Acceptance,
     ClaimedTask,
     DeliveryTarget,
@@ -82,17 +85,6 @@ from .models import (
 )
 
 
-UTC = timezone.utc
-
-
-def _new_id() -> str:
-    return shared._new_id()
-
-
-def _iso(value: Optional[datetime]) -> Optional[str]:
-    if value is None:
-        return None
-    return value.astimezone(UTC).isoformat()
 
 
 def _output_byte_count(path: str) -> int:
