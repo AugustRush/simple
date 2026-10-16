@@ -22,6 +22,10 @@ so they are kept separate and their differences are asserted.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+from agent.orchestration.runtime import SubtaskResult, SubtaskSpec
+
 import json
 from typing import Any
 
@@ -30,6 +34,8 @@ __all__ = [
     "bounded_json",
     "bounded_structured",
     "bounded_text",
+    "_with_upstream_summaries",
+    "_with_lead_summary",
 ]
 
 #: Suffix marking a truncated string, and the room reserved for it so the
@@ -99,3 +105,93 @@ def bounded_structured(value: Any, limit: int = 2400) -> Any:
         "_truncated": True,
         "preview": serialized[: max(0, limit - 64)].rstrip(),
     }
+
+
+_UPSTREAM_DETAIL_BUDGET = 2400
+
+_UPSTREAM_STRUCTURED_BUDGET = 1200
+
+_UPSTREAM_SUMMARY_BUDGET = 2400
+
+
+def _with_upstream_summaries(
+    spec: SubtaskSpec,
+    upstream_summaries: dict[str, str],
+    upstream_results: dict[str, SubtaskResult] | None = None,
+) -> SubtaskSpec:
+    summary_text = bounded_text(
+        "\n".join(
+            f"- {dep}: {summary}" for dep, summary in upstream_summaries.items()
+        ),
+        _UPSTREAM_SUMMARY_BUDGET,
+    )
+    task = append_named_block(
+        spec.task,
+        "Upstream summaries:",
+        [summary_text] if summary_text else [],
+    )
+    handoff: dict[str, Any] = dict(spec.handoff)
+    structured_lines: list[str] = []
+    detail_lines: list[str] = []
+    for dep, result in (upstream_results or {}).items():
+        if result.structured_content is not None:
+            bounded = bounded_structured(result.structured_content)
+            handoff[dep] = bounded
+            structured_lines.append(f"- {dep}: {bounded_json(bounded)}")
+        if result.content and len(result.content) > len(result.summary):
+            detail_lines.append(f"- {dep}: {result.content}")
+    detail_text = bounded_text(
+        "\n".join(detail_lines),
+        _UPSTREAM_DETAIL_BUDGET,
+    )
+    task = append_named_block(
+        task,
+        "Upstream detail:",
+        [detail_text] if detail_text else [],
+    )
+    structured_text = bounded_text(
+        "\n".join(structured_lines),
+        _UPSTREAM_STRUCTURED_BUDGET,
+    )
+    task = append_named_block(
+        task,
+        "Upstream structured results:",
+        [structured_text] if structured_text else [],
+    )
+    return replace(spec, task=task, handoff=handoff)
+
+
+def _with_lead_summary(
+    spec: SubtaskSpec,
+    lead_summary: str,
+    lead_structured_context: dict[str, Any] | None = None,
+) -> SubtaskSpec:
+    if not lead_summary and not lead_structured_context:
+        return spec
+    task = append_named_block(
+        spec.task,
+        "Lead summary:",
+        [bounded_text(lead_summary, _UPSTREAM_SUMMARY_BUDGET)]
+        if lead_summary
+        else [],
+    )
+    structured_lines = []
+    for dep, value in (lead_structured_context or {}).items():
+        bounded = bounded_structured(value)
+        structured_lines.append(f"- {dep}: {bounded_json(bounded)}")
+    task = append_named_block(
+        task,
+        "Lead structured results:",
+        [
+            bounded_text(
+                "\n".join(structured_lines),
+                _UPSTREAM_STRUCTURED_BUDGET,
+            )
+        ]
+        if structured_lines
+        else [],
+    )
+    handoff: dict[str, Any] = dict(spec.handoff)
+    for dep, value in (lead_structured_context or {}).items():
+        handoff[dep] = bounded_structured(value)
+    return replace(spec, task=task, handoff=handoff)

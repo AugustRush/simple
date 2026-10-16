@@ -896,6 +896,22 @@ def main(argv: list[str] | None = None) -> int:
         merged = existing + [m for m in moving if m not in existing]
         block = "__all__ = [\n" + "".join(f'    "{m}",\n' for m in merged) + "]"
         header = header[:listed.start()] + block + header[listed.end():]
+    # A wrapper calls into the new module as `stem.name`, so the name `stem` must mean the module.
+    # `from agent.core.bounded_text import bounded_text` binds the *function* of that name and
+    # shadows it: the wrapper then calls an attribute on a function, and the failure surfaces as
+    # "'function' object has no attribute '_with_lead_summary'" far from the move.
+    source_tree_check = ast.parse(pathlib.Path(args.file).read_text(encoding="utf-8"))
+    for node in ast.walk(source_tree_check):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[-1] == stem:
+            if any(a.name == stem and not a.asname for a in node.names):
+                print(
+                    f"REFUSING: {args.file} does `from {node.module} import {stem}`, which binds a "
+                    f"member of that name and shadows the module the wrappers call into.  Alias one "
+                    f"of the two imports first.",
+                    file=sys.stderr,
+                )
+                return 1
+
     # `agent/memory/retrieval.py` already existed -- BM25 retrieval over entries -- and a move
     # into that name silently replaced it.  Writing into an existing module is how this tool
     # appends to one it made earlier, so the check is not "does it exist" but "was that meant".

@@ -1,4 +1,8 @@
 from __future__ import annotations
+# aliased: `from agent.core.bounded_text import bounded_text` below binds the *function* of
+# that name, shadowing the module -- and the wrappers call module-level functions.
+from agent.core import bounded_text as bounded_text_module
+from agent.core import progress_events
 
 import asyncio
 import base64
@@ -156,9 +160,6 @@ from agent.core.turn_state import (
 )
 logger = logging.getLogger(__name__)
 
-_UPSTREAM_SUMMARY_BUDGET = 2400
-_UPSTREAM_DETAIL_BUDGET = 2400
-_UPSTREAM_STRUCTURED_BUDGET = 1200
 _RENDEZVOUS_INPUT_BUDGET = 6000
 
 #: Set on ``ctx.metadata`` for the duration of one turn, and read by
@@ -357,119 +358,32 @@ class BaseAgent:
 
 
     def _emit_subagent_event(self, event: SubAgentProgressEvent) -> None:
-        sink = _active_sink.get()
-        if sink is not None:
-            sink.on_subagent_event(event)
-            return
-        CliOutputSink(shared.CONSOLE).on_subagent_event(event)
+        progress_events._emit_subagent_event(
+            event=event,
+        )
+
 
     @staticmethod
     def _format_role_list(roles: list[str], *, limit: int = 3) -> str:
-        cleaned = [str(role).strip() for role in roles if str(role).strip()]
-        if not cleaned:
-            return "sub-agents"
-        if len(cleaned) <= limit:
-            return ", ".join(cleaned)
-        remaining = len(cleaned) - limit
-        return f"{', '.join(cleaned[:limit])}, +{remaining} more"
+        return progress_events._format_role_list(
+            roles=roles,
+            limit=limit,
+        )
+
 
     def _runtime_progress_message(self, kind: str, payload: dict[str, Any]) -> str:
-        mode = str(payload.get("execution_mode", "") or "").strip().lower()
-        if kind == "batch_progress" and mode == "parallel":
-            completed = int(payload.get("completed", 0) or 0)
-            total = int(payload.get("total", 0) or 0)
-            running = max(0, total - completed)
-            return (
-                f"Parallel batch running: {completed}/{total} completed, "
-                f"{running} still running"
-            )
+        return progress_events._runtime_progress_message(
+            kind=kind,
+            payload=payload,
+        )
 
-        if kind == "phase_started" and mode == "pipeline":
-            stage_index = int(payload.get("phase_index", 0) or 0)
-            ready_count = int(payload.get("ready_count", 0) or 0)
-            roles = self._format_role_list(list(payload.get("ready_roles", [])))
-            return (
-                f"Pipeline stage {stage_index} started: "
-                f"{ready_count} ready ({roles})"
-            )
-
-        if kind == "phase_finished" and mode == "pipeline":
-            stage_index = int(payload.get("phase_index", 0) or 0)
-            succeeded = int(payload.get("succeeded_count", 0) or 0)
-            failed = int(payload.get("failed_count", 0) or 0)
-            if failed:
-                return (
-                    f"Pipeline stage {stage_index} finished: "
-                    f"{succeeded} succeeded, {failed} failed"
-                )
-            return f"Pipeline stage {stage_index} finished: {succeeded} succeeded"
-
-        if kind == "phase_note" and mode == "pipeline":
-            if payload.get("phase_kind") == "skipped":
-                skipped = len(payload.get("skipped_ids") or [])
-                roles = self._format_role_list(list(payload.get("skipped_roles", [])))
-                reason = str(payload.get("reason", "") or "")
-                suffix = f" ({reason})" if reason else ""
-                return f"Pipeline: {skipped} blocked agents skipped{suffix}: {roles}"
-
-        if kind == "phase_started" and mode == "rendezvous":
-            round_index = int(payload.get("phase_index", 0) or 0)
-            round_total = int(payload.get("phase_total", 0) or 0)
-            participants = int(payload.get("participant_count", 0) or 0)
-            roles = self._format_role_list(list(payload.get("participant_roles", [])))
-            return (
-                f"Debate round {round_index}/{round_total} started: "
-                f"{participants} participants ({roles})"
-            )
-
-        if kind == "phase_finished" and mode == "rendezvous":
-            round_index = int(payload.get("phase_index", 0) or 0)
-            round_total = int(payload.get("phase_total", 0) or 0)
-            succeeded = int(payload.get("succeeded_count", 0) or 0)
-            failed = int(payload.get("failed_count", 0) or 0)
-            if failed:
-                return (
-                    f"Debate round {round_index}/{round_total} finished: "
-                    f"{succeeded} succeeded, {failed} failed"
-                )
-            return (
-                f"Debate round {round_index}/{round_total} finished: "
-                f"{succeeded} views collected"
-            )
-
-        if kind == "phase_note" and mode == "rendezvous":
-            round_index = int(payload.get("phase_index", 0) or 0)
-            round_total = int(payload.get("phase_total", 0) or 0)
-            continue_count = int(payload.get("continue_count", 0) or 0)
-            if bool(payload.get("final")):
-                return (
-                    f"Lead synthesis complete after round "
-                    f"{round_index}/{round_total}"
-                )
-            if bool(payload.get("stop")):
-                return (
-                    f"Lead summary after round {round_index}/{round_total}: "
-                    "no further round needed"
-                )
-            roles = self._format_role_list(list(payload.get("continue_roles", [])))
-            next_round = min(round_total, round_index + 1)
-            return (
-                f"Lead summary ready for round {next_round}/{round_total}: "
-                f"{continue_count} continue ({roles})"
-            )
-
-        return ""
 
     def _emit_runtime_progress_event(self, kind: str, payload: dict[str, Any]) -> None:
-        self._emit_subagent_event(
-            SubAgentProgressEvent(
-                kind=kind,
-                completed=int(payload.get("completed", 0) or 0),
-                total=int(payload.get("total", 0) or 0),
-                message=self._runtime_progress_message(kind, payload),
-                metrics=dict(payload),
-            )
+        progress_events._emit_runtime_progress_event(
+            kind=kind,
+            payload=payload,
         )
+
 
     def current_context(self) -> Optional["AgentContext"]:
         return _active_agent_context.get()
@@ -604,46 +518,12 @@ class BaseAgent:
         upstream_summaries: dict[str, str],
         upstream_results: dict[str, SubtaskResult] | None = None,
     ) -> SubtaskSpec:
-        summary_text = self._bounded_text(
-            "\n".join(
-                f"- {dep}: {summary}" for dep, summary in upstream_summaries.items()
-            ),
-            _UPSTREAM_SUMMARY_BUDGET,
+        return bounded_text_module._with_upstream_summaries(
+            spec=spec,
+            upstream_summaries=upstream_summaries,
+            upstream_results=upstream_results,
         )
-        task = self._append_named_block(
-            spec.task,
-            "Upstream summaries:",
-            [summary_text] if summary_text else [],
-        )
-        handoff: dict[str, Any] = dict(spec.handoff)
-        structured_lines: list[str] = []
-        detail_lines: list[str] = []
-        for dep, result in (upstream_results or {}).items():
-            if result.structured_content is not None:
-                bounded = self._bounded_structured(result.structured_content)
-                handoff[dep] = bounded
-                structured_lines.append(f"- {dep}: {self._bounded_json(bounded)}")
-            if result.content and len(result.content) > len(result.summary):
-                detail_lines.append(f"- {dep}: {result.content}")
-        detail_text = self._bounded_text(
-            "\n".join(detail_lines),
-            _UPSTREAM_DETAIL_BUDGET,
-        )
-        task = self._append_named_block(
-            task,
-            "Upstream detail:",
-            [detail_text] if detail_text else [],
-        )
-        structured_text = self._bounded_text(
-            "\n".join(structured_lines),
-            _UPSTREAM_STRUCTURED_BUDGET,
-        )
-        task = self._append_named_block(
-            task,
-            "Upstream structured results:",
-            [structured_text] if structured_text else [],
-        )
-        return replace(spec, task=task, handoff=handoff)
+
 
     def _with_lead_summary(
         self,
@@ -651,35 +531,12 @@ class BaseAgent:
         lead_summary: str,
         lead_structured_context: dict[str, Any] | None = None,
     ) -> SubtaskSpec:
-        if not lead_summary and not lead_structured_context:
-            return spec
-        task = self._append_named_block(
-            spec.task,
-            "Lead summary:",
-            [self._bounded_text(lead_summary, _UPSTREAM_SUMMARY_BUDGET)]
-            if lead_summary
-            else [],
+        return bounded_text_module._with_lead_summary(
+            spec=spec,
+            lead_summary=lead_summary,
+            lead_structured_context=lead_structured_context,
         )
-        structured_lines = []
-        for dep, value in (lead_structured_context or {}).items():
-            bounded = self._bounded_structured(value)
-            structured_lines.append(f"- {dep}: {self._bounded_json(bounded)}")
-        task = self._append_named_block(
-            task,
-            "Lead structured results:",
-            [
-                self._bounded_text(
-                    "\n".join(structured_lines),
-                    _UPSTREAM_STRUCTURED_BUDGET,
-                )
-            ]
-            if structured_lines
-            else [],
-        )
-        handoff: dict[str, Any] = dict(spec.handoff)
-        for dep, value in (lead_structured_context or {}).items():
-            handoff[dep] = self._bounded_structured(value)
-        return replace(spec, task=task, handoff=handoff)
+
 
     async def _summarize_rendezvous_round(
         self, results: list[SubtaskResult]
