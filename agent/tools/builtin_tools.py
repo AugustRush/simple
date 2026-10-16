@@ -27,6 +27,7 @@ from agent.core.output import _active_sink
 from agent.scheduler.models import LOCAL_TIMEZONE
 from agent.tools.files import FileProvider
 
+from . import builtin_web_tools
 from . import builtin_plugin_tools
 from . import builtin_schedule_tools
 from . import builtin_memory_tools
@@ -320,97 +321,7 @@ class BuiltinTools:
             source="builtin",
         )
 
-        r.register(
-            "web_search",
-            (
-                "Search the web using Tavily and return a list of results (title, url, snippet). "
-                "Use for current events, facts that may have changed, or anything requiring live data. "
-                "Requires a Tavily API key (set TAVILY_API_KEY or tavily_api_key in config)."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": f"Maximum number of results to return (1-{TAVILY_SEARCH_MAX_RESULTS})",
-                        "default": 5,
-                    },
-                },
-                "required": ["query"],
-            },
-            self._web_tools.search,
-            source="builtin",
-        )
-
-        r.register(
-            "web_fetch",
-            (
-                "Fetch the content of a URL and return it as plain text (HTML tags stripped). "
-                "Use to read articles, documentation, or any web page whose URL you already know. "
-                "Note: robots.txt is not checked; use responsibly."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "Full URL to fetch (must start with http:// or https://)",
-                    },
-                    "max_chars": {
-                        "type": "integer",
-                        "description": "Maximum characters of body text to return (default 8000)",
-                        "default": 8000,
-                    },
-                    "raw_html": {
-                        "type": "boolean",
-                        "description": "Return raw HTML instead of extracted text (default false)",
-                        "default": False,
-                    },
-                },
-                "required": ["url"],
-            },
-            self._web_tools.fetch,
-            source="builtin",
-        )
-
-        r.register(
-            "tavily_search",
-            (
-                "Search the web with Tavily and return normalized results. "
-                "Useful for current events, news, and broader live-web research when a Tavily API key is configured."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": f"Maximum number of results to return (1-{TAVILY_SEARCH_MAX_RESULTS})",
-                        "default": 5,
-                    },
-                    "search_depth": {
-                        "type": "string",
-                        "description": "Tavily search depth: 'basic' or 'advanced'",
-                        "default": "basic",
-                    },
-                    "include_answer": {
-                        "type": "boolean",
-                        "description": "Whether Tavily should include a synthesized short answer",
-                        "default": False,
-                    },
-                },
-                "required": ["query"],
-            },
-            self._web_tools.tavily_search,
-            source="builtin",
-        )
+        builtin_web_tools.register_web_tools(r, web_tools=self._web_tools)
 
         if self._output_dir is not None:
             r.register(
