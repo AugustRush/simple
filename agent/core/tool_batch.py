@@ -62,7 +62,7 @@ class ToolBatchOutcome:
 
 async def run_tool_batch(
     *,
-    agent: Any,
+    deps: "LoopDeps",
     ctx: Any,
     tool_uses: list,
     orchestration_decision: Any = None,
@@ -111,7 +111,7 @@ async def run_tool_batch(
     published = active_assistant_text is not None
     intent_token = active_assistant_text.set(intent_text) if published else None
     try:
-        results = await agent._run_tool_uses(
+        results = await deps.run_tool_uses(
             tool_uses,
             orchestration_decision=orchestration_decision,
         )
@@ -120,7 +120,7 @@ async def run_tool_batch(
             active_assistant_text.reset(intent_token)
 
     _emit_tool_metrics(
-        agent=agent,
+        registry=deps.registry,
         ctx=ctx,
         tool_uses=tool_uses,
         step_index=step_index,
@@ -131,20 +131,20 @@ async def run_tool_batch(
 
     if tool_result_history is not None:
         tool_result_history.extend(
-            (tu["name"], agent._extract_summary_text(res))
+            (tu["name"], deps.extract_summary_text(res))
             for tu, res in zip(tool_uses, results)
         )
 
     # Screen results before API submission: a flagged result is summarized so it
     # does not trip the provider's content policy on the next call.
     filtered_results, risky_indices = filter_tool_results(
-        agent.content_filter,
+        deps.content_filter,
         tool_uses,
         results,
-        threshold=agent._content_filter_threshold,
+        threshold=deps.content_filter_threshold,
     )
     if risky_indices:
-        await agent.content_filter.learn_and_persist(
+        await deps.content_filter.learn_and_persist(
             [results[i] for i in risky_indices]
         )
         if logger is not None:
@@ -155,7 +155,7 @@ async def run_tool_batch(
                 [tool_uses[i]["name"] for i in risky_indices],
             )
 
-    restart_message = agent._clear_context_restart_message(tool_uses, results)
+    restart_message = deps.clear_context_restart_message(tool_uses, results)
     return ToolBatchOutcome(
         results=results,
         filtered_results=filtered_results,
@@ -166,7 +166,7 @@ async def run_tool_batch(
 
 def _emit_tool_metrics(
     *,
-    agent: Any,
+    registry: Any,
     ctx: Any,
     tool_uses: list,
     step_index: int,
@@ -179,12 +179,12 @@ def _emit_tool_metrics(
     spawn_calls = sum(
         1
         for tool_use in tool_uses
-        if "orchestration" in agent.registry.tool_capabilities(tool_use["name"])
+        if "orchestration" in registry.tool_capabilities(tool_use["name"])
     )
     regular_calls = sum(
         1
         for tool_use in tool_uses
-        if "orchestration" not in agent.registry.tool_capabilities(tool_use["name"])
+        if "orchestration" not in registry.tool_capabilities(tool_use["name"])
     )
     if trace_latency is not None:
         trace_latency(

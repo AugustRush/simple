@@ -35,18 +35,18 @@ class _Agent:
         self.checked: list = []
         self.built: list = []
 
-    def _check_tool_loop_stuck(self, watchdog, tool_uses, results):
+    def check_tool_loop_stuck(self, watchdog, tool_uses, results):
         self.checked.append((watchdog, len(tool_uses), len(results)))
         return self.reason
 
-    def _build_tool_loop_stuck_response(self, **kwargs):
+    def build_tool_loop_stuck_response(self, **kwargs):
         self.built.append(kwargs)
         return f"stuck because {kwargs['reason']}"
 
 
 def _run(agent, *, ctx=None, log=None, calls=None, **overrides):
     kwargs = dict(
-        agent=agent,
+        deps=agent,
         ctx=ctx if ctx is not None else _Ctx(),
         watchdog={"last_outcome": {"status": "unproductive"}},
         tool_uses=[{"name": "read_file"}],

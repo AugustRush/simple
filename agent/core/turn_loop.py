@@ -202,10 +202,23 @@ class LoopDeps:
     retry_policy: Any
 
     #: Content-filter recovery, as a seam on the agent: a test patches it to drive
-    #: the recovery path without provoking a real filter block.  The streaming half
-    #: of the model call is *not* here -- ``llm_attempt`` reaches it through the
-    #: agent directly, so declaring it would be a field nothing in the loop reads.
+    #: the recovery path without provoking a real filter block.
     recover_from_content_filter: Callable[..., Any]
+
+    #: The rest of what the turn reads off the agent, named here so the loop needs
+    #: no agent at all.  Measured rather than guessed: these are every member that
+    #: ``obtain_response``, ``run_tool_batch`` and ``handle_stuck_loop`` used, and
+    #: with them declared ``run_turn_loop`` takes a ``LoopDeps`` and nothing else.
+    #: Two are seams a test swaps out (``check_tool_loop_stuck`` is subclassed once),
+    #: so they are carried as the agent's own callables -- the same reason ``create``
+    #: is, and the same trap if a struct were built from the transport instead.
+    stream_response: Callable[..., Any]
+    extract_summary_text: Callable[..., Any]
+    run_tool_uses: Callable[..., Any]
+    clear_context_restart_message: Callable[..., Any]
+    content_filter_threshold: float
+    build_tool_loop_stuck_response: Callable[..., Any]
+    check_tool_loop_stuck: Callable[..., Any]
 
     @classmethod
     def from_services(
@@ -221,6 +234,13 @@ class LoopDeps:
         create: Callable[..., Any],
         retry_policy: Any,
         recover_from_content_filter: Callable[..., Any],
+        stream_response: Callable[..., Any],
+        extract_summary_text: Callable[..., Any],
+        run_tool_uses: Callable[..., Any],
+        clear_context_restart_message: Callable[..., Any],
+        content_filter_threshold: float,
+        build_tool_loop_stuck_response: Callable[..., Any],
+        check_tool_loop_stuck: Callable[..., Any],
         token_budget: Any,
         content_filter: Any = None,
         event_bus: Any = None,
@@ -274,6 +294,13 @@ class LoopDeps:
             create=create,
             retry_policy=retry_policy,
             recover_from_content_filter=recover_from_content_filter,
+            stream_response=stream_response,
+            extract_summary_text=extract_summary_text,
+            run_tool_uses=run_tool_uses,
+            clear_context_restart_message=clear_context_restart_message,
+            content_filter_threshold=float(content_filter_threshold),
+            build_tool_loop_stuck_response=build_tool_loop_stuck_response,
+            check_tool_loop_stuck=check_tool_loop_stuck,
         )
 
     @classmethod
@@ -321,6 +348,13 @@ class LoopDeps:
             create=agent._create,
             retry_policy=agent._retry_policy(),
             recover_from_content_filter=agent._recover_from_content_filter,
+            stream_response=agent._stream_response,
+            extract_summary_text=agent._extract_summary_text,
+            run_tool_uses=agent._run_tool_uses,
+            clear_context_restart_message=agent._clear_context_restart_message,
+            content_filter_threshold=float(agent._content_filter_threshold),
+            build_tool_loop_stuck_response=agent._build_tool_loop_stuck_response,
+            check_tool_loop_stuck=agent._check_tool_loop_stuck,
         )
 def prepare_turn(
         deps: "LoopDeps",
@@ -1245,7 +1279,6 @@ def warn_missing_usage(deps: "LoopDeps", ctx: "AgentContext") -> None:
         )
 async def run_turn_loop(
         deps: "LoopDeps",
-        agent: Any,
         ctx: AgentContext,
         user_message: str,
         attachments: Any,
@@ -1348,7 +1381,7 @@ async def run_turn_loop(
                     heartbeat.operation("LLM", deps.effective_model(ctx))
                     recovered = filter_recovery.take_pending_response()
                     _attempt = await obtain_response(
-                        agent=agent,
+                        deps=deps,
                         ctx=ctx,
                         tools=tools,
                         user_message=user_message,
@@ -1425,7 +1458,7 @@ async def run_turn_loop(
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         step_tool_calls = len(tool_uses)
                         _batch = await run_tool_batch(
-                            agent=agent,
+                            deps=deps,
                             ctx=ctx,
                             tool_uses=tool_uses,
                             orchestration_decision=orchestration_decision,
@@ -1491,7 +1524,7 @@ async def run_turn_loop(
                                 )
 
                         _stuck = handle_stuck_loop(
-                            agent=agent,
+                            deps=deps,
                             ctx=ctx,
                             watchdog=watchdog,
                             tool_uses=tool_uses,

@@ -1188,12 +1188,17 @@ def _loop_dependency_surface() -> tuple[set[str], set[str]]:
     # ``agent/core/turn_loop.py`` reads its dependencies as ``deps.X``, and a scan
     # that only looked at ``agent.py`` would report those as no longer borrowed --
     # so the struct assertion would demand removing fields the loop still uses.
-    loop_module = ast.parse(
-        (REPO_ROOT / "agent/core/turn_loop.py").read_text(encoding="utf-8")
-    )
-    for node in ast.walk(loop_module):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "deps":
-            needed.add(node.attr.lstrip("_"))
+    # ...and the loop's own code now spans four files, not two: `run_turn_loop` hands
+    # `deps` to `obtain_response`, `run_tool_batch` and `handle_stuck_loop`, and those
+    # read the struct themselves.  A scan of `turn_loop.py` alone reported the seven
+    # members they read as declared-but-dead.
+    for loop_file in ("turn_loop.py", "llm_attempt.py", "tool_batch.py", "tool_loop_decision.py"):
+        loop_module = ast.parse(
+            (REPO_ROOT / "agent/core" / loop_file).read_text(encoding="utf-8")
+        )
+        for node in ast.walk(loop_module):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "deps":
+                needed.add(node.attr.lstrip("_"))
 
     owned_elsewhere: set[str] = set()
     for name, node in methods.items():
@@ -1219,7 +1224,7 @@ def _loop_dependency_surface() -> tuple[set[str], set[str]]:
 
 
 def test_the_loop_dependency_struct_covers_what_the_loop_reads() -> None:
-    """``LoopDeps`` must be exactly what the loop reads from the agent.
+    """``LoopDeps`` must be exactly what the loop reads from its struct.
 
     Two directions, and they mean different things:
 

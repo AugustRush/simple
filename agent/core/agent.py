@@ -1462,7 +1462,6 @@ class BaseAgent:
         state = _TurnLoopState()
         return await run_turn_loop(
             self._loop_deps(),
-            self,
             ctx,
             user_message,
             attachments,

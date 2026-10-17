@@ -81,6 +81,15 @@ def _deps(**overrides):
         create=object(),
         retry_policy=object(),
         recover_from_content_filter=lambda *a, **k: None,
+        # The seven members the turn used to read off the agent.  Measured, not guessed:
+        # see `LoopDeps`'s comment.  Carried as callables/values so the loop needs no agent.
+        stream_response=lambda *a, **k: None,
+        extract_summary_text=lambda *a, **k: "",
+        run_tool_uses=lambda *a, **k: None,
+        clear_context_restart_message=lambda *a, **k: "",
+        content_filter_threshold=0.0,
+        build_tool_loop_stuck_response=lambda *a, **k: "",
+        check_tool_loop_stuck=lambda *a, **k: False,
         token_budget=_Budget(),
     )
     kwargs.update(overrides)

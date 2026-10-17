@@ -66,24 +66,24 @@ class _Agent:
         self.restart = restart
         self.calls: list = []
         self.content_filter = _Filter(risky=risky)
-        self._content_filter_threshold = 0.5
+        self.content_filter_threshold = 0.5
         self.registry = _Registry()
 
-    async def _run_tool_uses(self, tool_uses, orchestration_decision=None):
+    async def run_tool_uses(self, tool_uses, orchestration_decision=None):
         self.calls.append(("run", len(tool_uses)))
         return list(self.results)
 
-    def _extract_summary_text(self, result):
+    def extract_summary_text(self, result):
         return f"summary({result})"
 
-    def _clear_context_restart_message(self, tool_uses, results):
+    def clear_context_restart_message(self, tool_uses, results):
         return self.restart
 
 
 def _run(agent, *, tool_uses=None, history=None, **overrides):
     tool_uses = tool_uses if tool_uses is not None else [{"name": "read_file"}]
     kwargs = dict(
-        agent=agent,
+        deps=agent,
         ctx=_Ctx(),
         tool_uses=tool_uses,
         orchestration_decision=None,
@@ -152,7 +152,7 @@ def test_the_token_is_reset_even_when_the_batch_raises() -> None:
     token = _Token()
 
     class _Boom(_Agent):
-        async def _run_tool_uses(self, tool_uses, orchestration_decision=None):
+        async def run_tool_uses(self, tool_uses, orchestration_decision=None):
             raise RuntimeError("tool exploded")
 
     with pytest.raises(RuntimeError, match="tool exploded"):
@@ -223,7 +223,7 @@ def test_the_filter_receives_the_configured_threshold() -> None:
         return list(results), []
 
     agent = _Agent()
-    agent._content_filter_threshold = 0.25
+    agent.content_filter_threshold = 0.25
     _run(agent, filter_tool_results=spy)
     assert seen["threshold"] == 0.25
     assert seen["filter"] is agent.content_filter
@@ -266,7 +266,7 @@ def test_the_orchestration_decision_reaches_the_runner() -> None:
     seen: dict = {}
 
     class _Recorder(_Agent):
-        async def _run_tool_uses(self, tool_uses, orchestration_decision=None):
+        async def run_tool_uses(self, tool_uses, orchestration_decision=None):
             seen["decision"] = orchestration_decision
             return list(self.results)
 

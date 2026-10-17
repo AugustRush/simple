@@ -69,7 +69,7 @@ class LLMAttempt:
 
 async def obtain_response(
     *,
-    agent: Any,
+    deps: "LoopDeps",
     ctx: Any,
     tools: list,
     user_message: str,
@@ -139,8 +139,8 @@ async def obtain_response(
         )
         llm_task = asyncio.create_task(
             retry(
-                agent._retry_policy(),
-                agent._stream_response,
+                deps.retry_policy,
+                deps.stream_response,
                 ctx,
                 tools,
                 tracked_callback,
@@ -151,7 +151,7 @@ async def obtain_response(
     else:
         tracked_callback = None
         llm_task = asyncio.create_task(
-            retry(agent._retry_policy(), agent._create, ctx, tools)
+            retry(deps.retry_policy, deps.create, ctx, tools)
         )
 
     def _abort_llm(level: str) -> None:

@@ -49,7 +49,7 @@ class StuckDecision:
 
 def handle_stuck_loop(
     *,
-    agent: Any,
+    deps: "LoopDeps",
     ctx: Any,
     watchdog: Any,
     tool_uses: list,
@@ -72,13 +72,13 @@ def handle_stuck_loop(
     Returns a decision with ``stuck=False`` for the ordinary case, which is the
     common path -- the check runs on every tool step and almost never fires.
     """
-    reason = agent._check_tool_loop_stuck(watchdog, tool_uses, results)
+    reason = deps.check_tool_loop_stuck(watchdog, tool_uses, results)
     if not reason:
         return StuckDecision(stuck=False)
 
     from agent.core.agent import AgentResult
 
-    text = agent._build_tool_loop_stuck_response(
+    text = deps.build_tool_loop_stuck_response(
         user_message=user_message,
         reason=reason,
         tool_uses=tool_uses,

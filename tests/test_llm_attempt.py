@@ -74,16 +74,16 @@ class _Agent:
         self.result = result if result is not None else "RESPONSE"
         self.raises = raises
         self.calls: list[str] = []
-        self._retry_policy = _stub_retry_policy
+        self.retry_policy = _stub_retry_policy()
         self._model_call = lambda: _stub_model_call(self)
 
-    async def _create(self, ctx, tools):
+    async def create(self, ctx, tools):
         self.calls.append("create")
         if self.raises:
             raise self.raises
         return self.result
 
-    async def _stream_response(self, ctx, tools, callback, reasoning, **kw):
+    async def stream_response(self, ctx, tools, callback, reasoning, **kw):
         self.calls.append("stream")
         if self.raises:
             raise self.raises
@@ -100,7 +100,7 @@ async def _passthrough(policy, fn, *args, **kwargs):
 
 def _run(agent, **overrides):
     kwargs = dict(
-        agent=agent,
+        deps=agent,
         retry=_passthrough,
         ctx=_Ctx(),
         tools=[],
