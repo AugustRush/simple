@@ -257,3 +257,100 @@ def test_both_routes_carry_the_real_budget_through() -> None:
         )
         assert isinstance(budget, int) and budget >= 0, (route, budget)
 
+
+
+# ── the runtime proof: a whole turn, from services, with no agent ─────────────
+
+
+class _StubTransport:
+    """The provider adapter's surface, as `run_turn_loop` reads it.
+
+    Enumerated from the four files the loop spans rather than guessed: `parse_response`,
+    `has_incomplete_tool_calls`, `completion_error`, `tool_result_rollback_count`,
+    `build_final_message`, `image_content_block`, `stream`.  Only `parse_response` is
+    exercised by a no-tool turn; the rest exist so a later branch fails with a real
+    assertion rather than an AttributeError.
+    """
+
+    tool_result_rollback_count = 0
+
+    def parse_response(self, response, *, model=None):
+        return ("stop", str(response), [])
+
+    def has_incomplete_tool_calls(self, *args, **kwargs) -> bool:
+        return False
+
+    def completion_error(self, *args, **kwargs):
+        return None
+
+    def build_final_message(self, *args, **kwargs):
+        return {}
+
+    def image_content_block(self, *args, **kwargs):
+        return {}
+
+    async def stream(self, *args, **kwargs):
+        return ("stop", "", [])
+
+
+class _StubBus:
+    def has_listeners(self, *args, **kwargs) -> bool:
+        return False
+
+    def emit(self, *args, **kwargs) -> None:
+        return None
+
+
+class _StubAssembler:
+    def select_tools(self, *args, **kwargs):
+        return []
+
+
+class _StubContextManager:
+    session_id = "s1"
+
+    def retrieve_implicit_context(self, *args, **kwargs):
+        return ""
+
+    def has_active_working_state(self) -> bool:
+        return False
+
+
+def test_a_whole_turn_runs_from_service_built_deps() -> None:
+    """The claim at runtime: one turn, from `from_services`, with no agent anywhere.
+
+    The structural test next door pins the signature.  This one pins that the struct built
+    from services is *sufficient*: the loop reaches the model, takes its answer, and returns
+    without an error.  Getting here took four missing members' worth of measurement -- the
+    transport surface (`has_incomplete_tool_calls`, ...) and a real `RetryPolicy` -- which is
+    exactly the kind of gap a signature check cannot see.
+    """
+    import asyncio
+
+    from agent import AgentContext, ToolRegistry
+    from agent.core.retry import RetryPolicy
+    from agent.core.turn_loop import run_one_turn
+
+    calls: list[str] = []
+
+    async def fake_create(ctx, tools):
+        calls.append(ctx.system_prompt)
+        return "the answer"
+
+    deps = _deps(
+        transport=_StubTransport(),
+        registry=ToolRegistry(),
+        context_assembler=_StubAssembler(),
+        context_manager_for=lambda ctx=None: _StubContextManager(),
+        create=fake_create,
+        event_bus=_StubBus(),
+        llm_event_bus=_StubBus(),
+        retry_policy=RetryPolicy(max_retries=0, base_delay=0.0, event_bus=None),
+        format_agent_error=lambda *a, **k: f"{type(a[0]).__name__}: {a[0]}" if a else "?",
+    )
+    ctx = AgentContext(system_prompt="system")
+    result = asyncio.run(run_one_turn(ctx, "a question", deps=deps))
+
+    assert result.error is None, result.error
+    assert result.content == "the answer"
+    assert calls == ["system"], calls
