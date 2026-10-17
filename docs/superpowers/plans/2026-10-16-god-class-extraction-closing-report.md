@@ -10,11 +10,18 @@ against the original.  Nothing here is claimed that those two did not check.
 
 | file | survey's original | this session's start | now | this session |
 |---|---|---|---|---|
+| `agent/tools/builtin_tools.py` | — | 2062 | **339** | −84% |
 | `agent/scheduler/store.py` | 4086 | 3538 | **1534** | −57% |
-| `agent/channels/web.py` | 3319 | 3225 | **2630** | −18% |
 | `agent/memory/store.py` | 2835 | 1837 | **1009** | −45% |
-| `agent/core/agent.py` | 2536 | 2235 | **2032** | −9% |
-| `agent/memory/context.py` | 2484 | 1911 | **1266** | −34% |
+| `agent/memory/context.py` | 2484 | 1911 | **1113** | −42% |
+| `agent/channels/web.py` | 3319 | 3225 | **2630** | −18% |
+| `agent/channels/feishu.py` | 1958 | 1958 | **1725** | −12% |
+| `agent/core/agent.py` | 2536 | 2235 | **1863** | −17% |
+
+`builtin_tools.py` is in the table because the round's last stretch took its `_register` method apart:
+1650 → 59 lines, seven cluster modules, and `_register` is now a readable ordered list.  It was not
+in the original survey's five because it was not one of the four god classes — it became the fifth
+when the measurements said 84% of it was one method.
 
 "Survey's original" is what the survey measured when the work was planned; "this session's start"
 is `232c345`, the first commit of this round.  Both are given because the earlier round had already
@@ -153,8 +160,34 @@ test's setup as a script and printing the swallowed error**.
 * **`feishu.py`** — five modules were extracted from it in an *earlier* round
   (`feishu_attachments/files/parsing/progress/render`); the rest depends heavily on `_client` /
   `_config` / `_handler`, so only one low-coupling family (the message attachments) came out.
-* **The smaller cousin**, `memory/context.py`, is down 34% but its remaining 1266 lines are mostly
-  the job cluster above.
+* **The smaller cousin**, `memory/context.py`, is down 42% — its job/consolidation cluster *was*
+  done: sixteen methods moved into `agent/memory/jobs.py` behind a `JobQueue` that owns the six
+  pieces of mutable state, with the two tests that reach into the instance kept working through
+  forwarding properties.
+
+## The boundary: from a claim to two proofs
+
+The extraction was never the goal; pluginization was, and the question it asks is whether a third
+party can extend this by depending only on published interfaces.  The turn was the last piece that
+could not answer it: `LoopDeps.from_services` existed and was only ever built by tests, so a turn
+still needed an agent.
+
+That is now closed, in two steps and with two proofs:
+
+* `run_turn_loop(deps, ctx, ...)` takes no agent.  The seven members the three runner functions read
+  were measured (not guessed) and declared on `LoopDeps`; **structural** proof: the signature has no
+  `agent`, and the four functions running a turn read every dependency as `deps.X`.
+* The turn's entry — the contextvars, heartbeat, watchdog, turn state — moved to
+  `turn_loop.run_one_turn`, so `BaseAgent.send_message` is a twelve-line adapter.
+  **Runtime** proof: `test_a_whole_turn_runs_from_service_built_deps` builds a `LoopDeps` from
+  services only and runs a whole turn; the model is reached and `result.error is None`.
+
+The two proofs are not redundant.  The structural one is cheap and would fail first on a
+regression; the runtime one found four gaps a signature check cannot see — a placeholder
+`retry_policy`, a transport missing `has_incomplete_tool_calls` (a seven-member surface), a
+`context_manager_for()` called without a context in one teardown path, and a `format_agent_error`
+stub that mapped the exception to `""` and so reported "no error, no model call" instead of the real
+`AttributeError`.  A stub that is too forgiving hides the failure it exists to surface.
 
 ## Corrections to my own claims
 
