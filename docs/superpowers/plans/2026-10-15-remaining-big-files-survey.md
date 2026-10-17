@@ -24,7 +24,7 @@ recording" below.
 |---|---|---|---|---|---|
 | `agent/scheduler/store.py` | 1534 (was 4086) | `SchedulerStore` | 74 | 2783 | **0 lines** |
 | `agent/memory/store.py` | 1009 (was 2835) | `LTMStore` | 67 | 1763 | **0 lines** |
-| `agent/core/agent.py` | 1980 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
+| `agent/core/agent.py` | 1958 (was 2536) | `BaseAgent` | 79 | 1940 | **33 / 301 lines** |
 | `agent/memory/context.py` | 1113 (was 2484) | `ContextManager` | 60 | 1563 | **2 / 21 lines** |
 
 81 methods and **1176 lines** can leave their class without designing a single seam.  That is
