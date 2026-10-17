@@ -320,6 +320,26 @@ the four files); `context_manager_for()` called with no ctx in one teardown path
 reported "no error, no model call" instead of the real `AttributeError`.  A stub that is too
 forgiving hides the failure it was supposed to surface.
 
+## 2g. The service declarations, checked at runtime as well as in source
+
+The composition's vocabulary (`agent/runtime/services.py`) already has four source guards: every
+declared name is written by someone, every contract member has a caller, every contract is checked
+somewhere, and every context key is read.  What those cannot say is whether a **real composition**
+provides them, so this was measured once by building it in-process (a temp home with a copy of the
+config, `_build_components_async`, then `resolve` for each declaration):
+
+* **15 declarations carry a contract** (a protocol — the ones a plugin may be told to inject).
+  **14 resolve**; the fifteenth, `mcp_client`, is registered **per session and only when the session
+  has one** (`bootstrap.py`: `if _session_mcp is not None`), which is a deliberate condition, not a
+  missing provider.
+* **52 are values** (computed by the composition, no contract).  Fifteen of them — `session_id`,
+  `workspace`, `permissions`, `shell_*`, `scheduler*`, `turn_request`, the two workers,
+  `_shares_global_runtime` — are absent in a bare composition because they are set when a session
+  or a turn starts.  Asking before starting one is the wrong moment, not a gap.
+
+So the vocabulary is enforced in both directions: source for "someone writes it", runtime for "the
+composition provides it", with the conditional one named rather than waived.
+
 ## 2d. `BaseAgent`'s orchestration core — measured: it is the irreducible kernel
 
 After the facade tier and the executors came out, `core/agent.py` is 1958 lines and what is left
