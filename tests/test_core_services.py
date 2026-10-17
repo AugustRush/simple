@@ -1552,17 +1552,31 @@ def test_the_loop_body_lives_in_the_loop_module() -> None:
     calls = {
         ast.unparse(call.func)
         for call in ast.walk(send)
-        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        if isinstance(call, ast.Call)
     }
-    assert "run_turn_loop" in calls, (
-        f"send_message must call the moved loop; it calls {sorted(calls)}"
+    # The entry now lives in `turn_loop.run_one_turn`, so the agent's `send_message` may reach
+    # the loop either directly or through that entry -- but it must reach it, and it must not
+    # carry a body of its own (a `try` here would mean the teardown came back).
+    assert "run_turn_loop" in calls or "turn_loop.run_one_turn" in calls, (
+        f"send_message must call the loop; it calls {sorted(calls)}"
+    )
+    assert not any(isinstance(stmt, ast.Try) for stmt in send.body), (
+        "send_message is an adapter: the teardown belongs with the loop"
     )
 
     loop_tree = ast.parse((REPO_ROOT / "agent/core/turn_loop.py").read_text(encoding="utf-8"))
-    fn = next(
-        node for node in ast.walk(loop_tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_turn_loop"
-    )
+    loop_functions = {
+        node.name: node
+        for node in ast.walk(loop_tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    for name in ("run_one_turn", "run_turn_loop"):
+        assert name in loop_functions, f"{name} belongs to agent/core/turn_loop.py"
+    entry = loop_functions["run_one_turn"]
+    assert "run_turn_loop" in {
+        ast.unparse(call.func) for call in ast.walk(entry) if isinstance(call, ast.Call)
+    }, "run_one_turn must call the loop"
+    fn = loop_functions["run_turn_loop"]
     assert any(isinstance(stmt, ast.Try) for stmt in fn.body), (
         "the loop and its teardown are one unit: the try/finally must be in the "
         "moved function, not left behind in the caller"

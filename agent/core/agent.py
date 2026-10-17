@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent.core import turn_loop
 from agent.core import subtask_execution
 from agent.core import agent_facades
 from agent.core import loop_messages
@@ -1374,111 +1375,16 @@ class BaseAgent:
         user_message: str,
         stream_callback: Optional[Callable[[str], None]] = None,
         attachments: tuple[MessageAttachment, ...] = (),
-    ) -> "AgentResult":
-        """Run one turn.
-
-        ``stream_callback`` receives the answer as it is produced.  The model's
-        thinking, when the provider produces any, goes to the turn's sink
-        instead (see ``_stream_response``): it is a sink capability rather than
-        a stream the caller asks for, so this signature did not have to grow a
-        second callback that every caller would then have to accept.
-        """
-        tool_calls_made: list[str] = []
-        tool_result_history: list[tuple[str, str]] = []
-        result_text = ""
-        watchdog = self._new_watchdog_state()
-        orchestration_token = None
-        if not ctx.metadata.get("_orchestration_child"):
-            orchestration_token = _active_orchestration_runs.set([])
-        filter_recovery = _ContentFilterRecovery()
-        turn_started_at = time.perf_counter()
-        trace_status = "ok"
-        trace_error: str | None = None
-        steps = 0
-        await _emit_domain_event(
-            self._event_bus,
-            TurnStarted,
-            agent_id=ctx.agent_id,
-            tools_enabled=bool(ctx.tools_enabled),
-            streamed=bool(stream_callback),
-        )
-        _interaction_log(
-            "turn_started",
-            agent_id=ctx.agent_id,
-            tools_enabled=ctx.tools_enabled,
-            stream=bool(stream_callback),
-            message_len=len(user_message),
-            message_preview=_preview_text(user_message),
-        )
-        _trace_latency(
-            "send_message_started",
-            agent_id=ctx.agent_id,
-            tools_enabled=ctx.tools_enabled,
-            stream=bool(stream_callback),
-            message_len=len(user_message),
+    ) -> 'AgentResult':
+        """Run one turn."""
+        return await turn_loop.run_one_turn(
+            ctx=ctx,
+            user_message=user_message,
+            stream_callback=stream_callback,
+            attachments=attachments,
+            deps=self._loop_deps(),
         )
 
-        # Set the active agent context so built-in tools (e.g. clear_context)
-        # can access the current ctx.messages.  Done before the try so the
-        # token is always bound when the finally clause reaches reset().
-        _active_ctx_token = _active_agent_context.set(ctx)
-        # Publish the cancel token via ContextVar so any tool deep in the
-        # call stack (shell subprocess, LLM transport) can register a cleanup
-        # without us having to thread the token through every API.
-        _cancel_token_token = shared._active_cancel_token.set(
-            ctx.metadata.get("cancel_token")
-        )
-        # The conversation this turn belongs to, for the same reason and for one
-        # more: a gateway that asks for "one stable id per conversation" in a
-        # request header gets it from here.  Set for the span of the turn by
-        # both the interactive paths and the scheduler, whose runs each carry
-        # their own `scheduler:<task>:<run>` id, so a scheduled run is one
-        # conversation to the provider just as it is to us.
-        _session_id_token = shared._active_session_id.set(
-            str(ctx.metadata.get("session_id") or "") or None
-        )
-
-        # B1: wrap ALL mutations (prompt injection, messages append, stack push)
-        # inside the try/finally so they are always cleaned up on error.
-        # Start the per-turn heartbeat here so it sees the active sink.
-        from agent.core.output import _active_sink as _hb_sink_var
-
-        heartbeat_writer: HeartbeatWriter | None = None
-        if ctx.metadata.get("heartbeat_enabled", True) is not False:
-            heartbeat_writer = HeartbeatWriter(
-                session_id=str(ctx.metadata.get("session_id") or ctx.agent_id),
-                agent_id=ctx.agent_id,
-                path=ctx.metadata.get("heartbeat_path"),
-            )
-        heartbeat = TurnHeartbeat(
-            writer=heartbeat_writer,
-            interval_seconds=float(ctx.metadata.get("heartbeat_interval", 5.0) or 5.0),
-            turn_id=str(ctx.metadata.get("turn_id") or ""),
-            pending_messages=lambda: len(ctx.metadata.get("pending_messages") or []),
-            sink_provider=_hb_sink_var.get,
-        )
-        await heartbeat.__aenter__()
-
-        state = _TurnLoopState()
-        return await run_turn_loop(
-            self._loop_deps(),
-            ctx,
-            user_message,
-            attachments,
-            stream_callback,
-            max_steps=max(1, int(self.max_tool_call_iterations)),
-            orchestration_token=orchestration_token,
-            filter_recovery=filter_recovery,
-            watchdog=watchdog,
-            tool_calls_made=tool_calls_made,
-            tool_result_history=tool_result_history,
-            heartbeat=heartbeat,
-            turn_started_at=turn_started_at,
-            active_ctx_token=_active_ctx_token,
-            cancel_token_token=_cancel_token_token,
-            session_id_token=_session_id_token,
-            state=state,
-        )
 
     @staticmethod
     def _post_turn_maintenance(

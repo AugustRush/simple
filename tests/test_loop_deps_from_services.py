@@ -256,3 +256,4 @@ def test_both_routes_carry_the_real_budget_through() -> None:
             _RealCtx(), [], current_user_content="hello"
         )
         assert isinstance(budget, int) and budget >= 0, (route, budget)
+
