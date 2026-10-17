@@ -198,7 +198,20 @@ Recorded rather than fixed:
    ("the loader does not know this shape"), which no runtime assertion can see.  The line is
    worth stating so that reading source does not become the default way to check something a
    type or a refusal could check.
-6. **The god classes' smaller cousin:** `agent/memory/context.py` at 2483 lines, and the
-   four remaining `MemoryPalace`-adjacent direct constructions in `agent/cli.py` that are
-   *not* on the read-only path — `memory tidy` builds a full composition, which is correct
-   but heavier than the rest.
+6. ~~**The god classes' smaller cousin**~~ — **done**, and the second half of this item was
+   wrong when written.  `agent/memory/context.py` is 1113 lines (2483 originally), with its
+   job/consolidation cluster behind a `JobQueue` in `agent/memory/jobs.py`.  And there are
+   **no** `MemoryPalace`-adjacent direct constructions left in `agent/cli.py`: counted with a
+   grep for `MemoryPalace(|LTMStore(|ContextManager(|ConsolidationEngine(|SchedulerStore(`
+   outside the composition, the only one in `cli.py` is `_fallback_plugin_catalog` (the gated
+   fallback added by the trust fix), and every memory command — `memory tidy` included — goes
+   through `memory_service(cfg)`, which is the composition's own declaration of that name.
+   Every other hit is a *provider* constructing its own implementation, which is what a
+   provider is for.
+
+   Two claims I re-checked while here, recorded so the next reader does not have to:
+   `import_dsh_profile` is real (`agent/tools/plugin_tools.py` and `agent/plugins/dsh_import.py`),
+   and `_post_turn_maintenance` still exists as a wrapper over `agent/core/post_turn.py` — the
+   backlog's "removed, not fixed" is about the *published service name*, not the method.  I
+   suspected both were stale and was wrong twice; measuring first is what kept that out of the
+   document.
