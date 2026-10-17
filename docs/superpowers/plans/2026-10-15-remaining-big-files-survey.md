@@ -270,6 +270,37 @@ check counted a constant's **own definition line** as a reader and refused a con
 else touched.  Both are the same lesson as the rest of this work: a guard that answers a
 different question than the one asked fails in the direction that looks like success.
 
+## 2d. `BaseAgent`'s orchestration core — measured: it is the irreducible kernel
+
+After the facade tier and the executors came out, `core/agent.py` is 1958 lines and what is left
+of the *orchestration* is four methods.  Each was measured for lines, instance writes and test
+doubles before deciding; none of the four can be moved by extraction, and the reason differs:
+
+| method | lines | writes instance state | test doubles | verdict |
+|---|---|---|---|---|
+| `run_rendezvous_subtasks` | 41 | no | none | **moved** (`core/subtask_execution.py`, seams as capabilities) |
+| `run_pipeline_subtasks` | 27 | no | 1 instance patch | a **thin delegate** to `orchestration/runtime`; nothing to move |
+| `run_parallel_subtasks` | 14 | no | 1 instance patch | same |
+| `_execute_agent` | 166 | no | closure of 17 methods / 296 lines | needs an `OrchestrationDeps` surface |
+| `_run_tool_uses` | 122 | no | closure of 36 methods / 788 lines | needs the same, plus the tool loop |
+| `send_message` | 111 | no | **30 test definitions, 15 patches** | a public seam; moving it breaks them |
+| `register_spawn_capability` | 157 | **`workspace_root`, `_base_system_prompt`** | 6 subclass overrides | writes state and builds a `parent = self` closure |
+
+So "it needs 14-18 collaborators" was the wrong summary.  The four that remain are blocked by
+three *different* things, and only one of them is cardinality:
+
+* **a public seam** (`send_message`) — 30 test doubles exist because it is the agent's entry point;
+* **state ownership** (`register_spawn_capability`) — it initialises two attributes and closes over
+  the agent; a facade would have to hand back the values and every caller would have to assign them;
+* **one large closure each** (`_execute_agent`, `_run_tool_uses`) — they are the turn's decision
+  graph, not a helper.
+
+That is what `LoopDeps.from_services` is for, and its docstring says so: a turn should take
+`llm`, `registry` and the rest as services, "with an agent being one thing that happens to hold
+them".  The path to these four is therefore not a move but a **second construction route** — an
+orchestration surface built from services the way `LoopDeps.from_services` is — and that is a
+redesign of the turn's entry, to be judged as such.
+
 ## 3. `agent/memory/store.py` — 2835 lines
 
 ### Shape
