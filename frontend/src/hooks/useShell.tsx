@@ -13,7 +13,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, connected, connecting, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -34,6 +34,32 @@ export function useShell(deps: Deps) {
   // why the idle cadence exists at all rather than the timer stopping when
   // nothing is imminent.
   const selectedScheduleId = selectedSchedule?.id || ''
+
+  // "/" starts a command, which is what the empty state tells the reader to do
+  // ("按 / 使用命令"). The key was only handled *inside* the textarea, and a freshly
+  // opened page has focus on the body -- so on the screen that prints the hint,
+  // pressing "/" did nothing at all. A typed draft is never overwritten: when there
+  // is text, focusing the composer is the whole gesture.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return
+      const target = event.target as HTMLElement | null
+      if (
+        target?.tagName === 'INPUT'
+        || target?.tagName === 'TEXTAREA'
+        || target?.isContentEditable
+      ) {
+        return
+      }
+      const composer = composerRef.current
+      if (!composer) return
+      event.preventDefault()
+      composer.focus()
+      if (!input.trim()) setInput('/')
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [composerRef, input, setInput])
 
   useEffect(() => {
     if (view !== 'schedules') return

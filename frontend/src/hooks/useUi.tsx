@@ -54,11 +54,21 @@ export function useUi() {
   }, [])
 
   useEffect(() => {
-    const collapseOnMobile = () => {
-      if (window.innerWidth <= 768) setCollapsed(true)
+    // Follow the breakpoint, not every resize: crossing 768px flips the sidebar
+    // either way, while a resize that stays on one side leaves the reader's own
+    // choice alone. The old listener only ever collapsed, so widening a window --
+    // or rotating a tablet -- left the sidebar closed until it was reopened by
+    // hand, and with it went the theme and settings entries: the collapsed sider
+    // is a zero-width one, not an icon rail.
+    let narrow = window.innerWidth <= 768
+    const onResize = () => {
+      const next = window.innerWidth <= 768
+      if (next === narrow) return
+      narrow = next
+      setCollapsed(next)
     }
-    window.addEventListener('resize', collapseOnMobile)
-    return () => window.removeEventListener('resize', collapseOnMobile)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
   }, [])
 
   return { clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, setThemeMode, setView, themeMode, view } as const
