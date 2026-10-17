@@ -270,6 +270,30 @@ check counted a constant's **own definition line** as a reader and refused a con
 else touched.  Both are the same lesson as the rest of this work: a guard that answers a
 different question than the one asked fails in the direction that looks like success.
 
+## 2e. The turn loop no longer needs an agent — the boundary is a fact now
+
+`LoopDeps.from_services` existed and was exercised by tests, but nothing production ran a turn
+through it; `LoopDeps.of(agent)` was the only route.  That is the difference between "the
+mechanism" and "the boundary", and it was the remaining pluginization gap.
+
+Measured, not guessed: `run_turn_loop` passed `agent` to exactly three functions
+(`obtain_response`, `run_tool_batch`, `handle_stuck_loop`), and those three read **ten**
+members between them.  Seven were missing from `LoopDeps` and were added; the three functions
+now take `deps`; `run_turn_loop(deps, ctx, ...)` has no agent parameter; `send_message` is a
+pure adapter (`self._loop_deps()`).  Two of the seven are test seams
+(`check_tool_loop_stuck` is subclassed once, `_run_tool_uses` is the orchestration kernel), so
+they are carried as **the agent's own callables** — the same reason `create` is a field, and
+the same trap if the struct were built from the transport instead.
+
+One dead parameter was found by the measurement: `_emit_tool_metrics(agent=...)` used no member
+of the agent and never forwarded it.
+
+The repository's own ledger guard caught the update I owed it: it scanned `turn_loop.py` for
+`deps.X` to check the struct covers what the loop reads, and the loop's code now spans **four**
+files — so the seven new fields looked declared-but-dead.  It now asks the sharper question
+("does the struct cover what the loop reads *from it*"), and a structural test (`run_turn_loop`
+takes no agent; the four runner functions read no `agent.X`) pins it.
+
 ## 2d. `BaseAgent`'s orchestration core — measured: it is the irreducible kernel
 
 After the facade tier and the executors came out, `core/agent.py` is 1958 lines and what is left
