@@ -248,6 +248,23 @@ class WebChannel(Channel):
             self._session_service = SessionService(live_states=self._sessions)
         return self._session_service
 
+    def _scheduler(self) -> Any:
+        """The mounted scheduler, or None when this composition has none.
+
+        By its **declared** name.  The scheduler is a mounted plugin and offers itself
+        as ``scheduler`` (``agent/runtime/services.py``), but these four routes asked
+        for ``scheduler_service`` -- a name nothing has provided since the plugin
+        switch -- so ``GET /api/scheduler/health`` answered "offline" on a healthy
+        gateway and run-now, retry and cancel all answered 503.  The screen built on
+        that read is what the browser showed: a red "调度器离线" and every 立即运行
+        button disabled, on a scheduler that was running the whole time.
+
+        Absence is tolerated rather than raised: a composition that mounts no
+        scheduler is a real one (a channel-only embed), and the honest answer to it
+        is 503, not an exception.
+        """
+        return self._components.get("scheduler")
+
     @staticmethod
     def _resolve_model_override(raw_model: Any) -> str | None:
         """Validate a model selected by the browser."""
@@ -1125,7 +1142,7 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        service = self._components.get("scheduler_service")
+        service = self._scheduler()
         if service is None:
             return JSONResponse({"error": "scheduler is offline"}, status_code=503)
         claimed = await service.run_task_now(str(request.path_params["task_id"]))
@@ -1146,7 +1163,7 @@ class WebChannel(Channel):
             body = {}
         if not isinstance(body, dict):
             return JSONResponse({"error": "invalid json body"}, status_code=400)
-        service = self._components.get("scheduler_service")
+        service = self._scheduler()
         if service is None:
             return JSONResponse({"error": "scheduler is offline"}, status_code=503)
         claimed = await service.retry_run(
@@ -1165,7 +1182,7 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        service = self._components.get("scheduler_service")
+        service = self._scheduler()
         if service is None:
             return JSONResponse({"error": "scheduler is offline"}, status_code=503)
         cancelled = await service.cancel_run(
@@ -1263,7 +1280,7 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        service = self._components.get("scheduler_service")
+        service = self._scheduler()
         if service is None:
             return JSONResponse({"status": "offline", "active_runs": 0})
         return JSONResponse(service.health())

@@ -511,23 +511,131 @@ def test_every_declared_name_is_written_by_someone() -> None:
 
 
 def test_every_source_use_is_declared() -> None:
-    """The direction that matters, and the one a mirror kept failing at.
+    """What this *used* to claim, and why it could never fail.
 
-    Reads *and* writes: a name the source touches and the table does not declare is an
-    undeclared service, and the whole point of the table is that there are none.  Both
-    directions were previously spread across four assertions whose only job was to compare
-    the table against this scan; now the scan simply is the answer.
+    It read the scan's buckets and reported a name in them that the table does not
+    declare -- but ``_scan``'s ``note`` drops every name outside the table before it
+    reaches a bucket, so both buckets are declared names by construction and the list
+    was always empty.  The scan cannot answer this question at all: it is keyed by
+    declared names, so an undeclared one is invisible to it.  Ten days of a red
+    "调度器离线" and a disabled 立即运行 on every scheduled task are what that gap
+    looked like; the question is asked properly by
+    :func:`test_every_key_read_from_a_component_mapping_is_declared`, which does not
+    consult the table before it looks.
     """
     writers, readers = _scan()
-    undeclared: list[str] = []
-    for bucket, label in ((writers, "writes"), (readers, "reads")):
-        for name, files in sorted(bucket.items()):
-            if name not in {entry.name for entry in SERVICES}:
-                undeclared.append(f"{name}: not declared, {label} by {sorted(files)}")
+    declared = {entry.name for entry in SERVICES}
+    # The two things the buckets really do say, and the reason they are kept: no entry
+    # names a service the table lacks, and both directions are populated at all.
+    assert set(writers) | set(readers) <= declared
+    assert writers and readers
+
+
+def _components_receiver(node: ast.AST) -> bool:
+    """Is this expression a *components* mapping -- the thing keyed by service name?
+
+    Matched by the name it is bound to (``components``, ``self._components``), which is
+    the convention every one of these mappings follows.  Deliberately not every dict:
+    ``metadata["skill_catalog"]`` carries a service name without being a service
+    container, and treating config sections as services has produced false positives
+    twice in this file already.
+    """
+    if isinstance(node, ast.Name):
+        return node.id == "components"
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"components", "_components"}
+    return False
+
+
+def _component_key_reads() -> dict[str, set[str]]:
+    """Every literal key read from a components mapping, by ``path:line``.
+
+    A components mapping is keyed by service name, so a key that is neither declared nor
+    runtime state is a read of something that does not exist.  This is the check the
+    table-shaped scan structurally cannot make (see the test above): it starts from the
+    source, not from the declaration.
+    """
+    reads: dict[str, set[str]] = {}
+    for path in sorted(AGENT_ROOT.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        rel = str(path.relative_to(REPO_ROOT))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        targets = _is_assignment_target(tree)
+        for node in ast.walk(tree):
+            key: str | None = None
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and _components_receiver(node.func.value)
+            ):
+                key = _string_key(node)
+            elif (
+                isinstance(node, ast.Subscript)
+                and _components_receiver(node.value)
+                and id(node) not in targets
+            ):
+                key = _string_key(node)
+            if key is not None:
+                reads.setdefault(key, set()).add(f"{rel}:{node.lineno}")
+    return reads
+
+
+#: Keys a components mapping carries that are *not* services, each with the reason.
+#: Every one is installed by the process that reads it (the channel runner, the gateway)
+#: rather than provided by a plugin, so there is no plugin-facing contract for the table
+#: to declare.  Listed rather than skipped: an unlisted key is the bug this catches.
+_RUNTIME_COMPONENT_KEYS: dict[str, str] = {
+    "session_runtime_cleanup": (
+        "installed by the channel runner (`components.setdefault`) so an evicted "
+        "session can tear down its runtime; the web channel only calls it"
+    ),
+    "project_memory_scope": (
+        "per-session memory scope installed by the channel runner before spawning a "
+        "session's memory context manager"
+    ),
+    "command_context": (
+        "the gateway's command context, set into the mapping so builtin commands can "
+        "read the session state they were invoked from"
+    ),
+    "ctx": (
+        "the same command context in the shape the evolution plugin reads; the gateway "
+        "puts it there, no plugin provides it"
+    ),
+}
+
+
+def test_every_key_read_from_a_component_mapping_is_declared() -> None:
+    """A read of a name nothing provides is a dead path, not a missing service.
+
+    This is the check that would have caught ``self._components.get("scheduler_service")``
+    in the web channel: the scheduler became a mounted plugin provided as ``scheduler``,
+    the four routes kept asking for the old name, and ``GET /api/scheduler/health``
+    answered "offline" for ten days on a gateway whose scheduler was running.  The
+    frontend built on it showed a red 调度器离线 and disabled every run-now button.
+    """
+    reads = _component_key_reads()
+    declared = {entry.name for entry in SERVICES}
+    undeclared = {
+        name: sorted(where)
+        for name, where in reads.items()
+        if name not in declared and name not in _RUNTIME_COMPONENT_KEYS
+    }
     assert not undeclared, (
-        "the source uses names the declaration does not have:\n  "
-        + "\n  ".join(undeclared)
+        "these keys are read from a components mapping but no service declares them:\n  "
+        + "\n  ".join(f"{name}: {where}" for name, where in sorted(undeclared.items()))
     )
+
+
+def test_the_runtime_component_allowance_is_not_stale() -> None:
+    """An allowance for something declared now is a lie about the current state."""
+    reads = _component_key_reads()
+    declared = {entry.name for entry in SERVICES}
+    for key, reason in _RUNTIME_COMPONENT_KEYS.items():
+        assert key not in declared, f"{key} is a service now; drop it from the allowance"
+        assert key in reads, f"{key} is not read anywhere; drop it from the allowance"
+        assert len(reason) > 40, f"{key}: say why, not just that"
 
 
 def test_the_scan_finds_reads_and_writes_at_all() -> None:

@@ -2732,7 +2732,13 @@ def test_web_schedule_controls_delegate_to_live_scheduler(tmp_path, monkeypatch)
 
     scheduler = Scheduler()
     channel = _channel()
-    channel.bind_runtime({}, {"scheduler_service": scheduler})
+    # By the name the composition actually provides.  This double used to bind
+    # ``scheduler_service`` -- the same stale name the routes asked for -- so the test
+    # and the code agreed with each other and both disagreed with the real gateway:
+    # the routes looked up a key nothing writes, found None, and answered "offline"
+    # and 503 while the scheduler ran.  Binding the declared name is what makes this
+    # test able to fail for that reason.
+    channel.bind_runtime({}, {"scheduler": scheduler})
     with TestClient(channel.app) as client:
         assert client.get("/api/scheduler/health").json()["status"] == "online"
         assert client.post("/api/schedules/task-1/run").status_code == 202
