@@ -306,15 +306,19 @@ body belongs to the loop module and that the `try`/`finally` (which restores thr
 must travel with it.  I created `agent/core/turn_entry.py` first and that guard failed — correctly
 — so the entry was merged back and the file deleted.
 
-**What is proven, and what is not.**  Proven: `run_turn_loop` takes no agent; the four functions
-running a turn read every dependency as `deps.X` (a structural test pins both).  **Not proven: a
-whole turn actually running from service-built deps.**  I tried: `LoopDeps.from_services(...)`, a
-`run_one_turn` call, and a stubbed transport/registry/assembler — the turn constructs, prepares,
-and returns without an error, but the stubbed `create` is **never called** (count 0), so the loop
-takes an early return on that route.  The test was removed rather than left red or made to pass on
-a weaker claim.  The next step is to find that early return (prime suspects: an empty registry's
-tool list, or the "no tools" path in `prepare_turn`), and only then is "a turn runs without an
-agent" a runtime fact rather than a structural one.
+**Both proofs now hold.**  Structural: `run_turn_loop` takes no agent and the four functions
+running a turn read every dependency as `deps.X`.  Runtime:
+`tests/test_loop_deps_from_services.py::test_a_whole_turn_runs_from_service_built_deps` builds a
+`LoopDeps` from services only and runs a whole turn — the model is reached, its answer comes back,
+and `result.error is None`.
+
+Getting there was a measurement exercise, and the four gaps it found were all invisible to a
+signature check: a placeholder `retry_policy=object()` (the loop needs a real `RetryPolicy`); a
+transport missing `has_incomplete_tool_calls` (the surface is **seven** members, enumerated from
+the four files); `context_manager_for()` called with no ctx in one teardown path; and a
+`format_agent_error` stub that mapped the exception to `""` — which is why the earlier attempt
+reported "no error, no model call" instead of the real `AttributeError`.  A stub that is too
+forgiving hides the failure it was supposed to surface.
 
 ## 2d. `BaseAgent`'s orchestration core — measured: it is the irreducible kernel
 
