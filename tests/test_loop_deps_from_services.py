@@ -96,6 +96,46 @@ def _deps(**overrides):
     return LoopDeps.from_services(**kwargs)
 
 
+def test_the_turn_loop_takes_no_agent_and_reads_none() -> None:
+    """The claim, structurally: the loop cannot reach an agent because it has none.
+
+    ``LoopDeps.from_services`` existing was only half of it -- nothing production ran a
+    turn through it.  ``run_turn_loop`` now takes a ``LoopDeps`` and a context, and the
+    four files the loop spans read every dependency as ``deps.X``.  A regression that
+    reintroduces an agent would show up here first, before any turn has to run.
+    """
+    import inspect
+
+    from agent.core.turn_loop import run_turn_loop
+
+    params = inspect.signature(run_turn_loop).parameters
+    assert "deps" in params, "the loop must take its struct"
+    assert "agent" not in params, f"the loop still takes an agent: {list(params)}"
+
+    # Only the functions that *run a turn*, not `LoopDeps.of(agent)` -- that adapter is
+    # exactly where reading an agent is allowed, and scanning the whole file counted it
+    # 28 times and failed on the adapter rather than on the loop.
+    runners = {
+        "turn_loop.py": {"run_turn_loop"},
+        "llm_attempt.py": {"obtain_response"},
+        "tool_batch.py": {"run_tool_batch"},
+        "tool_loop_decision.py": {"handle_stuck_loop"},
+    }
+    for name, wanted in runners.items():
+        tree = ast.parse((REPO_ROOT / "agent/core" / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in wanted:
+                continue
+            reads = [
+                inner.lineno
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Attribute)
+                and isinstance(inner.value, ast.Name)
+                and inner.value.id == "agent"
+            ]
+            assert not reads, f"{name}::{node.name} still reads an agent at {reads[:3]}"
+
+
 def test_the_dependencies_can_be_built_without_an_agent() -> None:
     """The claim, asserted: nothing in the construction needs an `agent` object."""
     deps = _deps()
