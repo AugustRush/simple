@@ -294,6 +294,28 @@ files — so the seven new fields looked declared-but-dead.  It now asks the sha
 ("does the struct cover what the loop reads *from it*"), and a structural test (`run_turn_loop`
 takes no agent; the four runner functions read no `agent.X`) pins it.
 
+## 2f. The turn's entry moved too — and the runtime proof is still open
+
+`BaseAgent.send_message`'s body (the cancel/session contextvars, the heartbeat, the watchdog, the
+turn state, and the call into `run_turn_loop`) moved to `turn_loop.run_one_turn(ctx, message, *,
+..., deps)`.  `send_message` is now a twelve-line adapter that passes `self._loop_deps()`.
+`agent/core/agent.py` is 1863 lines.
+
+It went **into `turn_loop.py`**, not a new module: the repository has a guard that says the loop's
+body belongs to the loop module and that the `try`/`finally` (which restores three contextvars)
+must travel with it.  I created `agent/core/turn_entry.py` first and that guard failed — correctly
+— so the entry was merged back and the file deleted.
+
+**What is proven, and what is not.**  Proven: `run_turn_loop` takes no agent; the four functions
+running a turn read every dependency as `deps.X` (a structural test pins both).  **Not proven: a
+whole turn actually running from service-built deps.**  I tried: `LoopDeps.from_services(...)`, a
+`run_one_turn` call, and a stubbed transport/registry/assembler — the turn constructs, prepares,
+and returns without an error, but the stubbed `create` is **never called** (count 0), so the loop
+takes an early return on that route.  The test was removed rather than left red or made to pass on
+a weaker claim.  The next step is to find that early return (prime suspects: an empty registry's
+tool list, or the "no tools" path in `prepare_turn`), and only then is "a turn runs without an
+agent" a runtime fact rather than a structural one.
+
 ## 2d. `BaseAgent`'s orchestration core — measured: it is the irreducible kernel
 
 After the facade tier and the executors came out, `core/agent.py` is 1958 lines and what is left
