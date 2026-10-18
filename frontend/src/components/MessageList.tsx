@@ -16,7 +16,9 @@ import {
   CloseOutlined,
   CopyOutlined,
   DownOutlined,
+  EditOutlined,
   FileTextOutlined,
+  ReloadOutlined,
   RobotOutlined,
   UserOutlined,
 } from '@ant-design/icons'
@@ -37,6 +39,9 @@ export interface MessageListProps {
   updateMessage: (id: string, patch: Partial<Message>) => void
   copyMessage: (content: string) => void
   toggleTraceExpanded: (id: string) => void
+  canRewind: boolean
+  onEditLast: () => void
+  onRegenerateLast: () => void
 }
 
 
@@ -355,7 +360,7 @@ function ToolTrace({ tools, expanded, onToggle, traceId, activeSession, token }:
 const MemoToolTrace = memo(ToolTrace)
 
 
-function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyMessage, toggleTraceExpanded, traceTools, traceId, traceExpanded, subagentNotes }: {
+function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyMessage, toggleTraceExpanded, traceTools, traceId, traceExpanded, subagentNotes, canEdit, canRegenerate, onEditLast, onRegenerateLast }: {
   item: Message
   activeSession: string | null
   token: string
@@ -367,6 +372,10 @@ function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyM
   traceId?: string
   traceExpanded?: boolean
   subagentNotes?: Message[]
+  canEdit?: boolean
+  canRegenerate?: boolean
+  onEditLast?: () => void
+  onRegenerateLast?: () => void
 }) {
   if (item.role === 'tool') {
     return <MemoToolEvent item={item} activeSession={activeSession} token={token} />
@@ -456,14 +465,38 @@ function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyM
           )}
         </div>
         {!isUser && item.content && (
+          <div className="message-actions">
+            <Button
+              type="text"
+              size="small"
+              className="message-copy"
+              icon={<CopyOutlined />}
+              onClick={() => copyMessage(item.content)}
+            >
+              复制
+            </Button>
+            {canRegenerate && (
+              <Button
+                type="text"
+                size="small"
+                className="message-copy"
+                icon={<ReloadOutlined />}
+                onClick={onRegenerateLast}
+              >
+                重新生成
+              </Button>
+            )}
+          </div>
+        )}
+        {isUser && canEdit && (
           <Button
             type="text"
             size="small"
-            className="message-copy"
-            icon={<CopyOutlined />}
-            onClick={() => copyMessage(item.content)}
+            className="message-edit"
+            icon={<EditOutlined />}
+            onClick={onEditLast}
           >
-            复制
+            编辑
           </Button>
         )}
       </div>
@@ -543,6 +576,9 @@ export function MessageList(props: MessageListProps) {
     updateMessage,
     copyMessage,
     toggleTraceExpanded,
+    canRewind,
+    onEditLast,
+    onRegenerateLast,
   } = props
 
   // Grouped once per transcript, not once per render. This is what makes the
@@ -551,6 +587,15 @@ export function MessageList(props: MessageListProps) {
   // it already had and `memo` can skip it. Regrouping inside the render body
   // instead hands every row a fresh array each time and quietly undoes that.
   const turns = useMemo(() => groupIntoTurns(messages), [messages])
+
+  // Which two rows may be taken back. Only the newest turn can be: the server
+  // cuts the transcript at the request, so an older turn would leave every turn
+  // after it answering a context that no longer exists.
+  const lastTurn = turns[turns.length - 1]
+  const lastUserId = lastTurn?.user?.id
+  const lastAssistantId = lastTurn
+    ? [...lastTurn.items].reverse().find(item => item.role === 'assistant')?.id
+    : undefined
 
   const nodes: React.ReactNode[] = []
   for (const turn of turns) {
@@ -566,6 +611,8 @@ export function MessageList(props: MessageListProps) {
           updateMessage={updateMessage}
           copyMessage={copyMessage}
           toggleTraceExpanded={toggleTraceExpanded}
+          canEdit={canRewind && user.id === lastUserId}
+          onEditLast={onEditLast}
         />,
       )
     }
@@ -591,6 +638,8 @@ export function MessageList(props: MessageListProps) {
           traceTools={shouldAttachTrace ? tools : undefined}
           traceId={shouldAttachTrace ? traceId : undefined}
           traceExpanded={traceId ? !!expandedTraces[traceId] : undefined}
+          canRegenerate={canRewind && item.id === lastAssistantId}
+          onRegenerateLast={onRegenerateLast}
           // The trace's id, not a closure over it: a fresh arrow per render
           // would be a new prop on every row every render, which is the one
           // thing memoisation cannot see through.

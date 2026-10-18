@@ -2020,6 +2020,58 @@ export function useConversations(deps: Deps) {
     focusComposer()
   }
 
+  // Taking the newest turn back is one server call, and the client does not
+  // splice its own copy afterwards: the cut is by transcript position, and the
+  // optimistic rows the client holds do not carry positions. Reloading is what
+  // makes the screen show what the record now says -- and it also drops the
+  // cached copy, so a refresh cannot resurrect the removed turn.
+  const rewindLastTurn = useCallback(async (): Promise<string | null> => {
+    const sid = activeSessionRef.current
+    if (!sid) return null
+    try {
+      const resp = await api(`/api/sessions/${encodeURIComponent(sid)}/rewind`, {
+        method: 'POST',
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok) {
+        messageApi.error(String(data.error || `回退失败（${resp.status}）`))
+        return null
+      }
+      await loadMessages(sid)
+      void loadSessions()
+      return String(data.user_text || '')
+    } catch {
+      messageApi.error('回退失败')
+      return null
+    }
+  }, [api, loadMessages, loadSessions, messageApi])
+
+  //: These two keep their identity (they are props of every memoised row) while
+  //: still calling the *current* handlers.  ``setInput`` closes over the draft
+  //: key, and ``sendMessage`` closes over the open session and its attachments;
+  //: a captured copy writes the editor's text into another session's draft, or
+  //: sends into the session that was open when the page first rendered.
+  const rewindHandlersRef = useRef({ setInput, focusComposer, sendMessage })
+  rewindHandlersRef.current = { setInput, focusComposer, sendMessage }
+
+  // Edit: rewind, then hand the words back to the composer. Nothing is sent --
+  // the reader asked to change the sentence, and they get to change it before
+  // it goes anywhere.
+  const editLastTurn = useCallback(async () => {
+    const text = await rewindLastTurn()
+    if (text === null) return
+    rewindHandlersRef.current.setInput(text)
+    rewindHandlersRef.current.focusComposer()
+  }, [rewindLastTurn])
+
+  // Regenerate: rewind and send the same words. The rewind tells us what they
+  // were, so the client is not guessing which turn the server removed.
+  const regenerateLastTurn = useCallback(async () => {
+    const text = await rewindLastTurn()
+    if (text === null) return
+    await rewindHandlersRef.current.sendMessage(text)
+  }, [rewindLastTurn])
+
   // Stable for the same reason as ``copyMessage``: it is a prop of every row that
   // owns a tool trace.
   const toggleTraceExpanded = useCallback((id: string) => {
@@ -2202,5 +2254,13 @@ export function useConversations(deps: Deps) {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
   }
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  //: The newest turn can be cut only while nothing is running and nothing is
+  //: queued: the server refuses otherwise, and a button that exists and is
+  //: refused is worse than one that is disabled.
+  const canRewind =
+    Boolean(activeSession) &&
+    !isStreaming &&
+    String(sessionState?.operation_state || 'idle') === 'idle'
+
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

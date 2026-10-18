@@ -18,6 +18,12 @@ export interface AppCtx {
   token: string
   turnRefs: MutableRefObject<Record<string, HTMLDivElement | null>>
   copyMessage: (content: string) => void
+  /** Whether the newest turn may be cut (idle, not streaming). */
+  canRewind: boolean
+  /** Rewind the newest turn and put its text back in the composer. */
+  editLastTurn: () => void
+  /** Rewind the newest turn and send the same text again. */
+  regenerateLastTurn: () => void
   expandedTraces: Record<string, boolean>
   toggleTraceExpanded: (id: string) => void
   messages: Message[]
