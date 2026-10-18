@@ -252,11 +252,19 @@ refresh the bundle that ships, run `npm run build:release` from `frontend/`.
 uv sync --extra web
 
 # Start gateway with the web channel enabled
+# (opens the UI in your browser once the port is listening)
 uv run simple gateway
+
+# Do not open a browser
+uv run simple gateway --no-open
 
 # In a named session
 uv run simple gateway --name prod
 ```
+
+The browser is opened only when the gateway is attached to a terminal, so a
+service, a CI job or a background command never puts a window on someone's
+screen; `SIMPLE_NO_BROWSER=1` suppresses it too. The URL is printed either way.
 
 Configure in `~/.agent/config.json`:
 ```json

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 import inspect
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import signal
 import sys
 from typing import Any, Callable, Optional, Sequence
+import webbrowser
 
 import typer
 from rich.markdown import Markdown
@@ -1139,6 +1141,71 @@ def _gateway_channel_guidance(cfg: dict) -> str:
     )
 
 
+def _gateway_web_channel(channels: Sequence[Any]) -> Any:
+    """The mounted web channel, or None when this gateway has none.
+
+    Asked of the channel rather than rebuilt from the config here: the bind
+    address and the address a browser can use are not the same string (a
+    wildcard bind is not a URL), and that distinction belongs next to the
+    server that knows it.
+    """
+    for channel in channels:
+        url = getattr(channel, "public_url", "")
+        if isinstance(url, str) and url:
+            return channel
+    return None
+
+
+def _should_open_browser(*, no_open: bool, interactive: bool) -> bool:
+    """Whether this gateway may put a window on the reader's screen.
+
+    Three gates. ``--no-open`` and ``SIMPLE_NO_BROWSER`` are the operator saying
+    no; a non-interactive stdout is the *absence* of an operator -- a service, a
+    CI job, or an agent's background command.  Opening a browser there is not a
+    convenience, it is a window nobody asked for and nobody is in front of.
+    """
+    if no_open:
+        return False
+    if os.environ.get("SIMPLE_NO_BROWSER", "").strip():
+        return False
+    return interactive
+
+
+def _stdout_is_interactive() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+async def _open_browser_when_ready(
+    url: str,
+    ready: Callable[[], Any],
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """Open the browser once the server says it is listening.
+
+    ``ready`` is the channel's own answer, not a socket probe: a port can be
+    held by something else entirely, and opening then would point the browser
+    at a stranger while this gateway's startup had failed.  A timeout or a
+    refusal simply means no window -- the URL was printed either way, and a
+    server that is still running is what the reader actually wanted.
+
+    A failure to open is not a gateway failure: a headless session, a browser
+    that is not installed, or a display that is not there all leave the server
+    running.
+    """
+    try:
+        listening = await asyncio.wait_for(ready(), timeout=max(0.0, float(timeout)))
+    except Exception:
+        return
+    if not listening:
+        return
+    with contextlib.suppress(Exception):
+        webbrowser.open(url)
+
+
 @app.command()
 def gateway(
     name: Optional[str] = typer.Option(
@@ -1151,6 +1218,14 @@ def gateway(
             "Named composition for this process's scheduled runs, e.g. "
             "'unattended' (see agent/bundles.py). Applied to each run's own copy "
             "of the config, so the file on disk is not changed."
+        ),
+    ),
+    no_open: bool = typer.Option(
+        False,
+        "--no-open",
+        help=(
+            "Do not open the web UI in a browser on startup. Opening is skipped "
+            "anyway when stdout is not a terminal or SIMPLE_NO_BROWSER is set."
         ),
     ),
 ):
@@ -1198,6 +1273,7 @@ def gateway(
         scheduler_max_concurrent = scheduler_settings.max_concurrent_runs
         scheduler_signal_depth = scheduler_settings.signal_max_depth
         scheduler_task: Optional[asyncio.Task] = None
+        browser_task: Optional[asyncio.Task] = None
         scheduler_store = None
         try:
             # From the composition, not from a tree of its own: the channel plugins
@@ -1211,6 +1287,22 @@ def gateway(
                 f"[dim]Gateway starting {len(channels)} channel(s). "
                 "Press Ctrl-C to stop.[/dim]"
             )
+            # The UI is the thing most people started this for, so open it --
+            # once the port actually accepts, not before (see the helper).  The
+            # address is printed either way: a browser that did not open (no
+            # display, another machine, --no-open) must still leave the reader
+            # something to click.
+            web_channel = _gateway_web_channel(channels)
+            if web_channel is not None:
+                web_url = str(web_channel.public_url)
+                shared.CONSOLE.print(f"[dim]Web UI: {web_url}[/dim]")
+                if _should_open_browser(
+                    no_open=no_open,
+                    interactive=_stdout_is_interactive(),
+                ):
+                    browser_task = asyncio.create_task(
+                        _open_browser_when_ready(web_url, web_channel.wait_ready)
+                    )
             # The scheduler is mounted, not built here.  The two things it cannot read
             # from the composition are the two this command resolves -- the run
             # parameters (config merged with argv) and the bundle's loader -- so they go
@@ -1229,6 +1321,9 @@ def gateway(
             runner = ChannelRunner(channels, components, gateway_cfg)
             await runner.run()
         finally:
+            if browser_task is not None and not browser_task.done():
+                browser_task.cancel()
+                await asyncio.gather(browser_task, return_exceptions=True)
             if scheduler_task is not None:
                 scheduler_task.cancel()
                 await asyncio.gather(scheduler_task, return_exceptions=True)

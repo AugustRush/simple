@@ -7,6 +7,8 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 
 from agent.channels.web import WebChannel, WebConfig
 from agent.session_service import SessionService
@@ -5747,3 +5749,59 @@ def test_the_entry_document_is_never_served_from_a_stale_cache():
     assert resp.headers["cache-control"] == "no-cache"
     # The hashed asset is allowed to be cached: its name changes with its bytes.
     assert "/assets/index-" in resp.text
+
+
+def test_a_bind_failure_ends_start_instead_of_hanging(monkeypatch):
+    """A gateway that could not bind must exit, not sit there looking healthy.
+
+    uvicorn ends ``serve()`` with ``SystemExit`` when the port is taken. Waiting
+    only for the stop event left the process printing an ERROR and then running
+    with nothing listening -- and, with the browser opener added, with no window
+    and no explanation.
+    """
+    import asyncio
+    import uvicorn
+
+    class FailingServer:
+        def __init__(self, config):
+            self.started = False
+            self.should_exit = False
+
+        async def serve(self):
+            await asyncio.sleep(0)
+            raise OSError(48, "address already in use")
+
+    monkeypatch.setattr(uvicorn, "Server", FailingServer)
+    channel = _channel()
+
+    async def scenario():
+        await channel.start(lambda msg, sink: None)
+
+    with pytest.raises(OSError):
+        asyncio.run(scenario())
+
+
+def test_stopping_the_channel_ends_start_cleanly(monkeypatch):
+    import asyncio
+    import uvicorn
+
+    class OkServer:
+        def __init__(self, config):
+            self.started = False
+            self.should_exit = False
+
+        async def serve(self):
+            self.started = True
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(uvicorn, "Server", OkServer)
+    channel = _channel()
+
+    async def scenario():
+        task = asyncio.create_task(channel.start(lambda msg, sink: None))
+        assert await channel.wait_ready(timeout=1.0) is True
+        await channel.stop()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(scenario())

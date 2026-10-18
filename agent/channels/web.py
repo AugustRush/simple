@@ -205,11 +205,38 @@ class WebChannel(Channel):
         self._session_service: Optional[SessionService] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._server_task: Optional[asyncio.Task[Any]] = None
+        #: The uvicorn server, once ``start`` has created it.  ``started`` on it
+        #: is the only trustworthy answer to "is this port *ours*" -- a TCP
+        #: connect cannot tell this server from whatever else holds the port.
+        self._server: Any = None
         self._app = self._build_app()
 
     @property
     def app(self) -> Any:
         return self._app
+
+    @property
+    def public_url(self) -> str:
+        """The address a person can paste into a browser, or '' when disabled.
+
+        The gateway opens this at startup, so it has to be the address the
+        *reader* can reach rather than the one the server binds: a wildcard
+        bind (``0.0.0.0`` / ``::``) is not a URL, and ``0.0.0.0:8787`` in a
+        browser is a connection to whatever the OS does with that address.
+        Localhost is the right answer for both -- a gateway on another machine
+        was already reachable by its own name, and this value is only used for
+        the browser launched beside it.
+        """
+        if not bool(getattr(self._config, "enabled", True)):
+            return ""
+        host = str(getattr(self._config, "host", "") or "127.0.0.1").strip()
+        if host in {"", "0.0.0.0", "::", "[::]"}:
+            host = "127.0.0.1"
+        try:
+            port = int(getattr(self._config, "port", 0) or 8787)
+        except (TypeError, ValueError):
+            port = 8787
+        return f"http://{host}:{port}/"
 
     @staticmethod
     def _web_dist_dir() -> Path:
@@ -2426,15 +2453,53 @@ class WebChannel(Channel):
             log_level="warning",
         )
         server = uvicorn.Server(config)
+        self._server = server
         self._server_task = asyncio.create_task(server.serve())
+        # Wait for either "stop was asked for" or "the server finished".  The
+        # second arm is not symmetry: a bind failure (port already in use) ends
+        # serve() with SystemExit, and waiting only on the stop event left a
+        # gateway that had printed an ERROR, opened no browser, and then sat
+        # there looking healthy with nothing listening.  Awaiting the finished
+        # task below re-raises that failure, so the process exits with it.
+        stop_waiter = asyncio.create_task(self._stop_event.wait())
         try:
-            await self._stop_event.wait()
+            await asyncio.wait(
+                {self._server_task, stop_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
+            stop_waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_waiter
             server.should_exit = True
-            if self._server_task is not None and not self._server_task.done():
-                await self._server_task
+            if self._server_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._server_task
             self._server_task = None
+            self._server = None
             self._handler = None
+
+    async def wait_ready(self, timeout: float = 10.0) -> bool:
+        """Whether the server is listening on its port, within ``timeout``.
+
+        Asks uvicorn, not the socket.  A connect succeeds against *anything*
+        holding the port, so a gateway launched onto an occupied port would
+        open a browser pointing at a stranger's server and report success --
+        while its own startup had already failed.  ``server.started`` is set
+        only after startup() bound successfully, and a finished server task
+        means it never will.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout))
+        while loop.time() < deadline:
+            server = self._server
+            if server is not None and bool(getattr(server, "started", False)):
+                return True
+            task = self._server_task
+            if task is not None and task.done():
+                return False
+            await asyncio.sleep(0.05)
+        return False
 
     async def stop(self) -> None:
         if self._stop_event is not None:
