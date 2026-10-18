@@ -18,9 +18,52 @@ import type {
 
 export function toolStateLabel(state?: ToolState): string {
   if (state === 'running') return '执行中'
+  if (state === 'failed') return '失败'
   if (state === 'blocked') return '已阻止'
   if (state === 'interrupted') return '已中断'
   return '已完成'
+}
+
+
+/** How many steps of a turn ended in each state, keyed by the state itself. */
+export function countToolStates(tools: Message[]): Record<ToolState, number> {
+  const counts: Record<ToolState, number> = {
+    done: 0,
+    running: 0,
+    failed: 0,
+    blocked: 0,
+    interrupted: 0,
+  }
+  for (const tool of tools) counts[tool.toolState || 'done'] += 1
+  return counts
+}
+
+
+/**
+ * The one thing a collapsed trace should say about its steps, or ''.
+ *
+ * Only the states a person would act on: a done step is not news, and a running
+ * one is already pulsing in the marks. When several kinds went wrong the worst
+ * is named -- the same worst-case rule the marks use -- because a summary that
+ * lists four categories is not a summary.
+ */
+export function toolAttentionLabel(counts: Record<ToolState, number>): string {
+  if (counts.failed) return `${counts.failed} 步失败`
+  if (counts.blocked) return `${counts.blocked} 步被阻止`
+  if (counts.interrupted) return `${counts.interrupted} 步中断`
+  return ''
+}
+
+
+/** The full breakdown, for a hover title or a detail header. */
+export function describeToolStates(counts: Record<ToolState, number>): string {
+  const parts: string[] = []
+  if (counts.done) parts.push(`${counts.done} 步完成`)
+  if (counts.running) parts.push(`${counts.running} 步执行中`)
+  if (counts.failed) parts.push(`${counts.failed} 步失败`)
+  if (counts.blocked) parts.push(`${counts.blocked} 步被阻止`)
+  if (counts.interrupted) parts.push(`${counts.interrupted} 步中断`)
+  return parts.join(' · ')
 }
 
 

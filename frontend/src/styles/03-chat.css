@@ -559,6 +559,13 @@ html[data-theme='light'] .code-block {
   background: var(--red);
 }
 
+/* A failed step and a blocked one are both red on purpose: the dot says "this
+ * turn needs a look", and the label beside it says which. Giving failure its
+ * own hue would invent a fourth meaning for a six-pixel mark. */
+.tool-dot.failed {
+  background: var(--red);
+}
+
 .tool-dot.interrupted,
 .tool-event-dot.interrupted {
   background: var(--amber);
@@ -573,6 +580,13 @@ html[data-theme='light'] .code-block {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
+}
+
+/* The whole summary turns red when a step needs a look, not just the dot:
+ * sit at the other end of a 900px row from marks you cannot name, and a
+ * single red pixel among five grey ones is not a signal. */
+.tool-trace-summary.has-attention .tool-trace-label {
+  color: var(--red);
 }
 
 .tool-trace-chevron {
@@ -651,6 +665,10 @@ html[data-theme='light'] .tool-trace-items {
 }
 
 .tool-event-dot.blocked {
+  background: var(--red);
+}
+
+.tool-event-dot.failed {
   background: var(--red);
 }
 

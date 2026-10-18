@@ -4,7 +4,7 @@
 
 export type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error' | 'subagent'
 
-export type ToolState = 'running' | 'done' | 'blocked' | 'interrupted'
+export type ToolState = 'running' | 'done' | 'failed' | 'blocked' | 'interrupted'
 
 export type ConfirmDecision =
   | 'allow_once'

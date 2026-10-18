@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
+import { parseRoute } from '../lib/route'
 
 export function useUi() {
   const [themeMode, setThemeMode] = useState<string>(
     () => localStorage.getItem('agent_theme') || 'dark',
   )
 
-  const [view, setView] = useState<string>('chat')
+  //: The hash is read once, here, rather than applied by an effect: an effect
+  //: that set the view after the first render would paint 对话 for a frame over
+  //: a page that asked for 设置, and the address-bar writer would then record
+  //: the wrong address before the correction.
+  const [view, setView] = useState<string>(() => parseRoute(window.location.hash).view)
 
   //: A clock for the two things on this page that are about the present moment
   //: rather than about the data: how long until the next run, and how long ago

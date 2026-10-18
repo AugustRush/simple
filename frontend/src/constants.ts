@@ -79,12 +79,15 @@ export const MAX_TRACE_DOTS = 20
 // That is the whole point of aggregating by worst case rather than picking
 // every n-th step: a single blocked call must not be able to disappear just
 // because the turn around it was long. ``done`` is the floor, matching the
-// `toolState || 'done'` the marks have always used.
+// `toolState || 'done'` the marks have always used. ``failed`` sits above
+// ``blocked``: both need a look, but "it ran and errored" is the stronger
+// claim, and a compressed span should report what actually happened.
 export const TRACE_SEVERITY: Record<ToolState, number> = {
   done: 0,
   running: 1,
   interrupted: 2,
   blocked: 3,
+  failed: 4,
 }
 
 

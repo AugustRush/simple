@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
 import { AppstoreOutlined, ClockCircleOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
+import { parseRoute, routeFor } from '../lib/route'
 import { useUi } from './useUi'
 import { useConversations } from './useConversations'
 import { useExtensions } from './useExtensions'
@@ -13,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -131,11 +132,18 @@ export function useShell(deps: Deps) {
    * so without this a click on any other nav item quietly threw the edits away
    * -- and coming back showed the saved values, as though nothing had happened.
    */
-  const navigateTo = (next: string) => {
+  const navigateTo = (next: string, options: { fromHistory?: boolean } = {}) => {
     if (next === view) return
     if (view !== 'settings' || !(settingsDirty || tokenDirty)) {
       setView(next)
       return
+    }
+    // This came from the address bar, and the guard is about to ask whether the
+    // edits may be dropped. Until the answer is yes the page *stayed* on
+    // settings, so the address has to say so again -- otherwise a cancelled
+    // confirm leaves the bar describing a page that is not on screen.
+    if (options.fromHistory) {
+      window.history.replaceState(null, '', routeFor(view, activeSession))
     }
     Modal.confirm({
       title: '放弃未保存的设置？',
@@ -162,6 +170,83 @@ export function useShell(deps: Deps) {
     navigateTo('schedules')
     setAutomationTab('attention')
   }
+
+  // ── The address bar ───────────────────────────────────────────────────────
+  //
+  // One writer, one reader. The writer records what is on screen after the fact
+  // -- it never drives the view -- so every existing way of changing state
+  // (nav, palette, a session row, a creating/deleting session) gets an address
+  // without being taught about it. The reader is the browser's popstate, which
+  // is the only source of change the app does not own.
+  const route = routeFor(view, activeSession)
+
+  // The entry the app was opened on is replaced, not pushed: a click on 设置
+  // straight after load should leave one "back" press between the two pages,
+  // not a duplicate entry for the landing page that says the same thing.
+  const firstRouteRef = useRef(true)
+  useEffect(() => {
+    const current = window.location.hash
+    if (current === route) {
+      firstRouteRef.current = false
+      return
+    }
+    const from = parseRoute(current)
+    const to = parseRoute(route)
+    // The landing page *becomes* the conversation: an empty chat is not a place
+    // to go back to, it is the page a session is started from, so the session
+    // takes its entry over instead of stacking on top of it. Without this the
+    // first session of a visit left "back" pointing at a welcome screen the
+    // reader had already passed through, and pressing it looked like a no-op.
+    const landingBecameConversation =
+      from.view === 'chat' && !from.sessionId && to.view === 'chat' && !!to.sessionId
+    // The other end of the same rule: a conversation whose link went stale
+    // collapses into the landing entry rather than stacking a corrected address
+    // on top of the stale one, which would make "back" revisit the dead link.
+    const conversationBecameLanding =
+      from.view === 'chat' && !!from.sessionId && to.view === 'chat' && !to.sessionId
+    if (firstRouteRef.current || landingBecameConversation || conversationBecameLanding) {
+      firstRouteRef.current = false
+      window.history.replaceState(null, '', route)
+      return
+    }
+    // push, not replace: the browser's back button is the second way to move
+    // between the pages the reader has visited, and replaceState would leave
+    // only the latest one.
+    firstRouteRef.current = false
+    window.history.pushState(null, '', route)
+  }, [route])
+
+  useEffect(() => {
+    // Both events, one handler. ``popstate`` is history traversal; ``hashchange``
+    // is the reader editing the address bar -- a page whose bar is part of its
+    // state has to answer both, or a pasted ``#/settings`` over a running app
+    // changes the URL and nothing else. Our own writer uses ``pushState``, which
+    // fires neither, so this cannot feed back into itself.
+    const applyAddress = () => {
+      const target = parseRoute(window.location.hash)
+      if (target.sessionId && target.sessionId !== activeSession) {
+        selectSession(target.sessionId)
+        return
+      }
+      if (target.view !== view) {
+        navigateTo(target.view, { fromHistory: true })
+        return
+      }
+      // The bare chat entry while a conversation is open. Closing that
+      // conversation here would detach a live socket to show a welcome screen;
+      // the bar goes back to naming what is actually open instead.
+      const current = routeFor(view, activeSession)
+      if (window.location.hash !== current) {
+        window.history.replaceState(null, '', current)
+      }
+    }
+    window.addEventListener('popstate', applyAddress)
+    window.addEventListener('hashchange', applyAddress)
+    return () => {
+      window.removeEventListener('popstate', applyAddress)
+      window.removeEventListener('hashchange', applyAddress)
+    }
+  }, [activeSession, navigateTo, selectSession, view])
 
   const paletteCommands = useMemo(() => {
     const query = paletteQuery.trim().toLowerCase()

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CONVERSATION_SUMMARY_HALF_HEIGHT, INTERRUPT_RETRY_MS, INTERRUPT_STUCK_MS, TASK_INTERRUPTED_STATUSES } from '../constants'
 import { truncate } from '../lib/format'
+import { parseRoute } from '../lib/route'
 import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
 import { compareSessions, isInTurnUserMessage, isSessionBusy, sessionStateBusy } from '../lib/tools'
@@ -37,7 +38,16 @@ export function useConversations(deps: Deps) {
 
   const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null)
 
-  const [activeSession, setActiveSession] = useState<string | null>(null)
+  //: A session named in the address bar is the one the page was asked for, so
+  //: it is the state from the first render rather than something an effect
+  //: applies later. An effect would run after the first paint, and the address
+  //: writer -- which records what is on screen -- would have already replaced
+  //: the link with a bare ``#/chat`` before the restore had a chance to open it.
+  //: The restore effect below still validates it against the server's list; a
+  //: stale id is cleared there and the bar follows.
+  const [activeSession, setActiveSession] = useState<string | null>(
+    () => parseRoute(window.location.hash).sessionId,
+  )
 
   const [messages, setMessages] = useState<Message[]>([])
 
@@ -239,7 +249,10 @@ export function useConversations(deps: Deps) {
   // the socket reconnect every time the dropdown changes.
   const currentModelRef = useRef(currentModel)
 
-  const activeSessionRef = useRef<string | null>(null)
+  //: Seeded with the same value as ``activeSession``: the socket's ``onopen``
+  //: ignores a connection whose id does not match this ref, so a linked session
+  //: opened at mount would connect and then be told it is not the active one.
+  const activeSessionRef = useRef<string | null>(activeSession)
 
   const pendingSendRef = useRef<string | null>(null)
 
@@ -965,7 +978,10 @@ export function useConversations(deps: Deps) {
           const target = findRunningTool()
           if (target) {
             updateMessage(target.id, {
-              toolState: 'done',
+              // The frame carries the executor's verdict. Without it a call
+              // that returned an error still closed as "已完成", which is a
+              // claim nothing had checked.
+              toolState: evt.ok === false ? 'failed' : 'done',
               content: evt.result ? truncate(String(evt.result), 220) : '',
             })
           }
@@ -1241,8 +1257,10 @@ export function useConversations(deps: Deps) {
   useEffect(() => {
     let cancelled = false
     // Read the remembered session before awaiting the fetch: the persist
-    // effect below clears the key while activeSession is still null.
-    const stored = localStorage.getItem('agent_active_session')
+    // effect below clears the key while activeSession is still null. A session
+    // named in the address bar outranks it: that is the one the link was to.
+    const linked = parseRoute(window.location.hash).sessionId
+    const stored = linked || localStorage.getItem('agent_active_session')
     const restore = async () => {
       // A browser refresh used to dump the user on the welcome screen even
       // though their conversation was still on the server. Re-open the last
@@ -1251,6 +1269,14 @@ export function useConversations(deps: Deps) {
       if (cancelled) return
       if (stored && list.some(item => item.session_id === stored)) {
         selectSession(stored)
+        return
+      }
+      // A linked session that is gone is not a conversation to show: drop it so
+      // the address bar follows the welcome screen instead of naming a session
+      // no socket can be opened against.
+      if (linked) {
+        activeSessionRef.current = null
+        setActiveSession(null)
       }
     }
     restore()

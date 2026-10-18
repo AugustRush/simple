@@ -25,7 +25,7 @@ import { formatDateTime, relativeTime } from '../lib/format'
 import { markdownToHtml } from '../lib/markdown'
 import { fileHref, mediaKindForUrl } from '../lib/media'
 import { subagentCounts } from '../lib/subagent'
-import { isInTurnUserMessage, summariseToolDots, toolStateLabel } from '../lib/tools'
+import { isInTurnUserMessage, countToolStates, describeToolStates, summariseToolDots, toolAttentionLabel, toolStateLabel } from '../lib/tools'
 import type { Message, SubAgentNote } from '../types'
 
 export interface MessageListProps {
@@ -289,9 +289,19 @@ function ToolTrace({ tools, expanded, onToggle, traceId, activeSession, token }:
 }) {
   const dots = summariseToolDots(tools)
   const summarised = dots.length < tools.length
+  const counts = countToolStates(tools)
+  const attention = toolAttentionLabel(counts)
   return (
     <div className={`tool-trace ${expanded ? 'tool-trace-expanded' : ''}`}>
-      <button type="button" className="tool-trace-summary" onClick={() => onToggle(traceId)}>
+      <button
+        type="button"
+        className={`tool-trace-summary ${attention ? 'has-attention' : ''}`}
+        onClick={() => onToggle(traceId)}
+        // The breakdown on hover, the way the step count is on the label: a
+        // collapsed trace that only says how many calls ran leaves the reader
+        // to open it to find out whether anything went wrong.
+        title={`工具轨迹：${describeToolStates(counts) || `${tools.length} 步`}`}
+      >
         <span
           className="tool-trace-dots"
           aria-hidden="true"
@@ -303,7 +313,9 @@ function ToolTrace({ tools, expanded, onToggle, traceId, activeSession, token }:
             <span key={index} className={`tool-dot ${dot.state}`} />
           ))}
         </span>
-        <span className="tool-trace-label">工具轨迹 · {tools.length} 步</span>
+        <span className="tool-trace-label">
+          工具轨迹 · {tools.length} 步{attention ? ` · ${attention}` : ''}
+        </span>
         <DownOutlined className="tool-trace-chevron" />
       </button>
       {expanded &&
