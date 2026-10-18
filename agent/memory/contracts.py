@@ -201,6 +201,15 @@ class MemoryStore(Protocol):
         pages by position hands a client a hundred tool events and no reply.
         """
 
+    def truncate_transcript(self, *, session_id: str, from_seq: int) -> "tuple[int, int]":
+        """Cut the session's timeline at ``from_seq``, returning what was removed.
+
+        The one write that takes history back, and the reason it is here rather
+        than in a caller: the turns and the tool events are two tables and one
+        timeline, so a caller deleting from one of them would leave a reply
+        without the request it answered.
+        """
+
     def message_has_answer(self, *, session_id: str, message_id: str) -> bool:
         """Whether this user message already has an assistant answer on disk."""
 

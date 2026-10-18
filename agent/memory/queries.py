@@ -461,3 +461,37 @@ def append_conversation_turn(conn, *,
         (cur.lastrowid,),
     ).fetchone()
     return _row_mappers._row_to_conversation_turn(row) if row else None
+
+
+def truncate_transcript(
+    conn,
+    *,
+    session_id: str,
+    from_seq: int,
+) -> tuple[int, int]:
+    """Delete every transcript position at or after ``from_seq``.
+
+    Returns ``(turns_removed, events_removed)``.  Both tables are cut in one
+    statement pair so a rewind cannot leave a turn without its tool calls or the
+    other way round -- the transcript is one timeline, and half of it is not a
+    shorter conversation but a broken one.
+
+    The sequence counter is **not** rewound.  Positions are identities: the
+    paging cursor, the client's cached ``oldest_seq`` and the transcript's
+    ordering all treat a sequence as something that names a row forever.  Reusing
+    one would let a new row stand where a deleted one was, and a client paging
+    back would read across its own cut.  A gap is the honest record of a rewind.
+    """
+    clean_session_id = str(session_id or "").strip()
+    start = int(from_seq or 0)
+    if not clean_session_id or start <= 0:
+        return 0, 0
+    turns = conn.execute(
+        "DELETE FROM conversation_turns WHERE session_id = ? AND seq >= ?",
+        (clean_session_id, start),
+    ).rowcount
+    events = conn.execute(
+        "DELETE FROM agent_events WHERE session_id = ? AND seq >= ?",
+        (clean_session_id, start),
+    ).rowcount
+    return int(turns or 0), int(events or 0)

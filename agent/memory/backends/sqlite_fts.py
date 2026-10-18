@@ -999,6 +999,30 @@ class SqliteFtsStore:
         events.sort(key=lambda event: event.seq)
         return turns, events, remaining is not None
 
+    def truncate_transcript(self, *, session_id: str, from_seq: int) -> tuple[int, int]:
+        """Cut the timeline at ``from_seq``; both tables or neither.
+
+        The same semantics as the built-in store, and here for the same reason the
+        rest of this class exists: a member added to the protocol is a promise the
+        second implementation has to keep, or "replaceable" was only ever a claim
+        about the first one.
+        """
+        start = int(from_seq or 0)
+        if not str(session_id or "").strip() or start <= 0:
+            return 0, 0
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                turns = conn.execute(
+                    "DELETE FROM conversation_turns WHERE session_id = ? AND seq >= ?",
+                    (session_id, start),
+                ).rowcount
+                events = conn.execute(
+                    "DELETE FROM agent_events WHERE session_id = ? AND seq >= ?",
+                    (session_id, start),
+                ).rowcount
+        return int(turns or 0), int(events or 0)
+
     # ── working state, checkpoints, usage ───────────────────────────────────
 
     def save_session_working_state(

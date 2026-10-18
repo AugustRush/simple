@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
+from agent.memory.rewind import cut_provider_checkpoint, request_message_index
+
 
 class _WebSessionRegistry:
     """Small metadata index for isolated Web session homes."""
@@ -423,6 +425,16 @@ def _order_display_messages(
         item.pop("turn_id", None)
         item.pop("reply_to_id", None)
     return ordered
+
+
+class SessionBusyError(RuntimeError):
+    """A rewind was refused because a turn is still running."""
+
+
+#: How many turns back the rewind scans for the newest user row.  A turn is
+#: rarely more than a few rows (its reply, its interjections), so this is a
+#: bound on a pathological log rather than a page size.
+_REWIND_SCAN_TURNS = 80
 
 
 class SessionService:
@@ -1097,6 +1109,98 @@ class SessionService:
             "messages": ordered,
             "has_more": has_more,
             "oldest_seq": oldest,
+        }
+
+    def rewind_last_turn(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Remove the newest turn so it can be asked again or edited.
+
+        What "remove" means, precisely, because there are three copies of a turn
+        and taking back one of them is not taking back the conversation:
+
+        1. **The durable transcript** -- the ``conversation_turns`` and
+           ``agent_events`` rows from the request's position onward.  This is
+           what the browser draws.
+        2. **The provider replay tail** -- the checkpoint a restarted or evicted
+           session reloads as ``ctx.messages``.  Cut at the request message when
+           the checkpoint still holds that turn; a checkpoint compacted past it
+           no longer contains the turn as a message, and then there is nothing
+           to cut (the turn survives only inside a summary, which is the same
+           state the model is in after a compaction).
+        3. **The live request history** -- ``ctx.messages`` of the session's
+           running state, matched the same way.  A live state whose context has
+           been compacted past the request is left alone for the same reason.
+
+        Deliberately **not** touched: long-term memory, the consolidation
+        staging buffer, and the session's task guidance.  Rewinding says "show
+        me that turn again", not "forget what you learned from it" -- memory is
+        what the agent carries forward, and a user editing a sentence is not
+        asking to unlearn a fact.  The consequence is stated rather than hidden:
+        memory consolidated from the rewound turn stays.
+
+        Only the **last** turn can be cut.  A middle turn would leave every later
+        turn answering a context that no longer exists, and repairing that is a
+        branch, not a truncation.
+
+        Returns the removed request's text and id (the client needs the text to
+        resend it), or ``None`` when there is no user turn to cut.  Raises
+        :class:`SessionBusyError` when a turn is running: cutting the history out
+        from under a live turn is exactly the race this is not allowed to have.
+        """
+        clean = str(session_id or "").strip()
+        if not clean:
+            return None
+        live = self._live_states.get(clean)
+        if live is not None:
+            busy = str(getattr(live, "operation_state", "idle") or "idle") != "idle"
+            if busy or getattr(live, "restart_queue", None):
+                raise SessionBusyError("会话正在运行，结束这一轮之后再重试")
+        store = self._store_for_session(clean)
+        if store is None:
+            return None
+        turns = store.recent_conversation_turns(
+            session_id=clean,
+            limit=_REWIND_SCAN_TURNS,
+        )
+        request = None
+        for turn in reversed(turns):
+            if str(getattr(turn, "role", "") or "") != "user":
+                continue
+            metadata = getattr(turn, "metadata", {})
+            if isinstance(metadata, dict) and metadata.get("interjection"):
+                continue
+            request = turn
+            break
+        if request is None:
+            return None
+        text = str(getattr(request, "content", "") or "").strip()
+        seq = int(getattr(request, "seq", 0) or 0)
+        if seq <= 0:
+            return None
+
+        checkpoint_cut = cut_provider_checkpoint(store, clean, text)
+        live_cut = 0
+        if live is not None:
+            ctx = getattr(live, "ctx", None)
+            messages = getattr(ctx, "messages", None)
+            if isinstance(messages, list):
+                index = request_message_index(messages, text)
+                if index is not None:
+                    live_cut = len(messages) - index
+                    del messages[index:]
+
+        removed_turns, removed_events = store.truncate_transcript(
+            session_id=clean,
+            from_seq=seq,
+        )
+        return {
+            "session_id": clean,
+            "user_text": text,
+            "message_id": str(getattr(request, "message_id", "") or ""),
+            "seq": seq,
+            "removed_turns": removed_turns,
+            "removed_events": removed_events,
+            "checkpoint_messages_removed": checkpoint_cut,
+            "live_messages_removed": live_cut,
         }
 
     def session_data_path(self, session_id: str) -> Optional[Path]:

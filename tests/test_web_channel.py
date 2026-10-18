@@ -5657,3 +5657,74 @@ def test_turn_tags_are_omitted_when_unknown():
     sink = WebOutputSink(collect=True)
     sink.on_stream_chunk("hi")
     assert all("turn_id" not in event for event in sink.events)
+
+
+def test_web_rewind_takes_the_newest_turn_back(tmp_path):
+    """The endpoint returns the words it cut, and answers 404 when there is
+    nothing left -- a client that retried its own copy of the message would be
+    guessing at which turn the server removed."""
+    from starlette.testclient import TestClient
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    for question, answer in (("第一问", "第一答"), ("第二问", "第二答")):
+        store.write_conversation_exchange(
+            session_id="s1",
+            user_content=question,
+            assistant_content=answer,
+            channel="web",
+            message_id=f"m-{question}",
+            reply_to_id=f"m-{question}",
+            assistant_message_id=f"m-{question}:reply",
+        )
+    channel = _channel()
+    channel.bind_runtime({}, {"ltm_store": store})
+
+    with TestClient(channel.app) as client:
+        first = client.post("/api/sessions/s1/rewind")
+        assert first.status_code == 200
+        body = first.json()
+        assert body["ok"] is True
+        assert body["user_text"] == "第二问"
+        assert body["removed_turns"] == 2
+
+        page = client.get("/api/sessions/s1/messages").json()
+        assert [item["content"] for item in page["messages"]] == ["第一问", "第一答"]
+
+        nothing_left = client.post("/api/sessions/s1/rewind")
+        # The first turn is still there, so this succeeds -- and that is the
+        # point: the endpoint always cuts the newest turn, one per call.
+        assert nothing_left.status_code == 200
+        assert nothing_left.json()["user_text"] == "第一问"
+        assert client.get("/api/sessions/s1/messages").json()["messages"] == []
+        assert client.post("/api/sessions/s1/rewind").status_code == 404
+
+
+def test_web_rewind_refuses_a_running_turn(tmp_path):
+    from starlette.testclient import TestClient
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="s1",
+        user_content="问题",
+        assistant_content="答案",
+        channel="web",
+        message_id="m-1",
+        reply_to_id="m-1",
+        assistant_message_id="m-1:reply",
+    )
+    running = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[{"role": "user", "content": "问题"}]),
+        operation_state="active",
+        restart_queue=[],
+    )
+    channel = _channel()
+    channel.bind_runtime({"s1": running}, {"ltm_store": store})
+
+    with TestClient(channel.app) as client:
+        refused = client.post("/api/sessions/s1/rewind")
+
+    assert refused.status_code == 409
+    page = client.get("/api/sessions/s1/messages")
+    assert [item["content"] for item in page.json()["messages"]] == ["问题", "答案"]

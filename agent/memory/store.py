@@ -559,6 +559,15 @@ class LTMStore:
                 before_seq=before_seq,
             )
 
+    def truncate_transcript(self, *, session_id: str, from_seq: int) -> tuple[int, int]:
+        """Cut this session's timeline at ``from_seq``; return what was removed."""
+        with self._connect() as conn:
+            return queries.truncate_transcript(
+                conn,
+                session_id=session_id,
+                from_seq=from_seq,
+            )
+
     def _rows_at_seqs(
         self, session_id: str, table: str, seqs: list[int]
     ) -> list[sqlite3.Row]:

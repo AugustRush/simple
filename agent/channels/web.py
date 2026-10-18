@@ -1691,6 +1691,29 @@ class WebChannel(Channel):
         session_id = str(request.path_params["session_id"])
         return JSONResponse(self._service().get_session_state(session_id))
 
+    async def _rewind_session(self, request: Any) -> Any:
+        """Take the newest turn back so it can be asked again or edited.
+
+        The turn's text comes back with the answer: the client needs the words
+        to resend them, and it must not be the client that guesses which message
+        was cut.  A running turn is refused rather than queued -- cutting history
+        out from under the loop would leave the in-flight request answering a
+        conversation that no longer exists.
+        """
+        from starlette.responses import JSONResponse
+        from agent.session_service import SessionBusyError
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        try:
+            result = self._service().rewind_last_turn(session_id)
+        except SessionBusyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        if result is None:
+            return JSONResponse({"error": "没有可以回退的一轮"}, status_code=404)
+        return JSONResponse({"ok": True, **result})
+
     async def _dismiss_task_guidance(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2615,6 +2638,11 @@ class WebChannel(Channel):
             Route(
                 "/api/sessions/{session_id}/cancel",
                 self._cancel_session,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/rewind",
+                self._rewind_session,
                 methods=["POST"],
             ),
             Route(
