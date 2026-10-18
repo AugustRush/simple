@@ -10,30 +10,32 @@
 .extensions-view .page-head {
   margin-bottom: 0;
 }
-/* The plugins search row and the skills summary strip: toolbar-height rows
-   directly under the tabs, so switching lists does not jump the content. */
+/* One toolbar shape for every list page (会话管理 / 扩展 / 自动化): search
+   first, at one width, then whatever narrows or acts on the list.  Before
+   this, the same control sat on the right of one page, the left of another
+   and in a bordered box on a third, so switching pages moved it across the
+   screen. */
 .list-toolbar {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
   margin-bottom: 16px;
 }
-.list-toolbar .workspace-search {
-  flex: 0 1 320px;
+.list-toolbar > .workspace-search {
+  width: 280px;
+  flex: 0 0 auto;
+}
+.list-toolbar > .segmented-control,
+.list-toolbar > .schedule-filter {
+  margin-left: auto;
+}
+.list-toolbar-side {
+  margin-left: auto;
 }
 .extensions-view .skills-summary {
   justify-content: flex-end;
   margin-bottom: 16px;
-}
-
-.skills-toolbar {
-  margin-bottom: 20px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface);
-}
-.skills-toolbar .workspace-search {
-  flex: 0 1 320px;
 }
 
 /* Settings page hierarchy and button contrast. */
@@ -154,13 +156,6 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
 }
 
 /* Skills and settings workspace */
-.eyebrow {
-  margin-bottom: 8px;
-  color: var(--text-muted);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .12em;
-}
 
 .skills-head {
   align-items: flex-end;
@@ -190,11 +185,8 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
 .skills-toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 16px;
   margin-bottom: 14px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--border);
 }
 
 .segmented-control {
@@ -226,9 +218,6 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
   box-shadow: 0 1px 2px rgba(0,0,0,.16);
 }
 
-.skills-search {
-  width: 280px;
-}
 
 .skills-list {
   display: flex;

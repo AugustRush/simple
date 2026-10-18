@@ -479,7 +479,7 @@ function ProvidersCard({
 }
 
 export function createSettingsView(ctx: AppCtx) {
-  const { activateProvider, applyToken, config, configText, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, pageMeta, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  const { activateProvider, applyToken, config, configText, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   const renderSettings = () => {
@@ -489,12 +489,10 @@ export function createSettingsView(ctx: AppCtx) {
     const blocked = settingsDirty && !jsonStatus.valid
     return (
     <div className="page-view settings-view">
+      {/* The bar above names the page; this row carries the one sentence that
+          describes it and the save controls, not a second copy of the title. */}
       <div className="page-head settings-page-head">
-        <div>
-          <div className="eyebrow">WORKSPACE</div>
-          <h2>{pageMeta.settings.title}</h2>
-          <p>配置访问权限、模型偏好与消息频道。</p>
-        </div>
+        <p className="page-lead">配置访问权限、模型偏好与消息频道。</p>
         <Space>
           <span className={`save-state ${unsaved ? 'dirty' : ''} ${blocked ? 'blocked' : ''}`}>
             <span className="save-state-dot" />

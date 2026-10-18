@@ -27,16 +27,12 @@
   font-size: 13px;
 }
 
-/* Controls that belong to the page but not to its heading row. The bar above
-   already names the page and counts it, so a page that repeats neither needs
-   its controls on their own line rather than riding up under the bar. */
-.page-controls {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 20px;
+/* The one line a page keeps once its title stops being repeated in the body. */
+.page-lead {
+  margin: 0 !important;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .page-empty {
@@ -115,11 +111,6 @@
 .session-card.session-card-selected:hover {
   border-color: var(--primary);
   box-shadow: 0 0 0 1px var(--primary), 0 14px 34px rgba(0, 0, 0, 0.1);
-}
-
-.sessions-search.ant-input-affix-wrapper {
-  width: 240px;
-  max-width: 100%;
 }
 
 /* Sticky so the bulk actions stay reachable while scrolling a long grid to

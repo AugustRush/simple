@@ -11,7 +11,7 @@ import {
 import { Button, Card, Col, Empty, Input, Row, Skeleton, Switch, Tag } from 'antd'
 
 export function renderExtensions(ctx: AppCtx) {
-  const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, pageMeta, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
+  const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
 
 
   // The two bodies behind the merged 扩展 page.  Each keeps its own toolbar
@@ -33,7 +33,7 @@ export function renderExtensions(ctx: AppCtx) {
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : filteredPlugins.length === 0 ? (
-        <Empty description="暂无插件" className="page-empty" />
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有插件" className="page-empty" />
       ) : (
         <Row gutter={[16, 16]}>
           {filteredPlugins.map(item => (
@@ -79,7 +79,15 @@ export function renderExtensions(ctx: AppCtx) {
         <span><strong>{skills.filter(item => !item.user_invocable).length}</strong> 内部</span>
       </div>
 
-      <div className="skills-toolbar">
+      <div className="list-toolbar skills-toolbar">
+        <Input
+          prefix={<SearchOutlined />}
+          placeholder="搜索技能"
+          value={skillSearch}
+          onChange={event => setSkillSearch(event.target.value)}
+          allowClear
+          className="workspace-search skills-search"
+        />
         <div className="segmented-control" role="tablist" aria-label="技能筛选">
           {[
             ['all', '全部'],
@@ -98,20 +106,12 @@ export function renderExtensions(ctx: AppCtx) {
             </button>
           ))}
         </div>
-        <Input
-          prefix={<SearchOutlined />}
-          placeholder="按名称、ID 或来源搜索"
-          value={skillSearch}
-          onChange={event => setSkillSearch(event.target.value)}
-          allowClear
-          className="workspace-search skills-search"
-        />
       </div>
 
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : filteredSkills.length === 0 ? (
-        <Empty description="暂无技能" className="page-empty" />
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有技能" className="page-empty" />
       ) : (
         <div className="skills-list">
           {filteredSkills.map(item => {
@@ -158,13 +158,10 @@ export function renderExtensions(ctx: AppCtx) {
 
   return (
     <div className="page-view extensions-view">
-      <div className="page-head">
-        <div>
-          <div className="eyebrow">CAPABILITIES</div>
-          <h2>{pageMeta.extensions.title}</h2>
-          <p>插件给 Agent 增加新的能力入口，技能决定这些能力怎么被调用。</p>
-        </div>
-      </div>
+      {/* No title here: the bar above already says 扩展 and counts both lists.
+          A body heading that repeats it word for word made the page open with
+          the same sentence twice, forty pixels apart. */}
+      <p className="page-lead">插件给 Agent 增加新的能力入口，技能决定这些能力怎么被调用。</p>
       {/* The same tab idiom as the 自动化 page, so the two multi-list pages
           read as one family.  Counts sit on the tabs because that is where
           the visitor decides which list they are about to see. */}

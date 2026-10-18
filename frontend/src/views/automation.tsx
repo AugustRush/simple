@@ -158,6 +158,7 @@ export function renderSchedules(ctx: AppCtx) {
       <div className="schedule-attention-list" aria-label="需要查看的运行">
         {attentionRuns.length === 0 ? (
           <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
             description="没有需要查看的运行"
             className="page-empty"
           />
@@ -558,6 +559,7 @@ export function renderSchedules(ctx: AppCtx) {
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : filteredWorkflows.length === 0 ? (
         <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={workflows.length
             ? '没有符合条件的流程'
             : '还没有流程。流程把几个任务串成一条链：上一步成功，下一步才运行。'}
@@ -665,8 +667,10 @@ export function renderSchedules(ctx: AppCtx) {
     <div className="page-view schedules-view">
       <div className="page-head schedule-page-head">
         <div>
+          {/* The bar above already says 自动化; the row keeps only the two
+              facts that change -- whether the scheduler is up, and how old
+              this reading is. */}
           <div className="schedule-title-row">
-            <h2>自动化</h2>
             <span className={`scheduler-health ${schedulerHealth.status === 'online' ? 'online' : 'offline'}`}>
               <i />{schedulerHealth.status === 'online' ? '调度器在线' : '调度器离线'}
             </span>
@@ -785,6 +789,7 @@ export function renderSchedules(ctx: AppCtx) {
             placeholder="搜索任务、项目目录或执行内容"
             value={scheduleQuery}
             onChange={event => setScheduleQuery(event.target.value)}
+            className="workspace-search"
           />
         ) : (
           <Input
@@ -793,6 +798,7 @@ export function renderSchedules(ctx: AppCtx) {
             placeholder="搜索流程、步骤名称或执行内容"
             value={workflowQuery}
             onChange={event => setWorkflowQuery(event.target.value)}
+            className="workspace-search"
           />
         )}
         {automationTab === 'tasks' && (
@@ -1636,7 +1642,13 @@ export function renderSchedules(ctx: AppCtx) {
         )}
       </Drawer>
       {automationTab === 'attention' ? renderAttention() : automationTab === 'workflows' ? renderWorkflows() : (
-      loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={scheduleQuery.trim() || scheduleStatusFilter !== 'all' ? '没有符合条件的任务' : '还没有独立任务。流程里的步骤在「流程」页签里。'} className="page-empty" /> : (
+      loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={scheduleQuery.trim() || scheduleStatusFilter !== 'all'
+            ? '没有符合条件的任务'
+            : '还没有任务。流程里的步骤在「流程」页签里。'}
+          className="page-empty"
+        /> : (
         <div className="schedule-list">
           {filteredSchedules.map(task => {
             const description = task.kind === 'agent_prompt'

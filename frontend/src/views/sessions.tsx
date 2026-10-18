@@ -237,7 +237,7 @@ export function renderSessions(ctx: AppCtx) {
   const renderEmpty = () => {
     if (sessions.length === 0) {
       return (
-        <Empty description="还没有会话" className="page-empty">
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有会话" className="page-empty">
           <Button type="primary" icon={<PlusOutlined />} loading={creatingSession} onClick={() => void createSession()}>
             新建会话
           </Button>
@@ -245,7 +245,7 @@ export function renderSessions(ctx: AppCtx) {
       )
     }
     return (
-      <Empty description={query ? `没有匹配「${query}」的会话` : '没有匹配的会话'} className="page-empty">
+      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query ? `没有匹配「${query}」的会话` : '没有匹配的会话'} className="page-empty">
         {query && <Button onClick={() => setSessionSearch('')}>清除搜索</Button>}
       </Empty>
     )
@@ -258,9 +258,21 @@ export function renderSessions(ctx: AppCtx) {
           reads as a rendering fault rather than as emphasis. What is left for
           this row is the controls -- so they keep their own line instead of
           riding up under the bar. */}
-      <div className="page-controls">
-        <Space wrap>
-          {filteredSessions.length > 0 && (
+      {/* One toolbar shape across the three list pages: search first, at the
+          same width, then whatever narrows or acts on the list.  The search
+          used to sit on the far right here while 扩展 and 自动化 put it on the
+          left, so switching pages moved the same control across the screen. */}
+      <div className="list-toolbar">
+        <Input
+          prefix={<SearchOutlined />}
+          placeholder="搜索会话"
+          value={sessionSearch}
+          onChange={event => setSessionSearch(event.target.value)}
+          allowClear
+          className="workspace-search"
+        />
+        {filteredSessions.length > 0 && (
+          <Space className="list-toolbar-side" wrap>
             <Checkbox
               checked={allFilteredSessionsSelected}
               indeterminate={selecting && !allFilteredSessionsSelected}
@@ -272,16 +284,8 @@ export function renderSessions(ctx: AppCtx) {
             >
               全选
             </Checkbox>
-          )}
-          <Input
-            prefix={<SearchOutlined />}
-            placeholder="搜索会话"
-            value={sessionSearch}
-            onChange={event => setSessionSearch(event.target.value)}
-            allowClear
-            className="sessions-search"
-          />
-        </Space>
+          </Space>
+        )}
       </div>
 
       {selecting && (

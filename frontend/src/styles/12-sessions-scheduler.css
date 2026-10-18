@@ -140,7 +140,7 @@ html[data-theme='dark'] .settings-inline-save:disabled {
 .schedule-freshness.stale { color:var(--amber, #b45309); }
 .schedule-freshness.stale i { background:var(--amber, #d97706); box-shadow:0 0 0 3px rgba(217,119,6,.14); }
 .schedule-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
-.schedule-toolbar > .ant-input-affix-wrapper { width:min(360px, 100%); }
+.schedule-toolbar > .ant-input-affix-wrapper { width:280px; }
 .schedule-filter { display:flex; align-items:center; gap:2px; padding:3px; border:1px solid var(--border); border-radius:8px; background:var(--surface-raised); }
 .schedule-filter button { min-height:26px; padding:0 10px; border:0; border-radius:6px; color:var(--text-muted); background:transparent; font-size:10px; cursor:pointer; }
 .schedule-filter button:hover { color:var(--text-secondary); background:var(--surface-hover); }
