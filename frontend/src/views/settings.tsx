@@ -19,6 +19,7 @@ import {
   Space,
   Switch,
   Tag,
+  Tooltip,
 } from 'antd'
 
 const { TextArea } = Input
@@ -375,24 +376,37 @@ function ProvidersCard({
                   >
                     测试
                   </Button>
-                  <Button
-                    size="small"
-                    disabled={isActive}
-                    onClick={() => onActivate(name)}
-                  >
-                    {isActive ? '当前使用' : '切换到此'}
-                  </Button>
+                  {/* The active provider gets no switch button at all: "使用中"
+                      in the title row is the same fact, and a disabled button
+                      repeating it reads as an action that exists and is being
+                      withheld -- next to 删除, which really is withheld. */}
+                  {!isActive && (
+                    <Button size="small" onClick={() => onActivate(name)}>
+                      切换到此
+                    </Button>
+                  )}
                   <Button size="small" onClick={() => (open ? setEditing(null) : openEditor(name))}>
                     {open ? '收起' : '编辑'}
                   </Button>
-                  <Popconfirm
-                    title={`删除 Provider「${name}」？`}
-                    onConfirm={() => onDelete(name)}
-                  >
-                    <Button size="small" danger disabled={isActive}>
-                      删除
-                    </Button>
-                  </Popconfirm>
+                  {/* Deleting the active provider is refused by the gateway, so
+                      the button stays disabled -- but a disabled button cannot
+                      explain itself, and "why can I not delete this" is the
+                      question the row raises. The span exists because a disabled
+                      button fires no pointer events for the tooltip to hang on. */}
+                  {isActive ? (
+                    <Tooltip title="正在使用的 Provider 不能删除，先切换到别的">
+                      <span>
+                        <Button size="small" type="text" danger disabled>删除</Button>
+                      </span>
+                    </Tooltip>
+                  ) : (
+                    <Popconfirm
+                      title={`删除 Provider「${name}」？`}
+                      onConfirm={() => onDelete(name)}
+                    >
+                      <Button size="small" type="text" danger>删除</Button>
+                    </Popconfirm>
+                  )}
                 </Space>
               </div>
               <div
@@ -540,7 +554,12 @@ export function createSettingsView(ctx: AppCtx) {
                   disabled={!tokenDirty}
                   onClick={applyToken}
                 >
-                  {tokenDirty ? '保存令牌' : '已保存'}
+                  {/* Always the action, never the state: a button whose label
+                      changes to "已保存" while it is disabled reads as either a
+                      thing you already pressed or a thing you cannot press.
+                      The page's own pill says 已同步 / 有未保存更改, and saving
+                      says so in a toast. */}
+                  保存令牌
                 </Button>
               </Space.Compact>
             </div>
