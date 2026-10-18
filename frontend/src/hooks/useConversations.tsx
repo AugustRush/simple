@@ -30,7 +30,7 @@ const narratesTurnWork = (type: string): boolean =>
   Boolean(type) && !IDLE_FRAMES.has(type)
 
 export function useConversations(deps: Deps) {
-  const { api, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, confirmDeadlineRef, makeId, messageApi, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setConfirmDetailOpen, setConfirmRemaining, setConfirmReq, setPaletteQuery, setView, token, wsRef } = deps
+  const { api, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, confirmDeadlineRef, makeId, messageApi, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setConfirmDetailOpen, setConfirmRemaining, setConfirmReq, setConfirmSession, setPaletteQuery, setView, token, wsRef } = deps
 
   const [sessions, setSessions] = useState<SessionInfo[]>([])
 
@@ -1185,6 +1185,7 @@ export function useConversations(deps: Deps) {
           confirmDeadlineRef.current = Date.now() + timeout * 1000
           setConfirmRemaining(timeout)
           setConfirmDetailOpen(false)
+          setConfirmSession(activeSessionRef.current || null)
           setConfirmReq(evt as ConfirmRequest)
           // The bar covers the composer, so a still-focused textarea would
           // swallow keystrokes into an input the user can no longer see, and

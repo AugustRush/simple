@@ -684,18 +684,47 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
  * navigates, so it has to stay visible and answerable from any page. Sits
  * under antd's modals (z-index 1000+): an open modal covers it, and Esc
  * closes that modal first, before the approval's own Esc-to-deny can hear it. */
-.approval-floating {
+/* A pending approval, seen from another page: which conversation is waiting,
+ * how long is left, and the way back.  Deliberately not the bar -- the full
+ * bar is an alertdialog with the command and the decision buttons, and it only
+ * belongs over the chat that can answer it. */
+.approval-notice {
   position: fixed;
   left: 50%;
   bottom: 16px;
   transform: translateX(-50%);
-  width: min(820px, calc(100vw - 32px));
   z-index: 700;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 9px 12px 9px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
 }
 
-.approval-floating .approval-bar {
-  width: 100%;
-  margin: 0;
+.approval-notice-icon {
+  color: var(--amber);
+  font-size: 14px;
+}
+
+.approval-notice-timer {
+  color: var(--amber);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  .approval-notice {
+    left: 12px;
+    right: 12px;
+    transform: none;
+    flex-wrap: wrap;
+    border-radius: 14px;
+  }
 }
 
 /* Conversation composer

@@ -10,6 +10,13 @@ export function useConfirm(deps: Deps) {
 
   const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null)
 
+  //: The session the prompt belongs to.  A confirmation is answered on the
+  //: socket of the session that raised it, so showing one over another
+  //: conversation (or over 设置) asks the reader to answer for a chat they are
+  //: not looking at.  Stored beside the request rather than on it because the
+  //: request is the server's shape, not the client's.
+  const [confirmSession, setConfirmSession] = useState<string | null>(null)
+
   const [confirmRemaining, setConfirmRemaining] = useState(0)
 
   const [confirmDetailOpen, setConfirmDetailOpen] = useState(false)
@@ -169,5 +176,5 @@ export function useConfirm(deps: Deps) {
     })
   }
 
-  return { attachApprovalCommand, confirmDeadlineRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmResourceDeletion, dismissConfirm, sendConfirm, setConfirmDetailOpen, setConfirmOverflowing, setConfirmRemaining, setConfirmReq } as const
+  return { attachApprovalCommand, confirmDeadlineRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmResourceDeletion, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen, setConfirmOverflowing, setConfirmRemaining, setConfirmReq, setConfirmSession } as const
 }

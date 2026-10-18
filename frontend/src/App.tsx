@@ -1,4 +1,4 @@
-import { CloseOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MenuOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import { CloseOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MenuOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
 import { Button, ConfigProvider, Dropdown, Empty, Input, Layout, Menu, Modal, Skeleton, theme, Tooltip } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
@@ -14,7 +14,6 @@ import { createSettingsView } from './views/settings'
 import { relativeTime } from './lib/format'
 import { isSessionBusy, sessionStatusOf } from './lib/tools'
 import { SessionTitle } from './components/SessionTitle'
-import { ApprovalBar } from './components/ApprovalBar'
 
 import { useUi } from './hooks/useUi'
 import { useApiClient } from './hooks/useApiClient'
@@ -76,7 +75,7 @@ function App() {
 
   const { contextHolder, messageApi, token } = apiClient
 
-  const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
+  const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
   const { activateTurnIndex, activeSession, activity, allFilteredSessionsSelected, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
@@ -125,6 +124,19 @@ function App() {
     }
   }
 
+  // A prompt belongs to the conversation that raised it: the decision goes out
+  // on that session's socket, so showing it over another chat (or over 设置)
+  // asks the reader to answer for a conversation they are not looking at.
+  // ``confirmSession`` is recorded when the request arrives; a request with no
+  // session recorded (an older backend) keeps the old behaviour.
+  const activeConfirm =
+    confirmReq && (!confirmSession || confirmSession === activeSession)
+      ? confirmReq
+      : null
+  const approvalSessionTitle =
+    (sessions.find(item => item.session_id === activeSession)?.title || '').trim()
+    || '未命名会话'
+
   // Views are pure renderers built from this one context object.
   const ctx: AppCtx = {
     updateMessage,
@@ -164,7 +176,7 @@ function App() {
     handleChatDrop,
     setInput,
     isStreaming,
-    confirmReq,
+    confirmReq: activeConfirm,
     confirmRemaining,
     confirmOverflowing,
     confirmDetailOpen,
@@ -683,23 +695,22 @@ function App() {
         </Layout>
       </Layout>
 
-      {/* The approval bar, shown on every view except chat (chat renders it
-          inside its composer stack). A pending approval keeps counting down
-          to an auto-deny wherever the user navigates, so it must stay visible
-          and answerable from any page, not silently expire in the view the
-          user left. */}
-      {view !== 'chat' && confirmReq && (
-        <div className="approval-floating">
-          <ApprovalBar
-            confirmReq={confirmReq}
-            remaining={confirmRemaining}
-            detailOpen={confirmDetailOpen}
-            overflowing={confirmOverflowing}
-            commandRef={attachApprovalCommand}
-            onToggleDetail={() => setConfirmDetailOpen(open => !open)}
-            onDecide={sendConfirm}
-            onDismiss={dismissConfirm}
-          />
+      {/* Not the bar itself: an approval is answerable only in the conversation
+          that raised it, and a full-width alertdialog over 设置 or 任务 takes the
+          page away to ask about a chat the reader is not looking at.  A compact
+          notice says which conversation is waiting and offers the way back --
+          the deadline keeps running, so saying nothing would be the silent
+          auto-deny this replaced. */}
+      {view !== 'chat' && activeConfirm && confirmRemaining > 0 && (
+        <div className="approval-notice" role="status" aria-live="polite">
+          <SafetyCertificateOutlined className="approval-notice-icon" />
+          <span>
+            会话「{approvalSessionTitle}」有一个操作等待你确认
+          </span>
+          <span className="approval-notice-timer">{confirmRemaining}s</span>
+          <Button size="small" type="primary" onClick={() => navigateTo('chat')}>
+            回到对话
+          </Button>
         </div>
       )}
 
