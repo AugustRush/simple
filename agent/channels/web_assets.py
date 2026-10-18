@@ -57,10 +57,29 @@ async def _index(
 
     dist = _web_dist_dir() / "index.html"
     if dist.is_file():
-        return HTMLResponse(dist.read_text(encoding="utf-8"))
-    return HTMLResponse(
+        return _uncached(HTMLResponse(dist.read_text(encoding="utf-8")))
+    return _uncached(HTMLResponse(
         "<html><body style='font-family:sans-serif;padding:40px'>"
         "<h1>Simple Agent API</h1>"
         "<p>This is the API endpoint for web integrations.</p>"
         "</body></html>"
-    )
+    ))
+
+
+def _uncached(response: Any) -> Any:
+    """Mark the entry document as revalidate-on-every-load.
+
+    The document is the one file that names the bundle (``index-<hash>.js``).
+    Cached, it keeps pointing at a bundle that a newer build has already
+    deleted -- and because the old script is cached too, the page keeps working
+    from cache and simply *never* shows the new UI.  That is the shape of "I
+    rebuilt the frontend and nothing changed": the tab was serving last week's
+    entry document, not the new one.
+
+    ``no-cache`` rather than ``no-store``: the document may be stored, it just
+    has to be revalidated, and it is 411 bytes -- there is nothing to save by
+    trusting a copy.  The hashed assets themselves keep their ETag and may be
+    cached forever: their name changes when their content does.
+    """
+    response.headers["Cache-Control"] = "no-cache"
+    return response

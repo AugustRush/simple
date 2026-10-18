@@ -5728,3 +5728,22 @@ def test_web_rewind_refuses_a_running_turn(tmp_path):
     assert refused.status_code == 409
     page = client.get("/api/sessions/s1/messages")
     assert [item["content"] for item in page.json()["messages"]] == ["问题", "答案"]
+
+
+def test_the_entry_document_is_never_served_from_a_stale_cache():
+    """The one document that names the bundle has to be revalidated.
+
+    ``index.html`` points at ``index-<hash>.js``.  Cached, a rebuilt frontend
+    keeps loading the old bundle -- which the browser also has cached -- so the
+    page works, is stale, and every UI change is invisible until a hard reload.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    with TestClient(channel.app) as client:
+        resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-cache"
+    # The hashed asset is allowed to be cached: its name changes with its bytes.
+    assert "/assets/index-" in resp.text
