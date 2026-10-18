@@ -383,12 +383,17 @@ class WebOutputSink(OutputSink):
         result: str,
         *,
         operation_id: str = "",
+        ok: bool = True,
     ) -> None:
         self._emit(
             {
                 "type": "tool_end",
                 "name": name,
                 "result": result,
+                # The transcript marks a step by this, not by the fact that a
+                # result came back: without it every failed call rendered as
+                # "已完成", and the trace's dots had no failure to show.
+                "ok": bool(ok),
                 **_operation_tag(operation_id),
                 **_turn_tag(self._turn_id),
             }

@@ -2400,6 +2400,67 @@ def test_session_service_merges_continuations_without_moving_trace_or_attachment
     assert page["messages"][2]["content"] == "我先检查文件。\n\n检查完成，这是最终结论。"
 
 
+def test_the_durable_transcript_separates_a_failed_call_from_a_blocked_one(tmp_path):
+    """A reloaded trace says what the live one said.
+
+    Three states used to collapse into two wrong ones: a completion carrying
+    ``ok: false`` was projected as ``blocked`` (it ran and failed), and a
+    ``tool_blocked`` event was dropped entirely, so the row kept its ``running``
+    state and a reload called a refusal ``interrupted`` -- the word for a call
+    whose process died. The live transcript distinguishes all three, so the
+    durable one has to as well.
+    """
+    from agent.memory.store import LTMStore
+    from agent.session_service import SessionService
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="看看这两个文件",
+        channel="web",
+        message_id="turn-1",
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="turn-1",
+        event_type="tool_started",
+        payload={"operation_id": "call-1", "tool_name": "read_file"},
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="turn-1",
+        event_type="tool_completed",
+        payload={
+            "operation_id": "call-1",
+            "tool_name": "read_file",
+            "ok": False,
+            "result_preview": "no such file",
+        },
+    )
+    # A gate can refuse before ``tool_started``: this event creates its own row.
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="turn-1",
+        event_type="tool_blocked",
+        payload={
+            "operation_id": "call-2",
+            "tool_name": "shell",
+            "reason": "requires confirmation",
+        },
+    )
+
+    page = SessionService(store=store).get_messages("web-session")
+    states = {
+        item["tool"]: (item["toolState"], item["content"])
+        for item in page["messages"]
+        if item["role"] == "tool"
+    }
+    assert states == {
+        "read_file": ("failed", "no such file"),
+        "shell": ("blocked", "requires confirmation"),
+    }
+
+
 def test_web_create_agent_schedule_with_structured_time(tmp_path, monkeypatch):
     from datetime import datetime, timedelta, timezone
     from starlette.testclient import TestClient
@@ -5531,6 +5592,23 @@ def test_socket_tool_events_carry_their_operation_id():
     assert [e["operation_id"] for e in started] == ["op-1", "op-2"]
     assert [e["operation_id"] for e in ended] == ["op-1", "op-2"]
     assert [e["inputs"] for e in started] == [{"path": "."}, {"path": ".."}]
+
+
+def test_a_tool_result_frame_says_whether_the_call_succeeded():
+    """The frame carries the executor's verdict, not just the result text.
+
+    A call that returned an error is still a call that returned. The transcript
+    marked every closed tool "已完成" because the frame could not say otherwise,
+    and the trace's failure colour had nothing to colour.
+    """
+    from agent.channels.web import WebOutputSink
+
+    sink = WebOutputSink(collect=True)
+    sink.on_tool_end("read_file", '{"ok": false, "error": "no such file"}', ok=False)
+    sink.on_tool_end("read_file", '{"ok": true, "content": "x"}', ok=True)
+
+    frames = [e for e in sink.events if e["type"] == "tool_end"]
+    assert [frame["ok"] for frame in frames] == [False, True]
 
 
 def test_stream_events_carry_the_turn_they_belong_to():

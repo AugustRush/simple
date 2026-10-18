@@ -341,7 +341,11 @@ class FeishuOutputSink(OutputSink):
         result: str,
         *,
         operation_id: str = "",
+        ok: bool = True,
     ) -> None:
+        # The chat surface sends no per-tool closing frame (the run's own progress
+        # message carries it), so the verdict has nowhere to go here; the argument
+        # is accepted so every sink shares one signature.
         return
 
     def on_tool_progress(self, name: str, progress: dict[str, Any]) -> None:

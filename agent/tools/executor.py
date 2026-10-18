@@ -536,7 +536,11 @@ class RegularToolExecutor:
         )
 
         if sink:
-            sink.on_tool_end(name, result, operation_id=operation_id)
+            # ``ok`` travels with the result: it is the executor's own reading of the
+            # tool's answer (the ``ok`` key of its JSON, computed above for the bus
+            # event), and without it every sink can only say "the call returned" --
+            # which the web transcript rendered as "已完成" over a failed tool.
+            sink.on_tool_end(name, result, operation_id=operation_id, ok=ok)
         else:
             shared.CONSOLE.print(
                 f"[dim]{result[:200]}{'...' if len(result) > 200 else ''}[/dim]"

@@ -34,8 +34,8 @@ class _RecordingSink:
     def on_tool_start(self, name, inputs, *, operation_id=""):
         self.events.append(("start", name, inputs, operation_id))
 
-    def on_tool_end(self, name, result, *, operation_id=""):
-        self.events.append(("end", name, result, operation_id))
+    def on_tool_end(self, name, result, *, operation_id="", ok=True):
+        self.events.append(("end", name, result, operation_id, ok))
 
     def on_tool_blocked(self, name, reason, *, operation_id=""):
         self.events.append(("blocked", name, reason, operation_id))
@@ -76,6 +76,33 @@ def test_regular_tool_executor_calls_registry_and_sink():
     assert events[0].fields["operation_id"] == call_id
     assert events[1].fields["operation_id"] == call_id
     assert events[0].fields["timeout_seconds"] == 1800
+
+
+def test_a_failed_tool_result_reaches_the_sink_as_a_failure():
+    """The sink is told the verdict, not left to infer it from the text.
+
+    ``ok`` is the executor's own reading of the tool's JSON answer -- the value
+    its bus event already carries -- and it is what lets a transcript mark a
+    step as failed instead of calling every closed call "已完成".
+    """
+    class FailingRegistry:
+        async def call(self, name, inputs):
+            return json.dumps({"ok": False, "error": "no such file"})
+
+    sink = _RecordingSink()
+    token = _active_sink.set(sink)
+    try:
+        asyncio.run(
+            RegularToolExecutor(FailingRegistry()).run(
+                {"name": "read_file", "input": {"path": "/nowhere"}}
+            )
+        )
+    finally:
+        _active_sink.reset(token)
+
+    ended = [event for event in sink.events if event[0] == "end"]
+    assert len(ended) == 1
+    assert ended[0][4] is False
 
 
 def test_regular_tool_executor_honors_a_blocking_listener():

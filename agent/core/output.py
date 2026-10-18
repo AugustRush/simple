@@ -496,8 +496,14 @@ class OutputSink(ABC):
         result: str,
         *,
         operation_id: str = "",
+        ok: bool = True,
     ) -> None:
-        """Called immediately after a tool returns its result."""
+        """Called immediately after a tool returns its result.
+
+        ``ok`` is the executor's reading of that result (the ``ok`` key of the
+        tool's JSON answer), the same value its bus event carries. A sink that
+        only knows "the call returned" has to call every call a success.
+        """
 
     def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
         """Called when a running tool reports progress."""
@@ -910,7 +916,13 @@ class CliOutputSink(OutputSink):
         result: str,
         *,
         operation_id: str = "",
+        ok: bool = True,
     ) -> None:
+        # ``ok`` is accepted to keep one signature across sinks, and not read: this
+        # sink already derives the same verdict from the result text it prints
+        # (``_summarize_tool_result``), and that derivation has a third state -- an
+        # unreadable answer stays "·" rather than being promoted to a green check by
+        # the executor's boolean.
         self._stop_activity()
         if self._tool_progress is not None:
             self._tool_progress.stop()

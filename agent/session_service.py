@@ -326,7 +326,13 @@ def _event_rows(
                     }
                 )
             continue
-        if event_type not in {"tool_started", "tool_progress", "tool_completed", "tool_failed"}:
+        if event_type not in {
+            "tool_started",
+            "tool_progress",
+            "tool_completed",
+            "tool_failed",
+            "tool_blocked",
+        }:
             continue
         operation_id = str(payload.get("operation_id") or "")
         if not operation_id:
@@ -349,11 +355,23 @@ def _event_rows(
             if detail is not None:
                 item["content"] = str(detail)[:220]
         elif event_type == "tool_completed":
-            item["toolState"] = "done" if payload.get("ok", True) else "blocked"
+            # ``ok: false`` is "it ran and reported a failure", not "it was
+            # blocked": those are different states to a reader, and the live
+            # transcript already draws them apart (``failed`` vs ``blocked``).
+            # Calling both "blocked" made a reloaded conversation disagree with
+            # the one it was a reload of.
+            item["toolState"] = "done" if payload.get("ok", True) else "failed"
             item["content"] = str(payload.get("result_preview") or item.get("content") or "")[:220]
         elif event_type == "tool_failed":
-            item["toolState"] = "blocked"
+            item["toolState"] = "failed"
             item["content"] = str(payload.get("result_preview") or item.get("content") or "执行失败")[:220]
+        elif event_type == "tool_blocked":
+            # A gate can refuse before ``tool_started`` is emitted, so this event
+            # creates the row as well as closing it. Without a case here the
+            # operation kept its ``running`` state and a reload showed a blocked
+            # call as interrupted -- a state that means "the process died".
+            item["toolState"] = "blocked"
+            item["content"] = str(payload.get("reason") or item.get("content") or "操作被阻止")[:220]
     # A process restart can leave the last tool_started event without
     # a terminal event. It is unsafe to present that operation as
     # completed (or to replay it automatically), so expose an
