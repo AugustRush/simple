@@ -259,7 +259,13 @@ export function renderChat(ctx: AppCtx) {
               <span>{truncate(sessionState.task.progress, 180)}</span>
             )}
             <div className="task-guidance-next">
-              <span>{sessionState.task.next_action ? `下一步：${truncate(sessionState.task.next_action, 180)}` : '任务已中断，可选择继续或放弃'}</span>
+              {/* ``next_action`` is the sentence the *model* is given
+                  ("Recover from the last error and continue the active goal
+                  if the user's next message is related.").  It used to be
+                  printed here as 下一步, which put an English instruction to
+                  the agent in front of the person.  What the person needs is
+                  the state of the attempt, not the agent's next move. */}
+              <span>上一轮没有完成。可以接着做，也可以让它不再提示。</span>
               <div className="task-guidance-actions">
                 <Button
                   type="text"
@@ -271,10 +277,9 @@ export function renderChat(ctx: AppCtx) {
                 <Button
                   type="text"
                   size="small"
-                  danger
                   onClick={dismissTaskGuidance}
                 >
-                  放弃任务
+                  不再提示
                 </Button>
               </div>
             </div>

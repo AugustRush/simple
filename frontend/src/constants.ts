@@ -131,10 +131,13 @@ export const SESSION_STATUS_LABELS: Record<string, string> = {
 }
 
 
+//: How the *last attempt* at the task ended, which is what the record says.
+//: ``failed`` is not "the task failed": the goal is still open, one turn hit an
+//: error.  Saying 失败 over the goal reads as a verdict on the work.
 export const TASK_STATUS_LABELS: Record<string, string> = {
   cancelled: '已取消',
   interrupted: '已中断',
-  failed: '失败',
+  failed: '未完成',
 }
 
 
