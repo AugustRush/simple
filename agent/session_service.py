@@ -22,6 +22,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from agent.memory.rewind import cut_provider_checkpoint, request_message_index
+from agent.memory.context_working_state import _is_continuation_message, _nearest_real_goal
 
 
 class _WebSessionRegistry:
@@ -766,9 +767,17 @@ class SessionService:
                     # Keep the payload intentionally bounded; recent turns and
                     # artifacts are enough to guide a continuation without
                     # shipping the whole memory database to the browser.
+                    # A record written before continuations were matched can
+                    # carry the phrase "继续当前任务" as its goal -- the words
+                    # the card's own button sends.  Resolve it here as well as
+                    # when writing, so the conversation on screen is fixed
+                    # without waiting for the next turn.
+                    goal = str(raw.get("active_goal") or "")
+                    if _is_continuation_message(goal):
+                        goal = _nearest_real_goal(raw.get("tasks")) or goal
                     task = {
                         "task_id": str(raw.get("task_id") or ""),
-                        "active_goal": str(raw.get("active_goal") or ""),
+                        "active_goal": goal,
                         "status": str(raw.get("status") or ""),
                         "progress": str(raw.get("progress") or ""),
                         "next_action": str(raw.get("next_action") or ""),

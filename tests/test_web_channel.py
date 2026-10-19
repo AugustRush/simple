@@ -5805,3 +5805,44 @@ def test_stopping_the_channel_ends_start_cleanly(monkeypatch):
         await asyncio.wait_for(task, timeout=2.0)
 
     asyncio.run(scenario())
+
+
+def test_session_state_repairs_a_goal_recorded_as_a_continuation_phrase(tmp_path):
+    """The card's title is the goal; "继续当前任务" is not one.
+
+    A state written before continuations were matched carries the button's own
+    words as the task's goal.  The API resolves it against the earlier tasks so
+    the conversation on screen is fixed without waiting for another turn.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.save_session_working_state(
+        "s1",
+        {
+            "task_id": "task-broken",
+            "active_goal": "继续当前任务",
+            "status": "failed",
+            "progress": "改了机位。",
+            "next_action": "Recover from the last error…",
+            "tasks": [
+                {
+                    "task_id": "task-real",
+                    "active_goal": "给我创作一个硬核的广告片",
+                    "status": "in_progress",
+                    "updated_at": "2026-10-18 13:04:54",
+                },
+                {
+                    "task_id": "task-broken",
+                    "active_goal": "继续当前任务",
+                    "status": "failed",
+                    "updated_at": "2026-10-18 18:46:50",
+                },
+            ],
+        },
+    )
+
+    state = SessionService(store=store).get_session_state("s1")
+
+    assert state["task"]["task_id"] == "task-broken"
+    assert state["task"]["active_goal"] == "给我创作一个硬核的广告片"

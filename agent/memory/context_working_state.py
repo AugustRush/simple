@@ -31,6 +31,62 @@ TURN_OUTCOME_EVENTS = frozenset(
 )
 
 
+#: Lines that ask for a stopped task to be picked back up rather than naming
+#: new work.  Matched against the whole line after punctuation is stripped, so
+#: "继续，把机位改近" stays a new instruction.
+_CONTINUATION_PHRASES = frozenset(
+    {
+        "继续",
+        "继续吧",
+        "继续任务",
+        "继续当前任务",
+        "继续做",
+        "接着",
+        "接着来",
+        "接着做",
+        "continue",
+        "goon",
+        "keepgoing",
+        "resume",
+        "carryon",
+    }
+)
+
+
+def _is_continuation_message(text: str) -> bool:
+    """Whether *text* means "carry on" and not "here is new work".
+
+    The task card's 继续任务 button sends exactly ``继续当前任务``.  Scored like
+    any other message it shares no terms with the goal it refers to, so it used
+    to mint a *new* task whose goal was the word "继续当前任务" -- and every
+    later failure then offered the prompt again under a fresh id, which is also
+    why answering it never stuck.  A continuation is recognised by being *only*
+    a continuation: an instruction attached to it is new work.
+    """
+    normalized = re.sub(
+        r"[\s，。！？!?,.;；:：…~～、]+", "", str(text or "")
+    ).casefold()
+    return normalized in _CONTINUATION_PHRASES
+
+
+def _nearest_real_goal(tasks: Any) -> str:
+    """The newest goal that is actually a goal.
+
+    A record written before continuations were matched can still carry
+    ``继续当前任务`` as its goal -- the phrase the card's button sends.  That is
+    not a goal, so the card's title falls back to the nearest earlier task that
+    named one.  Without this the repair would only help *new* tasks, and the
+    conversation the reader is looking at would keep the wrong title.
+    """
+    for task in reversed(list(tasks or ())):
+        if not isinstance(task, dict):
+            continue
+        goal = str(task.get("active_goal") or "").strip()
+        if goal and not _is_continuation_message(goal):
+            return goal
+    return ""
+
+
 def _working_state_relevance_score(
     state: dict[str, Any],
     query: str,
@@ -230,25 +286,37 @@ def _project_working_state_from_event(
         prior_tasks = [dict(prior_state)]
 
     matched_task: dict[str, Any] | None = None
+    continuation = _is_continuation_message(clean_user)
     if clean_user and prior_tasks:
-        scored_matches = [
-            (_working_state_relevance_score(task, clean_user), task)
-            for task in prior_tasks
-            if not _working_state_is_complete(task)
+        open_tasks = [
+            task for task in prior_tasks if not _working_state_is_complete(task)
         ]
-        scored_matches = [
-            (score, task) for score, task in scored_matches if score >= 2.0
-        ]
-        if scored_matches:
-            scored_matches.sort(
-                key=lambda item: (
-                    item[0],
-                    str(item[1].get("updated_at", "")),
-                    str(item[1].get("task_id", "")),
-                ),
-                reverse=True,
-            )
-            matched_task = dict(scored_matches[0][1])
+        if continuation:
+            # "Carry on" refers to the task we were just doing -- including one
+            # whose last *turn* finished, because a turn's "completed" is not
+            # the goal's: "继续" after a finished step means the next step.  The
+            # newest task is the one it refers to; taking only *open* ones
+            # matched nothing, since every successful turn closes its task, and
+            # that is how the phrase became a goal of its own.
+            matched_task = dict(prior_tasks[-1])
+        else:
+            scored_matches = [
+                (_working_state_relevance_score(task, clean_user), task)
+                for task in open_tasks
+            ]
+            scored_matches = [
+                (score, task) for score, task in scored_matches if score >= 2.0
+            ]
+            if scored_matches:
+                scored_matches.sort(
+                    key=lambda item: (
+                        item[0],
+                        str(item[1].get("updated_at", "")),
+                        str(item[1].get("task_id", "")),
+                    ),
+                    reverse=True,
+                )
+                matched_task = dict(scored_matches[0][1])
     elif prior_tasks:
         open_tasks = [
             task for task in prior_tasks if not _working_state_is_complete(task)
@@ -285,10 +353,19 @@ def _project_working_state_from_event(
         payload.get("artifacts"),
         (matched_task or {}).get("artifacts"),
     )
+    # A continuation never overwrites the goal it continues: the goal is what
+    # the user asked for, and "继续当前任务" is not that.
+    if continuation:
+        active_goal = str((matched_task or {}).get("active_goal", "") or "").strip()
+        if not active_goal or _is_continuation_message(active_goal):
+            active_goal = _nearest_real_goal(prior_tasks) or clean_user
+    else:
+        active_goal = clean_user or str(
+            (matched_task or {}).get("active_goal", "") or ""
+        )
     current_task = {
         "task_id": task_id,
-        "active_goal": clean_user
-        or str((matched_task or {}).get("active_goal", "") or ""),
+        "active_goal": active_goal,
         "status": status,
         "progress": progress,
         "next_action": next_action,

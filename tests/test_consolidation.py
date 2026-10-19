@@ -3411,3 +3411,123 @@ def test_fit_to_budget_is_usable_without_an_instance(tmp_path):
         messages, input_token_budget=900, estimate_tokens=estimate_message_tokens
     )
     assert via_class == via_instance
+
+
+def test_a_continuation_message_continues_the_open_task(tmp_path):
+    """The card's 继续任务 button sends a phrase, not a goal.
+
+    ``继续当前任务`` shares no terms with the work it refers to, so the matcher
+    used to mint a new task whose goal was that phrase.  Every later failure
+    then offered the card again under a fresh id -- which is also why answering
+    it never stuck -- and the card's title was the word "继续当前任务".
+    """
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "给我创作一个硬核的广告片，主题是 mac studio",
+            "assistant_content": "先确认机位和焦距。",
+        },
+    )
+    first = store.load_session_working_state("session-1").state
+    first_id = first["task_id"]
+
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "继续当前任务",
+            "assistant_content": "改了机位。",
+            "error": "OpenDesign: EOF (502)",
+        },
+    )
+    second = store.load_session_working_state("session-1").state
+
+    assert second["task_id"] == first_id, "a continuation minted a new task"
+    assert second["active_goal"].startswith("给我创作一个硬核的广告片")
+    assert second["status"] == "failed", "the attempt failed; the goal did not"
+
+
+def test_an_instruction_attached_to_继续_is_new_work(tmp_path):
+    """Only a bare "carry on" continues the open task.  "继续，把机位改近" is a
+    new instruction and keeps its own task -- folding it into the old one would
+    hide a real change of direction."""
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {"user_content": "创作广告片", "assistant_content": "先确认机位。"},
+    )
+    first_id = store.load_session_working_state("session-1").state["task_id"]
+
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {"user_content": "继续，把机位改近", "assistant_content": "改了。"},
+    )
+    after = store.load_session_working_state("session-1").state
+
+    assert after["task_id"] != first_id
+    assert after["active_goal"] == "继续，把机位改近"
+
+
+def test_a_continuation_repairs_a_goal_recorded_as_a_phrase(tmp_path):
+    """States written before continuations were matched carry the phrase as the
+    goal.  The next continuation must inherit the real goal, not keep it."""
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    store.save_session_working_state(
+        "session-1",
+        {
+            "task_id": "task-broken",
+            "active_goal": "继续当前任务",
+            "status": "failed",
+            "progress": "改了机位。",
+            "tasks": [
+                {
+                    "task_id": "task-real",
+                    "active_goal": "给我创作一个硬核的广告片",
+                    "status": "in_progress",
+                    "updated_at": "2026-10-18 13:04:54",
+                },
+                {
+                    "task_id": "task-broken",
+                    "active_goal": "继续当前任务",
+                    "status": "failed",
+                    "updated_at": "2026-10-18 18:46:50",
+                },
+            ],
+        },
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {"user_content": "继续当前任务", "assistant_content": "接着改。"},
+    )
+    after = store.load_session_working_state("session-1").state
+
+    assert after["task_id"] == "task-broken"
+    assert after["active_goal"] == "给我创作一个硬核的广告片"
