@@ -38,13 +38,26 @@ otherwise be tempted to "fix":
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent import shared
 from agent.scheduler.models import LOCAL_TIMEZONE, normalize_products
+from agent.scheduler.store_call import call_store_method
 
 from .runtime import _active_schedule_target
+
+
+logger = logging.getLogger(__name__)
+
+
+#: How a "run it now" reply says what happened, because the three cases are not
+#: the same promise.  An agent that reads one word for all of them is how
+#: "已经启动了" came to be said about a run nobody was executing.
+RUN_OUTCOME_STARTED = "started"  # executing in this process, run id known
+RUN_OUTCOME_WOKEN = "woken"  # a live scheduler took the request on its loop
+RUN_OUTCOME_QUEUED = "queued"  # no scheduler here: on the durable queue
 
 
 #: How much of a failed run's text a tool result carries.
@@ -861,7 +874,7 @@ class ScheduleTools:
             ),
         )
 
-    def schedule_run(
+    async def schedule_run(
         self, task_id: str, run_id: str = "", intent: str = ""
     ) -> dict[str, Any]:
         """Start a run now: this task as it is, or that run's snapshot again.
@@ -876,40 +889,132 @@ class ScheduleTools:
         A task that is already running is refused rather than queued.  The run
         in flight owns the row, so a second one would either wait invisibly or
         collide with it, and both are worse than being told.
+
+        **Where the run happens decides what this says.**  A scheduler serving
+        this process claims the run and starts it, and the reply names the run
+        (``started``).  A scheduler live on another loop is handed the request
+        and starts it there, which this call cannot name yet (``woken``).  With
+        no scheduler at all -- a single-turn CLI -- only the durable claim can
+        be made, and the reply says the run is queued for a gateway or
+        ``agent scheduler`` (``queued``).  The three are reported apart because
+        claiming "已经启动了" is exactly how the agent's answer and the system's
+        behaviour came apart: a claim nobody serves waits out its lease and is
+        then recorded as interrupted.
         """
         store = self._schedule_store()
         wanted = str(task_id or "").strip()
         if not wanted:
             return self._error("task_id 不能为空；用 schedule_list 里的 id。")
         source = str(run_id or "").strip()
+        wake = self.registry.get_context("scheduler_wake")
+        if callable(wake):
+            answered = await self._start_on_the_running_scheduler(
+                wake, store, wanted, source
+            )
+            if answered is not None:
+                return answered
+        return await self._queue_for_a_scheduler(store, wanted, source)
+
+    async def _start_on_the_running_scheduler(
+        self, wake: Callable[..., Any], store: Any, task_id: str, run_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Ask the scheduler this process is running to start the run.
+
+        Returns ``None`` when there is no live scheduler to ask, which sends the
+        caller to the durable queue.  A callback that raises is treated the same
+        way and logged: the run is still queued, and a courtesy that failed must
+        not turn into a tool error.
+        """
+        try:
+            outcome = await wake(task_id, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001 - fall through to the queue
+            logger.warning("scheduler wake failed; queueing instead: %s", exc)
+            return None
+        if not isinstance(outcome, dict):
+            return None
+        kind = str(outcome.get("outcome") or "")
+        if kind == "started":
+            run = getattr(outcome.get("claim"), "run", None)
+            return self._ok(
+                task_id=task_id,
+                run_id=str(getattr(run, "id", "") or ""),
+                trigger_source=str(getattr(run, "trigger_source", "") or ""),
+                attempt=int(getattr(run, "attempt", 1) or 1),
+                outcome=RUN_OUTCOME_STARTED,
+                note=(
+                    "已经在这个进程里起跑：调度器正在跑，它立刻接手了这次运行。"
+                    "运行在后台，可能要几分钟；用 schedule_runs 看结果。"
+                ),
+            )
+        if kind == "woken":
+            return self._ok(
+                task_id=task_id,
+                run_id="",
+                outcome=RUN_OUTCOME_WOKEN,
+                note=(
+                    "调度器正在跑，但不在当前这个事件循环上：请求已经交给它，"
+                    "它会在自己的循环里立刻起跑。这次调用拿不到运行 id；"
+                    "用 schedule_runs 看这次运行。"
+                ),
+            )
+        if kind == "busy":
+            return await self._refuse_busy(store, task_id, run_id)
+        return None
+
+    async def _refuse_busy(
+        self, store: Any, task_id: str, run_id: str
+    ) -> dict[str, Any]:
+        """The refusal a task with a run in flight gets, whichever side asked.
+
+        A live scheduler and the store's own claim agree on this: the row is
+        owned by the run that is going, so the answer is why, not a second run.
+        """
+        task = await call_store_method(store, "get_task", task_id)
+        if task is None:
+            return self._error(
+                f"没有 id 为「{task_id}」的任务。用 schedule_list 看现有任务。"
+            )
+        if task.active_run_id:
+            return self._error(
+                f"「{task.name}」正在运行（运行 {task.active_run_id}）。"
+                "要停掉它用 schedule_cancel；要看它跑成什么样用 schedule_runs。"
+            )
+        return self._error(
+            f"没找到可重跑的运行「{run_id}」，或者它还在运行中。"
+            "用 schedule_runs 看这个任务有哪些运行、各自是什么状态。"
+        )
+
+    async def _queue_for_a_scheduler(
+        self, store: Any, task_id: str, run_id: str
+    ) -> dict[str, Any]:
+        """Claim the row for a scheduler that is not in this process.
+
+        What this tool did in every case before there was a wake path.  It is
+        the right thing only here: the claim is durable, so a gateway or an
+        ``agent scheduler`` picks the work up -- once its lease has run out, if
+        this process still has nobody serving it, which is why the reply says
+        *queued* and names who consumes it.
+        """
         try:
             claimed = (
-                store.claim_retry(wanted, source) if source else store.claim_task_now(wanted)
+                await call_store_method(store, "claim_retry", task_id, run_id)
+                if run_id
+                else await call_store_method(store, "claim_task_now", task_id)
             )
         except ValueError as exc:
             return self._error(str(exc))
         if claimed is None:
-            task = store.get_task(wanted)
-            if task is None:
-                return self._error(
-                    f"没有 id 为「{wanted}」的任务。用 schedule_list 看现有任务。"
-                )
-            if task.active_run_id:
-                return self._error(
-                    f"「{task.name}」正在运行（运行 {task.active_run_id}）。"
-                    "要停掉它用 schedule_cancel；要看它跑成什么样用 schedule_runs。"
-                )
-            return self._error(
-                f"没找到可重跑的运行「{source}」，或者它还在运行中。"
-                "用 schedule_runs 看这个任务有哪些运行、各自是什么状态。"
-            )
+            return await self._refuse_busy(store, task_id, run_id)
         return self._ok(
             task_id=claimed.task.id,
             run_id=claimed.run.id,
             trigger_source=claimed.run.trigger_source,
             attempt=claimed.run.attempt,
+            outcome=RUN_OUTCOME_QUEUED,
             note=(
-                "已经排上队了。无人值守的运行要几分钟到几小时，"
+                "已经排队了：这个进程里没有正在运行的调度器，所以现在没有人跑它。"
+                "gateway 或 `agent scheduler` 会来接手（lease 到期后由它取走，"
+                "其间这次运行在历史里可能先记成 interrupted）。"
                 "用 schedule_runs 查这个任务就能看到结果。"
             ),
         )

@@ -247,6 +247,21 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         ),
     ),
     ContextKey(
+        key="scheduler_wake",
+        writers=("agent/scheduler/build.py",),
+        readers=("agent/tools/schedule_tools.py",),
+        note=(
+            "A callback, and the other half of `runtime_refresh`'s shape: the scheduler "
+            "builder publishes 'start this task now' so a tool call can reach the "
+            "scheduler that is running in *this* process. Without it `schedule_run` "
+            "claimed the row itself and stopped, which left a run that no poll can pick "
+            "up until its lease expires -- the tool said it had started and nothing was "
+            "running. Absent means there is no live scheduler here (a single-turn CLI), "
+            "and absence is an answer rather than a missing writer: the run is queued "
+            "for a gateway or `agent scheduler` to consume, and the tool says so."
+        ),
+    ),
+    ContextKey(
         key="user_tools_enabled",
         writers=(),
         readers=("agent/tools/user_tools.py",),

@@ -80,6 +80,11 @@ class SchedulerService:
         # up by the next poll -- charging every chain a full interval per step
         # on top of whatever the step itself took.  See `_idle_wait`.
         self._wake = asyncio.Event()
+        # The loop `run_forever` is actually serving, or None when nothing is.
+        # Kept because a request can arrive on a different loop -- a tool call
+        # runs wherever its turn runs -- and the claim has to be taken on the
+        # loop that will execute the run.  See `wake` and `start_now`.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._started_at = datetime.now(UTC)
         self._last_heartbeat = self._started_at
         self._running = False
@@ -201,6 +206,7 @@ class SchedulerService:
 
     async def run_forever(self) -> None:
         self._running = True
+        self._loop = asyncio.get_running_loop()
         try:
             while True:
                 self._last_heartbeat = datetime.now(UTC)
@@ -215,7 +221,92 @@ class SchedulerService:
                 self._last_heartbeat = datetime.now(UTC)
                 await self._idle_wait()
         finally:
+            self._loop = None
             self._running = False
+
+    def wake(self) -> bool:
+        """Make the next poll happen now: one early tick, not a second loop.
+
+        The interval is the fallback for "is anything due?", not the unit of
+        latency, so something that has just made work appear should not wait it
+        out.  This is the public, thread-safe form of the flag ``_idle_wait``
+        already consumes -- a tool call arrives on whatever loop its turn runs
+        on, and ``asyncio.Event`` is not safe to touch from another one, so the
+        set is scheduled onto the loop that is actually waiting.
+
+        ``False`` when nothing is serving this instance.  That is the honest
+        answer for a process that built a scheduler but never started one: the
+        caller has to queue rather than promise a tick that will not come.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return False
+        loop.call_soon_threadsafe(self._wake.set)
+        return True
+
+    async def start_now(self, task_id: str, *, run_id: str = "") -> dict[str, Any]:
+        """Start one run now, and say what actually happened to it.
+
+        This is what the tool layer calls through the registry context, so a
+        ``schedule_run`` from an agent turn starts the run instead of leaving a
+        claim for the next poll -- a claim is already ``running`` with a lease,
+        and ``claim_due_tasks`` never picks that up, so the run used to wait out
+        ``lease_seconds`` and then record itself as interrupted.
+
+        ``outcome`` is the report, and the cases are separate sentences rather
+        than one hedged one:
+
+        * ``started`` -- the claim is taken and the run is executing in this
+          process.  ``claim`` is the claimed pair, so the caller can name the
+          run it started.
+        * ``woken`` -- this service is live, but on another loop.  The claim is
+          handed to that loop, which takes it and starts the run there; there is
+          no run row to report *here* yet, and saying ``started`` would be a
+          guess about something the caller cannot see.
+        * ``busy`` -- a live scheduler answered and refused: the task already
+          has a run in flight, or that run id is not there.
+        * ``offline`` -- nothing is serving this instance, so the caller must
+          fall back to the durable queue.
+        """
+        loop = self._loop
+        if not self._running or loop is None or loop.is_closed():
+            return {"outcome": "offline"}
+        if loop is not asyncio.get_running_loop():
+            loop.call_soon_threadsafe(self._claim_on_our_loop, task_id, run_id)
+            return {"outcome": "woken"}
+        claimed = await (
+            self.retry_run(task_id, run_id) if run_id else self.run_task_now(task_id)
+        )
+        if claimed is None:
+            return {"outcome": "busy"}
+        return {"outcome": "started", "claim": claimed}
+
+    def _claim_on_our_loop(self, task_id: str, run_id: str) -> None:
+        """Take the claim over to this service's loop (this runs on it).
+
+        ``run_task_now`` creates the execution task on the loop it is called
+        from, so it has to be called here even though the request came from
+        elsewhere.  The next tick is moved forward as well: a run that has just
+        started can emit a signal for its workflow round, and that delivery
+        belongs to the next tick rather than a full interval from now.
+        """
+
+        async def claim() -> None:
+            try:
+                if run_id:
+                    await self.retry_run(task_id, run_id)
+                else:
+                    await self.run_task_now(task_id)
+            except Exception:  # pragma: no cover - a lost request must not kill the loop
+                logger.exception("Failed to start %s on the scheduler loop", task_id)
+
+        # Held, like every other background task here: a pending task nobody
+        # references can be collected mid-flight, and ``shutdown`` has to be
+        # able to cancel it.
+        operation = asyncio.create_task(claim())
+        self._background_tasks.add(operation)
+        operation.add_done_callback(self._background_tasks.discard)
+        self._wake.set()
 
     async def _idle_wait(self) -> None:
         """Wait for a run to finish, or for the poll interval to elapse.

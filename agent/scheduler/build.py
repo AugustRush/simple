@@ -239,6 +239,32 @@ def describe_upstream_results(snapshot: dict) -> str:
     )
 
 
+def _publish_wake(registry: Any, service: SchedulerService) -> None:
+    """Expose "start a run now" to whatever a tool call can see.
+
+    ``schedule_run`` claimed the row itself and stopped there, because nothing
+    in the tool layer could reach the process's scheduler.  The row it claimed
+    is already ``running`` with a lease, so the poll never picks it up: the run
+    waited out ``lease_seconds``, was recovered as interrupted, and only then
+    became due again -- while the answer to the person said it had started.
+
+    The builder is the one place holding both the service and the registry, so
+    it is where the callback is published.  Same shape as ``runtime_refresh``
+    (see ``agent/channels/base.py``): the tool layer looks a callable up by
+    name and never has to know what a ``SchedulerService`` is.
+
+    **Absent is an answer, not a failure.**  A single-turn CLI has no scheduler,
+    and ``schedule_run`` then says the run is queued for a gateway or
+    ``agent scheduler`` rather than pretending it started.
+    """
+    if registry is None:
+        return
+    set_context = getattr(registry, "set_context", None)
+    if not callable(set_context):
+        return
+    set_context("scheduler_wake", service.start_now)
+
+
 def build_scheduler_service(
     cfg: dict,
     *,
@@ -405,6 +431,11 @@ def build_scheduler_service(
             announce=False,
             resource_home=resource_home,
         )
+        # A run's own agent gets the same reach as a conversation's: a task that
+        # says "start that one now" must not queue behind a scheduler that is
+        # itself this very process.  `service` is assigned at the end of this
+        # function, which is before any run can execute.
+        _publish_wake(run_components.get("registry"), service)
         session_id = f"scheduler:{task_id}:{run_id}"
         context_policy = str(
             snapshot.get("context_policy")
@@ -581,4 +612,6 @@ def build_scheduler_service(
         signal_max_depth=signal_max_depth,
         notifier=_notifier,
     )
+    # The process's tool layer can now start a run instead of queueing one.
+    _publish_wake(registry, service)
     return service, store
