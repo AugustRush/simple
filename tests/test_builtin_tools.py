@@ -3236,3 +3236,37 @@ def test_workflow_create_refuses_a_step_product_outside_the_workspace(tmp_path):
 
     assert created["ok"] is False
     assert "产物" in created["error"]
+
+
+# ── the prompt must not teach a tool that does not exist ─────────────────────
+
+
+def test_the_self_extension_guidance_names_only_tools_that_exist(tmp_path):
+    """A prompt that teaches a missing tool is a defect with no error message.
+
+    The base prompt now tells the model that it may grow a capability, and it names
+    the tools for doing so.  That is documentation about behaviour, so it has the same
+    obligation as every other such sentence here: it is checked against the thing it
+    describes.  If `create_tool` is renamed, removed from a profile, or fails to
+    register, the agent would be instructed to call something that is not there -- and
+    the failure would look like the model being stupid rather than like the prompt
+    being wrong.
+    """
+    import re
+
+    from agent.core.turn_state import DEFAULT_SYSTEM_PROMPT as prompt
+    from agent.skills.catalog import SkillCatalog
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    # The skill half is registered by its own plugin, not by BuiltinTools, so the test
+    # asks that plugin for it rather than assuming one registry holds everything.
+    SkillCatalog(user_root=tmp_path / "skills").register_tools(registry)
+    available = set(registry.list_tools())
+
+    assert "## Growing a capability" in prompt
+    section = prompt.split("## Growing a capability", 1)[1]
+    promised = set(re.findall(r"`(create_[a-z_]+)`", section))
+
+    assert promised, "the section is supposed to name what it is talking about"
+    assert promised <= available, f"prompt promises tools that are not registered: {promised - available}"
+    assert "next turn" in section, "the reader has to know when the new tool becomes usable"

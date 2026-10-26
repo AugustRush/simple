@@ -605,10 +605,22 @@ first call with `PermissionError`. The end-to-end test is
 asks for something the agent has no tool for and the model creates one; turn 2 calls
 it over the same WebSocket.
 
-The last restart wall is the *composition*: which core plugins a deployment mounts,
-and which profile names them, are resolved once at startup. Changing the memory
-backend or mounting a different core plugin still means editing the config and
-restarting -- `ReloadTransaction` only re-discovers plugins today.
+**A reload re-reads the config, not only the directories.** Which plugins load -- an
+entry's `enabled` flag, or the profile's entries -- is now applied live. Before this, a
+reload re-discovered the plugin *directories* and ignored the `plugins` **section**, so
+the page's on/off switch had to assign `catalog._plugin_config` by hand to make its own
+save take effect; that private poke is gone, because the reload reads the file it was
+asked to honour.
+
+**What a reload still cannot do, it says.** The profile's `core` selection and its
+`service_replacements` decide which core plugins are *mounted*, and mounting happens once,
+before anything else exists: what it produced -- the agent, the tool registry, the memory
+store -- is what every long-lived holder captured. Re-mounting that under a serving
+gateway would rebuild the process's spine while turns are in flight, so a reload reports
+`restart_required` (in the API response, in the tool result, and as a warning on the page)
+instead of claiming it applied. Removing that last wall is a supervisor-level design -- the
+host has to outlive the composition and quiesce its turns -- not a patch to
+`ReloadTransaction`.
 
 ### Creating a skill
 
