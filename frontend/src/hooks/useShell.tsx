@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, ClockCircleOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor } from '../lib/route'
@@ -266,6 +266,11 @@ export function useShell(deps: Deps) {
     // ("what can the agent do beyond its own tools?") and each list on its
     // own is too short to justify a navigation slot of its own.
     { key: 'extensions', icon: <AppstoreOutlined />, label: '扩展' },
+    // 记忆 sits next to 扩展 because both answer "what is this agent made of":
+    // 扩展 is what it *can* do, 记忆 is what it *knows*. Before this page there
+    // was no way to see the second half, and a wrong memory could only be
+    // argued with inside a conversation.
+    { key: 'memory', icon: <BulbOutlined />, label: '记忆' },
     {
       key: 'schedules',
       icon: <ClockCircleOutlined />,
@@ -387,6 +392,10 @@ export function useShell(deps: Deps) {
     // One meta for the merged page: the head the visitor sees is the page's,
     // while each tab keeps its own counts where they already were -- the
     // skills summary strip and the plugins search both belong to their lists.
+    memory: {
+      title: '记忆',
+      subtitle: '它记得的关于你的事 —— 看得见，也改得动',
+    },
     extensions: {
       title: '扩展',
       subtitle: `${plugins.length} 个插件 · ${skills.length} 个技能`,

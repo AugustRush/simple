@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
+import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -279,4 +279,40 @@ export interface AppCtx {
   configText: string
   setConfigText: Dispatch<SetStateAction<string>>
   setSettingsDirty: Dispatch<SetStateAction<boolean>>
+  // Movement between pages, so a view can hand the reader somewhere else
+  // without reaching into the shell.  `navigateTo` keeps the unsaved-settings
+  // guard; `selectSession` plus `navigateTo('chat')` is what a link to a source
+  // conversation is made of.
+  navigateTo: (next: string) => void
+  selectSession: (sid: string) => void
+
+  /* ── 记忆页 ──────────────────────────────────────────────────────────── */
+  memoryOverview: MemoryOverview | null
+  memoryEntries: MemoryEntry[]
+  memoryEntryTotal: number
+  memoryFacts: MemoryFact[]
+  memoryQuery: string
+  memoryCategory: string
+  memoryCategoryOptions: string[]
+  memoryTab: 'entries' | 'facts'
+  memoryBusy: boolean
+  /** 这个部署没有记忆服务（503），和"读失败"是两种页面。 */
+  memoryUnavailable: boolean
+  memoryLimit: number
+  memoryEditorOpen: boolean
+  memoryEditing: MemoryEntry | null
+  memoryDraft: MemoryDraft
+  applyMemorySearch: (value: string) => void
+  applyMemoryCategory: (value: string) => void
+  loadMemory: (options?: { silent?: boolean }) => Promise<void>
+  loadMoreMemory: () => void
+  openMemoryCreate: () => void
+  openMemoryEdit: (entry: MemoryEntry) => void
+  closeMemoryEditor: () => void
+  updateMemoryDraft: (patch: Partial<MemoryDraft>) => void
+  saveMemoryEntry: () => Promise<void>
+  deleteMemoryEntry: (entry: MemoryEntry) => Promise<void>
+  toggleMemoryPin: (entry: MemoryEntry) => Promise<void>
+  forgetMemoryFact: (fact: MemoryFact) => Promise<void>
+  setMemoryTab: Dispatch<SetStateAction<'entries' | 'facts'>>
 }

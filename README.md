@@ -58,6 +58,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **One writer per agent home** | A second process on the same home is refused rather than allowed to corrupt it |
 | **Plugin hooks** | 8 lifecycle hooks: prompt submit, tool matchers, command hooks, continue loop |
 | **Vision** | Image attachments sent straight to the model when the provider sets `supports_vision` |
+| **Memory you can see and correct** | The `#/memory` page lists what it remembers with provenance, and lets you edit, pin or delete an entry — and reject a belief |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
 ### Measuring retrieval quality
@@ -755,6 +756,46 @@ In-session commands:
 /sessions   — recent session history with scores
 /session abcd1234  — details of a specific session
 ```
+
+#### The memory page (`#/memory`)
+
+The store is the system's core value, and until this page existed it had no
+surface: you could ask the agent what it remembered and get whatever the ranking
+felt like, and a wrong memory could only be argued with inside a conversation.
+The page lists every entry with its category, entity, importance, source
+conversation and age, and lets you change it:
+
+- **Entries** — edit the text, category, entity or importance; pin an entry so
+  retention no longer decays or archives it; delete it outright; or write a new
+  one by hand. Adding goes through the same write path the agent's own memory
+  tools use, so remembering something twice folds into the row that exists
+  rather than becoming a second answer.
+
+- **Facts** — the resolved beliefs, each with the evidence that produced it
+  (source kind, conversation, confidence). They are deliberately not editable: a
+  fact is an inference over an append-only ledger, and the next consolidation
+  pass would overwrite a hand edit. The page offers **忘记** instead, which
+  archives the assertions and drops the resolved belief, so the next evidence
+  resolves the key from scratch. Rejecting a belief and editing a note are
+  different acts, so they are different verbs.
+
+An edit is a field-wise patch: fields the page did not send (`scope`, the
+provenance, the timestamps) are left alone, which is what stops "fix the wording"
+from also resetting the score or re-attributing the memory.
+
+Two invariants are load-bearing and are tested directly
+(`tests/test_memory_curation.py`):
+
+- **A pin survives every rewrite of the row.** Consolidation re-states entries
+  through `add_entry`, which replaces the whole row; a pin that pass can drop is
+  a button that lies.
+- **Provenance is read from the evidence, never invented.** A store that cannot
+  join answers empty so the page can say "来源未知" instead of naming a
+  plausible conversation.
+
+Backed by three additions to the `MemoryStore` contract (`update_entry`,
+`delete_entry`, `retract_facts`), so the second backend implements them too and
+`run_store_contract` exercises both.
 
 ### Multi-agent orchestration
 

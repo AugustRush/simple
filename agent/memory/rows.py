@@ -33,6 +33,29 @@ __all__ = [
 ]
 
 
+def _row_flag(row: sqlite3.Row, column: str) -> int:
+    """Read a 0/1 column that a database written before it may not have.
+
+    ``sqlite3.Row`` raises on a missing key rather than returning ``None``, so a
+    mapper that reads the column directly turns "an old database" into a crash
+    on first read.  The migration adds it; this is what makes the window
+    between opening the file and the migration running harmless.
+    """
+    try:
+        return 1 if int(row[column] or 0) else 0
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
+def _row_optional(row: sqlite3.Row, column: str, default: str = "") -> str:
+    """Read a joined column that the joining query may not have selected."""
+    try:
+        value = row[column]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else str(value)
+
+
 def _row_to_entry(row: sqlite3.Row) -> LTMEntry:
     return LTMEntry(
         id=row["id"],
@@ -47,6 +70,7 @@ def _row_to_entry(row: sqlite3.Row) -> LTMEntry:
         status=row["status"],
         source_session=row["source_session"],
         confidence=row["confidence"],
+        pinned=_row_flag(row, "pinned"),
     )
 
 
@@ -137,4 +161,8 @@ def _row_to_resolved_fact(row: sqlite3.Row) -> ResolvedFact:
         confidence=float(row["confidence"] or 1.0),
         resolved_at=row["resolved_at"],
         updated_at=row["updated_at"],
+        source_kind=_row_optional(row, "evidence_source_kind"),
+        source_session=_row_optional(row, "evidence_source_session"),
+        channel=_row_optional(row, "evidence_channel"),
+        asserted_at=_row_optional(row, "evidence_created_at"),
     )

@@ -210,14 +210,44 @@ def read_resolved_facts(
     predicate: Optional[str] = None,
     scope: Optional[str] = None,
 ) -> list[ResolvedFact]:
-    return _read_facts(
-        conn, "resolved_facts",
-        "subject ASC, predicate ASC, scope ASC",
-        _row_mappers._row_to_resolved_fact,
-        subject=subject,
-        predicate=predicate,
-        scope=scope,
-    )
+    """Resolved beliefs, each carrying the evidence row that produced it.
+
+    The join is what makes "where did this come from" answerable.  Without it a
+    belief is an assertion with no author, and the memory page cannot tell a
+    sentence the operator typed from one the model inferred from a passing
+    remark -- which are exactly the two things a person needs to distinguish
+    before deciding whether to keep it.
+
+    ``LEFT JOIN`` rather than ``JOIN``: a winning assertion can be gone (a
+    database written before this join existed, a row archived while the
+    resolved row survived), and a fact whose evidence is missing is still a
+    fact this store believes.  Dropping it from the list would make the page
+    quietly incomplete rather than visibly uncertain; the provenance fields
+    come back empty and the page says so.
+    """
+    sql = """
+        SELECT resolved_facts.*,
+               fact_assertions.source_kind    AS evidence_source_kind,
+               fact_assertions.source_session AS evidence_source_session,
+               fact_assertions.channel        AS evidence_channel,
+               fact_assertions.created_at     AS evidence_created_at
+        FROM resolved_facts
+        LEFT JOIN fact_assertions
+               ON fact_assertions.id = resolved_facts.winning_assertion_id
+        WHERE 1 = 1
+    """
+    params: list[Any] = []
+    if subject is not None:
+        sql += " AND resolved_facts.subject = ?"
+        params.append(_normalize_fact_part(subject))
+    if predicate is not None:
+        sql += " AND resolved_facts.predicate = ?"
+        params.append(_normalize_fact_part(predicate))
+    if scope is not None:
+        sql += " AND resolved_facts.scope = ?"
+        params.append(_normalize_fact_part(scope, "global"))
+    sql += " ORDER BY resolved_facts.subject ASC, resolved_facts.predicate ASC, resolved_facts.scope ASC"
+    return [_row_mappers._row_to_resolved_fact(row) for row in conn.execute(sql, params).fetchall()]
 
 
 def has_conflicted_fact(

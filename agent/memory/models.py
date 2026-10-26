@@ -31,6 +31,11 @@ class LTMEntry:
     status: str = "active"
     source_session: str = ""
     confidence: float = 1.0
+    #: 0 or 1.  A pinned entry is exempt from retention's decay and archiving.
+    #: Deliberately *not* a ``status`` value: every read path filters on status,
+    #: and the first one that forgot would drop a pinned memory out of
+    #: retrieval, which is the exact failure pinning exists to prevent.
+    pinned: int = 0
 
     def decay(self, factor: float = shared.DECAY_FACTOR) -> None:
         self.importance = max(0.0, self.importance * factor)
@@ -49,6 +54,7 @@ class LTMEntry:
             "status": self.status,
             "source_session": self.source_session,
             "confidence": self.confidence,
+            "pinned": self.pinned,
         }
 
     @classmethod
@@ -192,6 +198,14 @@ class ResolvedFact:
     confidence: float = 1.0
     resolved_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+    #: Where the winning assertion came from.  Empty means "this store cannot
+    #: say" -- a replacement backend is allowed not to join, and a page that
+    #: shows provenance renders an unknown author as unknown rather than
+    #: inventing one.  Read from the evidence row, never from the belief.
+    source_kind: str = ""
+    source_session: str = ""
+    channel: str = ""
+    asserted_at: str = ""
 
 
 @dataclass(frozen=True)

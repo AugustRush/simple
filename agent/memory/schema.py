@@ -27,6 +27,7 @@ def _ensure_schema(conn) -> None:
             status TEXT NOT NULL DEFAULT 'active',
             source_session TEXT NOT NULL DEFAULT '',
             confidence REAL NOT NULL DEFAULT 1.0,
+            pinned INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );

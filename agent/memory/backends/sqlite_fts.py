@@ -151,6 +151,7 @@ class SqliteFtsStore:
                 status TEXT NOT NULL DEFAULT 'active',
                 source_session TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 1.0,
+                pinned INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             );
@@ -239,6 +240,18 @@ class SqliteFtsStore:
                 WHERE message_id != '';
             """
         )
+        # ``CREATE TABLE IF NOT EXISTS`` above is a no-op on a file that already
+        # has ``entries``, so a database written before ``pinned`` never gains the
+        # column from the schema script.  Without this ALTER the first read of a
+        # pre-existing palace-fts.db raises, which is the difference between a
+        # migrated store and an unreadable one.
+        existing_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(entries)")
+        }
+        if existing_columns and "pinned" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+            )
         try:
             conn.executescript(
                 """
@@ -273,6 +286,14 @@ class SqliteFtsStore:
 
     @staticmethod
     def _entry(row: sqlite3.Row) -> LTMEntry:
+        # ``pinned`` is read defensively rather than directly: this backend is
+        # also opened against files written before the column existed, and a
+        # mapper that raised on them would turn "an old palace-fts.db" into a
+        # store that cannot be read at all.
+        try:
+            pinned = int(row["pinned"] or 0)
+        except (IndexError, KeyError):
+            pinned = 0
         return LTMEntry(
             id=row["id"],
             content=row["content"],
@@ -286,6 +307,7 @@ class SqliteFtsStore:
             confidence=float(row["confidence"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            pinned=pinned,
         )
 
     def add_entry(self, entry: LTMEntry) -> None:
@@ -300,8 +322,9 @@ class SqliteFtsStore:
                         """
                         INSERT INTO entries (
                             id, content, importance, category, entity, memory_type,
-                            scope, status, source_session, confidence, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            scope, status, source_session, confidence, pinned,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             content=excluded.content,
                             importance=excluded.importance,
@@ -324,6 +347,7 @@ class SqliteFtsStore:
                             entry.status,
                             entry.source_session,
                             float(entry.confidence),
+                            int(entry.pinned or 0),
                             entry.created_at or _now(),
                             entry.updated_at or _now(),
                         ),
@@ -362,6 +386,84 @@ class SqliteFtsStore:
             "SELECT * FROM entries ORDER BY importance DESC, updated_at DESC"
         ).fetchall()
         return [self._entry(row) for row in rows]
+
+    def update_entry(
+        self,
+        entry_id: str,
+        *,
+        content: Optional[str] = None,
+        importance: Optional[float] = None,
+        category: Optional[str] = None,
+        entity: Optional[str] = None,
+        pinned: Optional[bool] = None,
+        confidence: Optional[float] = None,
+    ) -> Optional[LTMEntry]:
+        clean_id = str(entry_id or "").strip()
+        if not clean_id:
+            return None
+        with self._lock:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT * FROM entries WHERE id = ? LIMIT 1", (clean_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            updates: dict[str, Any] = {}
+            if content is not None:
+                cleaned = str(content).strip()
+                if not cleaned:
+                    raise ValueError("记忆内容不能为空")
+                updates["content"] = cleaned
+            if importance is not None:
+                updates["importance"] = max(0.0, min(1.0, float(importance)))
+            if confidence is not None:
+                updates["confidence"] = max(0.0, min(1.0, float(confidence)))
+            if pinned is not None:
+                updates["pinned"] = 1 if pinned else 0
+            if category is not None:
+                updates["category"] = self.normalize_category_name(str(category))
+            if entity is not None:
+                updates["entity"] = str(entity).strip().lower()
+            if not updates:
+                return self._entry(row)
+            updates["updated_at"] = _now()
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            with conn:
+                conn.execute(
+                    f"UPDATE entries SET {assignments} WHERE id = ?",
+                    (*updates.values(), clean_id),
+                )
+                if self._fts and "content" in updates:
+                    conn.execute("DELETE FROM entries_fts WHERE id = ?", (clean_id,))
+                    fresh_row = conn.execute(
+                        "SELECT content, category FROM entries WHERE id = ?", (clean_id,)
+                    ).fetchone()
+                    if fresh_row is not None:
+                        conn.execute(
+                            "INSERT INTO entries_fts(content, id, category) VALUES (?, ?, ?)",
+                            (fresh_row["content"], clean_id, fresh_row["category"]),
+                        )
+            fresh = conn.execute(
+                "SELECT * FROM entries WHERE id = ? LIMIT 1", (clean_id,)
+            ).fetchone()
+            return self._entry(fresh) if fresh is not None else None
+
+    def delete_entry(self, entry_id: str) -> bool:
+        clean_id = str(entry_id or "").strip()
+        if not clean_id:
+            return False
+        with self._lock:
+            conn = self._connect()
+            existing = conn.execute(
+                "SELECT 1 FROM entries WHERE id = ? LIMIT 1", (clean_id,)
+            ).fetchone()
+            if existing is None:
+                return False
+            with conn:
+                conn.execute("DELETE FROM entries WHERE id = ?", (clean_id,))
+                if self._fts:
+                    conn.execute("DELETE FROM entries_fts WHERE id = ?", (clean_id,))
+            return True
 
     def search_entries(
         self,
@@ -626,16 +728,31 @@ class SqliteFtsStore:
         clause = "1 = 1"
         params: list[Any] = []
         if subject:
-            clause += " AND subject = ?"
+            clause += " AND r.subject = ?"
             params.append(str(subject).strip().lower())
         if predicate:
-            clause += " AND predicate = ?"
+            clause += " AND r.predicate = ?"
             params.append(str(predicate).strip().lower())
         if scope:
-            clause += " AND scope = ?"
+            clause += " AND r.scope = ?"
             params.append(scope)
+        # The same evidence join the built-in store performs: a belief whose
+        # author cannot be named is a belief the memory page cannot let anyone
+        # judge.  LEFT JOIN for the same reason -- a missing evidence row must
+        # leave the belief visible and say "unknown", not drop it.
         rows = self._connect().execute(
-            f"SELECT * FROM resolved_facts WHERE {clause} ORDER BY updated_at DESC", params
+            f"""
+            SELECT r.*,
+                   a.source_kind    AS evidence_source_kind,
+                   a.source_session AS evidence_source_session,
+                   a.channel        AS evidence_channel,
+                   a.created_at     AS evidence_created_at
+            FROM resolved_facts AS r
+            LEFT JOIN fact_assertions AS a ON a.id = r.winning_assertion_id
+            WHERE {clause}
+            ORDER BY r.updated_at DESC
+            """,
+            params,
         ).fetchall()
         return [
             ResolvedFact(
@@ -650,6 +767,10 @@ class SqliteFtsStore:
                 confidence=float(row["confidence"]),
                 resolved_at=row["resolved_at"],
                 updated_at=row["updated_at"],
+                source_kind=str(row["evidence_source_kind"] or ""),
+                source_session=str(row["evidence_source_session"] or ""),
+                channel=str(row["evidence_channel"] or ""),
+                asserted_at=str(row["evidence_created_at"] or ""),
             )
             for row in rows
         ]
@@ -664,6 +785,23 @@ class SqliteFtsStore:
             ).fetchall()
         }
         return len(values) > 1
+
+    def retract_facts(self, subject: str, predicate: str, scope: str = "global") -> int:
+        key = _fact_key(str(subject).strip().lower(), str(predicate).strip().lower(), scope)
+        now = _now()
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE fact_assertions SET status = 'archived', updated_at = ?
+                    WHERE fact_key = ? AND status != 'archived'
+                    """,
+                    (now, key),
+                )
+                retired = int(cursor.rowcount or 0)
+                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
+            return retired
 
     # ── conversation history ────────────────────────────────────────────────
 

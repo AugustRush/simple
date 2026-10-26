@@ -12,6 +12,7 @@ from agent.channels import web_uploads
 from agent.channels import web_providers
 from agent.channels import web_requests
 from agent.channels import web_assets
+from agent.channels import web_memory
 
 import asyncio
 import contextlib
@@ -1445,6 +1446,52 @@ class WebChannel(Channel):
                     stats = {}
         return JSONResponse({"stats": stats})
 
+    # -- memory ----------------------------------------------------------------
+
+    def _memory_store(self) -> Any:
+        """The long-term store, or ``None`` when this deployment has no memory.
+
+        Resolved per call rather than captured at construction: the memory
+        plugin can be hot-swapped, and a channel holding the store it saw at
+        startup would keep answering from a store that has been unloaded.
+        """
+        return resolve(self._components, "ltm_store")
+
+    async def _memory_overview(self, request: Any) -> Any:
+        return await web_memory._memory_overview(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_entries(self, request: Any) -> Any:
+        return await web_memory._memory_entries(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_create_entry(self, request: Any) -> Any:
+        return await web_memory._memory_create_entry(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_update_entry(self, request: Any) -> Any:
+        return await web_memory._memory_update_entry(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_delete_entry(self, request: Any) -> Any:
+        return await web_memory._memory_delete_entry(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_facts(self, request: Any) -> Any:
+        return await web_memory._memory_facts(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_forget_fact(self, request: Any) -> Any:
+        return await web_memory._memory_forget_fact(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
     async def _rename_session(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2564,6 +2611,33 @@ class WebChannel(Channel):
             Route("/api/plugins", self._plugins, methods=["GET"]),
             Route("/api/skills", self._skills, methods=["GET"]),
             Route("/api/context", self._context_stats, methods=["GET"]),
+            # The memory page.  Reads and edits of the *corpus*, not of a
+            # session: this store is one per home, shared by every web session,
+            # which is exactly why the page is the only place it can be
+            # inspected as a whole.
+            Route("/api/memory", self._memory_overview, methods=["GET"]),
+            Route("/api/memory/entries", self._memory_entries, methods=["GET"]),
+            Route("/api/memory/entries", self._memory_create_entry, methods=["POST"]),
+            # Before the collection routes above can shadow them: Starlette
+            # matches in declaration order, and ``/api/memory/entries`` is not a
+            # prefix match, but keeping the item routes adjacent to their
+            # collection is what makes that reasoning checkable at a glance.
+            Route(
+                "/api/memory/entries/{entry_id}",
+                self._memory_update_entry,
+                methods=["PATCH"],
+            ),
+            Route(
+                "/api/memory/entries/{entry_id}",
+                self._memory_delete_entry,
+                methods=["DELETE"],
+            ),
+            Route("/api/memory/facts", self._memory_facts, methods=["GET"]),
+            Route(
+                "/api/memory/facts/forget",
+                self._memory_forget_fact,
+                methods=["POST"],
+            ),
             Route(
                 "/api/sessions/{session_id}",
                 self._rename_session,

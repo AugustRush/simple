@@ -1,6 +1,6 @@
 /** The address bar as one more view of the same state.
  *
- * The app is a single page with five views and a conversation, and none of it
+ * The app is a single page with six views and a conversation, and none of it
  * used to have an address: a refresh always landed on 对话, a conversation
  * could not be linked to, and the browser's back button left the app instead of
  * walking back through it. The hash is the smallest thing that fixes all three
@@ -8,11 +8,11 @@
  * ``index.html`` for every path it does not own).
  *
  * Shapes: ``#/chat/<session>``, ``#/chat``, ``#/sessions``, ``#/extensions``,
- * ``#/schedules``, ``#/settings``. An unknown or empty hash means chat: a URL
- * someone typed by hand should not be an error page.
+ * ``#/memory``, ``#/schedules``, ``#/settings``. An unknown or empty hash means
+ * chat: a URL someone typed by hand should not be an error page.
  */
 
-export const VIEW_NAMES = ['chat', 'sessions', 'extensions', 'schedules', 'settings'] as const
+export const VIEW_NAMES = ['chat', 'sessions', 'extensions', 'memory', 'schedules', 'settings'] as const
 
 export type ViewName = (typeof VIEW_NAMES)[number]
 

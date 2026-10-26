@@ -5846,3 +5846,176 @@ def test_session_state_repairs_a_goal_recorded_as_a_continuation_phrase(tmp_path
 
     assert state["task"]["task_id"] == "task-broken"
     assert state["task"]["active_goal"] == "给我创作一个硬核的广告片"
+
+
+# ── the memory page ───────────────────────────────────────────────────────────
+
+
+def _memory_store(tmp_path):
+    from agent.memory.models import FactAssertion, LTMEntry
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    for identifier, content, importance, category in (
+        ("m-1", "用户喜欢浓缩咖啡", 0.9, "preferences"),
+        ("m-2", "用户在做一个叫 simple 的项目", 0.6, "projects"),
+    ):
+        store.add_entry(
+            LTMEntry(
+                id=identifier,
+                content=content,
+                importance=importance,
+                category=category,
+                created_at="2026-10-26 00:00:00.000000 UTC",
+                updated_at="2026-10-26 00:00:00.000000 UTC",
+                entity="user",
+                memory_type="fact",
+                source_session="s1",
+            )
+        )
+    store.add_fact_assertion(
+        FactAssertion(
+            id="f-1",
+            subject="user",
+            predicate="drinks",
+            value="espresso",
+            source_kind="consolidation",
+            source_session="s1",
+            channel="web",
+        )
+    )
+    return store
+
+
+def test_web_memory_overview_agrees_with_the_list_below_it(tmp_path):
+    """The header numbers are derived from the same rows the list serves.
+
+    A page whose "3 条" disagrees with the three rows under it is the failure
+    this endpoint exists to avoid: two counts of one corpus, read at two
+    moments, is how a memory page loses its credibility.
+    """
+    from starlette.testclient import TestClient
+
+    store = _memory_store(tmp_path)
+    channel = _channel()
+    channel.bind_runtime({}, {"ltm_store": store})
+
+    with TestClient(channel.app) as client:
+        overview = client.get("/api/memory").json()
+        listed = client.get("/api/memory/entries").json()
+
+        assert overview["enabled"] is True
+        assert overview["entry_count"] == len(listed["entries"]) == 2
+        assert overview["fact_count"] == 1
+        assert overview["pinned_count"] == 0
+        assert {item["name"] for item in overview["categories"]} == {
+            "preferences",
+            "projects",
+        }
+        # ...and each entry says where it came from, which is the half that
+        # makes a wrong memory debuggable rather than merely visible.
+        assert {item["source_session"] for item in listed["entries"]} == {"s1"}
+
+
+def test_web_memory_create_edit_and_delete_are_the_pages_own(tmp_path):
+    """One round trip per verb, including the 404 that says the row is gone."""
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {"ltm_store": _memory_store(tmp_path)})
+
+    with TestClient(channel.app) as client:
+        created = client.post(
+            "/api/memory/entries",
+            json={"content": "用户不吃香菜", "category": "preferences", "importance": 0.7},
+        )
+        assert created.status_code == 200
+        entry_id = created.json()["entry"]["id"]
+        assert created.json()["entry"]["source_session"] == "manual"
+
+        edited = client.patch(
+            f"/api/memory/entries/{entry_id}",
+            json={"content": "用户不吃香菜和葱", "pinned": True},
+        )
+        assert edited.status_code == 200
+        assert edited.json()["entry"]["content"] == "用户不吃香菜和葱"
+        assert edited.json()["entry"]["pinned"] is True
+        # The edit left the score alone, because the client did not send one.
+        assert edited.json()["entry"]["importance"] == 0.7
+
+        assert client.delete(f"/api/memory/entries/{entry_id}").status_code == 200
+        assert client.delete(f"/api/memory/entries/{entry_id}").status_code == 404
+        remaining = client.get("/api/memory/entries").json()
+        assert entry_id not in {item["id"] for item in remaining["entries"]}
+
+
+def test_web_memory_forgets_a_fact_and_says_so_when_there_is_nothing_to_forget(tmp_path):
+    """Facts are rejected, not edited -- and the page's answer has to match.
+
+    A 200 on the second forget would tell the page a belief went away when the
+    list is about to look identical, which is the same lie as a delete that
+    returns ok without deleting.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {"ltm_store": _memory_store(tmp_path)})
+
+    with TestClient(channel.app) as client:
+        facts = client.get("/api/memory/facts").json()["facts"]
+        assert [(fact["subject"], fact["predicate"], fact["value"]) for fact in facts] == [
+            ("user", "drinks", "espresso")
+        ]
+        assert facts[0]["source_kind"] == "consolidation"
+        assert facts[0]["source_session"] == "s1"
+
+        forgot = client.post(
+            "/api/memory/facts/forget",
+            json={"subject": "user", "predicate": "drinks"},
+        )
+        assert forgot.status_code == 200
+        assert forgot.json()["retired"] == 1
+        assert client.get("/api/memory/facts").json()["facts"] == []
+
+        again = client.post(
+            "/api/memory/facts/forget",
+            json={"subject": "user", "predicate": "drinks"},
+        )
+        assert again.status_code == 404
+
+
+def test_web_memory_refuses_what_it_would_have_to_truncate(tmp_path):
+    """A memory that would be silently shortened has to be refused instead.
+
+    Truncating on the way in stores something that reads as complete and is
+    not, and the person who wrote it never learns which half survived.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {"ltm_store": _memory_store(tmp_path)})
+
+    with TestClient(channel.app) as client:
+        assert client.post("/api/memory/entries", json={"content": "   "}).status_code == 400
+        too_long = client.post("/api/memory/entries", json={"content": "记" * 4001})
+        assert too_long.status_code == 400
+        assert "4000" in too_long.json()["error"]
+        assert client.post("/api/memory/entries", json=["not", "an", "object"]).status_code == 400
+
+
+def test_web_memory_says_it_is_unavailable_rather_than_breaking(tmp_path):
+    """A deployment with memory off still renders the page, and the page reads.
+
+    An exception here would surface as a blank view; 503 with a sentence is what
+    lets the UI say "记忆未启用" and offer the setting that turns it on.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        for path in ("/api/memory", "/api/memory/entries", "/api/memory/facts"):
+            response = client.get(path)
+            assert response.status_code == 503
+            assert "记忆未启用" in response.json()["error"]

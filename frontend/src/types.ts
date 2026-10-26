@@ -570,3 +570,71 @@ export interface WorkflowGraphNode {
   status?: string
   taskId?: string
 }
+
+
+/* ── the memory page ────────────────────────────────────────────────────── */
+
+export interface MemoryCategory {
+  name: string
+  entry_count: number
+  avg_importance: number
+  last_updated: string
+}
+
+//: What the store says it holds, in the same read the lists come from.  The
+//: counts are the server's, not the page's: a header that counted what it had
+//: already rendered would say "0 条" while the first page is in flight.
+export interface MemoryOverview {
+  enabled: boolean
+  entry_count: number
+  fact_count: number
+  pinned_count: number
+  categories: MemoryCategory[]
+}
+
+//: One long-term memory, as the page edits it.  `pinned` is a boolean here and
+//: 0/1 in the database -- the store's column is a flag, the page's answer is a
+//: question ("is this pinned?"), and the endpoint does the translation.
+export interface MemoryEntry {
+  id: string
+  content: string
+  importance: number
+  category: string
+  entity: string
+  memory_type: string
+  scope: string
+  status: string
+  source_session: string
+  confidence: number
+  pinned: boolean
+  created_at: string
+  updated_at: string
+}
+
+//: A belief, with the evidence that produced it.  `source_kind` and
+//: `source_session` are what let the page say where it came from; both are
+//: empty when the store cannot join, and the page says "来源未知" rather than
+//: guessing.
+export interface MemoryFact {
+  fact_key: string
+  subject: string
+  predicate: string
+  value: unknown
+  value_type: string
+  scope: string
+  confidence: number
+  source_kind: string
+  source_session: string
+  channel: string
+  asserted_at: string
+  updated_at: string
+}
+
+//: The editor's form.  One shape for "add" and "edit": the same four fields,
+//: and `entry` on the editor state is what tells them apart.
+export interface MemoryDraft {
+  content: string
+  category: string
+  entity: string
+  importance: number
+}

@@ -49,6 +49,12 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
     for table, column, ddl in (
         ("conversation_turns", "seq", "INTEGER NOT NULL DEFAULT 0"),
         ("agent_events", "seq", "INTEGER NOT NULL DEFAULT 0"),
+        # ``pinned`` exempts an entry from retention.  Adding it here rather
+        # than only to ``_ensure_schema`` is what keeps an existing palace.db
+        # readable: the CREATE TABLE is a no-op on a file that already has the
+        # table, so without this the first read of the column would raise on
+        # the exact databases that hold someone's memories.
+        ("memory_items", "pinned", "INTEGER NOT NULL DEFAULT 0"),
     ):
         existing = {
             str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")
@@ -57,7 +63,7 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             # The table itself is missing (a fresh database), so the schema
             # script already created it with every column.
             continue
-        if "seq" in existing:
+        if column in existing:
             continue
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 

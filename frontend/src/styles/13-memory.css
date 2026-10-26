@@ -1,0 +1,212 @@
+/* 记忆页：一行一条，行本身是主体，操作在右侧。
+ *
+ * 和会话列表/自动化页共用 .list-toolbar 与 .page-lead（08/05 里），所以这里
+ * 只写这张页自己的东西。排版上的一个决定：条目的正文是主角，元信息压低到 12px
+ * 且用弱色 —— 一行记忆被读到的应该是内容，不是它的分类和重要度。
+ */
+
+/* 与 扩展 页同一个节奏：标签条到下面的工具条留 16px，两个多列表页看起来
+ * 才是一家人。 */
+.memory-tabs {
+  margin-bottom: 16px;
+}
+
+.memory-view .memory-category-filter {
+  width: 150px;
+  flex: 0 0 auto;
+}
+
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.memory-row:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-raised);
+}
+
+/* A pinned row is marked, not decorated: the left edge is the one thing that
+ * survives at a glance in a list of twenty, and it explains itself in the meta
+ * line ("已钉住") rather than requiring the reader to learn a colour. */
+.memory-row.is-pinned {
+  border-left: 2px solid var(--primary-border);
+  padding-left: 13px;
+}
+
+.memory-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.memory-row-text {
+  font-size: 14px;
+  line-height: 1.62;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.memory-row-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 7px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.memory-tag {
+  margin: 0 !important;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 7px;
+  border-radius: 9px;
+  background: var(--primary-soft);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+.memory-tag.is-quiet {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+/* A source that can be opened is a link, and says so on hover; one that cannot
+ * is plain text, so the reader never clicks a dead word twice. */
+.memory-meta-link {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-bottom: 1px dotted var(--border-strong);
+}
+.memory-meta-link:hover {
+  color: var(--text-secondary);
+  border-bottom-color: var(--text-secondary);
+}
+
+.memory-meta-plain {
+  color: var(--text-muted);
+}
+
+.memory-pin-flag {
+  color: var(--text-secondary);
+}
+
+.memory-row-side {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex: 0 0 auto;
+}
+
+/* 44×4 的一条：够读，不够抢。 */
+.memory-strength {
+  display: inline-block;
+  width: 44px;
+  height: 4px;
+  margin-right: 6px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.memory-strength > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+
+.memory-more {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 2px;
+}
+
+/* ── 事实行 ─────────────────────────────────────────────────────────────── */
+
+.memory-fact-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+}
+.memory-fact-subject {
+  font-weight: 600;
+}
+.memory-fact-predicate {
+  color: var(--text-secondary);
+}
+.memory-fact-op {
+  color: var(--text-muted);
+}
+.memory-fact-value {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* ── 编辑弹窗 ───────────────────────────────────────────────────────────── */
+
+.memory-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.memory-editor-category {
+  width: 200px;
+  flex: 0 0 auto;
+}
+.memory-editor-entity {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.memory-editor-importance {
+  gap: 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.memory-editor-importance .ant-slider {
+  flex: 1 1 auto;
+  margin: 0;
+}
+.memory-editor-importance-value {
+  width: 40px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+/* 窄一档时先让搜索让位：整行搜索 + 下一行的筛选与动作，比"搜索占 280px、
+ * 动作被挤出屏幕"更可读。 */
+@media (max-width: 640px) {
+  .memory-view .list-toolbar > .workspace-search {
+    flex: 1 1 100%;
+    width: auto;
+  }
+  .memory-view .memory-category-filter {
+    flex: 1 1 auto;
+    width: auto;
+  }
+  .memory-view .list-toolbar-side {
+    margin-left: 0;
+  }
+}

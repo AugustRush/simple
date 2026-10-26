@@ -7,6 +7,7 @@ from agent import shared
 from ._helpers import _new_id, _now
 from .models import LTMEntry
 from . import fts, normalize, rows as _row_mappers, entries, facts
+from .rows import _row_flag
 
 __all__ = [
     "_coerce_category_for_storage",
@@ -65,6 +66,12 @@ def _write_entry_row(
     if existing_row:
         entry.id = existing_row["id"]
         entry.created_at = existing_row["created_at"]
+        # A pin is the operator's decision, not a property of the prose.  The
+        # replace below rewrites the whole row, so carrying it here is what
+        # stops a consolidation pass that re-states a pinned entry from quietly
+        # unpinning it -- the pin would then vanish on the next retention sweep
+        # while the page still showed it as pinned a moment earlier.
+        entry.pinned = _row_flag(existing_row, "pinned")
         affected_categories.add(
             normalize.normalize_category_name(existing_row["category"])
         )
@@ -72,8 +79,8 @@ def _write_entry_row(
         """
             INSERT OR REPLACE INTO memory_items (
                 id, content, importance, category, entity, memory_type, scope,
-                status, source_session, confidence, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, source_session, confidence, pinned, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
         (
             entry.id,
@@ -86,6 +93,7 @@ def _write_entry_row(
             entry.status,
             entry.source_session,
             float(entry.confidence),
+            int(entry.pinned or 0),
             entry.created_at,
             entry.updated_at,
         ),

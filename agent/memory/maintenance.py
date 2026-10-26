@@ -111,6 +111,11 @@ def apply_retention(
         datetime.now(timezone.utc) - timedelta(days=_helpers._USAGE_EVENT_RETENTION_DAYS)
     ).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
     # Step 1: decay importance for all active episodes in a single UPDATE.
+    # ``pinned = 0`` is the whole promise of the pin: an entry the operator
+    # chose to keep is not decayed, so it can never fall through the importance
+    # floor in step 2 either.  Every step below repeats the clause rather than
+    # relying on that, because the run-scratch prunes select on age and row
+    # count, neither of which a pin affects.
     conn.execute(
         """
                 UPDATE memory_items
@@ -118,6 +123,7 @@ def apply_retention(
                     updated_at  = ?
                 WHERE category = 'episodes'
                   AND status NOT IN ('archived', 'superseded')
+                  AND pinned = 0
                 """,
         (shared.DECAY_FACTOR, now),
     )
@@ -130,6 +136,7 @@ def apply_retention(
                     WHERE category = 'episodes'
                       AND importance < ?
                       AND status NOT IN ('archived', 'superseded')
+                      AND pinned = 0
                     """,
             (shared.MIN_IMPORTANCE,),
         ).fetchall()
@@ -143,6 +150,7 @@ def apply_retention(
                       AND scope LIKE 'run:%'
                       AND created_at < ?
                       AND status NOT IN ('archived', 'superseded')
+                      AND pinned = 0
                     """,
             (run_cutoff,),
         ).fetchall()
@@ -155,6 +163,7 @@ def apply_retention(
                     WHERE category = 'episodes'
                       AND scope LIKE 'run:%'
                       AND status NOT IN ('archived', 'superseded')
+                      AND pinned = 0
                     ORDER BY created_at DESC, id DESC
                     LIMIT -1 OFFSET ?
                     """,

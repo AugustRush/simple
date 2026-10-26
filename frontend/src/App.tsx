@@ -9,6 +9,7 @@ import type { AppCtx } from './app/AppCtx'
 import { renderChat } from './views/chat'
 import { renderSessions } from './views/sessions'
 import { renderExtensions } from './views/extensions'
+import { renderMemory } from './views/memory'
 import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
 import { relativeTime } from './lib/format'
@@ -20,6 +21,7 @@ import { useApiClient } from './hooks/useApiClient'
 import { useConfirm } from './hooks/useConfirm'
 import { useConversations } from './hooks/useConversations'
 import { useExtensions } from './hooks/useExtensions'
+import { useMemory } from './hooks/useMemory'
 import { useSettings } from './hooks/useSettings'
 import { useAutomation } from './hooks/useAutomation'
 import { useShell } from './hooks/useShell'
@@ -64,6 +66,10 @@ function App() {
   const conversations = useConversations({ ...ui, ...apiClient, ...confirm })
 
   const extensions = useExtensions({ ...ui, ...apiClient, ...confirm })
+
+  // The memory page needs the api client and nothing else: it reads the
+  // corpus, not a session.
+  const memory = useMemory({ ...ui, ...apiClient })
 
   const settings = useSettings({ ...ui, ...apiClient, ...conversations })
 
@@ -139,6 +145,9 @@ function App() {
 
   // Views are pure renderers built from this one context object.
   const ctx: AppCtx = {
+    ...memory,
+    navigateTo,
+    selectSession,
     updateMessage,
     activeSession,
     canRewind,
@@ -393,6 +402,7 @@ function App() {
     if (view === 'chat') return renderChat(ctx)
     if (view === 'sessions') return renderSessions(ctx)
     if (view === 'extensions') return renderExtensions(ctx)
+    if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)
     if (view === 'settings') return renderSettings()
     return renderChat(ctx)

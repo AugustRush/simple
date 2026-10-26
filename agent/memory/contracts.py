@@ -107,6 +107,33 @@ class MemoryStore(Protocol):
     def all_entries(self) -> "list[LTMEntry]":
         """Every entry, for export and maintenance."""
 
+    def update_entry(
+        self,
+        entry_id: str,
+        *,
+        content: "Optional[str]" = None,
+        importance: "Optional[float]" = None,
+        category: "Optional[str]" = None,
+        entity: "Optional[str]" = None,
+        pinned: "Optional[bool]" = None,
+        confidence: "Optional[float]" = None,
+    ) -> "Optional[LTMEntry]":
+        """Edit one entry by hand, leaving fields passed as ``None`` untouched.
+
+        Returns the entry as it now reads, or ``None`` when no entry has that
+        id -- the distinction matters to a caller that has to answer 404 rather
+        than claim a write happened.
+        """
+
+    def delete_entry(self, entry_id: str) -> bool:
+        """Remove one entry.  ``True`` when it existed and is now gone.
+
+        Distinct from archiving: an archived entry is invisible to retrieval but
+        still in the database, while a deleted one is meant to stop existing.
+        A caller that wanted "stop showing me this" and got "stop existing" has
+        destroyed a memory, so the two are separate verbs on purpose.
+        """
+
     def search_entries(
         self,
         query: str,
@@ -267,6 +294,16 @@ class MemoryStore(Protocol):
 
     def has_conflicted_fact(self, subject: str, predicate: str, scope: str = "global") -> bool:
         """Whether a fact key has competing active assertions."""
+
+    def retract_facts(self, subject: str, predicate: str, scope: str = "global") -> int:
+        """Stop believing one fact key.  Returns how many claims were retired.
+
+        Archiving the assertions rather than deleting them is the point: the
+        ledger keeps what was once asserted (and by whom), so a later reading of
+        the store can tell "this was never said" from "this was said and
+        rejected".  The resolved row goes, and the next evidence resolves the
+        key from scratch.
+        """
 
     # ── maintenance ─────────────────────────────────────────────────────────
     def maintenance_snapshot(self, limit: int = 20) -> str:

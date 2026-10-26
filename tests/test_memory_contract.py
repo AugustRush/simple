@@ -615,6 +615,35 @@ def run_store_contract(store: Any, *, session_id: str = "contract-session") -> N
     stats = store.corpus_stats(["concise"])
     assert stats is not None
 
+    # ── curation: the two writes a person owns ──────────────────────────────
+    # Editing is a *field-wise* patch: what the caller did not mention stays as
+    # it was, which is what lets a page send only the thing that changed.
+    edited = store.update_entry("c-1", content="Prefers very concise responses")
+    assert edited is not None
+    assert edited.content == "Prefers very concise responses"
+    assert edited.category == store.normalize_category_name("identity")
+    assert edited.importance == 0.8, "an edit of the text must not reset the score"
+    assert edited.source_session == session_id, "an edit must not rewrite provenance"
+    # ...and the search index follows the text, or the old wording stays findable
+    # and the new one never is.
+    assert "c-1" in {item.id for item in store.search_entries("concise")}
+    assert "c-1" in {item.id for item in store.search_entries("very")}
+
+    pinned = store.update_entry("c-1", importance=0.95, pinned=True)
+    assert pinned is not None and pinned.pinned
+    # Writing the same entry again must not silently unpin it: consolidation
+    # re-states entries, and a pin that a background pass can drop is not a pin.
+    store.add_entry(entry("c-1", "Prefers very concise responses"))
+    assert {item.pinned for item in store.all_entries() if item.id == "c-1"} == {1}
+
+    assert store.update_entry("does-not-exist", content="x") is None
+    with pytest.raises(ValueError):
+        store.update_entry("c-1", content="   ")
+
+    assert store.delete_entry("c-2") is True
+    assert "c-2" not in {item.id for item in store.all_entries()}
+    assert store.delete_entry("c-2") is False, "deleting twice is not an error, just false"
+
     # ── manual notes and identity ───────────────────────────────────────────
     store.upsert_manual_note("notes", "user", "line one")
     note = store.read_manual_note("notes", "user")
@@ -648,6 +677,13 @@ def run_store_contract(store: Any, *, session_id: str = "contract-session") -> N
     resolved = store.read_resolved_facts(subject="user")
     assert "tea" in {fact.value for fact in resolved}
     assert store.has_conflicted_fact("user", "likes", "global") is False
+
+    # Rejecting a belief archives its evidence and drops the resolved row; the
+    # next assertion on the same key is free to resolve again, which is the
+    # difference between "I don't believe this" and "never say this again".
+    assert store.retract_facts("user", "likes") >= 1
+    assert store.read_resolved_facts(subject="user") == []
+    assert store.retract_facts("user", "likes") == 0, "already archived is nothing to retire"
 
     # ── conversation history ────────────────────────────────────────────────
     written = store.write_conversation_exchange(

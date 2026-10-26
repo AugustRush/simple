@@ -25,6 +25,7 @@ from . import fts
 from .retrieval import CorpusStats
 
 from . import facts
+from . import curation
 from . import queries
 from . import schema
 from . import usage
@@ -423,6 +424,46 @@ class LTMStore:
                 invalidate=self._sync_after_mutation,
                 max_categories=self.max_categories,
             )
+
+
+    def update_entry(
+        self,
+        entry_id: str,
+        *,
+        content: Optional[str] = None,
+        importance: Optional[float] = None,
+        category: Optional[str] = None,
+        entity: Optional[str] = None,
+        pinned: Optional[bool] = None,
+        confidence: Optional[float] = None,
+    ) -> Optional[LTMEntry]:
+        """Edit one entry by hand.  Fields left as ``None`` are not touched."""
+        with self._connect() as conn:
+            updated = curation.update_entry(
+                conn,
+                entry_id,
+                content=content,
+                importance=importance,
+                category=category,
+                entity=entity,
+                pinned=pinned,
+                confidence=confidence,
+                max_categories=self.max_categories,
+            )
+        if updated is None:
+            return None
+        self._sync_after_mutation({updated.category})
+        return updated
+
+
+    def delete_entry(self, entry_id: str) -> bool:
+        """Remove one entry (and its search row).  True when it existed."""
+        with self._connect() as conn:
+            removed = curation.delete_entry(conn, entry_id)
+        if removed is None:
+            return False
+        self._sync_after_mutation({removed.category})
+        return True
 
 
     def append_conversation_turn(
