@@ -27,7 +27,10 @@ from ._helpers import _emit_consolidation, _now
 from .staging import StagingBuffer
 from .models import LTMEntry
 
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 from collections import deque
 from typing import Any, Callable, Optional
 
@@ -60,6 +63,12 @@ class JobQueue:
         self.lock = threading.RLock()
         self.processing_job = False
         self.needs_consolidation = False
+        #: Consecutive failed extraction attempts since anything new was staged.
+        #: The idle trigger re-queues while ``needs_consolidation`` is set, so a
+        #: permanent failure would otherwise buy one model call every
+        #: ``idle_seconds`` for the life of the session, with a dim log line as
+        #: the only symptom.  ``MAX_CONSOLIDATION_FAILURES`` is the cap.
+        self.failed_consolidations = 0
         self.last_activity = 0.0
         self.suppress_next_turn_persistence = False
 
@@ -95,6 +104,9 @@ def mark_activity(
     with queue.lock:
         queue.last_activity = time.time()
         queue.needs_consolidation = True
+        # New material is a new question, and three failures about an old chunk
+        # must not silence the session for good.
+        queue.failed_consolidations = 0
 
 
 def idle_elapsed(
@@ -303,18 +315,63 @@ async def sleep(
     queue,
 ) -> list[dict]:
     """Run one sleep cycle (uses staging as source), then clear dirty flag."""
-    try:
-        result = await queue.consolidation.consolidate(
-            messages,
-            endpoint,
-            model,
-            staging=queue.staging,
-            project_scope=queue.project_scope,
-        )
-        return _render._coerce_consolidation_result(result).compressed_messages
-    finally:
+    # No ``finally`` here.  Clearing the trigger after a failed cycle told the
+    # idle path that the staged work had been dealt with when it had not: the
+    # chunk stayed staged, the flag said "nothing to do", and nothing ever
+    # mentioned it again.  The flag is a record of work pending, not of an
+    # attempt made.
+    result = await queue.consolidation.consolidate(
+        messages,
+        endpoint,
+        model,
+        staging=queue.staging,
+        project_scope=queue.project_scope,
+    )
+    consolidated = _render._coerce_consolidation_result(result)
+    if consolidated.success:
         with queue.lock:
             queue.needs_consolidation = False
+    return consolidated.compressed_messages
+
+
+#: Consecutive failed attempts before the idle trigger is dropped.  Three, because a
+#: transient provider error deserves a retry and a permanent one (unpaid account,
+#: revoked key, content the consolidating model refuses) does not: without a cap,
+#: ``should_process_jobs`` re-queues the same chunk every ``idle_seconds`` forever.
+MAX_CONSOLIDATION_FAILURES = 3
+
+
+def _note_consolidation_failure(*, queue, reason: str) -> None:
+    """Count a failed attempt and stop asking once the cap is reached.
+
+    Dropping the trigger is what ends the loop, and saying it out loud is what
+    makes the stop visible: the failure paths used to print one dim line per
+    attempt and keep going, which reads as background noise rather than as "this
+    session's memory is no longer being consolidated".
+    """
+    with queue.lock:
+        queue.failed_consolidations += 1
+        attempts = queue.failed_consolidations
+        capped = attempts >= MAX_CONSOLIDATION_FAILURES
+        if capped:
+            queue.needs_consolidation = False
+    if capped:
+        logger.warning(
+            "consolidation for session %s stopped after %s failed attempts (%s); "
+            "not retrying until new material is staged",
+            queue.staging.session_id,
+            attempts,
+            reason,
+        )
+        shared.CONSOLE.print(
+            f"[yellow]记忆整理连续失败 {attempts} 次（{reason}），已停止重试；"
+            "有新的对话内容时再继续。[/yellow]"
+        )
+
+
+def _note_consolidation_success(*, queue) -> None:
+    with queue.lock:
+        queue.failed_consolidations = 0
 
 
 async def process_one_job(
@@ -390,6 +447,7 @@ async def process_one_job(
             if is_primary_staging:
                 with queue.lock:
                     queue.needs_consolidation = False
+            _note_consolidation_success(queue=queue)
             _emit_consolidation("completed", entries_extracted=len(entries))
             return True
 
@@ -404,13 +462,16 @@ async def process_one_job(
         except Exception as exc:
             _emit_consolidation("failed", reason="llm_extraction_error", error=str(exc))
             shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")
+            _note_consolidation_failure(queue=queue, reason="模型调用失败")
             return False
         consolidated = _render._coerce_consolidation_result(result)
         if not consolidated.success:
             _emit_consolidation(
                 "failed", reason="extraction_returned_failure", error=consolidated.error
             )
+            _note_consolidation_failure(queue=queue, reason="抽取没有产出")
             return False
+        _note_consolidation_success(queue=queue)
         if is_primary_staging:
             with queue.lock:
                 queue.needs_consolidation = False

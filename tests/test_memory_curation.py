@@ -81,6 +81,35 @@ def test_a_pin_survives_the_rewrite_consolidation_performs(tmp_path):
     assert row.content == "memory m1, restated", "the rewrite still has to land"
 
 
+def test_rewriting_an_entry_leaves_columns_it_does_not_name_alone(tmp_path):
+    """The structural reason `pinned` was lost: ``INSERT OR REPLACE`` is a delete.
+
+    Consolidation re-states an entry through ``add_entry``, which rewrites the row.
+    With REPLACE that rewrite *takes the old row away and puts a new one in its
+    place*, so any column the writer does not name returns to its default -- which
+    is what silently unpinned a pinned memory (fixed then by carrying the value by
+    hand) and what would silently lose every column added later.  An upsert that
+    names the mutable columns removes the trap instead of documenting it.
+
+    The column here is added at runtime on purpose: the test must not depend on
+    today's schema, and the next person to add one gets this proof for free.
+    """
+    store = _store(tmp_path)
+    store.add_entry(_entry("m1"))
+
+    with store._connect() as conn:
+        conn.execute("ALTER TABLE memory_items ADD COLUMN scratch TEXT DEFAULT ''")
+        conn.execute("UPDATE memory_items SET scratch = 'kept' WHERE id = 'm1'")
+
+    store.add_entry(_entry("m1", content="memory m1, restated"))
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT scratch FROM memory_items WHERE id = 'm1'"
+        ).fetchone()
+    assert row["scratch"] == "kept", "an unnamed column must survive a rewrite"
+
+
 def test_deleting_an_entry_takes_its_search_row_with_it(tmp_path):
     """A deleted memory that still ranks is worse than one that was never deleted."""
     store = _store(tmp_path)

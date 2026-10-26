@@ -75,12 +75,31 @@ def _write_entry_row(
         affected_categories.add(
             normalize.normalize_category_name(existing_row["category"])
         )
+    # ``ON CONFLICT ... DO UPDATE`` rather than ``INSERT OR REPLACE``.  REPLACE
+    # is a delete followed by an insert, so every column *not* named in this
+    # statement is reset to its default on each rewrite -- which is exactly how
+    # ``pinned`` was silently unpinned by the next consolidation pass, and how
+    # the next column added to this table would be lost the same way.  Naming
+    # the mutable columns here makes the writer responsible only for what it
+    # means to overwrite.
     conn.execute(
         """
-            INSERT OR REPLACE INTO memory_items (
+            INSERT INTO memory_items (
                 id, content, importance, category, entity, memory_type, scope,
                 status, source_session, confidence, pinned, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                content = excluded.content,
+                importance = excluded.importance,
+                category = excluded.category,
+                entity = excluded.entity,
+                memory_type = excluded.memory_type,
+                scope = excluded.scope,
+                status = excluded.status,
+                source_session = excluded.source_session,
+                confidence = excluded.confidence,
+                pinned = excluded.pinned,
+                updated_at = excluded.updated_at
             """,
         (
             entry.id,

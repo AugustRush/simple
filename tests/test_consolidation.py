@@ -1650,7 +1650,40 @@ def test_sleep_clears_dirty_flag_when_consolidation_raises(tmp_path):
             )
         )
 
-    assert ctx_mgr._needs_consolidation is False
+    # The trigger is a record of work *pending*, not of an attempt made.  Clearing
+    # it here used to be the way the retry storm was avoided -- but it also told
+    # the idle path that the staged chunk had been dealt with, and nothing ever
+    # mentioned those turns again.  The storm is now bounded by
+    # ``MAX_CONSOLIDATION_FAILURES`` instead, so the flag can tell the truth.
+    assert ctx_mgr._needs_consolidation is True
+
+
+def test_the_idle_trigger_stops_retrying_after_the_cap(tmp_path):
+    """A permanent provider failure must not buy a model call every idle period.
+
+    The rule that used to hold this was "clear the trigger whatever happens",
+    which stopped the storm by forgetting the work.  The cap stops it instead,
+    and says so once: a session whose consolidation keeps failing is a session
+    whose memory is silently not being consolidated, and that has to be visible.
+    """
+    from agent.memory import jobs as jobs_module
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    queue = ctx_mgr._queue
+    ctx_mgr.mark_activity()
+
+    for attempt in range(jobs_module.MAX_CONSOLIDATION_FAILURES):
+        assert queue.needs_consolidation is True, attempt
+        jobs_module._note_consolidation_failure(queue=queue, reason="模型调用失败")
+
+    assert queue.failed_consolidations == jobs_module.MAX_CONSOLIDATION_FAILURES
+    assert queue.needs_consolidation is False, "the cap is what ends the retries"
+
+    # New material re-arms it: three failures about an old chunk must not silence
+    # the session for good.
+    ctx_mgr.mark_activity()
+    assert queue.needs_consolidation is True
+    assert queue.failed_consolidations == 0
 
 
 def test_stats_report_dynamic_category_count_against_limit(tmp_path):
