@@ -759,6 +759,11 @@ class ToolRegistry:
 #: what "asked, not yet confirmed" is reported as.
 _MCP_STOP_TIMEOUT = 10.0
 
+#: How long one health probe may take before the server counts as not answering.  Short,
+#: because the answer is "the child is wedged or gone" and waiting longer only delays the
+#: reconnect; a genuinely busy server answers a ping from its own read loop.
+_MCP_PING_TIMEOUT = 5.0
+
 
 class _MCPServer:
     """One MCP server's live state.
@@ -837,6 +842,14 @@ class MCPClient:
         #: :meth:`bind_status`.
         self._status: Optional[dict[str, Any]] = None
         self._self_tool_registered = False
+        #: Seconds between liveness pings; 0 (the default) disables them.
+        self._health_interval = 0.0
+        self._health_task: Optional[asyncio.Task[None]] = None
+        #: Servers that have already had their one automatic reconnect.  Per name and
+        #: per process: a manual ``reconnect`` clears the mark, because somebody asking
+        #: again is new information, while a timer retrying the same corpse forever is
+        #: the loop this cap exists to prevent.
+        self._auto_retried: set[str] = set()
 
     # -- names ---------------------------------------------------------------
 
@@ -877,6 +890,7 @@ class MCPClient:
         what this client is configured to run; it does not replace it.
         """
         self._extra_env = extra_env or {}
+        self._ensure_health_monitor()
         self._register_self_tool()
         for server_cfg in list(config.get("mcp_servers", []) or []):
             try:
@@ -1156,6 +1170,82 @@ class MCPClient:
             "status": self.status_summary(),
         }
 
+    # -- liveness ------------------------------------------------------------
+
+    def configure_health_checks(self, seconds: float) -> None:
+        """Ask for a periodic ping per connected server; ``0`` keeps them off.
+
+        The MCP SDK reports no exit for a stdio child, so a server that dies is
+        invisible until a tool call fails -- and by then the model has already been
+        offered its tools.  A ping is the only way to notice without one.  Off by
+        default because it is a background timer: this agent grows polling loops when
+        somebody asks for one, not before.
+        """
+        try:
+            self._health_interval = max(0.0, float(seconds or 0.0))
+        except (TypeError, ValueError):
+            self._health_interval = 0.0
+
+    def _ensure_health_monitor(self) -> None:
+        """Start the monitor on first connect, if an interval was configured."""
+        if self._health_interval <= 0 or self._health_task is not None:
+            return
+        if self._health_task is not None and not self._health_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._health_task = loop.create_task(
+            self._monitor_health(), name="mcp-health-monitor"
+        )
+
+    async def _monitor_health(self) -> None:
+        """Ping every connected server on the interval, and recover once per server."""
+        while True:
+            await asyncio.sleep(self._health_interval)
+            for handle in list(self._servers.values()):
+                if handle.state != "connected" or handle.session is None:
+                    continue
+                if await self._server_answers(handle):
+                    continue
+                await self._recover(handle)
+
+    @staticmethod
+    async def _server_answers(handle: _MCPServer) -> bool:
+        """One ping.  A session that cannot be pinged is not reported as broken."""
+        send_ping = getattr(handle.session, "send_ping", None)
+        if send_ping is None:
+            return True
+        try:
+            await asyncio.wait_for(send_ping(), timeout=_MCP_PING_TIMEOUT)
+            return True
+        except Exception:  # noqa: BLE001 - any failure is "not answering"
+            return False
+
+    async def _recover(self, handle: _MCPServer) -> None:
+        """One automatic reconnect, then leave it to a caller.
+
+        Bounded on purpose: a server that is permanently broken must not be restarted
+        every interval forever -- that is the retry loop this repository has fixed
+        twice already (consolidation, lease replay), and a timer makes it worse than a
+        turn because nobody is watching.  A manual ``reconnect`` clears the mark.
+        """
+        name = handle.name
+        if name in self._auto_retried:
+            return
+        self._auto_retried.add(name)
+        shared.CONSOLE.print(
+            f"[yellow]MCP server {name!r} stopped answering; reconnecting once[/yellow]"
+        )
+        result = await self._reconnect(name)
+        if not result.get("ok"):
+            shared.CONSOLE.print(
+                f"[red]MCP server {name!r} did not come back "
+                f"({result.get('error', 'unknown error')}); call mcp_reconnect to try "
+                "again[/red]"
+            )
+
     # -- disconnect / reconnect ----------------------------------------------
 
     async def disconnect(self, name: str) -> dict[str, Any]:
@@ -1222,7 +1312,16 @@ class MCPClient:
         A failure is returned as a failure: the old session is gone by then, so
         reporting success would describe a server that is not there.  The config
         stays known, so the call can simply be made again.
+
+        A *call* is new information, so it also clears this server's automatic-retry
+        mark: the liveness monitor gets one attempt per server, and somebody asking
+        again deserves a fresh one.
         """
+        self._auto_retried.discard(self._resolve(name))
+        return await self._reconnect(name)
+
+    async def _reconnect(self, name: str) -> dict[str, Any]:
+        """The reconnect itself, without touching the automatic-retry mark."""
         key = self._resolve(name)
         cfg = self._known.get(key)
         if cfg is None:
@@ -1376,6 +1475,18 @@ class MCPClient:
         servers back builds a new client, which is what a config change does.
         """
         self._shutdown.set()
+        # The monitor is this client's own task, so cancelling it is allowed and
+        # expected: it belongs to whoever started it, which is this class.  (A server
+        # task is the opposite case -- see the class docstring.)
+        monitor = self._health_task
+        self._health_task = None
+        if monitor is not None and not monitor.done():
+            try:
+                if monitor.get_loop() is asyncio.get_running_loop():
+                    monitor.cancel()
+            except RuntimeError:
+                # No running loop: the task's loop is closing, which cancels it too.
+                pass
         if self._server_tasks:
             loop = asyncio.get_running_loop()
             mine: list[asyncio.Task[None]] = []

@@ -134,6 +134,13 @@ DEFAULT_CONFIG: dict = {
     # cancels the connection before the model sees a single tool, so a server the user
     # configured reports itself as "no such tool" -- a wrong answer, not a fast one.
     "mcp_connect_timeout_seconds": 15.0,
+    # How often to *ping* each connected MCP server, in seconds.  ``0`` -- the default
+    # -- means never.  The SDK reports no exit, so a child that dies is invisible until
+    # a tool call fails; a periodic ping is the only way to notice without one.  Opt-in
+    # because this is a background timer, and a personal agent should not grow polling
+    # loops nobody asked for; when it *is* on, a server that fails the probe gets one
+    # automatic reconnect and then stays failed until something asks for it again.
+    "mcp_health_check_seconds": 0.0,
     # ── Evolution / self-improvement ──────────────────────────────────────
     "evolution": {
         "enabled": True,  # set to false to disable session scoring and rule learning
@@ -506,7 +513,7 @@ class ModelClientFactory:
 _KNOWN_SECTIONS = frozenset({
     "active_provider", "providers", "model", "max_tokens", "output_reserve",
     "memory", "orchestration", "evolution", "scheduler", "audio",
-    "mcp_servers", "mcp_connect_timeout_seconds",
+    "mcp_servers", "mcp_connect_timeout_seconds", "mcp_health_check_seconds",
     "context", "plugins", "skills", "channels", "user_tools",
     "system_prompt_file", "output_dir", "tavily_api_key",
     "assistant_identity", "shell_blocked_commands",

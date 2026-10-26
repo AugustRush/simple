@@ -1095,6 +1095,27 @@ from another group reaches its owner's endpoint too.
 
 ### Working with MCP tools
 
+**A server's lifetime is its own.** `mcp_reconnect` (the model's tool) restarts one
+server or all of them; a plugin reload that removes a plugin stops the MCP child that
+plugin declared, instead of leaving it running until the process exits. The process
+belonging to one server is stopped by the task that started it -- the MCP SDK's stdio
+session opens an anyio cancel scope, and a scope has to be exited by the task that
+entered it -- so `disconnect` asks rather than cancels.
+
+**Noticing a child that died is a different question, and it is opt-in.** The SDK reports
+no exit, so a dead server looks exactly like an idle one until a tool call fails. Set
+`mcp_health_check_seconds` to get a periodic ping per connected server:
+
+```json
+{ "mcp_health_check_seconds": 60 }
+```
+
+`0` (the default) means never. When it is on, a server that stops answering is
+reconnected **once**, and then stays failed until something asks again -- `mcp_reconnect`
+clears that mark, because asking is new information and a timer is not. Unbounded retries
+on a permanently broken server are the failure mode this cap exists to prevent.
+
+
 ```json
 {
   "mcp_servers": [

@@ -77,6 +77,16 @@ class MCPPlugin:
             # deployment) replaces this client, and a module-level import would
             # freeze the class before the substitution could reach it.
             client = agent_module.MCPClient(ctx.get("registry"))
+            # Off unless configured: a background ping loop is a decision, and the
+            # default answer is "no timer" (see `MCPClient.configure_health_checks`).
+            # Optional like `bind_status` below: a substituted client is a client, and
+            # one that does not probe liveness is a legitimate substitution rather than
+            # a defect this line should turn into a failed plugin.
+            configure_health = getattr(client, "configure_health_checks", None)
+            if callable(configure_health):
+                configure_health(
+                    float((cfg or {}).get("mcp_health_check_seconds", 0) or 0)
+                )
             # Optional, like the reload's ``disconnect``: a substituted client does
             # not have to know about a status dict it never asks anyone to update.
             bind_status = getattr(client, "bind_status", None)

@@ -45,6 +45,11 @@ class _FakeBackend:
         self.exit_tasks: dict[str, object] = {}
         #: Servers whose process refuses to start, so a failed connect is reachable.
         self.fail_start: set[str] = set()
+        #: Servers that stop answering pings -- a child that died without the session
+        #: noticing, which is exactly the state the liveness probe exists to catch.
+        self.silent: set[str] = set()
+        #: Pings served, per server: the probe must be observable, not assumed.
+        self.ping_counts: dict[str, int] = {}
 
     def add(self, name: str, *tool_names: str) -> None:
         self.tools[name] = list(tool_names)
@@ -109,6 +114,12 @@ class _FakeSession:
 
     async def initialize(self) -> None:
         return None
+
+    async def send_ping(self) -> None:
+        backend = self._backend
+        backend.ping_counts[self._name] = backend.ping_counts.get(self._name, 0) + 1
+        if self._name in backend.silent:
+            raise RuntimeError(f"{self._name} is not answering")
 
     async def list_tools(self):
         tools = [
@@ -764,3 +775,102 @@ def test_the_client_works_through_the_plugins_scoped_view(backend) -> None:
         "the tools must be gone from the registry the view wraps, not only from a "
         "count the client keeps"
     )
+
+
+# ── liveness: noticing a child that died ────────────────────────────────────
+
+
+def test_health_checks_are_off_by_default(backend) -> None:
+    """A background timer is a decision, and the default answer is "no timer"."""
+    backend.add("alpha", "echo")
+    client, _registry_ = _client()
+
+    async def scenario() -> None:
+        await client.connect_from_config(_config("alpha"))
+
+    asyncio.run(scenario())
+
+    assert client._health_task is None
+    assert backend.ping_counts == {}, "nothing should be pinging unless asked to"
+
+
+def test_a_silent_server_is_noticed_and_reconnected_once(backend) -> None:
+    """The SDK reports no exit, so a dead child is invisible until a tool call fails.
+
+    The probe is the only way to notice without one; one automatic reconnect is what
+    turns "my MCP tools stopped working" into a blip.  The second half of the assertion
+    is the one that matters: the tools are registered again, on a *new* child -- a
+    reconnect that reported success while leaving the session closed would pass a test
+    that only counted attempts.
+    """
+    backend.add("alpha", "echo")
+    client, registry = _client()
+    client.configure_health_checks(0.05)
+
+    async def scenario() -> None:
+        await client.connect_from_config(_config("alpha"))
+        assert backend.ping_counts.get("alpha", 0) == 0, "no probe before the interval"
+        backend.silent.add("alpha")  # the child dies without telling the session
+        await asyncio.sleep(0.15)
+        # The reconnect happened; make the *new* child healthy so the recovery is what
+        # the assertions below are about rather than the fake's own state.
+        backend.silent.clear()
+        await asyncio.sleep(0.2)
+        assert backend.enter_counts["alpha"] == 2, backend.enter_counts
+        assert backend.ping_counts["alpha"] >= 1, "the probe must actually have run"
+        assert client.is_connected("alpha") is True
+        assert "mcp_alpha_echo" in registry.list_tools()
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_server_that_stays_dead_is_retried_only_once(backend) -> None:
+    """Bounded on purpose: a timer restarting a corpse forever is the loop this cap prevents.
+
+    One automatic attempt, then silence until something asks again -- and asking
+    *again* is allowed, because a person or a model asking is new information that a
+    timer does not have.
+    """
+    backend.add("alpha", "echo")
+    client, registry = _client()
+    client.configure_health_checks(0.03)
+
+    async def scenario() -> None:
+        await client.connect_from_config(_config("alpha"))
+        backend.silent.add("alpha")
+        await asyncio.sleep(0.5)  # many probes, one budget
+        assert backend.enter_counts["alpha"] == 2, (
+            "one initial connect plus exactly one automatic reconnect, "
+            f"got {backend.enter_counts['alpha']} starts"
+        )
+        assert client.is_connected("alpha") is True, (
+            "the retry did connect; it is the *next* failure the budget covers"
+        )
+
+        # A manual reconnect clears the mark: somebody asking is not the timer.
+        backend.silent.clear()
+        result = await client.reconnect("alpha")
+        assert result["ok"] is True, result
+        assert backend.enter_counts["alpha"] == 3, backend.enter_counts
+        assert "mcp_alpha_echo" in registry.list_tools()
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_closing_cancels_the_monitor(backend) -> None:
+    """The monitor is the client's own task, so it may -- and must -- be cancelled here."""
+    backend.add("alpha", "echo")
+    client, _registry_ = _client()
+    client.configure_health_checks(0.05)
+
+    async def scenario() -> None:
+        await client.connect_from_config(_config("alpha"))
+        monitor = client._health_task
+        assert monitor is not None
+        await client.close()
+        await asyncio.sleep(0.05)
+        assert monitor.done(), "a closed client must not keep pinging"
+
+    asyncio.run(scenario())
