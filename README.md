@@ -148,6 +148,7 @@ This work is on the `refactor/service-kernel` branch.
 | Item | State |
 |---|---|
 | Plugin kernel: core, composition-as-data, scopes, domain buses | **done** — [`agent/kernel/`](agent/kernel), guarded by `tests/test_kernel_boundary.py` |
+| Recomposing a running process (a different memory backend, a different profile) | **done** — saving the config, or `POST /api/composition/reload`, rebuilds in place: quiesce (409 while a turn runs), drop the session runtimes, unmount the parts (the channels stay), remount, rebind, bump the revision. Proven by swapping `LTMStore` → `SqliteFtsStore` in a live gateway and answering the next turn against it |
 | Functional layer over the real entry points | **done** — 43 paths, [`tests/test_functional_turns.py`](tests/test_functional_turns.py) |
 | `simple chat` and MCP | **done** — the one-shot command waits for the background connect (bounded by `mcp_connect_timeout_seconds`) and says so when the wait runs out; before, its own teardown cancelled the connection and the model was offered every tool *except* the configured ones |
 | Content-filter recovery | **done** — reads the provider's own `code` (`content_policy_violation`) first and its prose second; the phrase list alone missed the real rejection, and that predicate gates the only mechanism that *repairs* a refusal instead of reporting it |
