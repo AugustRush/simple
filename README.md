@@ -153,7 +153,7 @@ This work is on the `refactor/service-kernel` branch.
 | Content-filter recovery | **done** — reads the provider's own `code` (`content_policy_violation`) first and its prose second; the phrase list alone missed the real rejection, and that predicate gates the only mechanism that *repairs* a refusal instead of reporting it |
 | `LoopDeps.of(agent)` surface | **partly** — the six pure pass-throughs (`_output_room` and friends, each `return self._token_budget.X(...)`) are gone, and both routes (`of` / `from_services`) are now driven with a real `TokenBudget`; the route that had never been driven was **broken**. `of` still reads 22 attributes off the agent, 13 of them underscored — each either real logic or a documented test seam (the model-call seam, the recovery seam) |
 | `agent/channels/web.py`, `feishu.py`, `agent/tools/builtin_tools.py` | **done** — surveyed first, as the roadmap asked, then extracted cluster by cluster: [`docs/superpowers/plans/2026-10-09-big-file-survey.md`](docs/superpowers/plans/2026-10-09-big-file-survey.md) is the survey and the per-move record, [`2026-10-09-big-file-extraction-closing-report.md`](docs/superpowers/plans/2026-10-09-big-file-extraction-closing-report.md) the closing report. **12292 → 7223 lines** across the three files, eighteen modules holding what left, and the full suite's FAILED set diffed against the baseline after each of the 29 commits. `web.py` 4191 → 3204 ([`web_payloads.py`](agent/channels/web_payloads.py), [`web_sink.py`](agent/channels/web_sink.py)); `feishu.py` 2587 → 1952 ([`feishu_render.py`](agent/channels/feishu_render.py), [`feishu_progress.py`](agent/channels/feishu_progress.py) — which also gained the 16 direct tests it never had — [`feishu_attachments.py`](agent/channels/feishu_attachments.py), [`feishu_parsing.py`](agent/channels/feishu_parsing.py), [`feishu_files.py`](agent/channels/feishu_files.py)); `builtin_tools.py` 5514 → 2067 ([`memory_tools.py`](agent/tools/memory_tools.py), [`web_tools.py`](agent/tools/web_tools.py), [`output_tools.py`](agent/tools/output_tools.py), [`signal_tools.py`](agent/tools/signal_tools.py), [`step_output_tools.py`](agent/tools/step_output_tools.py), [`schedule_tools.py`](agent/tools/schedule_tools.py) — 21 methods, −1413 lines — [`file_tools.py`](agent/tools/file_tools.py), [`audio_tools.py`](agent/tools/audio_tools.py), [`context_tools.py`](agent/tools/context_tools.py) — 11 new direct tests — [`shell_tools.py`](agent/tools/shell_tools.py) and [`plugin_tools.py`](agent/tools/plugin_tools.py)). The functional layer caught a defect the first six of those modules had introduced: a cluster whose methods are registered as tools must expose a public `registry`, or `ToolRegistry.call` cannot install the calling registry's merged context and a session's own workspace and output dir silently stop reaching the tools. What is left in `builtin_tools.py` is the host — the 1656-line `_register` table, the shared accessors and `_current_time` — and turning that table into per-cluster registrations is a design change, deliberately left as its own piece of work |
-| Browser-side JavaScript | **not covered** — the functional layer drives the HTTP/WebSocket protocol, not the page. Needs a headless browser, which is a different kind of investment |
+| Browser-side JavaScript | **partly covered** — `tests/test_web_route_contract.py` extracts every `/api/...` call the page makes from `frontend/src` and matches it against the real route table (74 call sites → 68 distinct endpoints, 0 mismatches). It catches the defect class that browser-less testing usually misses: an endpoint renamed or removed under the page. It does **not** prove DOM rendering, that a control is reachable, or anything about status codes and auth — that still needs a headless browser, and the dependency is a decision rather than an oversight |
 | Feishu channel | **not covered** — an external service; it shares the `Channel` abstraction with web, so most of the wiring is exercised, but the channel itself is undriven |
 | Intermittent `tests/test_ralph.py` failures | **not reproduced** in ~130 attempts (including two concurrent full suites under load) and repaired where it could not be diagnosed: the two wall-clock assumptions that made a slow machine indistinguishable from a broken product are gone, and the failure messages now carry the observed facts |
 
@@ -408,6 +408,14 @@ also understands `weekdays`, `monthly` and `signal` triggers; those, and chains
 of tasks, are built through [`workflow_create`](#workflows-a-chain-of-steps) or
 the Automation page.
 
+**A task is stored where you made it, but it runs where a clock is.** Creating a task
+does not start a scheduler, so the reply says which clock will serve it: `runner:
+"this-process"` when one is live here, `"external"` when the task is only queued for a
+gateway or `agent scheduler`. Saying that at creation is the cheapest moment to say
+it -- the asker is still there. `schedule_run` answers the same way, with three
+distinct words: `started` (running here, with a run id), `woken` (a scheduler on
+another loop took the request), `queued` (nothing is serving it yet).
+
 ### Workflows: a chain of steps
 
 A workflow is a graph of scheduled tasks where each step runs only after the
@@ -584,6 +592,17 @@ Two knobs set how much freedom that is:
   hash approval in the conversation, and editing the file revokes the approval.
 - **`install_plugin`** asks only when the plugin *ships code*; a plugin that is pure
   declarations (skills, commands, an MCP server) installs unattended.
+
+**A skill the agent made is freely editable; one a person wrote is not.** A `SKILL.md`
+is pasted into the system prompt, so rewriting it rewrites the agent's own
+instructions. The boundary is drawn on *ownership*, not on the verb: `create_skill`
+stamps `created-by: agent` **and a digest of what it wrote**, and `update_skill` /
+`delete_skill` / `write_skill_file` refuse to touch anything whose digest does not
+match without a stated `intent`. That second half matters: a hand edit to an
+agent-made skill changes the digest, so the bundle becomes somebody else's again --
+and an *authorised* edit to a user's skill does not stamp a digest, so the protection
+does not erode one permitted change at a time. Either way the refusal says whose file
+it is and how to ask again.
 
 What is deliberately **not** creatable is the layer that authorises creation: the tool
 sandbox, the approval gate, the budget guard, the audit trail. A thing the agent can
