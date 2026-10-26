@@ -47,6 +47,49 @@ if TYPE_CHECKING:  # the loader imports this module: types only, so no cycle
 __all__ = ["ReloadTransaction"]
 
 
+def _mcp_server_came_up(mcp_client: Any, config: dict) -> bool:
+    """Whether *config*'s server is connected now, when the client can say.
+
+    A client without ``is_connected`` (a substitution in a test, an older
+    composition) cannot tell a failed connection from a working one, so the
+    attempt is reported -- which is all that client ever reported.
+    """
+    probe = getattr(mcp_client, "is_connected", None)
+    if probe is None:
+        return True
+    return bool(probe(str(config.get("name", "?"))))
+
+
+async def _stop_mcp_server(mcp_client: Any, server_name: str, registry: Any) -> None:
+    """Stop one removed plugin's MCP server, then make sure its tools are gone.
+
+    ``disconnect`` is the real stop: it sets the server's own stop event and
+    awaits the task that owns the session, so the child process is reaped here
+    and not at process exit.  The prefix removal afterwards is the fallback for a
+    client that has no ``disconnect`` and the belt-and-braces for one that does;
+    both are no-ops when there is nothing left to remove.
+    """
+    disconnect = getattr(mcp_client, "disconnect", None)
+    if disconnect is not None:
+        try:
+            result = await disconnect(server_name)
+        except Exception as exc:
+            shared.CONSOLE.print(
+                f"[yellow]Plugin reload: MCP disconnect failed ({server_name}): "
+                f"{exc}[/yellow]"
+            )
+        else:
+            if not result.get("ok", True):
+                # Not fatal -- the reload's job is the tree, not this server -- but
+                # an operator reading the log has to be able to see it.
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin reload: MCP server {server_name!r} was not "
+                    f"stopped: {result.get('error', 'unknown error')}[/yellow]"
+                )
+    if registry is not None and hasattr(registry, "unregister_by_source_prefix"):
+        registry.unregister_by_source_prefix(f"mcp:{server_name}")
+
+
 class ReloadTransaction:
     """One ``PluginCatalog.reload`` call, with its snapshot and its rollback.
 
@@ -90,8 +133,10 @@ class ReloadTransaction:
         so each one genuinely becomes a new install and the old install's scope must not
         stay open beside it.  That is also what gives a plugin about to vanish its end
         hook, its scope unwind and its teardown -- without it, eviction was a table
-        rebuild that left the plugin's non-registration resources behind (the documented
-        MCP-subprocess leak).
+        rebuild that left the plugin's non-registration resources behind.  The MCP
+        subprocess that used to be left behind this way is stopped explicitly now, in
+        ``_connect_new_mcp``: the process belongs to the MCP client, not to the plugin
+        that declared the config, so the reload is the one holding both ends.
         """
         catalog = self._catalog
         old_plugin_names = before["plugin_names"]
@@ -169,12 +214,20 @@ class ReloadTransaction:
     async def _connect_new_mcp(
         self, mcp_registry: Any, old_mcp: set, removed: set, mcp_client: Any, registry: Any
     ) -> list[str]:
-        """Connect newly-declared servers, and drop tools of removed plugins' servers.
+        """Connect newly-declared servers, and **stop** removed plugins' servers.
 
-        The unregister half is best-effort and cannot be anything else: the stdio process
-        behind an MCP server is not killed here (see the loader's documented limitation),
-        so what is removed is the *tool registration*, by the source prefix the client
-        gave it.
+        Stopping them, not merely unregistering their tools.  A removed plugin's
+        stdio child used to outlive the plugin -- until the whole process exited --
+        because the reload had no way to close one server; ``disconnect`` is that
+        way now.  It signals the server's own task, which unwinds its
+        ``AsyncExitStack`` (an AnyIO cancel scope has to be exited by the task that
+        entered it, so nothing here may cancel it) and takes back the tools it
+        registered on the way out.
+
+        Best-effort, because a reload must not fail over a server that will not
+        die: a client that cannot ``disconnect`` (a substitution, an older
+        composition) still gets the tool rows taken back by prefix, which is all
+        the reload could ever do.
         """
         # The **records**, not ``_mcp_pairs``: that helper answers "which server, whose?"
         # as a set of ``(owner, name)`` keys for the membership test, and unpacking it as
@@ -189,15 +242,24 @@ class ReloadTransaction:
         if new_servers and mcp_client is not None:
             try:
                 await mcp_client.connect_from_config({"mcp_servers": new_servers})
-                connected = [str(c.get("name", "?")) for c in new_servers]
             except Exception as exc:
                 shared.CONSOLE.print(
                     f"[yellow]Plugin reload: MCP connect failed: {exc}[/yellow]"
                 )
-        if removed and registry is not None:
-            for pname, server_name in old_mcp:
-                if pname in removed and hasattr(registry, "unregister_by_source_prefix"):
-                    registry.unregister_by_source_prefix(f"mcp:{server_name}")
+            else:
+                # "attempted" and "connected" are different answers, and this list is
+                # published as "connected MCP".  A per-server failure inside
+                # ``connect_from_config`` is counted in the client's status rather than
+                # raised, so the client is asked which ones actually came up.
+                connected = [
+                    str(config.get("name", "?"))
+                    for config in new_servers
+                    if _mcp_server_came_up(mcp_client, config)
+                ]
+        if removed:
+            for owner, server_name in sorted(old_mcp):
+                if owner in removed:
+                    await _stop_mcp_server(mcp_client, str(server_name), registry)
         return connected
 
     # -- snapshot and rollback ----------------------------------------------

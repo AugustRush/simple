@@ -66,6 +66,10 @@ class MCPPlugin:
         contributed = list(ctx.get("contributed_mcp_servers").all())
         servers = configured + contributed
 
+        # Built before the client so the client can be handed it: the background
+        # connect fills this dict in, and a later model-triggered reconnect has to be
+        # able to keep it true -- see ``MCPClient.bind_status``.
+        status = empty_mcp_status(len(servers))
         client = None
         if servers:
             # Read through the package attribute, at setup time, exactly as the
@@ -73,6 +77,11 @@ class MCPPlugin:
             # deployment) replaces this client, and a module-level import would
             # freeze the class before the substitution could reach it.
             client = agent_module.MCPClient(ctx.get("registry"))
+            # Optional, like the reload's ``disconnect``: a substituted client does
+            # not have to know about a status dict it never asks anyone to update.
+            bind_status = getattr(client, "bind_status", None)
+            if bind_status is not None:
+                bind_status(status)
         if configured:
             shared.CONSOLE.print(
                 "[dim]MCP connecting in background: "
@@ -90,4 +99,4 @@ class MCPPlugin:
         if client is not None:
             ctx.provide("mcp_client", client)
         ctx.provide("mcp_server_configs", servers)
-        ctx.provide("mcp_status", empty_mcp_status(len(servers)))
+        ctx.provide("mcp_status", status)

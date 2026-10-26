@@ -753,84 +753,199 @@ class ToolRegistry:
 
 
 
+#: How long ``disconnect``/``reconnect`` wait for an owner task to finish its own
+#: unwind.  Bounded because a server that hung during start-up must not hang the
+#: turn that asked to restart it; ``False`` from :meth:`MCPClient._await_task` is
+#: what "asked, not yet confirmed" is reported as.
+_MCP_STOP_TIMEOUT = 10.0
+
+
+class _MCPServer:
+    """One MCP server's live state.
+
+    Private: the client owns these and hands callers plain dicts, so the
+    bookkeeping can change without changing an interface with it.
+    """
+
+    __slots__ = ("cfg", "name", "stop", "task", "session", "tool_names", "state")
+
+    def __init__(self, cfg: dict, name: str) -> None:
+        self.cfg = cfg
+        self.name = name
+        #: This server's own shutdown request.  The task that entered its
+        #: ``AsyncExitStack`` waits on it and leaves the stack itself -- see
+        #: :meth:`MCPClient._run_server`, which is the whole reason it exists.
+        self.stop = asyncio.Event()
+        self.task: Optional[asyncio.Task[None]] = None
+        self.session: Any = None
+        #: The tool names this server registered.  Owned per server, so
+        #: ``registered_tools`` is a count of what is actually installed rather
+        #: than of what was installed once.
+        self.tool_names: set[str] = set()
+        #: ``connecting`` -> ``connected`` -> ``stopped``, or ``failed``.
+        self.state = "connecting"
+
+
 class MCPClient:
-    """Connect to external MCP servers and inject tools into registry."""
+    """Connect to external MCP servers and inject tools into registry.
+
+    A server's lifetime is its own, not the process's: :meth:`disconnect` stops
+    one, :meth:`reconnect` starts one again, the ``mcp_reconnect`` tool is the
+    model's handle on both, and :meth:`close` is the composition's -- it stops
+    every server still running.
+
+    The rule the whole design follows
+    ---------------------------------
+    **AnyIO cancel scopes must be exited by the task that entered them.**  The
+    session ``mcp.stdio_client`` opens is one, so cancelling its task from
+    outside would leave a scope to be exited by a task that never entered it: a
+    ``RuntimeError`` from the SDK at best, a task that never unwinds at worst.
+    No caller ever cancels these tasks, therefore.  Each one waits on its own
+    ``stop`` event (and on the client-wide ``_shutdown``) and leaves ``async with
+    AsyncExitStack()`` itself; :meth:`disconnect` only sets the event and awaits
+    that same task -- which is also why it can say the stdio child is gone before
+    it returns.
+    """
 
     def __init__(self, registry: ToolRegistry):
-        self.registry = registry
-        self._sessions = []
-        # AnyIO cancel scopes must be exited by the task that entered them.
-        # Each stdio server therefore owns its context managers in a dedicated
-        # task which remains alive until ``close()`` signals shutdown.
+        # The composition hands this client `ctx.get("registry")`, which is the
+        # **scoped view** a plugin gets (so its registrations come back out when it
+        # unloads).  A view contributes but is not the registry: it has no
+        # `unregister_by_source_prefix`, so `_forget_tools`' defensive `getattr` found
+        # nothing and a disconnected server's tools stayed registered against a closed
+        # session -- the quiet half of the failure, since the process really did stop.
+        # Unwrapped here, where it is one line, for the same reason
+        # `UserToolCatalog.load_into_registry` unwraps: the caller that passes a view is
+        # the one that cannot see the difference, and the view names the registry it
+        # wraps for exactly this kind of caller.
+        self.registry = getattr(registry, "registry", registry)
+        #: Safe server name -> live state.  ``_server_key`` derives the name;
+        #: ``_resolve`` maps a caller's spelling of it onto the same entry.
+        self._servers: dict[str, _MCPServer] = {}
         self._server_tasks: list[asyncio.Task[None]] = []
         self._shutdown = asyncio.Event()
-        self._configured_servers = 0
-        self._connected_servers = 0
-        self._failed_servers = 0
-        self._registered_tools = 0
+        # Two maps, two questions.  ``_configured`` is what this client is
+        # expected to be running right now -- what ``configured_servers`` counts
+        # -- and ``_known`` is every config it was ever handed: a disconnected
+        # server is no longer configured, but it is still startable, which is
+        # what ``reconnect`` needs after ``disconnect``.
+        self._configured: dict[str, dict] = {}
+        self._known: dict[str, dict] = {}
+        self._extra_env: dict[str, str] = {}
+        #: The dict the composition publishes as ``mcp_status``, kept in step so a
+        #: model-triggered reconnect does not leave it describing startup.  See
+        #: :meth:`bind_status`.
+        self._status: Optional[dict[str, Any]] = None
+        self._self_tool_registered = False
+
+    # -- names ---------------------------------------------------------------
 
     @staticmethod
     def _safe_name(value: str) -> str:
         name = re.sub(r"[^0-9a-zA-Z_]+", "_", value.strip().lower())
         return name.strip("_") or "mcp"
 
+    @classmethod
+    def _server_key(cls, cfg: dict) -> str:
+        """The name a config is filed under: its own ``name``, else its command's."""
+        name = str(cfg.get("name") or "").strip()
+        if not name:
+            name = Path(str(cfg.get("command", "") or "")).name
+        return cls._safe_name(name or "mcp")
+
+    def _resolve(self, name: str) -> str:
+        """Map a caller's spelling onto the key the server is filed under.
+
+        ``disconnect("my server")`` and ``disconnect("my_server")`` are the same
+        request: one is what the config says, the other is what the tool names
+        are prefixed with, and a caller may have read either.
+        """
+        raw = str(name or "").strip()
+        if raw in self._servers or raw in self._known:
+            return raw
+        return self._safe_name(raw)
+
+    # -- connecting ----------------------------------------------------------
+
     async def connect_from_config(
         self, config: dict, extra_env: dict[str, str] | None = None
     ):
+        """Connect every server in *config*, counting failures rather than raising.
+
+        Called once by the composition with the merged list, and again by a plugin
+        reload with only the servers that appeared -- so a second call adds to
+        what this client is configured to run; it does not replace it.
+        """
         self._extra_env = extra_env or {}
-        self._configured_servers = len(config.get("mcp_servers", []) or [])
-        mcp_servers = config.get("mcp_servers", [])
-        for server_cfg in mcp_servers:
+        self._register_self_tool()
+        for server_cfg in list(config.get("mcp_servers", []) or []):
             try:
                 await self._connect_server(server_cfg)
-                self._connected_servers += 1
             except Exception as e:
-                self._failed_servers += 1
                 shared.CONSOLE.print(
-                    f"[yellow]MCP server connect failed ({server_cfg.get('name', '?')}): {e}[/yellow]"
+                    f"[yellow]MCP server connect failed "
+                    f"({server_cfg.get('name', '?')}): {e}[/yellow]"
                 )
+        self._publish_status()
 
-    async def _connect_server(self, cfg: dict):
+    async def _connect_server(self, cfg: dict) -> None:
+        """Start one server and wait until its tools are registered, or it failed."""
+        name = self._server_key(cfg)
+        if name in self._servers:
+            # A newer config for a name that is already running: stop the old
+            # process before the new one tries to register the same tool names.
+            await self.disconnect(name)
+        handle = _MCPServer(cfg, name)
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[None] = loop.create_future()
-        task = asyncio.create_task(
-            self._run_server(cfg, ready),
-            name=f"mcp-server-{self._safe_name(str(cfg.get('name') or 'mcp'))}",
+        handle.task = asyncio.create_task(
+            self._run_server(handle, ready), name=f"mcp-server-{name}"
         )
-        self._server_tasks.append(task)
+        self._servers[name] = handle
+        self._server_tasks.append(handle.task)
+        self._known[name] = cfg
+        self._configured[name] = cfg
         try:
             await ready
         except asyncio.CancelledError:
-            # If startup itself is cancelled, do not leave an unowned stdio
-            # process behind.  The owner task performs its own context unwind.
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            # The *caller* was cancelled while waiting for startup.  The task is
+            # still the only thing allowed to exit its own contexts, so it is
+            # asked to (stop), never cancelled.
+            handle.stop.set()
+            await asyncio.gather(handle.task, return_exceptions=True)
             raise
+        finally:
+            self._publish_status()
 
     async def _run_server(
         self,
-        cfg: dict,
+        handle: _MCPServer,
         ready: asyncio.Future[None],
     ) -> None:
-        """Own one MCP server's complete enter/wait/exit lifecycle."""
-        command = str(cfg.get("command", "")).strip()
+        """Own one MCP server's complete enter/wait/exit lifecycle.
+
+        Same task from the first line to the last, on purpose: the contexts
+        ``stdio_client`` and ``ClientSession`` enter are exited here, by the task
+        that entered them, once :meth:`_wait_for_stop` says it is time.  Nothing
+        outside this method closes them.
+        """
+        server_name = handle.name
+        command = str(handle.cfg.get("command", "")).strip()
         if not command:
+            handle.state = "failed"
             if not ready.done():
                 ready.set_exception(ValueError("MCP server config requires 'command'"))
             return
 
-        server_name = self._safe_name(
-            str(cfg.get("name") or Path(command).name or "mcp")
-        )
         # Merge: agent-level env < server-specific env (server wins)
-        server_env = dict(cfg.get("env", {}) or {})
+        server_env = dict(handle.cfg.get("env", {}) or {})
         merged_env = (
             {**self._extra_env, **server_env} if self._extra_env or server_env else None
         )
-        cwd = cfg.get("cwd") or self._extra_env.get("AGENT_OUTPUT_DIR")
+        cwd = handle.cfg.get("cwd") or self._extra_env.get("AGENT_OUTPUT_DIR")
         params = mcp.StdioServerParameters(
             command=command,
-            args=list(cfg.get("args", []) or []),
+            args=list(handle.cfg.get("args", []) or []),
             env=merged_env or None,
             cwd=str(cwd) if cwd else None,
         )
@@ -847,25 +962,58 @@ class MCPClient:
                     mcp.ClientSession(read_stream, write_stream)
                 )
                 await session.initialize()
-                self._sessions.append({"name": server_name, "session": session})
-
+                handle.session = session
                 tools_result = await session.list_tools()
                 for tool in getattr(tools_result, "tools", []):
-                    self._register_tool(server_name, session, tool)
+                    self._register_tool(handle, session, tool)
+                handle.state = "connected"
                 if not ready.done():
                     ready.set_result(None)
-                await self._shutdown.wait()
+                self._publish_status()
+                await self._wait_for_stop(handle)
+                handle.state = "stopped"
         except asyncio.CancelledError:
+            handle.state = "stopped"
             if not ready.done():
                 ready.cancel()
             raise
         except Exception as exc:
+            handle.state = "failed"
             if not ready.done():
                 ready.set_exception(exc)
             else:
                 shared.CONSOLE.print(
                     f"[yellow]MCP server stopped ({server_name}): {exc}[/yellow]"
                 )
+        finally:
+            # The stack has been left by now, so the session and the child are
+            # gone.  The tools it registered are this task's to take back: a
+            # registration pointing at a closed session is worse than none, and a
+            # count that kept it would be describing a server that is not there.
+            handle.session = None
+            self._forget_tools(handle)
+            self._publish_status()
+
+    async def _wait_for_stop(self, handle: _MCPServer) -> None:
+        """Block until *handle* is asked to stop, or the client is closing.
+
+        Two waiters, because the callers need different scopes: ``disconnect`` and
+        ``reconnect`` stop **one** server while ``close`` stops all of them, and
+        neither may reach into the task.  Whichever fires first ends this task's
+        turn at its ``AsyncExitStack``, which the task then leaves itself.
+        """
+        stop_waiter = asyncio.ensure_future(handle.stop.wait())
+        shutdown_waiter = asyncio.ensure_future(self._shutdown.wait())
+        try:
+            await asyncio.wait(
+                {stop_waiter, shutdown_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in (stop_waiter, shutdown_waiter):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(stop_waiter, shutdown_waiter, return_exceptions=True)
 
     def _open_server_errlog(self, stack: AsyncExitStack, server_name: str):
         """Return a process-compatible stderr target owned by this client."""
@@ -886,10 +1034,11 @@ class MCPClient:
             # reintroduce the input-line corruption this guard prevents.
             return subprocess.DEVNULL
 
-    def _register_tool(self, server_name: str, session: Any, tool: Any) -> None:
+    def _register_tool(self, handle: _MCPServer, session: Any, tool: Any) -> None:
         original_name = str(getattr(tool, "name", "")).strip()
         if not original_name:
             return
+        server_name = handle.name
         registered_name = f"mcp_{server_name}_{self._safe_name(original_name)}"
         description = getattr(tool, "description", None) or f"MCP tool {original_name}"
         parameters = getattr(tool, "inputSchema", None) or {
@@ -925,15 +1074,280 @@ class MCPClient:
             _call_mcp_tool,
             source=f"mcp:{server_name}",
         )
-        self._registered_tools += 1
+        handle.tool_names.add(registered_name)
+
+    def _forget_tools(self, handle: _MCPServer) -> None:
+        """Take back every tool *handle* registered.
+
+        By source prefix (``mcp:<server>``), which the composition owns outright
+        -- unlike a plugin's contribution, which has to undo by identity
+        (``unregister_contribution``): two plugin names may share a prefix, but
+        one server owns every tool under its own.
+
+        Idempotent by construction, and called twice on purpose: once by the
+        server's own task as it leaves its stack, and again by :meth:`disconnect`,
+        which covers a task that died before it could clean up and a task that
+        never started at all.
+        """
+        handle.tool_names.clear()
+        unregister = getattr(self.registry, "unregister_by_source_prefix", None)
+        if unregister is not None:
+            unregister(f"mcp:{handle.name}")
+
+    # -- the model's handle on the lifecycle ---------------------------------
+
+    def _register_self_tool(self) -> None:
+        """Offer the model one entry point: ``mcp_reconnect``.
+
+        Source ``mcp`` rather than ``mcp:<server>``: it has to outlive every
+        individual server, because the moment a server's tools are gone is
+        exactly when a caller wants to ask for it to come back.
+        """
+        if self._self_tool_registered:
+            return
+        register = getattr(self.registry, "register", None)
+        if register is None:
+            return
+        list_tools = getattr(self.registry, "list_tools", None)
+        if list_tools is not None and "mcp_reconnect" in list_tools():
+            # Another client already put it on this registry, which means the same
+            # composition: one handle is enough, and it reaches the same servers.
+            self._self_tool_registered = True
+            return
+        register(
+            "mcp_reconnect",
+            (
+                "Restart an MCP server and register its tools again. This stops an "
+                "external process and starts it again, so it costs what starting the "
+                "server costs and it interrupts the calls in flight on it. Use it when "
+                "an MCP tool failed or the server's tools disappeared. Without "
+                "`server`, every configured server is restarted."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Server name to restart; omit to restart them all.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            self._reconnect_tool,
+            source="mcp",
+            capabilities=("state_write",),
+        )
+        self._self_tool_registered = True
+
+    async def _reconnect_tool(self, server: str | None = None, **_ignored: Any):
+        """The tool body: restart one server, or all, and report each one."""
+        targets = [str(server)] if server else sorted(self._configured)
+        if not targets:
+            return {
+                "ok": False,
+                "error": "no MCP servers are configured for this session",
+                "results": [],
+            }
+        results = [await self.reconnect(target) for target in targets]
+        return {
+            "ok": all(item.get("ok") for item in results),
+            "results": results,
+            "status": self.status_summary(),
+        }
+
+    # -- disconnect / reconnect ----------------------------------------------
+
+    async def disconnect(self, name: str) -> dict[str, Any]:
+        """Stop one server, then take its tools back.
+
+        Returns what happened instead of raising: "there is no such server" is an
+        answer a caller (a reload, a model) has to report, and a failure to close
+        one server should not crash the composition shutting down.
+
+        The order is the promise.  Setting ``stop`` lets the **owner** task unwind
+        its own ``AsyncExitStack``, so the stdio child is reaped by the task that
+        started it; only then are the registrations removed, so no tool call can
+        land on a session that is already closed.
+        """
+        key = self._resolve(name)
+        handle = self._servers.get(key)
+        if handle is None:
+            if key in self._known:
+                # Stopped once already: still "nothing is running", which is the
+                # answer the caller asked for, so it is a result and not an error.
+                self._configured.pop(key, None)
+                self._publish_status()
+                return {
+                    "ok": True,
+                    "server": key,
+                    "stopped": True,
+                    "was_connected": False,
+                    "tools_removed": 0,
+                }
+            return {
+                "ok": False,
+                "server": str(name),
+                "error": (
+                    f"unknown MCP server {str(name)!r}: not one this client has "
+                    "been configured with"
+                ),
+            }
+        was_connected = handle.state == "connected"
+        tools_removed = len(handle.tool_names)
+        # The owner's own exit, requested.  Never a cancel from here: see the
+        # class docstring for why that is the one move this class does not make.
+        handle.stop.set()
+        stopped = True
+        if handle.task is not None:
+            stopped = await self._await_task(handle.task)
+            if handle.task in self._server_tasks:
+                self._server_tasks.remove(handle.task)
+        # Belt and braces for a task that never reached its own cleanup.
+        self._forget_tools(handle)
+        self._servers.pop(key, None)
+        self._configured.pop(key, None)
+        self._publish_status()
+        return {
+            "ok": True,
+            "server": key,
+            "stopped": stopped,
+            "was_connected": was_connected,
+            "tools_removed": tools_removed,
+        }
+
+    async def reconnect(self, name: str) -> dict[str, Any]:
+        """Stop one server and start it again from the config it was given.
+
+        A failure is returned as a failure: the old session is gone by then, so
+        reporting success would describe a server that is not there.  The config
+        stays known, so the call can simply be made again.
+        """
+        key = self._resolve(name)
+        cfg = self._known.get(key)
+        if cfg is None:
+            handle = self._servers.get(key)
+            cfg = handle.cfg if handle is not None else None
+        if cfg is None:
+            return {
+                "ok": False,
+                "server": str(name),
+                "connected": False,
+                "error": (
+                    f"unknown MCP server {str(name)!r}: not one this client has "
+                    "been configured with"
+                ),
+            }
+        if key in self._servers:
+            await self.disconnect(key)
+        try:
+            await self._connect_server(cfg)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "server": key,
+                "connected": False,
+                "error": str(exc),
+            }
+        handle = self._servers.get(key)
+        return {
+            "ok": True,
+            "server": key,
+            "connected": True,
+            "tools": sorted(handle.tool_names) if handle is not None else [],
+        }
+
+    async def _await_task(self, task: asyncio.Task[None]) -> bool:
+        """Wait for *task* to finish; ``False`` when it could not be waited for.
+
+        ``False`` is not a failure to report as one: it means the task belongs to
+        another loop (see :meth:`close`), so that loop has to run the unwind we
+        just requested.  Returning it lets the caller say "asked, not yet
+        confirmed" instead of inventing a success.
+
+        The wait is bounded, because a server that hung during start-up must not
+        hang the turn that asked to restart it.  ``shield`` is load-bearing:
+        without it the timeout would cancel the gather, and the gather would
+        cancel the task -- the one move this class may never make.
+        """
+        if task.done():
+            await asyncio.gather(task, return_exceptions=True)
+            return True
+        if task.get_loop() is not asyncio.get_running_loop():
+            return False
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(task, return_exceptions=True)),
+                timeout=_MCP_STOP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    # -- reading the state ---------------------------------------------------
 
     def status_summary(self) -> dict[str, Any]:
+        """The truth about the servers, counted from the servers themselves.
+
+        These used to be counters maintained by hand, which is how a server that
+        died in the background could still be counted as connected: nothing
+        decremented on the way out.  Derived state makes a crash, a disconnect, a
+        failed reconnect and a successful one all visible without anyone
+        remembering to update a number.
+        """
+        servers = list(self._servers.values())
         return {
-            "configured_servers": self._configured_servers,
-            "connected_servers": self._connected_servers,
-            "failed_servers": self._failed_servers,
-            "registered_tools": self._registered_tools,
+            "configured_servers": len(self._configured),
+            "connected_servers": sum(1 for h in servers if h.state == "connected"),
+            "failed_servers": sum(1 for h in servers if h.state == "failed"),
+            "registered_tools": sum(len(h.tool_names) for h in servers),
         }
+
+    def server_states(self) -> list[dict[str, Any]]:
+        """Per-server state, for a caller that has to report one line each."""
+        return [
+            {
+                "server": handle.name,
+                "state": handle.state,
+                "connected": handle.state == "connected",
+                "tools": sorted(handle.tool_names),
+            }
+            for handle in self._servers.values()
+        ]
+
+    def is_connected(self, name: str) -> bool:
+        """Whether *name* has a live session with its tools registered right now."""
+        handle = self._servers.get(self._resolve(name))
+        return handle is not None and handle.state == "connected"
+
+    def bind_status(self, status: dict[str, Any]) -> None:
+        """Publish this client's state into the composition's ``mcp_status`` dict.
+
+        The composition publishes that dict at setup -- holding what it is about to
+        attempt -- and the background connect fills it in.  A reconnect triggered
+        later, by the model through ``mcp_reconnect``, has nobody re-reading
+        ``status_summary``, so from here on every state change is written into the
+        same dict: the composition's account of what is connected keeps describing
+        the servers instead of the moment it started.
+
+        Binding writes nothing itself: the setup value is the honest one until an
+        attempt has reported something.
+        """
+        self._status = status
+
+    def _publish_status(self) -> None:
+        status = self._status
+        if status is None:
+            return
+        try:
+            status.clear()
+            status.update(self.status_summary())
+        except (AttributeError, TypeError):
+            # Not a mutable mapping of ours: stop trying rather than fail a
+            # reconnect over a status detail.
+            self._status = None
+
+    # -- shutting everything down --------------------------------------------
 
     async def close(self) -> None:
         """Signal shutdown, then wait for the server tasks **this loop** owns.
@@ -954,29 +1368,35 @@ class MCPClient:
         * if its loop is still **running** (another thread's), ``_shutdown`` has been
           set, which is the signal that task is waiting on, and cancelling it is that
           loop's business, so we ask it to.
+
+        Every server task also waits on this client's ``_shutdown`` beside its own
+        stop event, so setting it here is all they need to leave their contexts
+        themselves.  A closed client is finished: ``_shutdown`` stays set, so a
+        later ``connect_from_config`` stops immediately.  A composition that wants
+        servers back builds a new client, which is what a config change does.
         """
         self._shutdown.set()
-        if not self._server_tasks:
-            return
-        loop = asyncio.get_running_loop()
-        mine: list[asyncio.Task[None]] = []
-        foreign: list[asyncio.Task[None]] = []
-        for task in self._server_tasks:
-            (mine if task.get_loop() is loop else foreign).append(task)
-        self._server_tasks.clear()
-        if mine:
-            await asyncio.gather(*mine, return_exceptions=True)
-        for task in foreign:
-            if task.done():
-                continue
-            owner = task.get_loop()
-            if owner.is_running():
-                try:
-                    owner.call_soon_threadsafe(task.cancel)
-                except RuntimeError:
-                    # The loop stopped between the check and the call; its own
-                    # close has already cancelled the task.
-                    pass
+        if self._server_tasks:
+            loop = asyncio.get_running_loop()
+            mine: list[asyncio.Task[None]] = []
+            foreign: list[asyncio.Task[None]] = []
+            for task in self._server_tasks:
+                (mine if task.get_loop() is loop else foreign).append(task)
+            self._server_tasks.clear()
+            if mine:
+                await asyncio.gather(*mine, return_exceptions=True)
+            for task in foreign:
+                if task.done():
+                    continue
+                owner = task.get_loop()
+                if owner.is_running():
+                    try:
+                        owner.call_soon_threadsafe(task.cancel)
+                    except RuntimeError:
+                        # The loop stopped between the check and the call; its own
+                        # close has already cancelled the task.
+                        pass
+        self._publish_status()
 
 
 class UserToolCatalog:
