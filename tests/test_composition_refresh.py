@@ -13,10 +13,11 @@ What a reload can and cannot apply
   discovery for every plugin, so refreshing it here makes the change live.  That is the
   whole of the on/off switch.
 * The composition *itself* -- the profile's core selection and its service replacements --
-  decides which core plugins are mounted, and mounting is the composition root's act: it
-  runs once, and what it produced is what every long-lived holder captured.  Re-mounting
-  that in place would rebuild the process's spine under a serving gateway, so a reload
-  **reports** ``restart_required`` rather than pretending it applied something.
+  decides which core plugins are mounted.  A **plugin reload** cannot change that (the
+  services it would replace are held by everything that captured them), so it reports
+  ``restart_required`` instead of pretending it applied something.  Applying it is
+  ``PluginCatalog.recompose`` -- a whole-composition operation the caller owes an idle
+  process to; ``tests/test_functional_turns.py`` proves it against a live gateway.
 
 Two rules the tests below pin, because "reload" is an operation people run on a live
 system: it never raises for a config problem, and a config it could not parse leaves the
@@ -58,7 +59,7 @@ def _catalog(tmp_path, *, plugin_config=None, loader=None) -> PluginCatalog:
         plugin_config=plugin_config or {},
     )
     if loader is not None:
-        catalog.set_config_loader(loader)
+        catalog.bind_composition(config_loader=loader)
     return catalog
 
 
@@ -74,7 +75,7 @@ def test_a_reload_picks_up_a_plugin_switched_off_in_the_config(tmp_path):
 
     assert result["removed_plugins"] == ["hello"], result
     assert catalog.get_loaded_names_for_directory("hello") == set()
-    assert catalog.refresh_composition()["ok"] is True
+    assert catalog.catch_up()["ok"] is True
 
 
 def test_the_reload_reports_the_composition_and_what_is_still_owed(tmp_path):
@@ -120,7 +121,7 @@ def test_an_unknown_profile_name_is_reported_and_the_running_one_is_kept(tmp_pat
     before = catalog.core_plugin_selection()
 
     answer["plugins"] = {"_profile": "no-such-profile"}
-    report = catalog.refresh_composition()
+    report = catalog.catch_up()
 
     assert report["ok"] is False
     assert "no-such-profile" in report["error"]
@@ -147,7 +148,72 @@ def test_without_a_loader_the_construction_time_answer_is_kept(tmp_path):
     catalog = _catalog(tmp_path, plugin_config={"hello": {"enabled": False}})
     catalog.discover_and_load()
 
-    report = catalog.refresh_composition()
+    report = catalog.catch_up()
 
     assert report["ok"] is True
     assert catalog.get_loaded_names_for_directory("hello") == set()
+
+
+# ── the single wiring call, and recompose being safe to call ────────────────
+
+
+def test_binding_mounts_and_reports_what_it_mounted(tmp_path):
+    """One call instead of three, and the record is the mount's own return value.
+
+    The three calls it replaced were ``set_config_loader``,
+    ``set_composition_mounter`` and ``note_core_mounts`` -- and the third could describe
+    a mount that never happened, because nothing tied it to the second.  Here the names
+    come back from the act itself.
+    """
+    catalog = _catalog(tmp_path)
+    mounted: list[str] = []
+
+    def mount_core() -> list[str]:
+        mounted.append("mounted")
+        return ["registry", "memory", "session"]
+
+    names = catalog.bind_composition(
+        config_loader=lambda: {"_profile": "core"},
+        mount_core=mount_core,
+    )
+
+    assert names == ("registry", "memory", "session")
+    assert mounted == ["mounted"], "binding is the first mount, not a setter"
+
+
+def test_a_reader_without_a_mounter_can_still_report(tmp_path):
+    """An embedder may want the config re-read without giving the catalog the ability to
+    rebuild the process.  That is a legitimate binding; only ``recompose`` is refused."""
+    catalog = _catalog(tmp_path)
+    assert catalog.bind_composition(config_loader=lambda: {}) == ()
+
+    report = catalog.catch_up(apply=False)
+    assert report["ok"] is True
+
+    result = asyncio.run(catalog.recompose())
+    assert result["ok"] is False
+    assert "mounter" in result["error"]
+
+
+def test_recompose_with_nothing_owed_does_not_remount(tmp_path):
+    """Safe to call, not merely correct when called: an unchanged composition is a no-op.
+
+    Without the guard, a page that says "apply" on an unchanged config would stop and
+    restart every core service -- after the caller had already dropped its session
+    runtimes -- to arrive back where it started.
+    """
+    catalog = _catalog(tmp_path)
+    mounts: list[str] = []
+
+    def mount_core() -> list[str]:
+        mounts.append("mount")
+        return ["registry"]
+
+    catalog.bind_composition(config_loader=lambda: {"_profile": "core"}, mount_core=mount_core)
+    assert mounts == ["mount"]
+
+    result = asyncio.run(catalog.recompose())
+
+    assert result["ok"] is True
+    assert result["needs"] == "nothing", result
+    assert mounts == ["mount"], "a no-op recompose must not touch the mounted tree"

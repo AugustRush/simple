@@ -1250,7 +1250,7 @@ class PluginCatalog:
         #: a test or an embedder wants.
         self._config_loader: Any = None
         #: The core plugin names this catalog was told it mounted.  Recorded so
-        #: ``refresh_composition`` can say which part of a profile change this process
+        #: ``catch_up`` can say which part of a profile change this process
         #: cannot apply, instead of reporting a reload that quietly ignored it.
         self._mounted_core: tuple[str, ...] = ()
         #: How the composition mounts itself: a callable that mounts its own plugins and
@@ -1964,29 +1964,39 @@ class PluginCatalog:
 
     # ── Composition refresh ───────────────────────────────────────────────────
 
-    def set_config_loader(self, loader: Any) -> None:
-        """Install the callable that re-reads the ``plugins`` section.
+    def bind_composition(
+        self, *, config_loader: Any, mount_core: Any = None
+    ) -> tuple[str, ...]:
+        """Hand this catalog the two verbs only the composition root knows.
 
-        A loader rather than a path, because reading the config is the composition's
-        business: it owns the ``--name`` instance, the environment overrides and the
-        validator.  The catalog only knows that the answer it was constructed with may
-        be out of date.
+        Both used to be separate setters (``set_config_loader``,
+        ``set_composition_mounter``) plus a third call to report what the mount produced
+        (``note_core_mounts``).  That is three ways to say one thing -- "here is the
+        composition this catalog is a part of" -- and the third one could disagree with
+        the second, which is exactly the bug shape a *reported* fact invites.  So the
+        mount now **returns** the names it mounted, and this method is the only wiring
+        there is:
+
+        * ``config_loader`` re-reads the ``plugins`` section (the config is the
+          composition's business: the ``--name`` instance, the environment overrides
+          and the validator all live there).
+        * ``mount_core`` mounts the composition's own plugins, re-applies the decisions
+          that belong to them, and returns their names.
         """
-        self._config_loader = loader
-
-    def set_composition_mounter(self, mounter: Any) -> None:
-        """Install the callable that mounts this composition.
-
-        Handed over rather than imported: mounting means ``core_plugins(...)``, a
-        ``CoreContext`` and the post-mount facts (the spawn capability, the shell
-        posture, the trust switch), all of which are the composition root's knowledge.
-        Passing the *act* keeps that knowledge where it is already written down.
-        """
-        self._composition_mounter = mounter
-
-    def note_core_mounts(self, names: Any) -> None:
-        """Record which core plugins the composition actually mounted."""
-        self._mounted_core = tuple(str(name) for name in names)
+        self._config_loader = config_loader
+        self._composition_mounter = mount_core
+        if mount_core is None:
+            # A reader without a mounter is a legitimate binding -- an embedder, or a
+            # test of the config re-read.  Such a catalog can still say what a change
+            # would need; it just cannot perform it, and ``recompose`` says so.
+            self._mounted_core = ()
+            return ()
+        # Binding *is* the first mount.  It used to be three calls in the composition
+        # root -- install the reader, install the mounter, then report what the mount
+        # produced -- and the third could disagree with the second.  Here the mount's
+        # return value *is* the record, so it cannot.
+        self._mounted_core = tuple(str(name) for name in (mount_core() or ()))
+        return self._mounted_core
 
     @staticmethod
     def _core_names_for(profile: Any) -> tuple[str, ...]:
@@ -2000,10 +2010,6 @@ class PluginCatalog:
                 replacements=profile.service_replacements,
             )
         )
-
-    def composition_preview(self) -> dict:
-        """What a refresh would change, without changing it.  See ``refresh_composition``."""
-        return self.refresh_composition(apply=False)
 
     #: Prefixes of the plugins that are the **process** rather than a part of its
     #: composition.  A remount must not unmount these: a channel owns a listening socket
@@ -2080,9 +2086,16 @@ class PluginCatalog:
             if not self._is_host_plugin(name):
                 self.unload_plugin(name)
 
-        composition = self.refresh_composition()
+        composition = self.catch_up()
+        if not composition.get("restart_required"):
+            # Nothing in the mounted tree is stale.  Remounting anyway would stop and
+            # restart every core service to arrive back where we are -- and the caller
+            # has already dropped its session runtimes by the time it gets here, so this
+            # guard is the difference between "safe to call" and "costly to call for
+            # nothing".  `catch_up` still ran: the plugin section is re-read either way.
+            return {"ok": True, "needs": "nothing", "composition": composition}
         try:
-            mounter()
+            self._mounted_core = tuple(str(name) for name in (mounter() or ()))
             self.flush_pending()
             self.verify_replacements()
             loaded = self.discover_and_load()
@@ -2094,7 +2107,7 @@ class PluginCatalog:
                 for name in list(self._installs):
                     if not self._is_host_plugin(name):
                         self.unload_plugin(name)
-                mounter()
+                self._mounted_core = tuple(str(name) for name in (mounter() or ()))
                 self.flush_pending()
                 self.verify_replacements()
                 self.discover_and_load()
@@ -2121,7 +2134,7 @@ class PluginCatalog:
             "loaded": list(loaded),
         }
 
-    def refresh_composition(self, *, apply: bool = True) -> dict:
+    def catch_up(self, *, apply: bool = True) -> dict:
         """Re-read the plugin config, re-resolve the profile, and say what changed.
 
         Two kinds of change, with two different answers, because they cost different

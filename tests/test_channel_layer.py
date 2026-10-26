@@ -1736,11 +1736,21 @@ def test_channel_runner_fires_session_end_per_chat_session():
 
     class _PluginCatalog:
 
-        def set_composition_mounter(self, mounter=None):
-            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
-            # composition hands over the act of mounting itself so a recomposition can repeat
-            # it.  This stand-in never recomposes, so it only has to accept it.
-            self.composition_mounter = mounter
+        def bind_composition(self, *, config_loader=None, mount_core=None):
+            # The catalog's one wiring call: how to re-read the config, and how to mount
+            # the composition (which returns the names it mounted).  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same
+            # rule `mount(provenance=...)` below is here for.  It mounts, because the
+            # composition root's contract is that binding it *does* the first mount.
+            self.config_loader = config_loader
+            self.composition_mounter = mount_core
+            if mount_core is None:
+                return ()
+            self.core_mounts = tuple(mount_core() or ())
+            return self.core_mounts
+
+        def catch_up(self, *, apply=True):
+            return {"ok": True, "applied": apply, "restart_required": []}
 
         def is_mounted(self, name=""):
             # Asked by the mounter before it mounts: a recomposition keeps the host plugins
@@ -1749,20 +1759,6 @@ def test_channel_runner_fires_session_end_per_chat_session():
 
         def verify_replacements(self):
             return None
-
-        def composition_preview(self):
-            return {"ok": True, "restart_required": []}
-
-
-        def set_config_loader(self, loader=None):
-            # Part of the catalog's constructor-time API: the composition hands the catalog
-            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
-            # cannot accept it is not standing in for the catalog any more -- the same rule
-            # `mount(provenance=...)` below is here for.
-            self.config_loader = loader
-
-        def note_core_mounts(self, names=()):
-            self.core_mounts = tuple(names)
 
         def __init__(self):
             self.session_events = []

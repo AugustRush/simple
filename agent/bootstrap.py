@@ -728,9 +728,6 @@ async def _build_components_async(
     # place where "the file changed" has to become "the composition changed": the
     # catalog cannot load a config (that is the composition's own job, with its
     # `--name` instance and env overrides), so it is handed the reader.
-    plugin_catalog.set_config_loader(
-        lambda: (load_config()[0].get("plugins") or {})
-    )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
     # The plugins the composition root mounts itself; everything else is discovered from
@@ -756,7 +753,7 @@ async def _build_components_async(
     # ``components`` on each call -- the registry and the agent are **new objects** after
     # a remount, so a closure over the old ones would teach the retired composition and
     # leave the live one dumb, which is the quietest possible way to be wrong here.
-    def _mount_composition() -> None:
+    def _mount_composition() -> list[str]:
         selection = plugin_catalog.core_plugin_selection()
         replacements = plugin_catalog.service_replacements()
         mounted: list[str] = []
@@ -778,7 +775,6 @@ async def _build_components_async(
                 ),
                 provenance=Provenance(source=f"core:{entry.name}", kind=CORE),
             )
-        plugin_catalog.note_core_mounts(mounted)
 
         # The composition's own decisions, applied to whatever objects it just mounted.
         # ``registry`` and ``agent`` are resolved here rather than captured above, because
@@ -821,9 +817,15 @@ async def _build_components_async(
                 if str(entry).strip()
             ),
         )
+        return mounted
 
-    plugin_catalog.set_composition_mounter(_mount_composition)
-    _mount_composition()
+    # One call wires the composition to the catalog: how to re-read the config, and how
+    # to mount itself -- and the mount **returns** the names it mounted, so there is no
+    # separate "here is what happened" call that could disagree with it.
+    mounted_core = plugin_catalog.bind_composition(
+        config_loader=lambda: (load_config()[0].get("plugins") or {}),
+        mount_core=_mount_composition,
+    )
     # The registry and the skill catalog are provided by plugins now (``registry``,
     # ``skill_catalog``, declared first for a reader; the kernel pends their
     # dependents, so the order is documentation rather than a sequence).

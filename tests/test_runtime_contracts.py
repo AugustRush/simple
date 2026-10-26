@@ -529,11 +529,21 @@ def test_runtime_session_state_accepts_legacy_keywords(
 def test_turn_runner_complete_turn_records_state_and_maintenance(monkeypatch):
     class _PluginCatalog:
 
-        def set_composition_mounter(self, mounter=None):
-            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
-            # composition hands over the act of mounting itself so a recomposition can repeat
-            # it.  This stand-in never recomposes, so it only has to accept it.
-            self.composition_mounter = mounter
+        def bind_composition(self, *, config_loader=None, mount_core=None):
+            # The catalog's one wiring call: how to re-read the config, and how to mount
+            # the composition (which returns the names it mounted).  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same
+            # rule `mount(provenance=...)` below is here for.  It mounts, because the
+            # composition root's contract is that binding it *does* the first mount.
+            self.config_loader = config_loader
+            self.composition_mounter = mount_core
+            if mount_core is None:
+                return ()
+            self.core_mounts = tuple(mount_core() or ())
+            return self.core_mounts
+
+        def catch_up(self, *, apply=True):
+            return {"ok": True, "applied": apply, "restart_required": []}
 
         def is_mounted(self, name=""):
             # Asked by the mounter before it mounts: a recomposition keeps the host plugins
@@ -542,20 +552,6 @@ def test_turn_runner_complete_turn_records_state_and_maintenance(monkeypatch):
 
         def verify_replacements(self):
             return None
-
-        def composition_preview(self):
-            return {"ok": True, "restart_required": []}
-
-
-        def set_config_loader(self, loader=None):
-            # Part of the catalog's constructor-time API: the composition hands the catalog
-            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
-            # cannot accept it is not standing in for the catalog any more -- the same rule
-            # `mount(provenance=...)` below is here for.
-            self.config_loader = loader
-
-        def note_core_mounts(self, names=()):
-            self.core_mounts = tuple(names)
 
         def __init__(self):
             self.events = []
@@ -1092,12 +1088,6 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
 
     class _PluginCatalog:
 
-        def set_composition_mounter(self, mounter=None):
-            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
-            # composition hands over the act of mounting itself so a recomposition can repeat
-            # it.  This stand-in never recomposes, so it only has to accept it.
-            self.composition_mounter = mounter
-
         def is_mounted(self, name=""):
             # Asked by the mounter before it mounts: a recomposition keeps the host plugins
             # mounted, so the second mount must skip them instead of colliding.
@@ -1105,20 +1095,6 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
 
         def verify_replacements(self):
             return None
-
-        def composition_preview(self):
-            return {"ok": True, "restart_required": []}
-
-
-        def set_config_loader(self, loader=None):
-            # Part of the catalog's constructor-time API: the composition hands the catalog
-            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
-            # cannot accept it is not standing in for the catalog any more -- the same rule
-            # `mount(provenance=...)` below is here for.
-            self.config_loader = loader
-
-        def note_core_mounts(self, names=()):
-            self.core_mounts = tuple(names)
 
         def __init__(self):
             self.submitted = []
@@ -1290,12 +1266,6 @@ def test_agent_core_prompt_submit_metadata_uses_canonical_turn_identity():
 
     class _PluginCatalog:
 
-        def set_composition_mounter(self, mounter=None):
-            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
-            # composition hands over the act of mounting itself so a recomposition can repeat
-            # it.  This stand-in never recomposes, so it only has to accept it.
-            self.composition_mounter = mounter
-
         def is_mounted(self, name=""):
             # Asked by the mounter before it mounts: a recomposition keeps the host plugins
             # mounted, so the second mount must skip them instead of colliding.
@@ -1303,20 +1273,6 @@ def test_agent_core_prompt_submit_metadata_uses_canonical_turn_identity():
 
         def verify_replacements(self):
             return None
-
-        def composition_preview(self):
-            return {"ok": True, "restart_required": []}
-
-
-        def set_config_loader(self, loader=None):
-            # Part of the catalog's constructor-time API: the composition hands the catalog
-            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
-            # cannot accept it is not standing in for the catalog any more -- the same rule
-            # `mount(provenance=...)` below is here for.
-            self.config_loader = loader
-
-        def note_core_mounts(self, names=()):
-            self.core_mounts = tuple(names)
 
         def __init__(self):
             self.seen_metadata = []
@@ -1428,12 +1384,6 @@ def test_agent_core_returns_blocked_execution_with_reason_without_running_turn()
 
     class _PluginCatalog:
 
-        def set_composition_mounter(self, mounter=None):
-            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
-            # composition hands over the act of mounting itself so a recomposition can repeat
-            # it.  This stand-in never recomposes, so it only has to accept it.
-            self.composition_mounter = mounter
-
         def is_mounted(self, name=""):
             # Asked by the mounter before it mounts: a recomposition keeps the host plugins
             # mounted, so the second mount must skip them instead of colliding.
@@ -1441,20 +1391,6 @@ def test_agent_core_returns_blocked_execution_with_reason_without_running_turn()
 
         def verify_replacements(self):
             return None
-
-        def composition_preview(self):
-            return {"ok": True, "restart_required": []}
-
-
-        def set_config_loader(self, loader=None):
-            # Part of the catalog's constructor-time API: the composition hands the catalog
-            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
-            # cannot accept it is not standing in for the catalog any more -- the same rule
-            # `mount(provenance=...)` below is here for.
-            self.config_loader = loader
-
-        def note_core_mounts(self, names=()):
-            self.core_mounts = tuple(names)
 
         async def fire_prompt_submit(self, text, metadata=None):
             import agent as agent_module
@@ -1740,12 +1676,6 @@ def test_agent_core_normalizes_explicit_skill_requests_before_prompt_hooks():
 
     class _PluginCatalog:
 
-        def set_composition_mounter(self, mounter=None):
-            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
-            # composition hands over the act of mounting itself so a recomposition can repeat
-            # it.  This stand-in never recomposes, so it only has to accept it.
-            self.composition_mounter = mounter
-
         def is_mounted(self, name=""):
             # Asked by the mounter before it mounts: a recomposition keeps the host plugins
             # mounted, so the second mount must skip them instead of colliding.
@@ -1753,20 +1683,6 @@ def test_agent_core_normalizes_explicit_skill_requests_before_prompt_hooks():
 
         def verify_replacements(self):
             return None
-
-        def composition_preview(self):
-            return {"ok": True, "restart_required": []}
-
-
-        def set_config_loader(self, loader=None):
-            # Part of the catalog's constructor-time API: the composition hands the catalog
-            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
-            # cannot accept it is not standing in for the catalog any more -- the same rule
-            # `mount(provenance=...)` below is here for.
-            self.config_loader = loader
-
-        def note_core_mounts(self, names=()):
-            self.core_mounts = tuple(names)
 
         def __init__(self):
             self.seen = []

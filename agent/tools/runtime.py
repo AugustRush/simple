@@ -336,6 +336,8 @@ def _validate_tool_input(tool_input: Any, schema: Any) -> Optional[dict]:
 
 
 class ToolRegistry:
+    """Central registry for all tools."""
+
     def scoped(self, ctx: Any) -> Any:
         """A view of this registry bound to *ctx*'s lifetime.
 
@@ -348,8 +350,6 @@ class ToolRegistry:
         from agent.tools.scoped import ScopedTools
 
         return ScopedTools(self, ctx)
-
-    """Central registry for all tools."""
 
     _DEFAULT_TOOL_CAPABILITIES: dict[tuple[str, str], frozenset[str]] = {
         ("builtin", "current_time"): frozenset({"read"}),

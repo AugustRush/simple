@@ -526,8 +526,8 @@ class WebChannel(Channel):
         # running the composition it actually has.
         catalog = resolve(self._components, "plugin_catalog")
         preview = (
-            catalog.composition_preview()
-            if callable(getattr(catalog, "composition_preview", None))
+            catalog.catch_up(apply=False)
+            if callable(getattr(catalog, "catch_up", None))
             else {"restart_required": []}
         )
         owed = list(preview.get("restart_required") or ())
@@ -1650,7 +1650,7 @@ class WebChannel(Channel):
         reload_result: dict = {}
         if catalog is not None:
             # No private poke: the reload re-reads the `plugins` section itself now
-            # (`PluginCatalog.refresh_composition`), which is what makes this endpoint's
+            # (`PluginCatalog.catch_up`), which is what makes this endpoint's
             # own save the thing that takes effect.  It used to assign
             # `catalog._plugin_config` from here -- a second writer for a value the
             # catalog already knows how to read.

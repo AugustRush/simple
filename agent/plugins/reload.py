@@ -146,7 +146,7 @@ class ReloadTransaction:
         # them was a reload that ignored the file it was asked to honour.  (The web
         # page's on/off switch worked around exactly that by poking
         # ``catalog._plugin_config`` by hand.)
-        composition = catalog.refresh_composition()
+        composition = catalog.catch_up()
         if composition.get("restart_required"):
             shared.CONSOLE.print(
                 "[yellow]Plugin reload: the config changes the composition itself ("
