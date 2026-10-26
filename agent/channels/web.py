@@ -1604,23 +1604,35 @@ class WebChannel(Channel):
             return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
 
         catalog = resolve(self._components, "plugin_catalog")
+        reload_result: dict = {}
         if catalog is not None:
-            try:
-                catalog._plugin_config = plugins_cfg  # noqa: SLF001
-            except Exception:
-                pass
+            # No private poke: the reload re-reads the `plugins` section itself now
+            # (`PluginCatalog.refresh_composition`), which is what makes this endpoint's
+            # own save the thing that takes effect.  It used to assign
+            # `catalog._plugin_config` from here -- a second writer for a value the
+            # catalog already knows how to read.
             reload = getattr(catalog, "reload", None)
             if callable(reload):
                 try:
                     self._ensure_router()
-                    await reload(self._components)
+                    reload_result = await reload(self._components) or {}
                 except Exception as exc:
                     return JSONResponse(
                         {"error": f"reload failed: {exc}", "saved": True},
                         status_code=500,
                     )
         self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
-        return JSONResponse({"ok": True, "name": plugin_name, "enabled": desired})
+        # `restart_required` is reported rather than swallowed: a switch that changes the
+        # *composition* (not just a plugin's enabled flag) cannot be applied to a running
+        # gateway, and the page has to be able to say so.
+        return JSONResponse(
+            {
+                "ok": True,
+                "name": plugin_name,
+                "enabled": desired,
+                "restart_required": list(reload_result.get("restart_required") or ()),
+            }
+        )
 
     async def _delete_session(self, request: Any) -> Any:
         from starlette.responses import JSONResponse

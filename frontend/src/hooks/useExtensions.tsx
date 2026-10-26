@@ -56,12 +56,22 @@ export function useExtensions(deps: Deps) {
       prev.map(item => (item.name === plugin.name ? { ...item, enabled } : item)),
     )
     try {
-      await api(`/api/plugins/${encodeURIComponent(plugin.name)}/toggle`, {
+      const resp = await api(`/api/plugins/${encodeURIComponent(plugin.name)}/toggle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       })
-      messageApi.success(enabled ? '插件已启用' : '插件已停用')
+      // A switch that changes the *composition* (a core plugin, a service
+      // replacement) cannot be applied to a running gateway.  Saying "已启用"
+      // and leaving it there would be the界面 lying about the process, so the
+      // answer comes from the backend rather than from what we asked for.
+      const body = await resp.json().catch(() => ({}))
+      const owed: string[] = Array.isArray(body?.restart_required) ? body.restart_required : []
+      if (owed.length > 0) {
+        messageApi.warning(`已保存，但需要重启网关才生效：${owed.join('；')}`)
+      } else {
+        messageApi.success(enabled ? '插件已启用' : '插件已停用')
+      }
     } catch {
       setPlugins(prev =>
         prev.map(item =>

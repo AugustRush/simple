@@ -528,6 +528,17 @@ def test_runtime_session_state_accepts_legacy_keywords(
 
 def test_turn_runner_complete_turn_records_state_and_maintenance(monkeypatch):
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         def __init__(self):
             self.events = []
 
@@ -1062,6 +1073,17 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
             self.system_prompt = "system"
 
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         def __init__(self):
             self.submitted = []
 
@@ -1231,6 +1253,17 @@ def test_agent_core_prompt_submit_metadata_uses_canonical_turn_identity():
             self.system_prompt = "system"
 
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         def __init__(self):
             self.seen_metadata = []
 
@@ -1340,6 +1373,17 @@ def test_agent_core_returns_blocked_execution_with_reason_without_running_turn()
             self.system_prompt = "system"
 
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         async def fire_prompt_submit(self, text, metadata=None):
             import agent as agent_module
 
@@ -1623,6 +1667,17 @@ def test_agent_core_normalizes_explicit_skill_requests_before_prompt_hooks():
             return _Bundle() if skill_ref == "quality/review" else None
 
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         def __init__(self):
             self.seen = []
 

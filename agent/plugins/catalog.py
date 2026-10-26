@@ -24,7 +24,7 @@ from agent.plugins.hook_dispatch import (
 from agent.kernel.plugin import PluginHost
 from agent.plugins import formats as plugin_formats
 from agent.plugins.profile_selection import profile_from_config
-from agent.plugins.profiles import resolve_plugin_state
+from agent.plugins.profiles import KnownProfileError, resolve_plugin_state
 from agent.runtime.provenance import CORE, PLUGIN, Provenance
 from agent.plugins.reload import ReloadTransaction
 
@@ -1242,6 +1242,17 @@ class PluginCatalog:
         #: name raises here rather than silently loading the default set, so a
         #: run under a narrowed composition cannot quietly get everything.
         self._plugin_profile = profile_from_config(self._plugin_config)
+        #: How to *re-read* the ``plugins`` section when the composition is refreshed.
+        #: Installed by the composition root, because reading the config file is its
+        #: business (it owns ``--name``, the env overrides and the validator); the
+        #: catalog only knows that the answer may have changed since it was built.
+        #: ``None`` keeps the construction-time answer, which is what a bare catalog in
+        #: a test or an embedder wants.
+        self._config_loader: Any = None
+        #: The core plugin names this catalog was told it mounted.  Recorded so
+        #: ``refresh_composition`` can say which part of a profile change this process
+        #: cannot apply, instead of reporting a reload that quietly ignored it.
+        self._mounted_core: tuple[str, ...] = ()
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
         self._reload_lock = asyncio.Lock()
         self._hook_executor = ThreadPoolExecutor(
@@ -1944,6 +1955,124 @@ class PluginCatalog:
         return {
             name: [dep for dep in pending.inject if not self._services.has(dep)]
             for name, pending in sorted(self._pending.items())
+        }
+
+    # ── Composition refresh ───────────────────────────────────────────────────
+
+    def set_config_loader(self, loader: Any) -> None:
+        """Install the callable that re-reads the ``plugins`` section.
+
+        A loader rather than a path, because reading the config is the composition's
+        business: it owns the ``--name`` instance, the environment overrides and the
+        validator.  The catalog only knows that the answer it was constructed with may
+        be out of date.
+        """
+        self._config_loader = loader
+
+    def note_core_mounts(self, names: Any) -> None:
+        """Record which core plugins the composition actually mounted."""
+        self._mounted_core = tuple(str(name) for name in names)
+
+    @staticmethod
+    def _core_names_for(profile: Any) -> tuple[str, ...]:
+        """The core plugin names a profile resolves to, in mount order."""
+        from agent.plugins.core import core_plugins
+
+        return tuple(
+            entry.name
+            for entry in core_plugins(
+                enabled=profile.core,
+                replacements=profile.service_replacements,
+            )
+        )
+
+    def refresh_composition(self) -> dict:
+        """Re-read the plugin config, re-resolve the profile, and say what changed.
+
+        Two kinds of change, with two different answers, because they cost different
+        things:
+
+        * **Which plugins load** --- an entry's ``enabled`` flag, or the profile's
+          entries.  Discovery asks ``_is_plugin_enabled`` for every plugin on every
+          load, so refreshing these here is all a reload needs: this is the missing
+          half of the page's on/off switch, which used to write the config and then
+          poke ``catalog._plugin_config`` by hand to make its own save take effect.
+        * **The composition itself** --- the profile's ``core`` selection and its
+          ``service_replacements``.  Those decide which *core* plugins are mounted,
+          and mounting is the composition root's act: it runs once, before anything
+          else exists, and what it produced (the agent, the tool registry, the memory
+          store) is what every long-lived holder captured.  Re-mounting them in place
+          would rebuild the process's spine while the gateway is serving turns on it,
+          so this **reports** ``restart_required`` instead of pretending.  The
+          alternative -- a swap that is not atomic with respect to an in-flight turn
+          -- fails as "the memory service disappeared", which is a worse answer than
+          "restart".
+
+        Never raises.  A reload is driven by a person or by an agent and both need an
+        answer; an unknown profile name is reported here rather than raised, because
+        the construction path already fails loudly for it and a live gateway must not
+        go down for a typo in a file it just re-read.
+        """
+        before_profile = self._plugin_profile
+        before_core = self._core_names_for(before_profile)
+        before_config = dict(self._plugin_config)
+
+        if callable(self._config_loader):
+            try:
+                loaded = self._config_loader()
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                return {
+                    "ok": False,
+                    "error": f"could not re-read the plugin config: {exc}",
+                    "profile": before_profile.key,
+                    "restart_required": [],
+                }
+            if isinstance(loaded, Mapping):
+                self._plugin_config = dict(loaded)
+
+        try:
+            profile = profile_from_config(self._plugin_config)
+        except KnownProfileError as exc:
+            # Keep running the composition that is already up: an operator fixing a
+            # typo should not have to restart a gateway that is serving requests.
+            self._plugin_config = before_config
+            return {
+                "ok": False,
+                "error": str(exc),
+                "profile": before_profile.key,
+                "previous_profile": before_profile.key,
+                "restart_required": [],
+            }
+
+        self._plugin_profile = profile
+        after_core = self._core_names_for(profile)
+
+        restart: list[str] = []
+        for name in after_core:
+            if name not in before_core:
+                restart.append(f"mounting core plugin {name!r}")
+        for name in before_core:
+            if name not in after_core:
+                restart.append(f"unmounting core plugin {name!r}")
+        if dict(before_profile.service_replacements) != dict(
+            profile.service_replacements
+        ):
+            changed = {
+                service: plugin
+                for service, plugin in dict(profile.service_replacements).items()
+                if dict(before_profile.service_replacements).get(service) != plugin
+            }
+            restart.append(
+                "service replacement for " + ", ".join(sorted(changed)) + " differs"
+            )
+
+        return {
+            "ok": True,
+            "profile": profile.key,
+            "previous_profile": before_profile.key,
+            "core": list(after_core),
+            "discovery_changed": before_config != dict(self._plugin_config),
+            "restart_required": restart,
         }
 
     def core_plugin_selection(self) -> tuple[str, ...] | None:

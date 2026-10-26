@@ -1735,6 +1735,17 @@ def test_channel_runner_fires_session_end_per_chat_session():
             )
 
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         def __init__(self):
             self.session_events = []
             self.turn_events = []

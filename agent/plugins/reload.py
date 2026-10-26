@@ -96,6 +96,19 @@ class ReloadTransaction:
         catalog = self._catalog
         old_plugin_names = before["plugin_names"]
 
+        # Re-read the plugin config *before* discovery: ``enabled`` flags and the
+        # profile's entries decide what discovery loads, and a reload that skipped
+        # them was a reload that ignored the file it was asked to honour.  (The web
+        # page's on/off switch worked around exactly that by poking
+        # ``catalog._plugin_config`` by hand.)
+        composition = catalog.refresh_composition()
+        if composition.get("restart_required"):
+            shared.CONSOLE.print(
+                "[yellow]Plugin reload: the config changes the composition itself ("
+                + "; ".join(composition["restart_required"])
+                + ") — restart to apply[/yellow]"
+            )
+
         mcp_registry = catalog._core("contributed_mcp_servers")
         old_mcp = self._mcp_pairs(mcp_registry)
 
@@ -145,6 +158,12 @@ class ReloadTransaction:
             "removed_plugins": sorted(removed),
             "newly_connected_mcp": connected,
             "total_loaded": len(loaded),
+            # What the config asked for, what was applied, and what needs a restart.
+            # Reported on success: "reloaded" and "reloaded the parts of the config
+            # this process can apply" are different sentences, and the caller cannot
+            # tell them apart from ``ok``.
+            "composition": composition,
+            "restart_required": list(composition.get("restart_required") or ()),
         }
 
     async def _connect_new_mcp(

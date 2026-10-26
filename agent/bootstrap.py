@@ -20,6 +20,7 @@ from agent.config import (
     active_context_window,
     active_output_reserve,
     bounded_int,
+    load_config,
     provider_supports_vision,
 )
 from agent.commands import (
@@ -723,6 +724,13 @@ async def _build_components_async(
         # against the contract its name declares, before the registration is recorded.
         service_validator=validator_for(),
     )
+    # How to re-read the answer this catalog was built with.  A reload is the one
+    # place where "the file changed" has to become "the composition changed": the
+    # catalog cannot load a config (that is the composition's own job, with its
+    # `--name` instance and env overrides), so it is handed the reader.
+    plugin_catalog.set_config_loader(
+        lambda: (load_config()[0].get("plugins") or {})
+    )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
     # The plugins the composition root mounts itself; everything else is discovered from
@@ -743,9 +751,11 @@ async def _build_components_async(
     # it; ``None`` means all, which is what every existing composition expects.
     _core_selection = plugin_catalog.core_plugin_selection()
     _replacements = plugin_catalog.service_replacements()
+    _mounted_core: list[str] = []
     for _core_plugin in core_plugins(
         enabled=_core_selection, replacements=_replacements
     ):
+        _mounted_core.append(_core_plugin.name)
         plugin_catalog.mount(
             _core_plugin.build(
                 CoreContext(
@@ -755,6 +765,7 @@ async def _build_components_async(
             ),
             provenance=Provenance(source=f"core:{_core_plugin.name}", kind=CORE),
         )
+    plugin_catalog.note_core_mounts(_mounted_core)
     # The registry and the skill catalog are provided by plugins now (``registry``,
     # ``skill_catalog``, declared first for a reader; the kernel pends their
     # dependents, so the order is documentation rather than a sequence).  Everything

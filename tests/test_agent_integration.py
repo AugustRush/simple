@@ -371,6 +371,17 @@ user-invocable: true
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     class _PluginCatalog:
+
+        def set_config_loader(self, loader=None):
+            # Part of the catalog's constructor-time API: the composition hands the catalog
+            # the reader a reload uses to re-read the `plugins` section.  A stand-in that
+            # cannot accept it is not standing in for the catalog any more -- the same rule
+            # `mount(provenance=...)` below is here for.
+            self.config_loader = loader
+
+        def note_core_mounts(self, names=()):
+            self.core_mounts = tuple(names)
+
         def __init__(self, **kwargs):
             # The mapping the composition hands the real catalog, and which it adopts as
             # its registry.  Kept because `mount` has to *run* a plugin, not just accept
@@ -949,6 +960,13 @@ Follow the review checklist.
 
 # ── Skill management tool tests ──────────────────────────────────────────────
 
+# ``_write_skill_bundle`` leaves no ``created-by`` mark, so these bundles read as
+# hand-written -- and a bundle the user wrote may only be rewritten with a stated
+# reason.  The intent below is what that costs; the boundary itself (and the
+# freely-editable agent-created case) is ``tests/test_skill_ownership.py``, while
+# these tests stay about the edit mechanics.
+_HANDWRITTEN_INTENT = "用户要求改这份手写技能的内容，他说现在这版步骤顺序写反了"
+
 
 def test_create_skill_creates_bundle_in_user_root(tmp_path):
     import agent as agent_module
@@ -1110,6 +1128,7 @@ def test_update_skill_modifies_user_skill(tmp_path):
                     "name": "New Name",
                     "description": "New desc",
                     "instructions": "New body.",
+                    "intent": _HANDWRITTEN_INTENT,
                 },
             )
         )
@@ -1145,7 +1164,11 @@ def test_update_skill_partial_update_preserves_unset_fields(tmp_path):
         asyncio.run(
             registry.call(
                 "update_skill",
-                {"skill_id": "partial", "description": "Updated desc only"},
+                {
+                    "skill_id": "partial",
+                    "description": "Updated desc only",
+                    "intent": _HANDWRITTEN_INTENT,
+                },
             )
         )
     )
@@ -1178,7 +1201,11 @@ def test_update_skill_empty_instructions_preserves_existing_body(tmp_path):
         asyncio.run(
             registry.call(
                 "update_skill",
-                {"skill_id": "partial", "instructions": ""},
+                {
+                    "skill_id": "partial",
+                    "instructions": "",
+                    "intent": _HANDWRITTEN_INTENT,
+                },
             )
         )
     )
@@ -1240,7 +1267,12 @@ def test_delete_skill_removes_user_skill(tmp_path):
     assert catalog.get("to-delete") is not None
 
     result = json.loads(
-        asyncio.run(registry.call("delete_skill", {"skill_id": "to-delete"}))
+        asyncio.run(
+            registry.call(
+                "delete_skill",
+                {"skill_id": "to-delete", "intent": _HANDWRITTEN_INTENT},
+            )
+        )
     )
 
     assert result["ok"] is True
@@ -1317,6 +1349,7 @@ def test_write_skill_file_creates_supporting_file(tmp_path):
                     "skill_name": "writable",
                     "path": "templates/checklist.md",
                     "content": "# Checklist\n- [ ] Item 1",
+                    "intent": _HANDWRITTEN_INTENT,
                 },
             )
         )
@@ -1390,6 +1423,7 @@ def test_write_skill_file_rejects_skill_md_override(tmp_path):
                     "skill_name": "guarded",
                     "path": "SKILL.md",
                     "content": "Overwritten!",
+                    "intent": _HANDWRITTEN_INTENT,
                 },
             )
         )
@@ -1424,6 +1458,7 @@ def test_write_skill_file_rejects_path_escape(tmp_path):
                     "skill_name": "sandboxed",
                     "path": "../../etc/passwd",
                     "content": "bad",
+                    "intent": _HANDWRITTEN_INTENT,
                 },
             )
         )
@@ -1497,7 +1532,11 @@ def test_update_skill_sets_dirty_flag(tmp_path):
     asyncio.run(
         registry.call(
             "update_skill",
-            {"skill_id": "mutable", "description": "Updated"},
+            {
+                "skill_id": "mutable",
+                "description": "Updated",
+                "intent": _HANDWRITTEN_INTENT,
+            },
         )
     )
 
@@ -1519,7 +1558,12 @@ def test_delete_skill_sets_dirty_flag(tmp_path):
 
     assert catalog.consume_dirty() is False
 
-    asyncio.run(registry.call("delete_skill", {"skill_id": "doomed"}))
+    asyncio.run(
+        registry.call(
+            "delete_skill",
+            {"skill_id": "doomed", "intent": _HANDWRITTEN_INTENT},
+        )
+    )
 
     assert catalog.consume_dirty() is True
     assert catalog.get("doomed") is None
