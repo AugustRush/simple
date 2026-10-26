@@ -22,6 +22,13 @@ dependencies = [
 feishu = ["lark-oapi"]
 # pip install simple[web]  /  uv sync --extra web
 web = ["starlette", "uvicorn"]
+# The browser-level tests (tests/test_web_ui_e2e.py) drive the real page in Chromium.
+# Deliberately not in the core: the download is ~100MB and the rest of the suite drives
+# protocols, so an install that only wants the agent should not pay for it.  Skipped,
+# not silently passed, when absent -- see that module's docstring.
+#   uv pip install --python .venv/bin/python --extra e2e .
+#   .venv/bin/python -m playwright install chromium
+e2e = ["playwright"]
 
 [project.scripts]
 simple = "agent.cli:app"

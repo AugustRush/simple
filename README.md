@@ -153,7 +153,7 @@ This work is on the `refactor/service-kernel` branch.
 | Content-filter recovery | **done** — reads the provider's own `code` (`content_policy_violation`) first and its prose second; the phrase list alone missed the real rejection, and that predicate gates the only mechanism that *repairs* a refusal instead of reporting it |
 | `LoopDeps.of(agent)` surface | **partly** — the six pure pass-throughs (`_output_room` and friends, each `return self._token_budget.X(...)`) are gone, and both routes (`of` / `from_services`) are now driven with a real `TokenBudget`; the route that had never been driven was **broken**. `of` still reads 22 attributes off the agent, 13 of them underscored — each either real logic or a documented test seam (the model-call seam, the recovery seam) |
 | `agent/channels/web.py`, `feishu.py`, `agent/tools/builtin_tools.py` | **done** — surveyed first, as the roadmap asked, then extracted cluster by cluster: [`docs/superpowers/plans/2026-10-09-big-file-survey.md`](docs/superpowers/plans/2026-10-09-big-file-survey.md) is the survey and the per-move record, [`2026-10-09-big-file-extraction-closing-report.md`](docs/superpowers/plans/2026-10-09-big-file-extraction-closing-report.md) the closing report. **12292 → 7223 lines** across the three files, eighteen modules holding what left, and the full suite's FAILED set diffed against the baseline after each of the 29 commits. `web.py` 4191 → 3204 ([`web_payloads.py`](agent/channels/web_payloads.py), [`web_sink.py`](agent/channels/web_sink.py)); `feishu.py` 2587 → 1952 ([`feishu_render.py`](agent/channels/feishu_render.py), [`feishu_progress.py`](agent/channels/feishu_progress.py) — which also gained the 16 direct tests it never had — [`feishu_attachments.py`](agent/channels/feishu_attachments.py), [`feishu_parsing.py`](agent/channels/feishu_parsing.py), [`feishu_files.py`](agent/channels/feishu_files.py)); `builtin_tools.py` 5514 → 2067 ([`memory_tools.py`](agent/tools/memory_tools.py), [`web_tools.py`](agent/tools/web_tools.py), [`output_tools.py`](agent/tools/output_tools.py), [`signal_tools.py`](agent/tools/signal_tools.py), [`step_output_tools.py`](agent/tools/step_output_tools.py), [`schedule_tools.py`](agent/tools/schedule_tools.py) — 21 methods, −1413 lines — [`file_tools.py`](agent/tools/file_tools.py), [`audio_tools.py`](agent/tools/audio_tools.py), [`context_tools.py`](agent/tools/context_tools.py) — 11 new direct tests — [`shell_tools.py`](agent/tools/shell_tools.py) and [`plugin_tools.py`](agent/tools/plugin_tools.py)). The functional layer caught a defect the first six of those modules had introduced: a cluster whose methods are registered as tools must expose a public `registry`, or `ToolRegistry.call` cannot install the calling registry's merged context and a session's own workspace and output dir silently stop reaching the tools. What is left in `builtin_tools.py` is the host — the 1656-line `_register` table, the shared accessors and `_current_time` — and turning that table into per-cluster registrations is a design change, deliberately left as its own piece of work |
-| Browser-side JavaScript | **partly covered** — `tests/test_web_route_contract.py` extracts every `/api/...` call the page makes from `frontend/src` and matches it against the real route table (74 call sites → 68 distinct endpoints, 0 mismatches). It catches the defect class that browser-less testing usually misses: an endpoint renamed or removed under the page. It does **not** prove DOM rendering, that a control is reachable, or anything about status codes and auth — that still needs a headless browser, and the dependency is a decision rather than an oversight |
+| Browser-side JavaScript | **covered, in two layers** — (1) `tests/test_web_route_contract.py` extracts every `/api/...` call the page makes from `frontend/src` and matches it against the real route table (74 call sites → 68 distinct endpoints, 0 mismatches): it catches an endpoint renamed or removed under the page, without a browser. (2) `tests/test_web_ui_e2e.py` launches a real gateway subprocess, loads the built bundle in headless Chromium and asserts that the shell renders, that a message is answered **in the DOM**, that a second route renders its own view, that navigation is clickable, and that nothing logged a JavaScript error — the failure the protocol tests cannot see. It needs `playwright` (~100MB), so it is an optional extra (`[e2e]`) and **skips, visibly**, when absent |
 | Feishu channel | **not covered** — an external service; it shares the `Channel` abstraction with web, so most of the wiring is exercised, but the channel itself is undriven |
 | Intermittent `tests/test_ralph.py` failures | **not reproduced** in ~130 attempts (including two concurrent full suites under load) and repaired where it could not be diagnosed: the two wall-clock assumptions that made a slow machine indistinguishable from a broken product are gone, and the failure messages now carry the observed facts |
 
@@ -640,6 +640,21 @@ gateway would rebuild the process's spine while turns are in flight, so a reload
 instead of claiming it applied. Removing that last wall is a supervisor-level design -- the
 host has to outlive the composition and quiesce its turns -- not a patch to
 `ReloadTransaction`.
+
+### Browser-level tests (optional)
+
+```bash
+uv pip install --python .venv/bin/python --extra e2e .
+.venv/bin/python -m playwright install chromium
+.venv/bin/python -m pytest tests/test_web_ui_e2e.py
+```
+
+They launch `python -m agent.cli gateway` as a subprocess (a real one, on a real port,
+serving the built bundle), drive it with headless Chromium, and assert what only a
+browser can: the page mounts, a reply reaches the DOM, a second route renders, and the
+console stays clean. Without the extra they **skip**, which is the honest report — a
+skipped test is visible in the summary, while a test that claims to check the page and
+really checks an HTTP response is not.
 
 ### Creating a skill
 
