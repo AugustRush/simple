@@ -1526,6 +1526,76 @@ def test_astop_is_awaited_like_a_registered_teardown() -> None:
     assert plugin.stopped is True
 
 
+def test_async_teardowns_from_two_generations_run_oldest_first() -> None:
+    """A reload is two generations of one name, not one list of handlers.
+
+    A synchronous ``unload`` claims the awaitable half and cannot await it; loading
+    the same name again starts a second generation, whose claim must not be *merged*
+    with the first.  Merged, the eventual drain reverses across both generations --
+    the older cleanup runs last, after the newer one has already released what it
+    owns -- and ``pending_async_disposals()`` cannot even say there were two.
+    """
+    import asyncio
+
+    order: list[str] = []
+
+    class Gen:
+        name = "gen"
+
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def setup(self, ctx) -> None:
+            tag = self.tag
+
+            async def close() -> None:
+                order.append(tag)
+
+            ctx.on_unwind_async(close)
+
+    host, _ = _host()
+    host.load(Gen("A"))
+    host.unload("gen")
+    host.load(Gen("B"))
+    host.unload("gen")
+    asyncio.run(host.adispose())
+
+    assert order == ["A", "B"], f"generations must drain oldest first, got {order}"
+
+
+def test_a_failing_scope_teardown_still_unloads_the_plugin() -> None:
+    """A raising handler must not leave a phantom in the tree.
+
+    ``ServiceScope.dispose`` runs every handler and re-raises the first failure so
+    the caller learns.  The host's bookkeeping used to run *after* that call, so one
+    raising handler left the install in ``_installs``: ``loaded()`` named a plugin
+    whose services were already gone, every dependent resolved a name nobody
+    provides, and ``load()`` refused the name as taken.
+    """
+
+    class Leaky:
+        name = "leaky"
+
+        def setup(self, ctx) -> None:
+            ctx.provide("leaky.marker", True)
+
+            def boom() -> None:
+                raise RuntimeError("teardown exploded")
+
+            ctx.on_unwind(boom)
+
+    host, _ = _host()
+    host.load(Leaky())
+    host.unload("leaky")
+
+    assert host.loaded() == (), "an unloaded plugin must not stay in the tree"
+    assert not host.services.has("leaky.marker")
+    assert host.was_unloaded("leaky")
+    # ...and the name is free again, which is what makes a reload possible at all.
+    host.load(Leaky())
+    assert host.loaded() == ("leaky",)
+
+
 def test_a_synchronous_only_plugin_reports_nothing_pending() -> None:
     """Control: the report names only plugins that actually needed awaiting."""
     host, _ = _host()

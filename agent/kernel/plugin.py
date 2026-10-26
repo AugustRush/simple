@@ -178,7 +178,15 @@ class PluginHost:
         #: a scope cannot await, and a teardown that is never awaited is a resource
         #: released nowhere -- so it waits here, by name, until something with an event
         #: loop collects it.  ``pending_async_disposals()`` is how you see it.
-        self._async_disposals: dict[str, list[Callable[[], Awaitable[None]]]] = {}
+        #:
+        #: **One list per unload, not one list per name.**  A reload is two generations
+        #: of one name, and flattening them merged two lifetimes into one drain: the
+        #: reversed order then ran the newer generation first and the older one last,
+        #: i.e. an old cleanup after the new resource that replaced it was already
+        #: released.  Batches drain oldest first (see ``_await_disposals``).
+        self._async_disposals: dict[
+            str, list[list[Callable[[], Awaitable[None]]]]
+        ] = {}
 
     # -- introspection -------------------------------------------------------
 
@@ -535,9 +543,14 @@ class PluginHost:
         # 1b. ``astop`` -- the awaitable counterpart of ``teardown``, for a plugin that
         #     would rather declare it than register it.  Claimed the same way and waiting
         #     in the same place, so both spellings have one lifetime rule.
+        #
+        #     This unload's awaitable half is **one batch**.  Kept as its own list rather
+        #     than extended into a single list per name, because a reload is two
+        #     generations of one name -- see ``_async_disposals``.
+        batch: list[Callable[[], Awaitable[None]]] = []
         astop = getattr(install.plugin, "astop", None)
         if callable(astop):
-            self._async_disposals.setdefault(name, []).append(astop)
+            batch.append(astop)
 
         # 2. The scope: every service, every subscription, every child install.
         #
@@ -546,8 +559,20 @@ class PluginHost:
         # instead of the handlers being dropped here.
         awaitable = install.scope.take_async_unwind()
         if awaitable:
-            self._async_disposals.setdefault(name, []).extend(awaitable)
-        install.scope.dispose()
+            batch.extend(awaitable)
+        if batch:
+            self._async_disposals.setdefault(name, []).append(batch)
+
+        # ``dispose`` runs every handler and then re-raises the first failure, so by
+        # the time it raises, the scope has already undone everything it owns.  The
+        # tree's bookkeeping therefore has to happen either way: an install left in
+        # ``_installs`` with no registrations behind it is a phantom -- ``loaded()``
+        # names it, ``load()`` refuses its name as taken, and every dependent resolves
+        # a service nobody provides.
+        try:
+            install.scope.dispose()
+        except Exception as exc:  # noqa: BLE001 - one bad teardown must not strand the tree
+            logger.warning("plugin %r scope teardown failed: %s", name, exc)
 
         self._installs.pop(name, None)
         self._pending.pop(name, None)
@@ -567,7 +592,9 @@ class PluginHost:
         async handler is *claimed* and waits here; a composition that never awaits it would
         otherwise release nothing and say nothing.
         """
-        return tuple(name for name, items in self._async_disposals.items() if items)
+        return tuple(
+            name for name, batches in self._async_disposals.items() if any(batches)
+        )
 
     async def aunload(self, name: str) -> Install:
         """Unload *name* and await whatever teardown it registered asynchronously."""
@@ -581,15 +608,18 @@ class PluginHost:
             await self._await_disposals(name)
 
     async def _await_disposals(self, name: str) -> None:
-        handlers = self._async_disposals.pop(name, [])
+        batches = self._async_disposals.pop(name, [])
         first_error: Optional[BaseException] = None
-        for handler in reversed(handlers):
-            try:
-                await handler()
-            except BaseException as exc:  # noqa: BLE001 - one bad teardown must not strand the rest
-                logger.warning("plugin %r async teardown failed: %s", name, exc)
-                if first_error is None:
-                    first_error = exc
+        # Oldest generation first, and LIFO *within* each: the order things were
+        # released is the order their cleanups are owed in.
+        for batch in batches:
+            for handler in reversed(batch):
+                try:
+                    await handler()
+                except BaseException as exc:  # noqa: BLE001 - one bad teardown must not strand the rest
+                    logger.warning("plugin %r async teardown failed: %s", name, exc)
+                    if first_error is None:
+                        first_error = exc
         if first_error is not None:
             raise first_error
 
