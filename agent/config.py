@@ -103,6 +103,14 @@ DEFAULT_CONFIG: dict = {
     "budget": {
         "max_session_tokens": 0,
     },
+    # ── Out-of-page notifications ─────────────────────────────────────────
+    # How this system reaches you when no page is open.  Only scheduled runs
+    # that need a person are announced -- the same runs the red badge counts --
+    # because a banner per successful run is how the one that mattered gets
+    # dismissed without being read.
+    "notifications": {
+        "desktop": True,
+    },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
     # How long a *one-shot* command (``simple chat``) waits for the MCP servers to
@@ -493,6 +501,7 @@ _KNOWN_SECTIONS = frozenset({
     "max_steps",
     "max_truncation_continuations", "file_access",
     "budget",
+    "notifications",
     "web_proxy",
 })
 
@@ -831,6 +840,22 @@ def _check_numeric_ranges(cfg: dict, warnings: list[str]) -> None:
     # Nested, so it gets its own check rather than the flat ``_check_int`` above.
     # A ceiling below one request's worth of tokens is legal (it stops the very
     # first step) and ``0`` is the default "no ceiling", so the range is 0..N.
+    notifications_cfg = cfg.get("notifications")
+    if notifications_cfg is not None:
+        if not isinstance(notifications_cfg, dict):
+            warnings.append(
+                f"'notifications': expected an object with desktop=true|false, "
+                f"got {notifications_cfg!r}"
+            )
+        elif "desktop" in notifications_cfg and not isinstance(
+            notifications_cfg["desktop"], bool
+        ):
+            warnings.append(
+                "'notifications.desktop': should be true or false, got "
+                f"{notifications_cfg['desktop']!r} "
+                "(a string is read as a word, but the example uses a boolean)"
+            )
+
     budget_cfg = cfg.get("budget")
     if isinstance(budget_cfg, dict):
         limit = budget_cfg.get("max_session_tokens")

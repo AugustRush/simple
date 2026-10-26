@@ -60,6 +60,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Vision** | Image attachments sent straight to the model when the provider sets `supports_vision` |
 | **Memory you can see and correct** | The `#/memory` page lists what it remembers with provenance, and lets you edit, pin or delete an entry — and reject a belief |
 | **Spend guard** | `budget.max_session_tokens` stops the loop before the next model call when a session is out of budget, and the page shows the same number beside the composer |
+| **It can reach you** | A scheduled run that needs a person posts a macOS notification — the same runs the red badge counts, so the two cannot disagree |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
 ### Measuring retrieval quality
@@ -833,6 +834,45 @@ whatever it costs. `budget.max_session_tokens` is the missing ceiling.
 The number is read through `ContextService.token_usage`, a service verb rather
 than a store one, so the second context service answers it too and the loop never
 learns where usage rows live.
+
+#### Reaching you when no page is open
+
+Every other channel in this system is *pull*: the 自动化 page, the red badge on
+the navigation entry, the run history. All of them wait for you to come and look
+-- which is exactly what you are not doing when a 07:00 task fails and you open
+the laptop at 11:00.
+
+A scheduled run that ends **failed**, **interrupted**, **unverified**, or that
+reports earlier occurrences were skipped while nothing was running, posts a macOS
+notification. That is the same population the red badge counts, defined once
+(`status_wants_a_person`) and used by both, so the badge and the banner cannot
+disagree about which runs are owed a reader.
+
+```json
+{ "notifications": { "desktop": false } }
+```
+
+- **On by default, and narrow.** The alternative is a scheduler that fails
+  silently. A banner per successful run would be noise, and noise is how the one
+  that mattered gets dismissed unread, so success is not announced.
+- **The message is the run's own words** -- its error first, because that is the
+  question a failed run raises. It is a pointer to evidence, never a verdict:
+  the agent's self-assessment is not what this channel carries.
+- **Text is passed as argv, not interpolated into the AppleScript source.** A
+  task name or an error message containing a quote is ordinary; a quote that
+  ends the string literal in the script is an injected command. `tests/
+  test_desktop_notify.py` sends a hostile message through the real command line
+  and asserts it stays one argument.
+- **A notification cannot fail a run.** It is sent after the run is recorded,
+  every failure path answers `False`, and a hanging `osascript` is killed after
+  five seconds -- a run must not wait forever on a permission prompt.
+- **Silent where there is no notification centre.** A headless Linux gateway
+  gets `False` and no subprocess, not an error per run.
+
+The runtime decides *when* a run wants a person (the injected `notifier` call in
+`SchedulerService`); the composition decides *how* it reaches them. That split is
+the same one `delivery` has, and it is what lets a test assert the wiring without
+posting a banner.
 
 ### Multi-agent orchestration
 

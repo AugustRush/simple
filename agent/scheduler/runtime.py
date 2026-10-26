@@ -18,6 +18,7 @@ from agent.verification import (
 )
 
 from .models import (
+    status_wants_a_person,
     DEFAULT_SIGNAL_MAX_DEPTH,
     RETRYABLE_RUN_STATUSES,
     RUN_SUCCESS_STATUS,
@@ -52,11 +53,18 @@ class SchedulerService:
         lease_seconds: int = 300,
         max_concurrent_runs: int = 3,
         signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
+        #: "Tell the person, who is not looking at the page", as one callable.
+        #: Injected like ``delivery`` for the same reason: the runtime decides
+        #: *when* a run wants a human, and the composition decides *how* that
+        #: reaches them (a desktop banner here; nothing on a headless box).
+        #: ``None`` means this deployment has no out-of-page channel.
+        notifier: Optional[Callable[..., Awaitable[Any]]] = None,
     ):
         self.store = store
         self.agent_executor = agent_executor
         self.system_executor = system_executor
         self.delivery = delivery
+        self.notifier = notifier
         self.poll_seconds = poll_seconds
         self.lease_seconds = int(lease_seconds)
         if self.lease_seconds < 3:
@@ -771,6 +779,12 @@ class SchedulerService:
                     else None
                 ),
             )
+            # After the record, never before it: the notification points at a
+            # run that already exists in history, so a banner tapped a second
+            # later lands on something to look at.
+            await self._notify_attention(
+                task, run, status=status, summary=run_summary, error=error
+            )
         except asyncio.CancelledError:
             if run.id in self._cancel_requested:
                 await self._store_call(
@@ -823,6 +837,7 @@ class SchedulerService:
                     else None
                 ),
             )
+            await self._notify_attention(task, run, status=status, error=str(exc))
         finally:
             # Only the run's own bookkeeping is dropped here.  The lease renewal
             # and the cancellation watcher are owned by `_execute_with_limit`,
@@ -831,6 +846,41 @@ class SchedulerService:
             # this method is ever entered.
             self._active_tasks.pop(run.id, None)
             self._cancel_requested.discard(run.id)
+
+    async def _notify_attention(
+        self,
+        task,
+        run,
+        *,
+        status: str,
+        summary: str = "",
+        error: str = "",
+    ) -> None:
+        """Reach the person, if this run is one they have to look at.
+
+        The *when* is here and the *how* is injected, the same split ``deliver``
+        has.  Anything that goes wrong is swallowed: a banner that fails must
+        not turn a recorded run into an unrecorded one, and the run is already
+        completed by the time this is called.
+        """
+        notifier = self.notifier
+        if not callable(notifier):
+            return
+        # The *when* is this class's decision, not the channel's: a notifier
+        # that also had to decide which runs want a person would be a second
+        # copy of the badge's rule, and the first thing to drift from it.
+        if not status_wants_a_person(status, getattr(run, "missed_count", 0)):
+            return
+        try:
+            await notifier(
+                task=task,
+                run=run,
+                status=status,
+                summary=summary,
+                error=error,
+            )
+        except Exception as exc:  # pragma: no cover - depends on the platform
+            logger.debug("scheduled-run notification failed: %s", exc)
 
     async def _deliver(self, task, run, result: ExecutionResult):
         if callable(self.delivery):

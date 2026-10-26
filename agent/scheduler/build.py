@@ -35,6 +35,10 @@ from agent.runtime.contracts import (
     agent_core_for_components,
 )
 from agent.runtime.factory import RuntimeFactory
+from agent.channels.desktop_notify import (
+    desktop_notifications_enabled,
+    notify_run_needs_attention,
+)
 from agent.scheduler.delivery import SchedulerDelivery
 from agent.scheduler.models import (
     DEFAULT_SIGNAL_MAX_DEPTH,
@@ -279,6 +283,21 @@ def build_scheduler_service(
         output_root=(output_dir or DEFAULT_OUTPUT_DIR)
         / "scheduler",
     )
+    # The out-of-page channel.  Built here rather than in the runtime because
+    # the *how* depends on config and platform, and the runtime only decides
+    # *when*: it calls this for a run that needs a person, and this either
+    # posts a banner or finds that this deployment has no banner to post.
+    notifications_on = desktop_notifications_enabled(cfg)
+
+    async def _notifier(*, task, run, status, summary="", error=""):
+        return await notify_run_needs_attention(
+            task_name=str(getattr(task, "name", "") or ""),
+            status=str(status or ""),
+            summary=str(summary or ""),
+            error=str(error or ""),
+            missed_count=int(getattr(run, "missed_count", 0) or 0),
+            enabled=notifications_on,
+        )
 
     async def _agent_executor(task, run):
         # `agent/__init__` imports this package, so these are reached here rather than
@@ -560,5 +579,6 @@ def build_scheduler_service(
         lease_seconds=lease_seconds,
         max_concurrent_runs=max_concurrent_runs,
         signal_max_depth=signal_max_depth,
+        notifier=_notifier,
     )
     return service, store

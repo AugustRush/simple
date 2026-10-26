@@ -2406,3 +2406,74 @@ def test_a_wake_that_arrived_before_the_wait_is_drained_once(tmp_path):
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+def test_a_failed_run_reaches_out_of_the_page_and_a_successful_one_does_not(tmp_path):
+    """The scheduler's half of the out-of-page channel.
+
+    The rule is the badge's rule (``ATTENTION_STATUSES`` plus missed
+    occurrences), so this asserts the *wiring*: a run that ends badly hands
+    itself to the notifier, and a run that ends well does not. The notifier
+    itself is injected, which is the same seam ``delivery`` has -- the runtime
+    decides when a person is wanted, the composition decides how to reach them.
+    """
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    async def failing(task, run):
+        raise RuntimeError("boom")
+
+    async def succeeding(task, run):
+        return ExecutionResult(summary="done", text_output="summary text")
+
+    async def unused_executor(task, run):
+        raise AssertionError("system executor should not be called")
+
+    async def unused_delivery(task, run, result):
+        return "delivered"
+
+    def _service(store, executor, seen):
+        async def notifier(*, task, run, status, summary="", error=""):
+            seen.append({"status": status, "error": error, "summary": summary})
+
+        return SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=unused_executor,
+            delivery=unused_delivery,
+            poll_seconds=1,
+            lease_seconds=300,
+            notifier=notifier,
+        )
+
+    for executor, expected_status in ((failing, "failed"), (succeeding, None)):
+        store = SchedulerStore(db_path=tmp_path / f"{expected_status or 'ok'}.db")
+        task = store.create_task(
+            NewScheduledTask(
+                name="out-of-page",
+                kind="agent_prompt",
+                trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+                payload={"prompt": "run"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+        seen: list[dict] = []
+        service = _service(store, executor, seen)
+        asyncio.run(
+            service.run_once(now=datetime(2026, 4, 19, tzinfo=timezone.utc))
+        )
+        runs = store.list_runs(task.id)
+        assert runs and runs[0].status != "queued", runs
+        if expected_status is None:
+            assert seen == [], "a clean run must not pop a banner: silence is the default"
+        else:
+            assert [item["status"] for item in seen] == [expected_status], seen
+            assert "boom" in seen[0]["error"], seen
+        store.close()

@@ -1319,9 +1319,24 @@ def run_needs_attention(run: "TaskRun") -> bool:
     """
     if getattr(run, "acknowledged_at", None) is not None:
         return False
-    if int(getattr(run, "missed_count", 0) or 0) > 0:
+    return status_wants_a_person(
+        str(getattr(run, "status", "") or ""),
+        int(getattr(run, "missed_count", 0) or 0),
+    )
+
+
+def status_wants_a_person(status: str, missed_count: int = 0) -> bool:
+    """The same rule, for a status that has just been recorded.
+
+    Exists because the notification is sent *from the completion path*, before
+    the in-memory ``run`` object has caught up with the row just written -- and
+    asks "does this outcome want a person" rather than "does this old object".
+    One definition, so the badge, the out-of-page channel and the acknowledgement
+    logic cannot disagree about which runs are owed a reader.
+    """
+    if int(missed_count or 0) > 0:
         return True
-    return str(getattr(run, "status", "") or "") in ATTENTION_STATUSES
+    return str(status or "") in ATTENTION_STATUSES
 
 
 @dataclass
