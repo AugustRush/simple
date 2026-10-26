@@ -117,6 +117,31 @@ class ChannelRunner:
         self._channels = channels
         self._components = components
         self._cfg = cfg
+        self._publish_runtime_refresh()
+
+    def _bump_config_revision(self) -> None:
+        """Make every session rebuild its runtime before its next message."""
+        self._components["config_revision"] = (
+            int(self._components.get("config_revision", 0) or 0) + 1
+        )
+
+    def _publish_runtime_refresh(self) -> None:
+        """Expose "rebuild the sessions" to whatever changes the tool set.
+
+        A tool created mid-conversation is registered on the global registry, while
+        every open session holds a *fork* made when it started -- so the session that
+        asked for the tool is precisely the one that cannot see it.  The runner is the
+        only object that holds both facts (the components and the revision the session
+        loop compares), so it publishes the fix as a registry-context callback: the tool
+        layer calls it and never has to search the component mapping for a channel.
+
+        Absent -- a single-turn CLI, a bare composition -- means there are no session
+        forks to be stale, and that is a different answer rather than a failure.
+        """
+        registry = resolve(self._components, "registry")
+        set_context = getattr(registry, "set_context", None)
+        if callable(set_context):
+            set_context("runtime_refresh", self._bump_config_revision)
 
     def _build_session_context_manager(self, session_id: str, components: dict):
         base_ctx_mgr = resolve(components, "context_manager")

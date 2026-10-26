@@ -353,6 +353,45 @@ class PluginTools:
         root = Path(str(raw)) if raw else shared.USER_PLUGINS_DIR
         return root.expanduser()
 
+    def _after_tool_set_change(self, result: dict) -> dict:
+        """Tell the runtime its tool set moved, and say what that means for the caller.
+
+        A session's registry is a *fork* made when the session started, so a tool
+        registered now lives on the global registry and that session's next turn cannot
+        see it.  The composition's way of saying "rebuild before the next turn" is a
+        revision bump -- the same one a settings save uses -- and it is provided through
+        the registry context so this layer never reaches into the component mapping.
+
+        Three honest answers, and they are not the same sentence:
+
+        * ``announced`` -- open sessions rebuild on their next message, so the tool is
+          visible from the next turn on;
+        * ``absent`` -- nothing in this process has sessions (a single-turn CLI), so
+          there is no stale fork and the tool is callable immediately;
+        * ``failed`` -- something has sessions and could not be told.  The tool is
+          registered, but the caller must not promise it is visible yet.
+        """
+        if not result.get("ok"):
+            return result
+        refresh = self.registry.get_context("runtime_refresh")
+        if not callable(refresh):
+            result["refresh"] = "absent"
+            result["session_visible"] = True
+            return result
+        try:
+            refresh()
+        except Exception as exc:  # noqa: BLE001 - a courtesy must not fail the creation
+            result["refresh"] = f"failed: {exc}"
+            result["session_visible"] = False
+            result["recovery_hint"] = (
+                "the tool is registered, but open sessions were not told to rebuild; "
+                "open a new session to use it"
+            )
+            return result
+        result["refresh"] = "announced"
+        result["session_visible"] = True
+        return result
+
     async def create_tool(
         self, tool_id: str, code: str, intent: str = ""
     ) -> dict:
@@ -367,8 +406,10 @@ class PluginTools:
                     "lowercase letters, digits, and underscores."
                 ),
             }
-        return await user_tools.author_tool(
-            normalized, code, registry=self.registry, replace=False
+        return self._after_tool_set_change(
+            await user_tools.author_tool(
+                normalized, code, registry=self.registry, replace=False
+            )
         )
 
     async def update_tool(
@@ -379,8 +420,10 @@ class PluginTools:
         normalized = user_tools.normalize_tool_id(tool_id)
         if not normalized:
             return {"ok": False, "error": f"Invalid tool id '{tool_id}'"}
-        return await user_tools.author_tool(
-            normalized, code, registry=self.registry, replace=True
+        return self._after_tool_set_change(
+            await user_tools.author_tool(
+                normalized, code, registry=self.registry, replace=True
+            )
         )
 
     async def delete_tool(self, tool_id: str, intent: str = "") -> dict:
@@ -389,7 +432,9 @@ class PluginTools:
         normalized = user_tools.normalize_tool_id(tool_id)
         if not normalized:
             return {"ok": False, "error": f"Invalid tool id '{tool_id}'"}
-        return user_tools.remove_tool(normalized, registry=self.registry)
+        return self._after_tool_set_change(
+            user_tools.remove_tool(normalized, registry=self.registry)
+        )
 
     def list_user_tools(self) -> dict:
         from agent.tools import user_tools

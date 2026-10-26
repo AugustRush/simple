@@ -376,6 +376,20 @@ def resolve_policy(request: ShellSandboxRequest) -> ResolvedSandboxPolicy:
         for candidate in _both_spellings([str(request.agent_home / "plugins")]):
             restrictions.append(PathRule(candidate, read=True, write=False))
 
+        # 3a-ter. Paths the *caller* named as "this child cannot start without".
+        #     They were granted in ``read_grants`` (above), and the blanket deny we
+        #     just emitted sits *after* them, so last-match-wins made those grants
+        #     decorative: the policy model itself answered ``(False, False)`` for a
+        #     file under the tools directory.  The consequence was total rather than
+        #     cosmetic -- every user tool raised ``PermissionError: Operation not
+        #     permitted`` the first time it was called, including tools that had been
+        #     loaded at startup, so "the agent writes a tool and uses it" had never
+        #     worked.  Re-opened here, after the deny, read-only: the home's deny is
+        #     what protects ``config.json`` and the databases, and these are the roots
+        #     the child was invoked to read.
+        for candidate in _both_spellings(request.extra_read_paths):
+            restrictions.append(PathRule(candidate, read=True, write=False))
+
     # 3b. Internal bookkeeping (locks, profiles, scratch internals) stays
     #     hidden.  Must follow the output_root re-open above: it lives inside.
     restrictions.append(PathRule(internal, read=False, write=False))

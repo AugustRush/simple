@@ -562,6 +562,54 @@ the step by its `key`. Only steps it depends on, directly or transitively, are
 readable, and only outputs the scheduler itself recorded, so it cannot be used
 to read arbitrary files.
 
+### Growing a capability at runtime
+
+The kernel is 1,826 lines of 96,492 -- the small-core claim is measurable. What
+matters for a *personal* agent is the other direction: it should be able to grow the
+capability it needs instead of waiting for a release. Five kinds are creatable by the
+model at runtime, and four take effect without a restart:
+
+| Kind | Tool the model calls | When it is usable |
+|---|---|---|
+| Tool | `create_tool` / `update_tool` / `delete_tool` | the next turn, in this session |
+| Skill | `create_skill` / `update_skill` / `write_skill_file` | the next turn (catalog reloads, prompt is republished) |
+| Scheduled task | `schedule_create` | the next scheduler poll (≤ 30 s) |
+| Workflow | `workflow_create` | the next trigger tick |
+| Plugin | `install_plugin` (git / https / local path) | the same call — the catalog hot-reloads |
+
+Two knobs set how much freedom that is:
+
+- **`user_tools.enabled: true`** trusts `~/.agent/tools` wholesale: the agent writes a
+  tool and activates it without asking. Off (the default), each new file stops at a
+  hash approval in the conversation, and editing the file revokes the approval.
+- **`install_plugin`** asks only when the plugin *ships code*; a plugin that is pure
+  declarations (skills, commands, an MCP server) installs unattended.
+
+What is deliberately **not** creatable is the layer that authorises creation: the tool
+sandbox, the approval gate, the budget guard, the audit trail. A thing the agent can
+rewrite cannot be the thing that authorises the agent. So `create_tool` runs the
+module through an out-of-process import probe and then executes it in a sandboxed
+child that cannot read `config.json`, the memory database or the session records --
+while the tools directory itself *is* readable, because a tool that cannot read its
+own source is a tool that never runs.
+
+None of that was true before it was tested. The loop had three breaks with one shape:
+a plugin is handed a **scoped view** of the registry (so its registrations are
+undoable), and three places assumed the registry itself -- `create_tool` raised
+`AttributeError` *after* writing the file and its approval, `user_tools_enabled` was
+read from a context key nobody ever wrote (so the trust switch was decorative and
+unattended creation was always refused), and the sandbox's extra read grants sat
+before the home's deny, which last-match-wins overrode, so every user tool failed its
+first call with `PermissionError`. The end-to-end test is
+`test_the_agent_builds_a_capability_mid_conversation_and_uses_it_next_turn`: turn 1
+asks for something the agent has no tool for and the model creates one; turn 2 calls
+it over the same WebSocket.
+
+The last restart wall is the *composition*: which core plugins a deployment mounts,
+and which profile names them, are resolved once at startup. Changing the memory
+backend or mounting a different core plugin still means editing the config and
+restarting -- `ReloadTransaction` only re-discovers plugins today.
+
 ### Creating a skill
 
 ```bash

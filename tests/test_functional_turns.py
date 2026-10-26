@@ -3492,3 +3492,166 @@ def test_the_one_shot_chat_says_when_the_servers_are_not_ready(home, monkeypatch
         ), "and the turn still has to happen"
     finally:
         provider.close()
+
+
+#: A user tool module: `register(registry)` is the whole contract.
+_ECHO_TOOL_SOURCE = '''
+def register(registry):
+    async def echo_demo(text: str) -> str:
+        return "echo:" + str(text)
+
+    registry.register(
+        "echo_demo",
+        "Repeat the text back.",
+        {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        echo_demo,
+    )
+'''
+
+
+def test_the_agent_builds_a_capability_mid_conversation_and_uses_it_next_turn(home):
+    """The whole self-extension loop, over the socket a browser uses.
+
+    Turn 1 asks for something the agent has no tool for, and the model answers by
+    creating one.  Turn 2 calls it.  Everything in between is production: the
+    composition, the tools plugin's *scoped view*, the out-of-process probe, the
+    catalog that registers, the session-registry fork, the revision the channel
+    compares, and the sandboxed child that actually runs the new tool's code.
+
+    That chain is the point.  Each link existed on its own and every unit test
+    passed; the loop did not close, because the catalog was handed a plugin's view
+    (which registers but cannot unregister by source prefix) and because a session
+    that started before the tool did holds a fork of the registry the new tool never
+    reached.  Both failures look like "the tool was created" from the outside.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "tool": (
+                "create_tool",
+                {
+                    "tool_id": "echo_demo",
+                    "code": _ECHO_TOOL_SOURCE,
+                    "intent": "the reply needs a tool that repeats text",
+                },
+            )
+        },
+        {"text": "I made a tool for that."},
+        {"tool": ("echo_demo", {"text": "hi"})},
+        # Deliberately does *not* contain the tool's output: the assertion has to read
+        # the tool result, or it would pass on the model's own words.
+        {"text": "done"},
+    )
+    # Whole-directory trust is the documented freedom switch; without it the creation
+    # would stop and ask a human, which is a different test (and the right default).
+    cfg = write_config(
+        home, provider, channels=WEB_CHANNELS, user_tools={"enabled": True}
+    )
+    try:
+
+        async def run() -> tuple[list[dict], list[dict], list[str]]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/self-extend/stream"
+                ) as socket:
+                    first = await _ask(socket, "I need something that repeats text", "m1")
+                    second = await _ask(socket, "use what you just built", "m2")
+                    return first, second, list(components["registry"].list_tools())
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        first, second, registered = asyncio.run(run())
+
+        # Turn 1 really created it: the registry the composition owns has the tool,
+        # and the call the model made reported success.
+        assert "echo_demo" in registered, registered
+        created = [
+            event
+            for event in first
+            if event.get("type") == "tool_end" and event.get("name") == "create_tool"
+        ]
+        assert created and created[0]["ok"] is True, created
+        assert "made a tool" in _answer(first), _answer(first)
+
+        # Turn 2 really ran it -- same session, no restart, no new conversation -- and
+        # the result came back from the sandboxed child that executed the authored code.
+        ran = [
+            event
+            for event in second
+            if event.get("type") == "tool_end" and event.get("name") == "echo_demo"
+        ]
+        assert ran, [event.get("name") for event in second if event.get("type") == "tool_end"]
+        assert ran[0]["ok"] is True, ran[0]
+        assert "echo:hi" in str(ran[0]["result"]), ran[0]
+    finally:
+        provider.close()
+
+
+def test_a_created_tool_reaches_a_session_that_was_already_open(home):
+    """The half that a unit test cannot see: the *session* registry is a fork.
+
+    `create_tool` registers on the global registry, and a conversation that was
+    already running printed its tool list into the prompt it sent.  Without a rebuild
+    the model is never offered the new tool again -- the loop closes only if the
+    channel is told, which is what `runtime_refresh` is for.  This asserts the
+    mechanism directly rather than through a model's choice to call something.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "ok"})
+    cfg = write_config(
+        home, provider, channels=WEB_CHANNELS, user_tools={"enabled": True}
+    )
+    try:
+
+        async def run() -> tuple[int, int, bool]:
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                import websockets
+
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/fork-test/stream"
+                ) as socket:
+                    await _ask(socket, "start a session", "m1")
+                    before = int(components.get("config_revision", 0) or 0)
+                    result = await components["registry"].call(
+                        "create_tool",
+                        {
+                            "tool_id": "echo_demo",
+                            "code": _ECHO_TOOL_SOURCE,
+                            "intent": "the session needs a tool that repeats text",
+                        },
+                    )
+                    payload = json.loads(result)
+                    # A message after the creation rebuilds against the registry the
+                    # creation just changed.
+                    await _ask(socket, "and now", "m2")
+                    after = int(components.get("config_revision", 0) or 0)
+                    return before, after, payload
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        before, after, payload = asyncio.run(run())
+
+        assert payload.get("ok") is True, payload
+        assert after > before, "the channel was told to rebuild before the next message"
+    finally:
+        provider.close()

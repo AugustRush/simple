@@ -688,7 +688,14 @@ async def author_tool(
 
         registered = [str(item.get("name", "")) for item in probe.tools]
         digest = source_digest(code)
-        if not is_approved(tool_id, digest, target_root):
+        # ``enabled`` is the whole-directory trust switch, and it must mean the same
+        # thing here as it does when the catalog loads at startup.  It used not to: a
+        # deployment with ``user_tools.enabled=true`` still stopped at an interactive
+        # confirmation for every new file, and in an unattended gateway -- where no
+        # approval sink exists -- that confirmation is *refused*, so such a deployment
+        # could never create a tool at all.  Blanket trust grants nothing extra by
+        # skipping this prompt: the next start loads the directory unapproved anyway.
+        if not enabled and not is_approved(tool_id, digest, target_root):
             from agent.security.tool_approval import (
                 authorization_scope,
                 confirm_tool_activation,

@@ -1020,6 +1020,15 @@ class UserToolCatalog:
         """
         self.root.mkdir(parents=True, exist_ok=True)
         user_tools.ensure_deps_on_path(self.root)
+        # A plugin's view is not the registry.  The composition hands the tools plugin a
+        # `ScopedTools` -- so that plugin's own registrations are undone when it unloads --
+        # and a view contributes but has no `unregister_by_source_prefix`, which is what
+        # replacing a module's tools needs.  Normalising here is what makes `create_tool`
+        # work at all from inside the running agent: without it the author writes the
+        # file, records its approval, and then raises, leaving a tool that exists on disk
+        # and nowhere else.  The view names the registry behind it (`ScopedTools.registry`)
+        # for exactly this kind of caller; `ToolRegistry.call` unwraps a view the same way.
+        registry = getattr(registry, "registry", registry)
         registry.unregister_by_source_prefix("user_tool:")
         loaded: list[str] = []
         for tool_file in self.discover():

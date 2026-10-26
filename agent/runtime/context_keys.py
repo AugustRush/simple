@@ -234,6 +234,19 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         partial=True,
     ),
     ContextKey(
+        key="runtime_refresh",
+        writers=("agent/channels/base.py",),
+        readers=("agent/tools/plugin_tools.py",),
+        note=(
+            "A callback rather than a value: whoever changes the tool set calls it, and "
+            "every open session rebuilds its registry fork before the next message. "
+            "Published by the channel runner because that is the object holding both the "
+            "component mapping and the revision the session loop compares. Absent in a "
+            "single-turn CLI -- and absence is an answer here, not a missing writer: it "
+            "means there are no session forks to refresh."
+        ),
+    ),
+    ContextKey(
         key="user_tools_enabled",
         writers=(),
         readers=("agent/tools/user_tools.py",),

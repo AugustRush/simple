@@ -332,3 +332,49 @@ def test_asset_classes_are_protected_in_every_sandboxed_mode(tmp_path, mode):
     assert policy.effective_rights(home / ".aws")[0] is False
     assert policy.effective_rights(home / ".zshrc")[1] is False
     assert policy.effective_rights(home / "Documents")[1] is False
+
+
+def test_a_path_the_caller_requires_is_readable_inside_the_denied_home(tmp_path):
+    """``extra_read_paths`` must outrank the home's blanket deny, not lose to it.
+
+    The user-tools runner asks for exactly two things beyond Python itself: the
+    tools directory and its dependency directory, both inside ``~/.agent`` -- which
+    this policy denies wholesale, because ``config.json`` lives there and holds
+    provider keys.  Those grants were recorded *before* the deny, and the rules are
+    resolved last-match-wins, so the policy model answered ``(False, False)`` for a
+    module the child was launched to import.  Enforcement agreed: every user tool
+    failed its first call with ``PermissionError: Operation not permitted``,
+    including tools loaded at startup.
+
+    A request field whose whole purpose is to override the default denies has to be
+    applied after them.  The home stays denied for everything else, which is the
+    property the deny exists for.
+    """
+    home = tmp_path / "agent-home"
+    tools = home / "tools"
+    (tools / "_deps").mkdir(parents=True)
+    policy = resolve_policy(
+        _request(
+            tmp_path,
+            extra_read_paths=(str(tools), str(tools / "_deps")),
+            agent_home=home,
+        )
+    )
+
+    assert policy.effective_rights(tools / "echo_demo.py") == (True, False)
+    assert policy.effective_rights(tools / "_deps" / "pkg" / "mod.py") == (True, False)
+    # The reason the home is denied is untouched: keys stay unreadable, and the
+    # grant is read-only.
+    assert policy.effective_rights(home / "config.json") == (False, False)
+    assert policy.effective_rights(home / "memory" / "ltm.db") == (False, False)
+    assert policy.effective_rights(tools / "echo_demo.py")[1] is False
+
+
+def test_the_plugins_subtree_stays_readable_and_is_not_a_general_home_reopen(tmp_path):
+    """Control: the existing plugin re-open must not widen into the whole home."""
+    home = tmp_path / "agent-home"
+    (home / "plugins" / "acme").mkdir(parents=True)
+    policy = resolve_policy(_request(tmp_path, agent_home=home))
+
+    assert policy.effective_rights(home / "plugins" / "acme" / "run.sh")[0] is True
+    assert policy.effective_rights(home / "sessions" / "s.json") == (False, False)

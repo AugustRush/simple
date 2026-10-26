@@ -774,6 +774,15 @@ async def _build_components_async(
     registry.set_context("output_dir", str(output_dir))
     registry.set_context("file_access_policy", file_policy)
     registry.set_context("supports_vision", supports_vision)
+    # ``user_tools_enabled`` is *declared* in ``runtime/context_keys.py`` and *read*
+    # by ``user_tools.resolve_catalog`` -- and it was never written.  So the switch
+    # that means "trust this tools directory" was invisible to the running agent:
+    # every creation stopped at the interactive approval gate, and in an unattended
+    # gateway that gate *refuses* instead of waiting, which made "the agent writes a
+    # tool" impossible exactly where nobody is sitting in front of it.  Published
+    # beside the other composition decisions; a session fork copies the context, so
+    # every session sees the same answer.
+    registry.set_context("user_tools_enabled", user_tools_enabled)
     registry.set_context(
         "shell_blocked_commands",
         list(cfg.get("shell_blocked_commands", [])),
