@@ -20,13 +20,21 @@ def _catalog_with_files(tmp_path, skill_id: str, files: list[str]) -> SkillCatal
     root = tmp_path / "skills"
     skill_dir = root / skill_id
     skill_dir.mkdir(parents=True)
+    # Stamped the way `create_skill` stamps it: ownership is "the agent wrote this
+    # AND nobody has edited it since", so a fixture that claims the first half
+    # without the second is not a fixture of an agent-made skill -- and under the
+    # real gate it reads as somebody's else's, which is how this line came to exist.
+    from agent.skills.catalog import stamp_skill_digest
+
     (skill_dir / "SKILL.md").write_text(
-        "---\n"
-        f"name: {skill_id}\n"
-        "user-invocable: true\n"
-        "created-by: agent\n"
-        "---\n"
-        "Instructions.\n",
+        stamp_skill_digest(
+            "---\n"
+            f"name: {skill_id}\n"
+            "user-invocable: true\n"
+            "created-by: agent\n"
+            "---\n"
+            "Instructions.\n"
+        ),
         encoding="utf-8",
     )
     for rel in files:

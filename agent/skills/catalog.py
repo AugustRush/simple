@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import hmac
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import difflib
@@ -53,6 +55,12 @@ def _is_skill_version(leaf_name: str) -> bool:
 #: plugin's name) leaves the bundle protected -- an unrecognised marker can fail to
 #: unlock a bundle, but it can never be used to unlock one.
 _SKILL_ORIGIN_KEY = "created-by"
+#: Digest of the last SKILL.md the agent wrote, so "the agent owns this" can be
+#: narrowed to "the agent owns this *as it stands now*".  Without it, a person who
+#: edits an agent-made skill leaves a bundle still marked ``created-by: agent``, and
+#: the agent goes on overwriting their edits without asking -- the boundary would
+#: protect hand-written skills and not hand-*edited* ones.
+_SKILL_DIGEST_KEY = "agent-digest"
 _SKILL_ORIGIN_AGENT = "agent"
 
 
@@ -71,6 +79,82 @@ def _resolve_within_bundle(bundle_root: Path, rel_path: Path) -> Optional[Path]:
     if target == root or root in target.parents:
         return target
     return None
+
+
+def _skill_digest_source(text: str) -> str:
+    """The part of a SKILL.md the digest is computed over.
+
+    The digest line itself is excluded -- otherwise writing the digest would change
+    what it digests, and every stamp would invalidate itself.  Everything else is
+    hashed verbatim, including the frontmatter: a person who retitles a skill has
+    changed what the agent will follow, so their edit counts too.
+    """
+    kept = [
+        line
+        for line in text.splitlines()
+        if not line.strip().startswith(f"{_SKILL_DIGEST_KEY}:")
+    ]
+    return "\n".join(kept)
+
+
+def _normalized_digest_source(text: str) -> str:
+    """The exact bytes the digest is taken over, as the file will hold them.
+
+    ``splitlines``/``join`` on purpose: the composer may end with a blank line and a
+    stamp may not, and hashing the text *as read* while writing it *as joined* made
+    every freshly stamped file disagree with its own digest -- so the first edit
+    looked like somebody else's.  Normalising on both sides is what makes stamp and
+    check agree.
+    """
+    return "\n".join(_skill_digest_source(text).splitlines())
+
+
+def _skill_digest(text: str) -> str:
+    return "sha256:" + hashlib.sha256(
+        _normalized_digest_source(text).encode("utf-8")
+    ).hexdigest()
+
+
+def stamp_skill_digest(text: str) -> str:
+    """Return *text* with a fresh ``agent-digest`` line in its frontmatter.
+
+    Idempotent: any existing digest line is removed first, so re-stamping a file
+    that already has one replaces it instead of accumulating.
+    """
+    body = _normalized_digest_source(text)
+    digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != "---":
+        # A SKILL.md without frontmatter cannot carry provenance; the composer
+        # always writes one, so this is a guard against a shape nobody produces.
+        return body
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            lines.insert(index, f"{_SKILL_DIGEST_KEY}: {digest}")
+            return "\n".join(lines)
+    return body
+
+
+def skill_is_agent_owned(bundle: "SkillBundle") -> bool:
+    """Whether the agent wrote this bundle **and nobody has edited it since**.
+
+    Both halves matter.  ``created-by: agent`` alone says who made the file, not who
+    last touched it, and the case this exists for is exactly the second one: a person
+    fixes an agent-made skill by hand, and the next consolidation pass would overwrite
+    their fix without a word.  A bundle stamped before digests existed has no digest,
+    so it reads as unowned -- asking once more is the safe direction to be wrong in.
+    """
+    if not bundle.agent_authored:
+        return False
+    stored = str(bundle.metadata.get(_SKILL_DIGEST_KEY) or "").strip()
+    if not stored:
+        return False
+    skill_file = bundle.path / "SKILL.md"
+    try:
+        text = skill_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return hmac.compare_digest(stored, _skill_digest(text))
 
 
 @dataclass
@@ -933,6 +1017,11 @@ class SkillCatalog:
                     # root -- indistinguishable from one a person typed by hand.
                     created_by=_SKILL_ORIGIN_AGENT,
                 )
+                # The digest covers the file as this write leaves it, so "the agent
+                # owns this" means "and nobody has edited it since".  Stamped here
+                # rather than checked later: a digest computed from something else
+                # would be a guess about what was written.
+                content = stamp_skill_digest(content)
                 # Create-only (guarded by the exists() check above), but use the
                 # durable primitive anyway so the rule needs no per-site reasoning.
                 shared._atomic_write_text(skill_file, content)
@@ -1016,6 +1105,13 @@ class SkillCatalog:
                     # "agent": an edit is not a claim of authorship.
                     created_by=str(bundle.metadata.get(_SKILL_ORIGIN_KEY) or ""),
                 )
+                if bundle.agent_authored:
+                    # Re-stamped only for a bundle that is already the agent's: the
+                    # new digest covers the text just written, which is what keeps
+                    # the next edit free.  A user's bundle gets no digest at all --
+                    # writing one into it would be claiming authorship we do not
+                    # have, and the boundary would stop protecting it.
+                    content = stamp_skill_digest(content)
                 # Keep the version being replaced.  An edit is a hypothesis
                 # about what the skill should say, and a hypothesis needs a way
                 # back: without this, a change that makes the skill worse is
@@ -1142,7 +1238,7 @@ class SkillCatalog:
             """
             ref = tool_input.get("skill_id") or tool_input.get("skill_name") or ""
             bundle = self.find_any(str(ref))
-            if bundle is None or bundle.source != "user" or bundle.agent_authored:
+            if bundle is None or bundle.source != "user" or skill_is_agent_owned(bundle):
                 return None
             intent = str(tool_input.get("intent") or "").strip()
             if intent:
@@ -1173,8 +1269,11 @@ class SkillCatalog:
                     "have them. If nobody asked, leave this bundle alone and "
                     "propose the change in your reply. Bundles created with "
                     f"create_skill carry '{_SKILL_ORIGIN_KEY}: {_SKILL_ORIGIN_AGENT}' "
-                    "and stay freely editable, so a new skill of your own is also "
-                    "an option."
+                    "plus a digest of what was written, and stay freely editable "
+                    "for as long as nobody has edited them since -- a hand edit to "
+                    "one of those makes it somebody's again, which is why this "
+                    "bundle may now be one. A new skill of your own is also an "
+                    "option."
                 ),
             }
 

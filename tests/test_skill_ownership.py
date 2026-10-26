@@ -35,21 +35,28 @@ def _registry(catalog: SkillCatalog) -> ToolRegistry:
     return registry
 
 
-def _catalog(tmp_path, extra_frontmatter: str = "") -> SkillCatalog:
+def _catalog(tmp_path, extra_frontmatter: str = "", *, stamp: bool = True) -> SkillCatalog:
     """A user root with one bundle that was written by hand, as a person would."""
+    from agent.skills.catalog import stamp_skill_digest
+
     root = tmp_path / "skills"
     bundle = root / "handwritten"
     bundle.mkdir(parents=True)
-    (bundle / "SKILL.md").write_text(
+    content = (
         "---\n"
         "name: Hand Written\n"
         "description: written by a person, not by the agent\n"
         f"{extra_frontmatter}"
         "user-invocable: true\n"
         "---\n"
-        "Original instructions.\n",
-        encoding="utf-8",
+        "Original instructions.\n"
     )
+    # A bundle claiming `created-by: agent` has to carry the digest the real writer
+    # would have stamped -- otherwise it is a *legacy* shape (agent-authored before
+    # digests existed), which the gate deliberately treats as not-owned.
+    if stamp and "created-by: agent" in content:
+        content = stamp_skill_digest(content)
+    (bundle / "SKILL.md").write_text(content, encoding="utf-8")
     catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
     catalog.load_all()
     return catalog
@@ -385,3 +392,106 @@ def test_a_builtin_skill_still_answers_builtin(tmp_path):
     assert result["ok"] is False
     assert "built-in" in result["error"]
     assert "intent_required" not in result
+
+
+# ── the digest: "the agent's" is narrowed to "as the agent left it" ──────────
+
+
+def test_editing_an_agent_made_skill_by_hand_takes_the_freedom_away(tmp_path):
+    """The residual hole the marker alone left open, closed.
+
+    ``created-by: agent`` says who *made* the file, not who last touched it.  So a
+    person who fixed an agent-made skill by hand left a bundle that still claimed to
+    be the agent's -- and the next pass would overwrite their fix without a word.
+    The digest is the second half of the claim: it covers the file as the agent wrote
+    it, so any edit invalidates it and the boundary applies again.
+    """
+    catalog = SkillCatalog(user_root=tmp_path / "skills", builtin_root=tmp_path / "b")
+    catalog.load_all()
+    registry = _registry(catalog)
+    _call(registry, "create_skill", {"skill_id": "mine", "name": "Mine"})
+    skill_md = tmp_path / "skills" / "mine" / "SKILL.md"
+
+    # A person edits the body.  Everything else stays exactly as it was.
+    skill_md.write_text(
+        skill_md.read_text(encoding="utf-8").replace(
+            "## Steps", "## Steps (my own ordering)"
+        )
+        + "\nA line a person added.\n",
+        encoding="utf-8",
+    )
+    catalog.reload()
+    edited = skill_md.read_text(encoding="utf-8")
+
+    refused = _call(
+        registry, "update_skill", {"skill_id": "mine", "instructions": "agent's rewrite"}
+    )
+    assert refused["ok"] is False, refused
+    assert "intent" in refused["error"]
+    assert skill_md.read_text(encoding="utf-8") == edited, "the edit survived"
+
+    allowed = _call(
+        registry,
+        "update_skill",
+        {"skill_id": "mine", "instructions": "agent's rewrite", "intent": SPECIFIC_INTENT},
+    )
+    assert allowed["ok"] is True, allowed
+
+
+def test_a_bundle_marked_agent_without_a_digest_is_treated_as_somebody_elses(tmp_path):
+    """Migration rule, and the safe direction to be wrong in.
+
+    Bundles written before digests existed carry ``created-by: agent`` and nothing
+    else.  There is no way to tell whether a person has edited one since, so the gate
+    asks once more rather than assuming freedom it cannot verify.
+    """
+    catalog = _catalog(tmp_path, "created-by: agent\n", stamp=False)  # legacy shape
+    registry = _registry(catalog)
+
+    refused = _call(registry, "update_skill", {"skill_id": "handwritten", "instructions": "x"})
+
+    assert refused["ok"] is False
+    assert "intent" in refused["error"]
+
+
+def test_editing_a_users_skill_does_not_stamp_it_as_the_agents(tmp_path):
+    """An authorised edit is not a claim of authorship.
+
+    Once a person's bundle is edited with intent, writing a digest into it would make
+    the *next* write free -- so the second edit would silently succeed where the first
+    needed a reason, and the boundary would erode one authorised change at a time.
+    """
+    catalog = _catalog(tmp_path)
+    registry = _registry(catalog)
+
+    first = _call(
+        registry,
+        "update_skill",
+        {"skill_id": "handwritten", "instructions": "revised", "intent": SPECIFIC_INTENT},
+    )
+    assert first["ok"] is True, first
+
+    from agent.skills.catalog import _SKILL_DIGEST_KEY
+
+    text = (tmp_path / "skills" / "handwritten" / "SKILL.md").read_text(encoding="utf-8")
+    assert f"{_SKILL_DIGEST_KEY}:" not in text, "a user's bundle must stay unmarked"
+
+    second = _call(registry, "update_skill", {"skill_id": "handwritten", "instructions": "again"})
+    assert second["ok"] is False, "the second edit still needs a reason"
+
+
+def test_the_digest_survives_a_reload(tmp_path):
+    """Persistence, not process state: a new catalog over the same directory agrees."""
+    first = SkillCatalog(user_root=tmp_path / "skills", builtin_root=tmp_path / "b")
+    first.load_all()
+    _call(_registry(first), "create_skill", {"skill_id": "mine", "name": "Mine"})
+
+    second = SkillCatalog(user_root=tmp_path / "skills", builtin_root=tmp_path / "b")
+    second.load_all()
+    bundle = second.find_any("mine")
+
+    from agent.skills.catalog import skill_is_agent_owned
+
+    assert skill_is_agent_owned(bundle) is True
+    result = _call(_registry(second), "update_skill", {"skill_id": "mine", "name": "Renamed"})
+    assert result["ok"] is True, result

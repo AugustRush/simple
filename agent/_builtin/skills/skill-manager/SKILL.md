@@ -61,6 +61,7 @@ Instructions for the agent when this skill is activated.
 | `user-invocable` | bool | true | User can explicitly invoke via `/skill` |
 | `disable-model-invocation` | bool | false | Prevent model from auto-activating |
 | `created-by` | string | absent | `agent` on bundles `create_skill` made. Written by the tools, not by hand -- see "Whose skill is it?" |
+| `agent-digest` | string | absent | `sha256:...` of the SKILL.md as the agent last wrote it. Stamp and check are both the tools' job; a hand edit invalidates it -- see below |
 
 **Critical:** `description` is the primary triggering mechanism. "When to use" info must be here, not in the body (the body loads only after triggering).
 
@@ -77,8 +78,10 @@ After any mutation, the catalog hot-reloads automatically -- the new/updated ski
 
 A `SKILL.md` is injected into the system prompt, so writing one rewrites the agent's own instructions. The rule is about **ownership, not about the verb**:
 
-- A bundle **you created** carries `created-by: agent` and stays freely editable, deletable, and writable. That is how you extend yourself.
+- A bundle **you created** carries `created-by: agent` **and** a digest of what you wrote. It stays freely editable, deletable, and writable -- that is how you extend yourself.
+- **A hand edit to one of yours makes it the user's again.** The digest covers the file as you left it, so if it no longer matches, somebody changed the instructions after you did; from then on the bundle needs `intent` like any hand-written one. Editing it with `intent` is allowed and does *not* re-stamp it as yours, so the protection does not erode one authorised change at a time.
 - A bundle **the user wrote** (or installed from elsewhere) has no such mark. Rewriting it is refused with `intent_required` unless the call carries `intent`.
+- Bundles marked `created-by: agent` **without** a digest predate this rule. Treat them as the user's: the gate does, because nothing can prove they were not edited.
 - If you get that refusal: it is the user's file. Retry with `intent` saying what you are changing and why -- quote their words if you have them -- or leave it alone and propose the change in your reply. Do not add `created-by: agent` by hand to get around this: that erases the distinction the field exists for.
 
 ## Bundled Scripts
