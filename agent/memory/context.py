@@ -975,6 +975,22 @@ class ContextManager:
             metadata=metadata, store=self.store
         )
 
+    def token_usage(self, session_id: str) -> dict[str, Any]:
+        """What this session has spent, read straight from the usage ledger.
+
+        Deliberately a straight read of what was recorded, not a running total
+        kept in memory: a gateway restart mid-session would reset a counter to
+        zero and hand the session a fresh budget, and the ledger is the thing
+        that survives.
+        """
+        summary = getattr(self.store, "usage_summary", None)
+        if not callable(summary):
+            return {}
+        try:
+            return dict(summary(session_id) or {})
+        except Exception:
+            return {}
+
 
     def retrieve_context(
         self,

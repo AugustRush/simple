@@ -22,6 +22,7 @@ import { useConfirm } from './hooks/useConfirm'
 import { useConversations } from './hooks/useConversations'
 import { useExtensions } from './hooks/useExtensions'
 import { useMemory } from './hooks/useMemory'
+import { useSessionUsage } from './hooks/useSessionUsage'
 import { useSettings } from './hooks/useSettings'
 import { useAutomation } from './hooks/useAutomation'
 import { useShell } from './hooks/useShell'
@@ -70,6 +71,10 @@ function App() {
   // The memory page needs the api client and nothing else: it reads the
   // corpus, not a session.
   const memory = useMemory({ ...ui, ...apiClient })
+
+  // Spend, for the chip beside the composer: it follows the active session and
+  // refreshes when a turn ends, which is when the number changed.
+  const usage = useSessionUsage({ ...ui, ...apiClient, ...conversations })
 
   const settings = useSettings({ ...ui, ...apiClient, ...conversations })
 
@@ -146,6 +151,7 @@ function App() {
   // Views are pure renderers built from this one context object.
   const ctx: AppCtx = {
     ...memory,
+    ...usage,
     navigateTo,
     selectSession,
     updateMessage,

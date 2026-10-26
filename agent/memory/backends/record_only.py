@@ -327,6 +327,22 @@ class RecordOnlyContextService:
             metadata=metadata,
         )
 
+    def token_usage(self, session_id: str) -> dict[str, Any]:
+        """Read back what was recorded.
+
+        This backend records usage and nothing else, so the total is exactly the
+        rows it wrote -- which is also why it is the honest implementation of
+        the member rather than a stub: a spend guard on this service sees what
+        this service spent.
+        """
+        reader = getattr(self.store, "usage_summary", None)
+        if not callable(reader):
+            return {}
+        try:
+            return dict(reader(session_id) or {})
+        except Exception:
+            return {}
+
 class RecordOnlyContextPlugin:
     """Provides ``context_manager`` -- record and retrieve, no consolidation."""
 

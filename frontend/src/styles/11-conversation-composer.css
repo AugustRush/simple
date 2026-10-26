@@ -522,3 +522,67 @@ html[data-theme='light'] .app-main {
     height: 34px !important;
   }
 }
+
+/* ── 用量读数与预算提示 ──────────────────────────────────────────────────── */
+
+/* 安静地待在本轮控制器末尾：一个数字加一条细进度，读的人是在扫，不是在读。
+   等宽数字（tabular-nums）是因为它会一路从 9.9k 涨到 100k，宽度变化会让旁边的
+   控件跟着跳。 */
+.usage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+}
+.usage-chip-bar {
+  width: 34px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.usage-chip-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+/* 到上限时才用红：平时它是一个读数，不是警告。 */
+.usage-chip.is-exhausted {
+  color: var(--red);
+  border-color: var(--red-soft);
+  background: var(--red-soft);
+}
+.usage-chip.is-exhausted .usage-chip-bar > span {
+  background: var(--red);
+}
+
+/* 说明"为什么下一句不会有回答"，就放在输入框正上方一行。宽度跟着输入框
+   （.composer-stage 是 min(820px, 100%) 居中），否则它会比输入框宽出一截，
+   看起来像页面级横幅而不是这一处的提示。 */
+.budget-notice {
+  width: min(820px, 100%);
+  margin: 0 auto 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--red-soft);
+  border-left: 2px solid var(--red);
+  border-radius: 8px;
+  background: var(--red-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.budget-notice code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+}

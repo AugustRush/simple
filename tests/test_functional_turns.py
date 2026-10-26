@@ -427,6 +427,46 @@ def test_a_tool_call_goes_out_and_its_result_comes_back(home):
         provider.close()
 
 
+def test_a_spent_budget_stops_the_turn_before_the_next_model_call(home):
+    """A one-token ceiling stops a tool round trip at the step boundary.
+
+    The scripted provider reports 13 tokens per call, so the first call already
+    spends past a one-token budget: the boundary that would send the tool result
+    back to the model has to stop instead.  Asserting on the *second request
+    never arriving* is the point -- a guard that only explained itself after
+    spending the money would still pass a test that read the final text.
+
+    Also asserts the notice reaches the user: a stop with no sentence is
+    indistinguishable from a hang.
+    """
+    provider = scripted(
+        {"tool": ("read_file", {"path": "budget-guard.txt"})},
+        {"text": "this answer must never be requested"},
+    )
+    write_config(home, provider, budget={"max_session_tokens": 1})
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "read that file"])
+
+        assert result.exit_code == 0, result.output
+        assert len(provider.requests) == 1, (
+            "the guard has to stop the round trip, not report it afterwards: "
+            f"{len(provider.requests)} model calls went out"
+        )
+        # The prompt is English, so the notice is too (`_looks_like_chinese`
+        # decides which of the two sentences to send; the localized pair itself
+        # is asserted in tests/test_budget_guard.py).  Rich wraps, so the phrase
+        # runs against the text with the line breaks taken out.
+        flat = result.output.replace("\n", "")
+        assert "stopped before the" in flat, result.output
+        assert "max_session_tokens" in flat, result.output
+    finally:
+        provider.close()
+
+
 # ── 3. The web channel, over a real WebSocket ────────────────────────────────
 
 WEB_CHANNELS = {

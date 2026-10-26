@@ -185,6 +185,22 @@ class WebConfig:
 #: a pattern rather than an enumeration.
 
 
+def _session_token_budget(cfg: Any) -> int:
+    """The configured per-session ceiling, or 0 when there is none.
+
+    Read from the *composition's* config each call rather than from the channel's
+    own: ``budget`` is an agent setting, the channel never stores it, and a
+    hot-reloaded config has to reach the page without a restart.
+    """
+    budget = cfg.get("budget") if isinstance(cfg, dict) else None
+    if not isinstance(budget, dict):
+        return 0
+    try:
+        return max(0, int(budget.get("max_session_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class WebChannel(Channel):
     """Starlette-based channel for a browser frontend."""
 
@@ -1492,6 +1508,50 @@ class WebChannel(Channel):
             request, authorized=self._authorized, store=self._memory_store()
         )
 
+    async def _session_usage(self, request: Any) -> Any:
+        """What one session has spent, and the ceiling it is measured against.
+
+        The page's number and the loop's step-boundary check read the same
+        ledger through the same service verb, so "12.3k / 200k" beside the
+        composer and "the turn stopped for budget" cannot disagree about which
+        side of the limit the session is on.
+
+        A deployment with no memory service answers with zeroes and a ceiling
+        of 0 (no ceiling) rather than 503: usage is accounting, and a page that
+        cannot show its own cost is worse than one showing "0".
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        store = self._memory_store()
+        usage: dict[str, Any] = {}
+        if store is not None:
+            try:
+                usage = dict(store.usage_summary(session_id) or {})
+            except Exception as exc:
+                return JSONResponse({"error": f"读取用量失败：{exc}"}, status_code=500)
+        limit = _session_token_budget(resolve(self._components, "cfg") or {})
+        used = int(usage.get("input_tokens", 0) or 0) + int(
+            usage.get("output_tokens", 0) or 0
+        )
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "calls": int(usage.get("calls", 0) or 0),
+                "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                "cached_input_tokens": int(usage.get("cached_input_tokens", 0) or 0),
+                "budget": {
+                    "limit": limit,
+                    "used": used,
+                    "remaining": max(0, limit - used) if limit > 0 else 0,
+                    "exhausted": bool(limit > 0 and used >= limit),
+                },
+            }
+        )
+
     async def _rename_session(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2757,6 +2817,11 @@ class WebChannel(Channel):
             Route(
                 "/api/sessions/{session_id}/state",
                 self._get_session_state,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/usage",
+                self._session_usage,
                 methods=["GET"],
             ),
             Route(

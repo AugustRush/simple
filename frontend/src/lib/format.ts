@@ -124,3 +124,18 @@ export function formatFileSize(sizeBytes: number): string {
   if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`
   return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
 }
+
+
+/** 一个 token 数，缩到人一眼能读的量级。
+ *
+ * 精确到个位没有意义——读的人判断的是"离上限还有多远"，不是差 3 个 token。
+ * 1 万以上用 k，一百万以上用 M，都不带小数位（102,400 → 102k），因为小数位
+ * 在这里唯一的作用是让宽度跳来跳去。
+ */
+export function formatTokens(value: number | undefined): string {
+  const count = Math.max(0, Math.round(Number(value) || 0))
+  if (count >= 1_000_000) return `${Math.round(count / 1_000_000)}M`
+  if (count >= 10_000) return `${Math.round(count / 1_000)}k`
+  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`
+  return String(count)
+}

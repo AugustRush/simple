@@ -60,6 +60,10 @@ class AgentSettings:
     max_agents_per_turn: int = 0  # 0 = derive from max_parallel_agents
     #: Steps (model request plus its tools) allowed in one turn.
     max_tool_call_iterations: int = shared.MAX_TOOL_CALL_ITERATIONS
+    #: Tokens one session may spend before the loop stops calling the model.
+    #: ``0`` means no ceiling -- the historical behaviour, and the only bound
+    #: most deployments want by default.
+    max_session_tokens: int = 0
     max_truncation_continuations: int = shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS
     llm_max_retries: int = shared.DEFAULT_LLM_MAX_RETRIES
     llm_retry_base_delay: float = shared.DEFAULT_LLM_RETRY_BASE_DELAY
@@ -118,6 +122,18 @@ class AgentSettings:
                 default=shared.MAX_TOOL_CALL_ITERATIONS,
                 min_value=1,
                 max_value=shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
+            ),
+            # The floor is 0 rather than 1 because 0 is the documented "no
+            # ceiling" value; there is no upper clamp, because a budget is a
+            # number the operator picked, not a constant this code knows better
+            # than they do.
+            max_session_tokens=bounded_int(
+                (cfg.get("budget") or {}).get("max_session_tokens", 0)
+                if isinstance(cfg.get("budget"), Mapping)
+                else 0,
+                default=0,
+                min_value=0,
+                max_value=2_000_000_000,
             ),
             max_truncation_continuations=bounded_int(
                 cfg.get(

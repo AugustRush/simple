@@ -93,6 +93,16 @@ DEFAULT_CONFIG: dict = {
     "max_steps": shared.MAX_TOOL_CALL_ITERATIONS,
     # Bounded follow-up calls used to finish a response stopped by the output cap.
     "max_truncation_continuations": shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
+    # ── Spend guardrails ──────────────────────────────────────────────────
+    # Tokens one session may spend before the turn loop stops calling the model.
+    # ``0`` means "no ceiling", which is the historical behaviour: ``max_steps``
+    # bounds iterations, and iterations are not money -- a long unattended run on
+    # an expensive model can stay well inside its step budget and still cost
+    # whatever it costs.  The check is a *stop*, not a failure, and it happens at
+    # the same step boundary cancellation does, so it never orphans a tool.
+    "budget": {
+        "max_session_tokens": 0,
+    },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
     # How long a *one-shot* command (``simple chat``) waits for the MCP servers to
@@ -482,6 +492,7 @@ _KNOWN_SECTIONS = frozenset({
     "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
     "max_steps",
     "max_truncation_continuations", "file_access",
+    "budget",
     "web_proxy",
 })
 
@@ -817,6 +828,28 @@ def _check_numeric_ranges(cfg: dict, warnings: list[str]) -> None:
     # Bounded by the largest window any provider here offers, because a reserve
     # bigger than the window would leave the input budget negative.
     _check_int("output_reserve", 1, 1_000_000)
+    # Nested, so it gets its own check rather than the flat ``_check_int`` above.
+    # A ceiling below one request's worth of tokens is legal (it stops the very
+    # first step) and ``0`` is the default "no ceiling", so the range is 0..N.
+    budget_cfg = cfg.get("budget")
+    if isinstance(budget_cfg, dict):
+        limit = budget_cfg.get("max_session_tokens")
+        if limit is not None:
+            try:
+                limit_int = int(limit)
+                if limit_int < 0:
+                    warnings.append(
+                        f"'budget.max_session_tokens': {limit_int} must be >= 0 "
+                        "(0 means no ceiling)"
+                    )
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"'budget.max_session_tokens': must be an integer, got {limit!r}"
+                )
+    elif budget_cfg is not None:
+        warnings.append(
+            f"'budget': expected an object with max_session_tokens, got {budget_cfg!r}"
+        )
 
 
 def _check_scheduler(cfg: dict, warnings: list[str]) -> None:

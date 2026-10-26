@@ -95,6 +95,10 @@
   },
   "max_tool_call_iterations": 40,
   "_max_tool_call_iterations_readme": "Maximum model/tool exchange rounds in one turn before stopping as a possible loop. Values above the runtime cap are clamped; long workflows should make progress visible instead of raising this limit.",
+  "budget": {
+    "_readme": "How much one session may spend before the turn loop stops calling the model. max_session_tokens counts input + output tokens across every turn of the session (background consolidation and sub-agents included, because they are rows in the same ledger). 0 means no ceiling, which is the default and the historical behaviour -- max_steps bounds iterations, and iterations are not money. The check runs at each step boundary, next to cancellation, so a stopped turn never leaves a tool half-run; the user gets one sentence saying what was spent and which key to raise, and the web page shows the same number beside the composer.",
+    "max_session_tokens": 0
+  },
   "_output_reserve_readme": "How much of the context window a request holds back for the answer, in tokens. This is NOT max_tokens: max_tokens is a ceiling on one response, while output_reserve is the room the conversation must leave free. Keeping them separate is what lets a provider be configured for long answers without shrinking its usable context -- deriving the input budget from max_tokens meant a 64000-token cap against a 128000 window left roughly 57k for the entire conversation. Set it per provider under providers.<name>.output_reserve, or here for all of them. The cap actually sent is derived per request as min(max_tokens, window - request - margin), so a request that nearly fills the window gets a smaller cap while a short one still gets the full max_tokens.",
   "memory": {
     "_readme": "tidy_interval_seconds: how often (in seconds) the agent auto-reorganises memory. tidy_file_threshold: minimum number of new memory files before a tidy is triggered.",

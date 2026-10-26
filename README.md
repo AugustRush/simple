@@ -59,6 +59,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Plugin hooks** | 8 lifecycle hooks: prompt submit, tool matchers, command hooks, continue loop |
 | **Vision** | Image attachments sent straight to the model when the provider sets `supports_vision` |
 | **Memory you can see and correct** | The `#/memory` page lists what it remembers with provenance, and lets you edit, pin or delete an entry — and reject a belief |
+| **Spend guard** | `budget.max_session_tokens` stops the loop before the next model call when a session is out of budget, and the page shows the same number beside the composer |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
 ### Measuring retrieval quality
@@ -796,6 +797,42 @@ Two invariants are load-bearing and are tested directly
 Backed by three additions to the `MemoryStore` contract (`update_entry`,
 `delete_entry`, `retract_facts`), so the second backend implements them too and
 `run_store_contract` exercises both.
+
+#### The spend guard
+
+`max_steps` bounds iterations, and iterations are not money: one tool-heavy turn
+on an expensive model can stay well inside its step budget and still cost
+whatever it costs. `budget.max_session_tokens` is the missing ceiling.
+
+```json
+{ "budget": { "max_session_tokens": 200000 } }
+```
+
+- **Where it checks.** At the step boundary, next to cancellation -- before the
+  model request, so a stopped turn never leaves a tool half-run or a request in
+  flight. Checking once per turn would only notice after the money was spent.
+- **What it stops.** The next model call. The user gets one sentence saying what
+  was spent, what the ceiling is, and which key raises it (localized the same
+  way cancellation is); the turn's status is `budget_exhausted`, not a fabricated
+  error, and no `usage_events` row is invented for a call that never happened.
+- **What it counts.** `input_tokens + output_tokens` for the session, from the
+  same `usage_events` ledger the page reads. Background consolidation and
+  sub-agents land in that ledger too, so "the session spent 200k" includes the
+  work it did while you were not looking.
+- **The page's number is the guard's number.** `GET /api/sessions/{id}/usage`
+  answers what the loop consults, and the composer shows it (`12.3k / 200k`,
+  with a thin bar that turns red at the ceiling). A notice above the composer
+  explains why the next message will not be answered.
+- **`0` means off.** The default. An unset budget is never read as "zero tokens
+  left": the guard is opt-in, and a deployment that never configured one must
+  behave exactly as it did before this existed.
+- **A guard that cannot read is not an outage.** If the service cannot total its
+  usage -- no accounting table, an unreadable one -- the turn keeps running
+  without a ceiling. The check is a courtesy, not a failsafe.
+
+The number is read through `ContextService.token_usage`, a service verb rather
+than a store one, so the second context service answers it too and the loop never
+learns where usage rows live.
 
 ### Multi-agent orchestration
 

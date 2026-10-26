@@ -350,6 +350,9 @@ class BaseAgent:
         # 0 = derive from max_parallel_agents (see _max_agents_per_turn).
         self.max_agents_per_turn = self.settings.max_agents_per_turn
         self.max_tool_call_iterations = self.settings.max_tool_call_iterations
+        #: 0 means "no ceiling".  Read by the loop at every step boundary through
+        #: ``LoopDeps``, never by the agent itself.
+        self.max_session_tokens = self.settings.max_session_tokens
         self.max_truncation_continuations = self.settings.max_truncation_continuations
         self.max_rendezvous_rounds = 2  # Mirrors OrchestrationDecision default.
         self.result_content_max_chars = self.settings.result_content_max_chars
@@ -406,6 +409,45 @@ class BaseAgent:
         return agent_facades._effective_model(
             ctx=ctx, model=self.model, current_context=self.current_context
         )
+
+    def _session_token_spend(self, ctx: Optional["AgentContext"] = None) -> int:
+        """Tokens this session has spent so far, as the context service counts them.
+
+        The spend guard's only input.  It reads through the service rather than
+        the store: ``token_usage`` is a declared ``ContextService`` member, so a
+        replacement context manager (the record-only one included) answers it
+        too, and the loop never has to know where usage rows live.
+
+        A failure here answers ``0`` rather than raising.  A stream that cannot
+        total its own usage is a reason to keep the turn running without a
+        ceiling, not a reason to fail a turn the user asked for -- and the
+        no-ceiling case is the default anyway.
+        """
+        manager = self._context_manager_for(ctx)
+        reader = getattr(manager, "token_usage", None)
+        if not callable(reader):
+            return 0
+        metadata = getattr(ctx, "metadata", None) or {}
+        # The same three-step resolution the usage *writer* uses
+        # (``observe_provider_usage``): metadata, then the manager's own session,
+        # then the agent id.  Two different resolutions would let a turn spend
+        # under one id and read the total of another, which is a budget that
+        # never fires -- silently.
+        session_id = str(
+            metadata.get("session_id")
+            or getattr(manager, "session_id", "")
+            or getattr(ctx, "agent_id", "")
+            or ""
+        )
+        if not session_id:
+            return 0
+        try:
+            totals = reader(session_id) or {}
+            return int(totals.get("input_tokens", 0) or 0) + int(
+                totals.get("output_tokens", 0) or 0
+            )
+        except Exception:
+            return 0
 
 
     def endpoint_for(self, model: Optional[str] = None) -> "ModelEndpoint":

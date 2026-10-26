@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview } from '../types'
+import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -294,6 +294,9 @@ export interface AppCtx {
   memoryQuery: string
   memoryCategory: string
   memoryCategoryOptions: string[]
+  /** 这个会话花了多少 token、离上限多远；null = 还没有会话或还没读到。 */
+  sessionUsage: SessionUsage | null
+  loadUsage: () => Promise<void>
   memoryTab: 'entries' | 'facts'
   memoryBusy: boolean
   /** 这个部署没有记忆服务（503），和"读失败"是两种页面。 */

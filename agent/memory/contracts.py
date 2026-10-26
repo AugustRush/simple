@@ -522,6 +522,19 @@ class ContextService(Protocol):
         that does not keep it says so rather than failing the turn.
         """
 
+    def token_usage(self, session_id: str) -> "dict[str, Any]":
+        """What this session has spent so far: ``calls`` and the three token totals.
+
+        The spend guard's only read.  It is a *service* verb rather than a store
+        one because the turn loop has a context manager and not a store: routing
+        it through the manager is what lets a replacement service answer it
+        without exposing the storage the protocol deliberately hides.
+
+        Returning ``{}`` is legitimate -- a service that keeps no accounting
+        cannot invent a total, and ``0`` spent is the honest reading of "no
+        ceiling measured".
+        """
+
 
 @runtime_checkable
 class MemoryService(Protocol):

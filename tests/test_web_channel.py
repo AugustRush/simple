@@ -6019,3 +6019,74 @@ def test_web_memory_says_it_is_unavailable_rather_than_breaking(tmp_path):
             response = client.get(path)
             assert response.status_code == 503
             assert "记忆未启用" in response.json()["error"]
+
+
+# ── spend guard: the number the page shows ───────────────────────────────────
+
+
+def _usage_store(tmp_path, *, input_tokens: int = 1200, output_tokens: int = 300):
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    for _ in range(2):
+        store.append_usage_event(
+            session_id="s1",
+            phase="foreground",
+            model="test-model",
+            input_tokens=input_tokens // 2,
+            output_tokens=output_tokens // 2,
+        )
+    return store
+
+
+def test_web_session_usage_reports_spend_against_the_configured_ceiling(tmp_path):
+    """The page's number and the loop's guard read one ledger through one verb.
+
+    Asserted as arithmetic on what was recorded, not as a fixed figure: the
+    point is that "used" is the sum the guard sums, so a page showing
+    "1,500 / 1,800" and a turn that keeps running cannot disagree.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime(
+        {},
+        {"ltm_store": _usage_store(tmp_path), "cfg": {"budget": {"max_session_tokens": 1800}}},
+    )
+
+    with TestClient(channel.app) as client:
+        payload = client.get("/api/sessions/s1/usage").json()
+
+    assert payload["calls"] == 2
+    assert payload["input_tokens"] == 1200
+    assert payload["output_tokens"] == 300
+    budget = payload["budget"]
+    assert budget["limit"] == 1800
+    assert budget["used"] == 1500, "input + output, the same sum the guard uses"
+    assert budget["remaining"] == 300
+    assert budget["exhausted"] is False
+
+
+def test_web_session_usage_says_exhausted_and_handles_no_ceiling(tmp_path):
+    """Two states a page has to render differently, and neither is an error."""
+    from starlette.testclient import TestClient
+
+    capped = _channel()
+    capped.bind_runtime(
+        {},
+        {"ltm_store": _usage_store(tmp_path), "cfg": {"budget": {"max_session_tokens": 900}}},
+    )
+    with TestClient(capped.app) as client:
+        budget = client.get("/api/sessions/s1/usage").json()["budget"]
+    assert budget["exhausted"] is True
+    assert budget["remaining"] == 0, "a negative remainder would read as credit"
+
+    # No ceiling configured: 0 is "off", and the page must not render it as "0
+    # of 0 left" -- which would look like an exhausted budget on every deploy
+    # that never set one.
+    uncapped = _channel()
+    uncapped.bind_runtime({}, {"ltm_store": _usage_store(tmp_path), "cfg": {}})
+    with TestClient(uncapped.app) as client:
+        budget = client.get("/api/sessions/s1/usage").json()["budget"]
+    assert budget["limit"] == 0
+    assert budget["exhausted"] is False

@@ -638,3 +638,25 @@ export interface MemoryDraft {
   entity: string
   importance: number
 }
+
+
+/* ── what a session has spent ───────────────────────────────────────────── */
+
+//: The ceiling the spend guard is measuring against.  ``limit === 0`` is "no
+//: ceiling", which is the default and must render as "not configured" rather
+//: than "0 of 0 left".
+export interface SessionUsageBudget {
+  limit: number
+  used: number
+  remaining: number
+  exhausted: boolean
+}
+
+export interface SessionUsage {
+  session_id: string
+  calls: number
+  input_tokens: number
+  output_tokens: number
+  cached_input_tokens: number
+  budget: SessionUsageBudget
+}

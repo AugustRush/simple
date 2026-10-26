@@ -563,6 +563,23 @@ def run_context_contract(service: Any, *, store: Any) -> None:
     )
     assert isinstance(kept, list) and kept
 
+    # Usage read-back: the spend guard reads *this* to decide whether a turn may
+    # make another model call, so it has to follow what was recorded rather than
+    # invent a total.  Written first, then read, so the relationship is asserted
+    # and not merely the shape.
+    before = service.token_usage(session_id)
+    assert isinstance(before, dict)
+    service.record_usage_event(
+        session_id=session_id,
+        phase="foreground",
+        model="contract-model",
+        input_tokens=40,
+        output_tokens=2,
+    )
+    after = service.token_usage(session_id)
+    assert int(after.get("input_tokens", 0)) >= int(before.get("input_tokens", 0)) + 40
+    assert int(after.get("output_tokens", 0)) >= int(before.get("output_tokens", 0)) + 2
+
     # Session fan-out, recovery and teardown.
     spawned = service.spawn_session("contract-child")
     assert spawned.session_id == "contract-child"

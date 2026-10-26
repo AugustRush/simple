@@ -232,6 +232,15 @@ class LoopDeps:
     build_tool_loop_stuck_response: Callable[..., Any]
     check_tool_loop_stuck: Callable[..., Any]
 
+    #: Spend guard.  ``max_session_tokens == 0`` turns it off, which is the
+    #: default; ``session_token_spend(ctx)`` answers what this session has spent
+    #: so far through the context *service* (``ContextService.token_usage``), so
+    #: the loop never learns where usage rows live.  Both carry defaults because
+    #: they were added after the struct existed: a caller constructing a
+    #: ``LoopDeps`` by hand (a test) keeps working, just without a ceiling.
+    max_session_tokens: int = 0
+    session_token_spend: Optional[Callable[..., int]] = None
+
     @classmethod
     def from_services(
         cls,
@@ -257,6 +266,7 @@ class LoopDeps:
         content_filter: Any = None,
         event_bus: Any = None,
         llm_event_bus: Any = None,
+        session_token_spend: Optional[Callable[..., int]] = None,
     ) -> "LoopDeps":
         """Build the loop's dependencies from **services and settings**, not from an agent.
 
@@ -313,6 +323,8 @@ class LoopDeps:
             content_filter_threshold=float(content_filter_threshold),
             build_tool_loop_stuck_response=build_tool_loop_stuck_response,
             check_tool_loop_stuck=check_tool_loop_stuck,
+            max_session_tokens=int(getattr(settings, "max_session_tokens", 0) or 0),
+            session_token_spend=session_token_spend,
         )
 
     @classmethod
@@ -367,6 +379,8 @@ class LoopDeps:
             content_filter_threshold=float(agent._content_filter_threshold),
             build_tool_loop_stuck_response=agent._build_tool_loop_stuck_response,
             check_tool_loop_stuck=agent._check_tool_loop_stuck,
+            max_session_tokens=int(getattr(agent, "max_session_tokens", 0) or 0),
+            session_token_spend=agent._session_token_spend,
         )
 def prepare_turn(
         deps: "LoopDeps",
@@ -1289,6 +1303,60 @@ def warn_missing_usage(deps: "LoopDeps", ctx: "AgentContext") -> None:
             "usage_events. If the gateway rejects stream_options, set "
             "providers.<name>.stream_usage to false.[/yellow]"
         )
+
+
+def budget_stop_text(
+    deps: "LoopDeps",
+    ctx: "AgentContext",
+    reference_text: object = "",
+) -> Optional[str]:
+    """Why this turn has to stop for lack of budget, or ``None`` to continue.
+
+    Read at the step boundary rather than once per turn: a single turn with
+    twenty tool steps is the expensive case, and checking only on entry would
+    notice after the money was spent.  The number is the *session's* total, not
+    this turn's -- a budget is about the conversation's cost, and a per-turn
+    ceiling with no session ceiling is a ceiling that resets by starting a new
+    turn.
+
+    ``None`` when no ceiling is configured, which is the default and must stay
+    free: the guard is opt-in, and an unset budget cannot be made to look like a
+    zero one.
+    """
+    # Read straight off the struct rather than through ``getattr``: the fields
+    # are declared and defaulted, and the guard that keeps ``LoopDeps`` in step
+    # with what the loop reads is an AST scan for ``deps.name`` -- a string
+    # lookup would make a real dependency invisible to it and the two fields
+    # would show up as declared-but-unused.
+    limit = int(deps.max_session_tokens or 0)
+    if limit <= 0:
+        return None
+    reader = deps.session_token_spend
+    if not callable(reader):
+        return None
+    try:
+        spent = int(reader(ctx) or 0)
+    except Exception:
+        # A service that cannot total its usage is a reason to keep running
+        # without a ceiling, not a reason to fail the user's turn.
+        return None
+    if spent < limit:
+        return None
+    # No square brackets around the sentence: the CLI prints assistant text
+    # through rich, which reads `[...]` as markup and would swallow the whole
+    # notice -- the one line that explains why the turn stopped.
+    if shared._looks_like_chinese(reference_text):
+        return (
+            f"本会话已用 {spent:,} tokens，达到上限 {limit:,}；这一轮停在这里，"
+            "没有再调用模型。调大 budget.max_session_tokens，或开一个新会话继续。"
+        )
+    return (
+        f"This session has spent {spent:,} of its {limit:,}-token budget; the turn "
+        "stopped before the next model call. Raise budget.max_session_tokens or "
+        "start a new session to continue."
+    )
+
+
 async def run_turn_loop(
         deps: "LoopDeps",
         ctx: AgentContext,
@@ -1383,6 +1451,27 @@ async def run_turn_loop(
                         content=state.result_text or shared._cancelled_by_user_text(user_message),
                         tool_calls_made=tool_calls_made,
                         error=state.trace_error,
+                    )
+
+                # Spend guard, at the same boundary as cancellation and for the
+                # same reason: the check sits before the model request, so a
+                # stopped turn never leaves a tool half-run or a request in
+                # flight.  It is a stop, not a failure -- the caller gets prose
+                # saying so and `budget_exhausted`, so a task's outcome is
+                # "paused" rather than a fabricated error.
+                budget_stop = budget_stop_text(deps, ctx, user_message)
+                if budget_stop is not None:
+                    state.trace_status = "budget_exhausted"
+                    state.trace_error = ""
+                    return AgentResult(
+                        agent_id=ctx.agent_id,
+                        content=(
+                            f"{state.result_text.rstrip()}\n\n{budget_stop}".strip()
+                            if state.result_text
+                            else budget_stop
+                        ),
+                        tool_calls_made=tool_calls_made,
+                        error="",
                     )
 
                 emit_event("step_started", step=state.steps)

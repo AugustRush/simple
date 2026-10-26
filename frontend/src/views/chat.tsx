@@ -4,7 +4,7 @@ import type { AppCtx } from '../app/AppCtx'
 import { ApprovalBar } from '../components/ApprovalBar'
 import { MessageList } from '../components/MessageList'
 import { TASK_STATUS_LABELS } from '../constants'
-import { compactWorkspacePath, truncate } from '../lib/format'
+import { compactWorkspacePath, formatTokens, truncate } from '../lib/format'
 import { fileHref } from '../lib/media'
 import {
   ApiOutlined,
@@ -27,7 +27,7 @@ import React from 'react'
 const { TextArea } = Input
 
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, canRewind, editLastTurn, regenerateLastTurn, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, canRewind, editLastTurn, regenerateLastTurn, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, sessionUsage, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
   return (
@@ -306,6 +306,20 @@ export function renderChat(ctx: AppCtx) {
             the bar's own buttons, and 允许本次 stopped being clickable (a
             real page probe caught it; the unit tests and the type checker
             cannot see that). See .composer-stage in 04-composer.css. */}
+        {/* The notice is a *sibling* of the stage, not a child: `.composer-stage`
+            is a 1x1 grid whose children are all stacked in the same cell (that
+            is how the approval cover lands on top of the composer), so a child
+            would be drawn underneath the composer instead of above it. */}
+        {sessionUsage?.budget.exhausted && (
+          <div className="budget-notice" role="status">
+            <span>
+              本会话已用 {formatTokens(sessionUsage.budget.used)} /{' '}
+              {formatTokens(sessionUsage.budget.limit)} tokens，达到预算上限。
+              再发消息不会调用模型——调大 <code>budget.max_session_tokens</code>{' '}
+              或开一个新会话即可继续。
+            </span>
+          </div>
+        )}
         <div className="composer-stage">
           <div className={`composer${confirmReq ? ' approval-pending' : ''}`}>
             {pendingAttachments.length > 0 && (
@@ -500,6 +514,48 @@ export function renderChat(ctx: AppCtx) {
                     popupMatchSelectWidth={false}
                     variant="borderless"
                   />
+                  {/* 用量的读数：只在有数的时候出现（新会话的第一轮之前它没有
+                      意义），有上限时带上上限和一条进度。没有上限的部署只显示
+                      "已用 N"，而不是"N / 0"——那会看起来像一个已经用完的预算。 */}
+                  {sessionUsage && (
+                    <Tooltip
+                      title={
+                        sessionUsage.budget.limit > 0
+                          ? `本会话已用 ${formatTokens(sessionUsage.budget.used)} tokens，上限 ${formatTokens(sessionUsage.budget.limit)}（共 ${sessionUsage.calls} 次模型调用）`
+                          : `本会话已用 ${formatTokens(sessionUsage.budget.used)} tokens（未设预算上限）`
+                      }
+                    >
+                      <span
+                        className={`usage-chip${sessionUsage.budget.exhausted ? ' is-exhausted' : ''}`}
+                        aria-label={
+                          sessionUsage.budget.limit > 0
+                            ? `本会话用量 ${formatTokens(sessionUsage.budget.used)} / ${formatTokens(sessionUsage.budget.limit)} tokens`
+                            : `本会话用量 ${formatTokens(sessionUsage.budget.used)} tokens`
+                        }
+                      >
+                        {sessionUsage.budget.limit > 0 && (
+                          <span className="usage-chip-bar" aria-hidden="true">
+                            <span
+                              style={{
+                                width: `${Math.min(
+                                  100,
+                                  Math.round(
+                                    (sessionUsage.budget.used /
+                                      Math.max(1, sessionUsage.budget.limit)) *
+                                      100,
+                                  ),
+                                )}%`,
+                              }}
+                            />
+                          </span>
+                        )}
+                        {formatTokens(sessionUsage.budget.used)}
+                        {sessionUsage.budget.limit > 0
+                          ? ` / ${formatTokens(sessionUsage.budget.limit)}`
+                          : ''}
+                      </span>
+                    </Tooltip>
+                  )}
                 </div>
               </div>
               <div className="composer-actions">
