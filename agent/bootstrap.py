@@ -749,86 +749,88 @@ async def _build_components_async(
     # is a dependency graph the kernel resolves, not a sequence it needs.
     # Which of the composition's own plugins this deployment has.  A profile may narrow
     # it; ``None`` means all, which is what every existing composition expects.
-    _core_selection = plugin_catalog.core_plugin_selection()
-    _replacements = plugin_catalog.service_replacements()
-    _mounted_core: list[str] = []
-    for _core_plugin in core_plugins(
-        enabled=_core_selection, replacements=_replacements
-    ):
-        _mounted_core.append(_core_plugin.name)
-        plugin_catalog.mount(
-            _core_plugin.build(
-                CoreContext(
-                    agent_class=BaseAgent,
-                    tools_class=builtin_tools_cls,
-                )
-            ),
-            provenance=Provenance(source=f"core:{_core_plugin.name}", kind=CORE),
+    #
+    # Mounting is a *function*, not a loop, because it has to be able to run twice: once
+    # here, and again when a reload asks for a different composition
+    # (``PluginCatalog.recompose``).  Everything it touches is re-resolved from
+    # ``components`` on each call -- the registry and the agent are **new objects** after
+    # a remount, so a closure over the old ones would teach the retired composition and
+    # leave the live one dumb, which is the quietest possible way to be wrong here.
+    def _mount_composition() -> None:
+        selection = plugin_catalog.core_plugin_selection()
+        replacements = plugin_catalog.service_replacements()
+        mounted: list[str] = []
+        for entry in core_plugins(enabled=selection, replacements=replacements):
+            mounted.append(entry.name)
+            if plugin_catalog.is_mounted(entry.name):
+                # The host plugins -- the channel registry and the channels -- are kept
+                # mounted across a recomposition (they own the listening socket), so a
+                # rebuild finds them already there.  Mounting them twice is the kernel's
+                # "already loaded" refusal, and skipping is the correct answer: this
+                # composition still has that plugin.
+                continue
+            plugin_catalog.mount(
+                entry.build(
+                    CoreContext(
+                        agent_class=BaseAgent,
+                        tools_class=builtin_tools_cls,
+                    )
+                ),
+                provenance=Provenance(source=f"core:{entry.name}", kind=CORE),
+            )
+        plugin_catalog.note_core_mounts(mounted)
+
+        # The composition's own decisions, applied to whatever objects it just mounted.
+        # ``registry`` and ``agent`` are resolved here rather than captured above, because
+        # a remount replaces them.
+        mounted_registry = require_service(components, "registry")
+        require_service(components, "agent").register_spawn_capability(
+            system_prompt, workspace_root=workspace_root
         )
-    plugin_catalog.note_core_mounts(_mounted_core)
+        mounted_registry.set_context("output_dir", str(output_dir))
+        mounted_registry.set_context("file_access_policy", file_policy)
+        mounted_registry.set_context("supports_vision", supports_vision)
+        mounted_registry.set_context("user_tools_enabled", user_tools_enabled)
+        mounted_registry.set_context(
+            "shell_blocked_commands", list(cfg.get("shell_blocked_commands", []))
+        )
+        mounted_registry.set_context(
+            "shell_allowed_commands", list(cfg.get("shell_allowed_commands", []))
+        )
+        mounted_registry.set_context(
+            "shell_permission_level",
+            str((cfg.get("permissions") or {}).get("shell_level", "ask") or "ask"),
+        )
+        mounted_registry.set_context(
+            "shell_sandbox_mode",
+            str(
+                (cfg.get("permissions") or {}).get("shell_sandbox", "read_all")
+                or "read_all"
+            ),
+        )
+        mounted_registry.set_context(
+            "shell_devices", bool((cfg.get("permissions") or {}).get("shell_devices", True))
+        )
+        mounted_registry.set_context(
+            "shell_secret_paths",
+            tuple(
+                str(entry).strip()
+                for entry in (
+                    (cfg.get("permissions") or {}).get("shell_secret_paths") or ()
+                )
+                if str(entry).strip()
+            ),
+        )
+
+    plugin_catalog.set_composition_mounter(_mount_composition)
+    _mount_composition()
     # The registry and the skill catalog are provided by plugins now (``registry``,
     # ``skill_catalog``, declared first for a reader; the kernel pends their
-    # dependents, so the order is documentation rather than a sequence).  Everything
-    # below that used to read the objects the composition built resolves them here.
+    # dependents, so the order is documentation rather than a sequence).
+    # Resolved *after* the mount, because that is what provides them.
     registry = require_service(components, "registry")
     skill_catalog = require_service(components, "skill_catalog")
 
-    # The built-in tool set used to be constructed here directly, which made every tool it
-    # registers permanent for the life of the process.
-    # Resolved, not built: the agent is a plugin's now.  This call is the composition
-    # teaching it about the spawn capability, which is composition knowledge.
-    require_service(components, "agent").register_spawn_capability(
-        system_prompt, workspace_root=workspace_root
-    )
-
-    # Share output_dir with skills via registry context
-    registry.set_context("output_dir", str(output_dir))
-    registry.set_context("file_access_policy", file_policy)
-    registry.set_context("supports_vision", supports_vision)
-    # ``user_tools_enabled`` is *declared* in ``runtime/context_keys.py`` and *read*
-    # by ``user_tools.resolve_catalog`` -- and it was never written.  So the switch
-    # that means "trust this tools directory" was invisible to the running agent:
-    # every creation stopped at the interactive approval gate, and in an unattended
-    # gateway that gate *refuses* instead of waiting, which made "the agent writes a
-    # tool" impossible exactly where nobody is sitting in front of it.  Published
-    # beside the other composition decisions; a session fork copies the context, so
-    # every session sees the same answer.
-    registry.set_context("user_tools_enabled", user_tools_enabled)
-    registry.set_context(
-        "shell_blocked_commands",
-        list(cfg.get("shell_blocked_commands", [])),
-    )
-    registry.set_context(
-        "shell_allowed_commands",
-        list(cfg.get("shell_allowed_commands", [])),
-    )
-    registry.set_context(
-        "shell_permission_level",
-        str(
-            (cfg.get("permissions") or {}).get("shell_level", "ask") or "ask"
-        ),
-    )
-    registry.set_context(
-        "shell_sandbox_mode",
-        str(
-            (cfg.get("permissions") or {}).get("shell_sandbox", "read_all")
-            or "read_all"
-        ),
-    )
-    registry.set_context(
-        "shell_devices",
-        bool((cfg.get("permissions") or {}).get("shell_devices", True)),
-    )
-    registry.set_context(
-        "shell_secret_paths",
-        tuple(
-            str(entry).strip()
-            for entry in (
-                (cfg.get("permissions") or {}).get("shell_secret_paths") or ()
-            )
-            if str(entry).strip()
-        ),
-    )
     if announce:
         # A posture nobody can see is a posture nobody maintains.  Running unsandboxed
         # is a deliberate, temporary choice that lives in a permanent file, so it has to
@@ -911,19 +913,10 @@ async def _build_components_async(
     # So the composition says when it has finished writing.
     plugin_catalog.flush_pending()
 
-    # A declared replacement is **checked**, not trusted.  `core_plugins` decided what not to
-    # mount; whether the named plugin actually came up and actually provided the service is a
-    # different question, and the failure without this is a KeyError three layers away naming
-    # neither the profile nor the replacement.
-    for _service, _provider in sorted(_replacements.items()):
-        _actual = plugin_catalog.who_provides(_service)
-        if _actual != _provider:
-            raise RuntimeError(
-                f"profile {getattr(plugin_catalog, '_plugin_profile', None) and plugin_catalog._plugin_profile.key!r} "
-                f"declares {_service!r} is provided by {_provider!r}, but it is "
-                f"{'provided by ' + repr(_actual) if _actual else 'not provided at all'} "
-                f"-- see the plugin's own failed_report()/pending_report()"
-            )
+    # A declared replacement is **checked**, not trusted.  The check lives on the catalog
+    # now, because a recomposition has to run the same one after rebuilding (see
+    # ``PluginCatalog.recompose``), and two copies of a check is one copy that drifts.
+    plugin_catalog.verify_replacements()
 
     # The agent loop is mounted like any other plugin, into the composition's own
     # host, so it activates only once ``agent`` and ``system_prompt`` exist -- which

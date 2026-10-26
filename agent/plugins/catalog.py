@@ -1253,6 +1253,11 @@ class PluginCatalog:
         #: ``refresh_composition`` can say which part of a profile change this process
         #: cannot apply, instead of reporting a reload that quietly ignored it.
         self._mounted_core: tuple[str, ...] = ()
+        #: How the composition mounts itself: a callable that mounts its own plugins and
+        #: re-applies the decisions that belong to them.  Installed by the composition
+        #: root, because "which plugins, built with what, and told what" is its knowledge
+        #: -- the catalog only knows that the answer can change.
+        self._composition_mounter: Any = None
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
         self._reload_lock = asyncio.Lock()
         self._hook_executor = ThreadPoolExecutor(
@@ -1969,6 +1974,16 @@ class PluginCatalog:
         """
         self._config_loader = loader
 
+    def set_composition_mounter(self, mounter: Any) -> None:
+        """Install the callable that mounts this composition.
+
+        Handed over rather than imported: mounting means ``core_plugins(...)``, a
+        ``CoreContext`` and the post-mount facts (the spawn capability, the shell
+        posture, the trust switch), all of which are the composition root's knowledge.
+        Passing the *act* keeps that knowledge where it is already written down.
+        """
+        self._composition_mounter = mounter
+
     def note_core_mounts(self, names: Any) -> None:
         """Record which core plugins the composition actually mounted."""
         self._mounted_core = tuple(str(name) for name in names)
@@ -1986,7 +2001,127 @@ class PluginCatalog:
             )
         )
 
-    def refresh_composition(self) -> dict:
+    def composition_preview(self) -> dict:
+        """What a refresh would change, without changing it.  See ``refresh_composition``."""
+        return self.refresh_composition(apply=False)
+
+    #: Prefixes of the plugins that are the **process** rather than a part of its
+    #: composition.  A remount must not unmount these: a channel owns a listening socket
+    #: and the connections on it, and `channels` is the registry they are in.  Everything
+    #: else is a part, and parts are what a recomposition replaces.
+    HOST_PLUGIN_PREFIXES: tuple[str, ...] = ("channels", "channel.")
+
+    def _is_host_plugin(self, name: str) -> bool:
+        return any(
+            name == prefix or name.startswith(prefix)
+            for prefix in self.HOST_PLUGIN_PREFIXES
+        )
+
+    def is_mounted(self, name: str) -> bool:
+        """Whether *name* is in the tree right now, core or discovered."""
+        return name in self._installs
+
+    def verify_replacements(self) -> None:
+        """Fail if a profile's declared replacement did not actually provide the service.
+
+        ``core_plugins`` decided what *not* to mount; whether the named plugin came up
+        and provided the service is a different question, and the failure without this is
+        a ``KeyError`` three layers away naming neither the profile nor the replacement.
+        Called by the composition root after its first mount and by :meth:`recompose`
+        after every rebuild.
+        """
+        for service, provider in sorted(self.service_replacements().items()):
+            actual = self.who_provides(service)
+            if actual != provider:
+                raise RuntimeError(
+                    f"profile {self._plugin_profile.key!r} declares {service!r} is "
+                    f"provided by {provider!r}, but it is "
+                    f"{'provided by ' + repr(actual) if actual else 'not provided at all'}"
+                    " -- see the plugin's own failed_report()/pending_report()"
+                )
+
+    async def recompose(self) -> dict:
+        """Rebuild the composition in place: unmount the parts, re-read the config, remount.
+
+        The one operation that changes *which core plugins exist* without a new process.
+        It exists because a profile change -- a different memory backend, a different
+        session service -- used to be a restart, and saying so was the best available
+        answer until a caller could be found that knows nothing is mid-turn.
+
+        What makes it safe is not this method: it is the caller's **quiesce**.  Between
+        unmounting ``memory`` and mounting its replacement there is a window where the
+        service does not exist, and a turn landing in that window would fail in a way
+        that looks like data loss.  ``recompose`` therefore refuses nothing and waits for
+        nothing -- it is a whole-composition operation, and the caller owes it an idle
+        process (the web channel checks every session's ``operation_state`` first).
+
+        The host plugins -- ``channels`` and the channels themselves -- stay mounted:
+        they own the sockets this process is serving on, and "recompose" must not mean
+        "disconnect everyone".
+
+        Rollback is attempted, and reported rather than promised: a failure is usually
+        the *new* config, so putting the previous profile back and re-mounting it is the
+        one recovery that can work.  ``restored`` says whether it did.
+        """
+        mounter = self._composition_mounter
+        if mounter is None:
+            return {
+                "ok": False,
+                "error": (
+                    "this composition installed no mounter, so it cannot rebuild itself "
+                    "(a bare catalog in a test or an embedder)"
+                ),
+            }
+        previous_profile = self._plugin_profile
+        previous_config = dict(self._plugin_config)
+        host = [name for name in self._installs if self._is_host_plugin(name)]
+
+        for name in list(self._installs):
+            if not self._is_host_plugin(name):
+                self.unload_plugin(name)
+
+        composition = self.refresh_composition()
+        try:
+            mounter()
+            self.flush_pending()
+            self.verify_replacements()
+            loaded = self.discover_and_load()
+        except Exception as exc:  # noqa: BLE001 - reported, and rolled back below
+            self._plugin_profile = previous_profile
+            self._plugin_config = previous_config
+            restored = False
+            try:
+                for name in list(self._installs):
+                    if not self._is_host_plugin(name):
+                        self.unload_plugin(name)
+                mounter()
+                self.flush_pending()
+                self.verify_replacements()
+                self.discover_and_load()
+                restored = True
+            except Exception as restore_exc:  # noqa: BLE001 - the report carries it
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "restored": False,
+                    "restore_error": str(restore_exc),
+                    "composition": composition,
+                }
+            return {
+                "ok": False,
+                "error": str(exc),
+                "restored": restored,
+                "composition": composition,
+            }
+        return {
+            "ok": True,
+            "composition": composition,
+            "host": host,
+            "core": list(self._mounted_core),
+            "loaded": list(loaded),
+        }
+
+    def refresh_composition(self, *, apply: bool = True) -> dict:
         """Re-read the plugin config, re-resolve the profile, and say what changed.
 
         Two kinds of change, with two different answers, because they cost different
@@ -2012,6 +2147,11 @@ class PluginCatalog:
         answer; an unknown profile name is reported here rather than raised, because
         the construction path already fails loudly for it and a live gateway must not
         go down for a typo in a file it just re-read.
+
+        ``apply=False`` answers "what would change" and leaves this catalog running the
+        composition it has.  That is what a config save needs: it must be able to say
+        "saved, but a turn is running" *without* leaving the catalog claiming a profile
+        whose plugins it has not mounted -- a claim no later reload could untangle.
         """
         before_profile = self._plugin_profile
         before_core = self._core_names_for(before_profile)
@@ -2044,7 +2184,13 @@ class PluginCatalog:
                 "restart_required": [],
             }
 
-        self._plugin_profile = profile
+        if apply:
+            self._plugin_profile = profile
+        else:
+            # Preview: the running profile stays, so a caller that cannot apply the
+            # change yet does not leave the catalog describing a composition it is not
+            # running.
+            self._plugin_config = before_config
         after_core = self._core_names_for(profile)
 
         restart: list[str] = []
@@ -2068,6 +2214,7 @@ class PluginCatalog:
 
         return {
             "ok": True,
+            "applied": bool(apply),
             "profile": profile.key,
             "previous_profile": before_profile.key,
             "core": list(after_core),

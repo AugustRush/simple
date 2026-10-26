@@ -1736,6 +1736,24 @@ def test_channel_runner_fires_session_end_per_chat_session():
 
     class _PluginCatalog:
 
+        def set_composition_mounter(self, mounter=None):
+            # Part of the catalog's constructor-time API, like `set_config_loader` above: the
+            # composition hands over the act of mounting itself so a recomposition can repeat
+            # it.  This stand-in never recomposes, so it only has to accept it.
+            self.composition_mounter = mounter
+
+        def is_mounted(self, name=""):
+            # Asked by the mounter before it mounts: a recomposition keeps the host plugins
+            # mounted, so the second mount must skip them instead of colliding.
+            return False
+
+        def verify_replacements(self):
+            return None
+
+        def composition_preview(self):
+            return {"ok": True, "restart_required": []}
+
+
         def set_config_loader(self, loader=None):
             # Part of the catalog's constructor-time API: the composition hands the catalog
             # the reader a reload uses to re-read the `plugins` section.  A stand-in that

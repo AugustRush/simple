@@ -80,39 +80,56 @@ def test_the_declaration_is_a_mapping_of_service_to_plugin() -> None:
     }
 
 
-def test_the_composition_root_checks_the_replacement_rather_than_trusting_it() -> None:
-    """Deciding what not to mount does not tell you whether the replacement arrived.
-
-    Without the check the failure is a `KeyError` three layers away naming neither the profile
-    nor the replacement -- so the composition root asks who actually provided each declared
-    service and refuses to come up if the answer is not the declared plugin.
-    """
+def _calls_in(source: str, function: str, *, asynchronous: bool = False) -> set[str]:
+    """Attribute names called inside *function*'s body."""
     import ast
-    import pathlib
 
-    source = (
-        pathlib.Path(__file__).resolve().parents[1] / "agent/bootstrap.py"
-    ).read_text(encoding="utf-8")
     tree = ast.parse(source)
+    wanted = ast.AsyncFunctionDef if asynchronous else ast.FunctionDef
     fn = next(
         node
-        for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_build_components_async"
+        for node in ast.walk(tree)
+        if isinstance(node, wanted) and node.name == function
     )
-
-    calls = [
+    return {
         node.func.attr
         for node in ast.walk(fn)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    ]
-    assert "who_provides" in calls, "the composition must ask who provided it"
-    assert "service_replacements" in calls, "and must have read the declaration"
+    }
+
+
+def test_the_composition_checks_the_replacement_rather_than_trusting_it() -> None:
+    """Deciding what not to mount does not tell you whether the replacement arrived.
+
+    Without the check the failure is a `KeyError` three layers away naming neither the profile
+    nor the replacement -- so the composition asks who actually provided each declared service
+    and refuses to come up if the answer is not the declared plugin.
+
+    The check lives on the *catalog* rather than inline in the composition root, because a
+    recomposition has to run the same one after it rebuilds (``PluginCatalog.recompose``);
+    two copies of a check is one copy that drifts.  What this asserts is the chain: the root
+    calls it, and it asks the questions that make it a check.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "agent"
+    bootstrap = (root / "bootstrap.py").read_text(encoding="utf-8")
+    catalog_source = (root / "plugins/catalog.py").read_text(encoding="utf-8")
+
+    assert "verify_replacements" in _calls_in(
+        bootstrap, "_build_components_async", asynchronous=True
+    ), "the composition root must run the check"
+
+    calls = _calls_in(catalog_source, "verify_replacements")
+    assert "who_provides" in calls, "the check must ask who provided it"
+    assert "service_replacements" in calls, "and must read the declaration"
 
 
 def test_a_failed_replacement_says_which_plugin_was_expected() -> None:
     """The error is the feature: 'declared X, but it is Y' is actionable; a KeyError is not."""
     source = (
-        __import__("pathlib").Path(__file__).resolve().parents[1] / "agent/bootstrap.py"
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "agent/plugins/catalog.py"
     ).read_text(encoding="utf-8")
 
     assert "declares" in source and "not provided at all" in source

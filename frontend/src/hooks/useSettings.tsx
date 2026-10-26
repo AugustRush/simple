@@ -361,12 +361,23 @@ export function useSettings(deps: Deps) {
       const values = await form.validateFields()
       const cfg = mergeSettingsForm(JSON.parse(configText || '{}'), values)
 
-      await api('/api/config', {
+      const resp = await api('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ config: cfg }),
       })
-      messageApi.success('设置已保存')
+      // A composition change (a different memory backend, a different profile) cannot
+      // be applied while a turn is running: the services it replaces are still in use.
+      // Saying "已保存" alone would leave the file and the process disagreeing, which
+      // is exactly the state that used to need a restart to discover.
+      const saved = await resp.json().catch(() => ({}))
+      if (saved?.applied === false) {
+        messageApi.warning(
+          '设置已保存；有对话正在进行，组合变更会在空闲后再应用（无需重启）',
+        )
+      } else {
+        messageApi.success('设置已保存')
+      }
       setSettingsDirty(false)
       loadSettings()
     } catch (error) {

@@ -514,10 +514,53 @@ class WebChannel(Channel):
             save_config(new_cfg)
         except Exception as exc:
             return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
-        # Existing turns continue with their captured components; the next
-        # turn will rebuild each session runtime against the new global config.
+        # Existing turns continue with their captured components; the next turn will
+        # rebuild each session runtime against the new global config.  That covers a
+        # provider edit, a prompt edit, a shell posture -- everything sessions re-read.
+        #
+        # A change to the *composition* is not that kind of change: no session rebuild
+        # mounts a different memory backend.  So this asks what the save would change,
+        # and applies it here when it can -- which is what makes "save the profile, no
+        # restart" true from the page.  When a turn is running it says so instead, and
+        # the change stays on disk for a later recomposition; the catalog is left
+        # running the composition it actually has.
+        catalog = resolve(self._components, "plugin_catalog")
+        preview = (
+            catalog.composition_preview()
+            if callable(getattr(catalog, "composition_preview", None))
+            else {"restart_required": []}
+        )
+        owed = list(preview.get("restart_required") or ())
+        if owed:
+            busy = self._busy_sessions()
+            if busy:
+                self._bump_config_revision()
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "saved": True,
+                        "applied": False,
+                        "busy_sessions": busy,
+                        "restart_required": owed,
+                        "retryable": True,
+                    }
+                )
+            result = await self._recompose_now()
+            if not result.get("ok"):
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "saved": True,
+                        "applied": False,
+                        "restart_required": owed,
+                        "composition": result,
+                    }
+                )
+            return JSONResponse(
+                {"ok": True, "saved": True, "applied": True, "composition": result}
+            )
         self._bump_config_revision()
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, "saved": True, "applied": True})
 
     async def _plugins(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -1634,6 +1677,93 @@ class WebChannel(Channel):
             }
         )
 
+    def _busy_sessions(self) -> list[str]:
+        """Sessions with a turn in flight, by id.
+
+        The channel's own answer to "may I do something that rearranges the world", and
+        the one thing a recomposition cannot do without: between unmounting a service and
+        mounting its replacement there is a window in which the service does not exist.
+        A turn landing in that window fails as though data had been lost, which is a much
+        worse outcome than "try again in a moment".
+        """
+        return sorted(
+            str(session_id)
+            for session_id, state in (self._sessions or {}).items()
+            if str(getattr(state, "operation_state", "idle") or "idle") != "idle"
+        )
+
+    async def _composition_reload(self, request: Any) -> Any:
+        """Rebuild the composition in place: a profile change without a restart.
+
+        The operation the roadmap called "the last restart wall", and the reason it is a
+        route rather than a tool: it is allowed only when **nothing is running**.  Three
+        steps, in this order, and each one is load-bearing:
+
+        1. **Quiesce.**  Every session must be idle.  A recomposition unmounts services
+           before it remounts them, so a turn in flight would see one disappear; that
+           failure looks like data loss, and no amount of rollback fixes it after the
+           fact.  A busy process is told to try again (409, not 500).
+        2. **Drop the session runtimes.**  Each one holds a fork of the registry and
+           references to the services about to be replaced; the recomposition is below
+           them, so they cannot survive it.
+        3. **Rebind this channel.**  ``bind_runtime`` resolved ``ltm_store`` into a
+           ``SessionService`` at startup.  After a memory-backend swap that object holds
+           the *old* store -- the new one would be open, healthy, and unused.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        catalog = resolve(self._components, "plugin_catalog")
+        recompose = getattr(catalog, "recompose", None)
+        if not callable(recompose):
+            return JSONResponse(
+                {"error": "this composition cannot rebuild itself"},
+                status_code=500,
+            )
+        busy = self._busy_sessions()
+        if busy:
+            return JSONResponse(
+                {
+                    "error": (
+                        "a turn is running, and a recomposition replaces the services "
+                        "underneath it"
+                    ),
+                    "busy_sessions": busy,
+                    "retryable": True,
+                },
+                status_code=409,
+            )
+
+        result = await self._recompose_now()
+        if not result.get("ok"):
+            return JSONResponse(result, status_code=500)
+        return JSONResponse(result)
+
+    async def _recompose_now(self) -> dict:
+        """The recomposition itself, with the caller having established that it may run.
+
+        Split out because there are two entry points -- the explicit route and the
+        config save that made the change -- and the steps between them are the ones that
+        must not diverge: drop the session runtimes, rebuild, rebind this channel, bump
+        the revision.
+        """
+        catalog = resolve(self._components, "plugin_catalog")
+        cleanup = self._components.get("session_runtime_cleanup")
+        for session_id in list(self._sessions or {}):
+            if callable(cleanup):
+                await cleanup(session_id)
+
+        result = await catalog.recompose()
+        if not result.get("ok"):
+            return result
+
+        # Re-resolve what this channel captured, then tell open pages to reload: the
+        # session runtimes are gone, so the next message builds against the new tree.
+        self.bind_runtime(self._sessions or {}, self._components)
+        self._bump_config_revision()
+        return result
+
     async def _delete_session(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2728,6 +2858,14 @@ class WebChannel(Channel):
             Route(
                 "/api/plugins/{plugin_name}/toggle",
                 self._toggle_plugin,
+                methods=["POST"],
+            ),
+            # Only when idle; a busy process is told to retry.  Not a tool: it is an
+            # operation on the *process*, and the model has no way to know whether a
+            # turn is in flight in another tab.
+            Route(
+                "/api/composition/reload",
+                self._composition_reload,
                 methods=["POST"],
             ),
             Route("/api/plugins/{plugin_name}", self._delete_plugin, methods=["DELETE"]),

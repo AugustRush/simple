@@ -3655,3 +3655,209 @@ def test_a_created_tool_reaches_a_session_that_was_already_open(home):
         assert after > before, "the channel was told to rebuild before the next message"
     finally:
         provider.close()
+
+
+# ── recomposition: the last restart wall ─────────────────────────────────────
+
+
+async def _post_json(
+    port: int, path: str, payload: "dict | None" = None
+) -> tuple[int, dict]:
+    """POST from a worker thread: the server lives on this loop, so blocking it deadlocks."""
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(payload if payload is not None else {}).encode("utf-8")
+
+    def _do() -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}",
+            method="POST",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    import asyncio
+
+    return await asyncio.to_thread(_do)
+
+
+def test_a_profile_change_is_applied_to_a_running_gateway(home):
+    """The last restart wall, end to end: swap the memory backend in a live process.
+
+    Everything else about this operation is testable in pieces -- the catalog's
+    ``recompose``, the busy check, the rebind.  This is the one that matters: a gateway
+    that is already serving, a config rewritten on disk, one POST, and *the same
+    process* answers a turn against the new store.  Before this, the only honest answer
+    to "apply that profile" was "restart", and the reload silently did nothing.
+
+    The whole sequence is here on purpose: rewrite the config, quiesce, drop the session
+    runtimes, recompose, rebind the channel, and then talk to it again.  Any one of
+    those skipped leaves a process that looks fine and serves the old composition.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    # Two turns: one before the swap, one after.  The second is the evidence.
+    provider = scripted({"text": "before the swap"}, {"text": "recomposed and still here"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> tuple[str, str, dict, str]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                store_before = type(components["ltm_store"]).__name__
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/recompose/stream"
+                ) as socket:
+                    await _ask(socket, "before", "m1")
+
+                    # The operator saves a different profile.  `sqlite-fts-memory` replaces
+                    # the whole store; nothing about it can be applied by a plugin reload.
+                    write_config(
+                        home,
+                        provider,
+                        channels=WEB_CHANNELS,
+                        plugins={"_profile": "sqlite-fts-memory"},
+                    )
+                    status, body = await _post_json(port, "/api/composition/reload")
+                    assert status == 200, body
+                    assert body.get("ok") is True, body
+                    assert body["composition"]["profile"] == "sqlite-fts-memory", body
+                    store_after = type(components["ltm_store"]).__name__
+
+                    after = await _ask(socket, "after", "m2")
+                    return store_before, store_after, body, _answer(after)
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        store_before, store_after, body, answer = asyncio.run(run())
+
+        assert store_before == "LTMStore", store_before
+        assert store_after == "SqliteFtsStore", (
+            f"the profile was reported applied but the store is still {store_after}"
+        )
+        assert body.get("restored") is None, body
+        # ...and the process is still serving, against the new tree.
+        assert "recomposed and still here" in answer, answer
+    finally:
+        provider.close()
+
+
+def test_a_recomposition_is_refused_while_a_turn_is_running(home):
+    """Between unmounting a service and mounting its replacement, it does not exist.
+
+    A turn landing in that window fails as though data had been lost, which no rollback
+    repairs after the fact.  So the channel checks every session's ``operation_state``
+    first and answers 409 -- a retryable answer, not an error that suggests breakage.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "slow answer", "delay": 1.5})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> dict:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/busy/stream"
+                ) as socket:
+                    await socket.send(
+                        json.dumps(
+                            {"type": "message", "text": "hi", "message_id": "m1"}
+                        )
+                    )
+                    # The turn is in flight for 1.5s; ask for the recomposition now.
+                    await asyncio.sleep(0.4)
+                    status, body = await _post_json(port, "/api/composition/reload")
+                    assert status == 409, body
+                    assert body["retryable"] is True, body
+                    assert "turn is running" in body.get("error", ""), body
+                    assert body["busy_sessions"] == ["busy"], body
+                    # Let the turn finish so the loop can shut down cleanly.
+                    while True:
+                        event = json.loads(await asyncio.wait_for(socket.recv(), 30))
+                        if event.get("type") == "turn_complete":
+                            break
+                    return body
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        body = asyncio.run(run())
+        assert body.get("busy_sessions"), body
+    finally:
+        provider.close()
+
+def test_saving_a_config_with_a_new_profile_applies_it_without_restarting(home):
+    """The path a person actually takes: change the config, save, nothing restarts.
+
+    The explicit recomposition route is the mechanism; this is the *interface*.  Saving
+    the config and being told "saved" while the running process kept the old memory
+    backend is the failure this closes -- the file and the process disagree, and nothing
+    says so until the next restart, which is the only thing that ever reads the change.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted({"text": "before"}, {"text": "saved and applied"})
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> tuple[str, str, dict, str]:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                store_before = type(components["ltm_store"]).__name__
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/saved/stream"
+                ) as socket:
+                    await _ask(socket, "before", "m1")
+
+                    saved = dict(cfg)
+                    saved["plugins"] = {"_profile": "sqlite-fts-memory"}
+                    status, body = await _post_json(
+                        port, "/api/config", {"config": saved}
+                    )
+                    assert status == 200, body
+                    assert body.get("applied") is True, body
+                    store_after = type(components["ltm_store"]).__name__
+
+                    after = await _ask(socket, "after", "m2")
+                    return store_before, store_after, body, _answer(after)
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        store_before, store_after, body, answer = asyncio.run(run())
+
+        assert store_before == "LTMStore", store_before
+        assert store_after == "SqliteFtsStore", (
+            f"the save was reported ok but the process kept {store_after}"
+        )
+        assert body["composition"]["composition"]["profile"] == "sqlite-fts-memory"
+        assert "saved and applied" in answer, answer
+    finally:
+        provider.close()

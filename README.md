@@ -631,15 +631,27 @@ the page's on/off switch had to assign `catalog._plugin_config` by hand to make 
 save take effect; that private poke is gone, because the reload reads the file it was
 asked to honour.
 
-**What a reload still cannot do, it says.** The profile's `core` selection and its
-`service_replacements` decide which core plugins are *mounted*, and mounting happens once,
-before anything else exists: what it produced -- the agent, the tool registry, the memory
-store -- is what every long-lived holder captured. Re-mounting that under a serving
-gateway would rebuild the process's spine while turns are in flight, so a reload reports
-`restart_required` (in the API response, in the tool result, and as a warning on the page)
-instead of claiming it applied. Removing that last wall is a supervisor-level design -- the
-host has to outlive the composition and quiesce its turns -- not a patch to
-`ReloadTransaction`.
+**A composition change is applied, not just saved.** The profile's `core` selection and
+its `service_replacements` decide which core plugins are *mounted* -- a different memory
+backend, a different session service. A plugin reload cannot do that, so it reports
+`restart_required` instead of claiming it applied. Two interfaces can:
+
+- **Saving the config** (`POST /api/config`) detects a composition change and rebuilds the
+  process in place: it drops the session runtimes, unmounts the parts, re-reads the config,
+  remounts, rebinds the channel, and bumps the revision -- so the very next turn runs
+  against the new tree. This is the one a person uses, from the settings page.
+- **`POST /api/composition/reload`** does the same on demand.
+
+Both refuse while a turn is running (`409`, with the busy session ids): between unmounting
+a service and mounting its replacement there is a window where it does not exist, and a
+turn landing in that window fails as though data had been lost. The host plugins -- the
+channel registry and the channels themselves -- stay mounted across a rebuild, because
+they own the sockets the process is serving on: "recompose" must not mean "disconnect
+everyone". A failed rebuild puts the previous profile back and reports whether that
+worked (`restored`), rather than leaving a half-mounted tree that merely looks fine.
+
+What is *not* dynamic: the process's own identity (its home, its `--name`, its event
+buses). Those are what a restart is for.
 
 ### Browser-level tests (optional)
 
