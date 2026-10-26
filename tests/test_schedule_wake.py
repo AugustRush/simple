@@ -564,3 +564,52 @@ def test_a_composition_without_a_registry_publishes_nothing_and_does_not_fail(
 
 async def _unreachable_executor(*args, **kwargs):
     raise AssertionError("no run should reach an executor here")
+
+
+# ── creation says which clock will serve the task ────────────────────────────
+
+
+def test_creating_a_task_where_nothing_schedules_says_so(tmp_path):
+    """The cheapest moment to say "this will not run here" is while the asker is here.
+
+    A task created in a single-turn CLI is stored correctly and will never start
+    until some other process serves it.  "Created" reads as "will run", so the reply
+    carries the same signal `schedule_run` uses: a live scheduler publishes itself
+    into the registry context, and absence means "no clock in this process" rather
+    than a missing writer.
+    """
+    tools, registry, _ = make_tools(tmp_path)
+
+    created = asyncio.run(_call(registry, "schedule_create", {
+        "name": "nightly",
+        "action_type": "agent_task",
+        "prompt": "写一份日报",
+        "trigger_type": "once",
+        "at": _soon(),
+        "timezone_name": "Asia/Shanghai",
+        "intent": "用户要每天一份日报",
+    }))
+
+    assert created["ok"] is True, created
+    assert created["task"]["runner"] == "external"
+    assert "gateway" in created["summary_text"], created["summary_text"]
+    assert "agent scheduler" in created["summary_text"], created["summary_text"]
+
+
+def test_creating_a_task_under_a_live_scheduler_does_not_hedge(tmp_path):
+    """Control: saying "someone else will run it" when we are the someone is noise."""
+    tools, registry, _ = make_tools(tmp_path)
+    registry.set_context("scheduler_wake", lambda *a, **k: None)
+
+    created = asyncio.run(_call(registry, "schedule_create", {
+        "name": "nightly",
+        "action_type": "agent_task",
+        "prompt": "写一份日报",
+        "trigger_type": "once",
+        "at": _soon(),
+        "timezone_name": "Asia/Shanghai",
+        "intent": "用户要每天一份日报",
+    }))
+
+    assert created["task"]["runner"] == "this-process"
+    assert "gateway" not in created["summary_text"], created["summary_text"]

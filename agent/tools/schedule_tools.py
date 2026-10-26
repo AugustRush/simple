@@ -424,12 +424,32 @@ class ScheduleTools:
         existing = task is not None
         if task is None:
             task = store.create_task(new_task)
+        # Where the clock lives decides whether this task ever rings, and "created"
+        # reads as "will run".  The signal is the same one `schedule_run` uses: a
+        # scheduler serving this process publishes itself into the registry context,
+        # and its absence is not a misconfiguration -- it is a process that does not
+        # serve schedules (a single-turn CLI, a sub-agent's own runtime).  Saying so
+        # at creation is the cheapest moment to say it: the asker is still here.
+        runner = (
+            "this-process"
+            if callable(self.registry.get_context("scheduler_wake"))
+            else "external"
+        )
+        external_note = (
+            ""
+            if runner == "this-process"
+            else "\n调度器不在这个进程里：任务已经存好，要由 gateway 或 "
+            "`agent scheduler` 接手后才会跑。"
+        )
         return self._ok(
             task={
                 "id": task.id,
                 "name": task.name,
                 "kind": task.kind,
                 "delivery_mode": task.delivery_mode,
+                # Which clock will serve it, so the caller does not have to infer
+                # "it will run" from "it was created".
+                "runner": runner,
                 "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
                 # Echoed back so the caller can confirm the envelope that was
                 # actually stored instead of assuming the defaults held.
@@ -448,6 +468,7 @@ class ScheduleTools:
                 f"{summary_text}\n运行权限：{profile.label}；项目文件夹：{task_workspace}"
                 f"{self.describe_products(task.produces)}"
                 f"{self.describe_acceptance(task.acceptance)}"
+                f"{external_note}"
             ),
         )
 
