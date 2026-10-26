@@ -376,6 +376,16 @@ SERVICES: tuple[ServiceDeclaration, ...] = (
         summary="What the MCP client reports about the servers it was asked to connect.",
     ),
     ServiceDeclaration(
+        name="connectors",
+        plugin_visible=True,
+        summary=(
+            "The read-only connectors this deployment knows about, configured or not: "
+            "each answers a status with a reason.  Present even when nothing is "
+            "configured, so \"why can't it read my mail\" has an answer.  Tools are "
+            "registered only for the connectors that are usable."
+        ),
+    ),
+    ServiceDeclaration(
         name="plugin.meta",
         plugin_visible=True,
         summary="The manifest of the plugin being set up, while its ``setup`` runs.",

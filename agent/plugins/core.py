@@ -138,6 +138,12 @@ def _mcp(_: CoreContext) -> Any:
     return MCPPlugin()
 
 
+def _connectors(_: CoreContext) -> Any:
+    from agent.connectors.plugin import ConnectorPlugin
+
+    return ConnectorPlugin()
+
+
 def _record_only_context(_: CoreContext) -> Any:
     from agent.memory.backends.record_only import RecordOnlyContextPlugin
 
@@ -256,6 +262,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         ),
         factory=_mcp,
         provides=("mcp_client", "mcp_server_configs", "mcp_status"),
+    ),
+    CorePlugin(
+        name="connectors",
+        summary=(
+            "read-only connectors to the owner's own services (a mailbox today); "
+            "provides `connectors`, and registers no tools until one is configured"
+        ),
+        factory=_connectors,
+        provides=("connectors",),
     ),
     CorePlugin(
         name="record-only-context",

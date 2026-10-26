@@ -111,6 +111,21 @@ DEFAULT_CONFIG: dict = {
     "notifications": {
         "desktop": True,
     },
+    # ── Connectors ────────────────────────────────────────────────────────
+    # Read-only connections to the owner's own services.  Empty by default:
+    # an unconfigured connector registers no tools, so this section being
+    # present and blank is the *normal* state rather than a misconfiguration.
+    # The password is read from the environment variable named here.
+    "connectors": {
+        "email": {
+            "host": "",
+            "port": 993,
+            "user": "",
+            "password_env": "EMAIL_PASSWORD",
+            "mailbox": "INBOX",
+            "search_window": 60,
+        },
+    },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
     # How long a *one-shot* command (``simple chat``) waits for the MCP servers to
@@ -502,6 +517,7 @@ _KNOWN_SECTIONS = frozenset({
     "max_truncation_continuations", "file_access",
     "budget",
     "notifications",
+    "connectors",
     "web_proxy",
 })
 

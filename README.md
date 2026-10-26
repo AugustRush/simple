@@ -61,6 +61,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Memory you can see and correct** | The `#/memory` page lists what it remembers with provenance, and lets you edit, pin or delete an entry — and reject a belief |
 | **Spend guard** | `budget.max_session_tokens` stops the loop before the next model call when a session is out of budget, and the page shows the same number beside the composer |
 | **It can reach you** | A scheduled run that needs a person posts a macOS notification — the same runs the red badge counts, so the two cannot disagree |
+| **Read-only connectors** | `connectors.email` gives the agent search and read over your own mailbox — no send, no move, no marking read, and no tools at all until you configure it |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
 ### Measuring retrieval quality
@@ -873,6 +874,54 @@ The runtime decides *when* a run wants a person (the injected `notifier` call in
 `SchedulerService`); the composition decides *how* it reaches them. That split is
 the same one `delivery` has, and it is what lets a test assert the wiring without
 posting a banner.
+
+#### Connectors: read-only, and absent until configured
+
+MCP is the general answer for reaching a third-party service, and it is the right
+one for anything that ships a server. It is the wrong answer for the two things a
+*personal* agent needs most -- your mail and your calendar -- because neither has an
+official server, and the usual workaround is a shell command with a password pasted
+into it. A **connector** is that other shape: small, in-repo, and read-only.
+
+```json
+{
+  "connectors": {
+    "email": {
+      "host": "imap.example.com",
+      "user": "me@example.com",
+      "password_env": "EMAIL_PASSWORD",
+      "mailbox": "INBOX"
+    }
+  }
+}
+```
+
+- **Nothing is connected today, and nothing needs to be** for the capability to
+  exist: with no configuration, the connector registers **no tools at all**. A tool
+  the model can see but that can only answer "not configured" is worse than no tool
+  -- it invites the model to try, fail, and explain its own failure to you.
+- **Read-only three times over**, because "the agent promised" is not an enforcement
+  mechanism: the mailbox is selected with `readonly=True` (the server refuses
+  writes), bodies are fetched with `BODY.PEEK` (nothing is marked as read, which
+  would otherwise quietly change your mailbox), and there is no function in the
+  module that could emit `STORE`/`COPY`/`MOVE`/`EXPUNGE`/`APPEND`. There is no
+  send verb to add a permission to later.
+- **The password comes from the environment.** A literal `password` in the config is
+  detected and **refused** in the status line, not honoured -- the config file is
+  what people paste into issues and commit to dotfiles repos.
+- **Search is matched here, not by IMAP `SEARCH`.** IMAP's own search needs a
+  per-server charset story for non-ASCII and is a Chinese query's worst case; instead
+  one batched `FETCH` of the newest window of headers comes back in one round trip
+  and the substring match runs locally, where "contains" means the same thing on
+  every provider.
+- **The surface exists even when unusable.** `connectors` is a provided service
+  holding every connector with a status and a reason, so "why can't it read my mail"
+  has a sentence for an answer rather than a traceback.
+
+The plugin is `agent/connectors/plugin.py`; it declares `cfg` and `registry`, so
+"What it contributes depends on configuration" is expressed by the only mechanism
+that can express it. Tools are registered with `capabilities=("read",)` and nothing
+else, which is what a read-only permission profile filters on.
 
 ### Multi-agent orchestration
 

@@ -47,6 +47,7 @@ def test_a_default_composition_is_unchanged() -> None:
         "memory",
         "mcp_servers",
         "mcp",
+        "connectors",
         "session",
         "agent",
         "tools",

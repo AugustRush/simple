@@ -103,6 +103,18 @@
     "_readme": "How the system reaches you when no page is open. Only scheduled runs that need a person are announced -- the same runs the red badge on the navigation entry counts (failed / interrupted / unverified, plus a run that reports earlier occurrences were skipped while nothing was running). A banner per successful run would be noise, and noise is how the one that mattered gets dismissed unread. desktop=false silences it; on a machine with no notification centre (a headless Linux gateway) the channel is a silent no-op rather than an error.",
     "desktop": true
   },
+  "connectors": {
+    "_readme": "Read-only connections to your own services. Nothing is connected until you fill one in, and an unconfigured connector registers no tools at all (so the model never sees a tool that can only answer 'not configured'). The password is read from an environment variable named by password_env -- a literal password in this file is refused, not honoured, because this file is what people paste into issues. Today: connectors.email (IMAP, read-only: search and read, no send/move/delete/mark).",
+    "email": {
+      "_readme": "host/user/password_env/mailbox. Port 993 and TLS. search_window is how many of the newest messages one search looks through (one batched fetch); results are capped at 20.",
+      "host": "",
+      "port": 993,
+      "user": "",
+      "password_env": "EMAIL_PASSWORD",
+      "mailbox": "INBOX",
+      "search_window": 60
+    }
+  },
   "_output_reserve_readme": "How much of the context window a request holds back for the answer, in tokens. This is NOT max_tokens: max_tokens is a ceiling on one response, while output_reserve is the room the conversation must leave free. Keeping them separate is what lets a provider be configured for long answers without shrinking its usable context -- deriving the input budget from max_tokens meant a 64000-token cap against a 128000 window left roughly 57k for the entire conversation. Set it per provider under providers.<name>.output_reserve, or here for all of them. The cap actually sent is derived per request as min(max_tokens, window - request - margin), so a request that nearly fills the window gets a smaller cap while a short one still gets the full max_tokens.",
   "memory": {
     "_readme": "tidy_interval_seconds: how often (in seconds) the agent auto-reorganises memory. tidy_file_threshold: minimum number of new memory files before a tidy is triggered.",
