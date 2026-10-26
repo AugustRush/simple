@@ -1,0 +1,73 @@
+name: check
+
+# Four thousand tests that only run when somebody remembers to run them are four thousand
+# tests that run when somebody suspects something.  This is the remembering.
+#
+# The suite step is `scripts/check.sh`, the same script a person runs locally, so
+# "green here" and "green on the runner" are one claim rather than two.
+#
+# What it does **not** cover, deliberately:
+#   - the browser tests (`tests/test_web_ui_e2e.py`): they need the optional [e2e] extra
+#     (playwright + ~100MB chromium).  They skip, visibly, rather than silently passing.
+#   - anything that needs a real MCP server, a real Feishu tenant or the macOS seatbelt
+#     sandbox: those skip on the hosts that cannot provide them, by design.
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: pytest (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor the package advertises, and the newest interpreter it is developed
+        # on.  The middle is not interesting: nothing here is version-specific.
+        python: ["3.11", "3.13"]
+    env:
+      # A runner has no terminal.  `rich` reads an empty TERM as "dumb" and then reports
+      # 80x25 regardless of the width it was given, which is exactly the ambient-state
+      # leak the three console-width tests used to fail on.
+      TERM: xterm-256color
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --group dev --extra web
+
+      - name: Check
+        run: bash scripts/check.sh
+
+  frontend:
+    name: frontend typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: frontend
+
+      # Type-checking, not building: the committed bundle is compared against the
+      # sources by `tests/test_web_bundle_freshness.py`, and a rebuild here would
+      # produce different hashed filenames on a different vite version -- a diff that
+      # means nothing.  A TS error is what this job is for.
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: frontend

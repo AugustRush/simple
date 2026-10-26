@@ -2100,6 +2100,27 @@ def test_scroll_accounting_tolerates_a_failing_renderer():
 # ── Terminal resize follow-through ──────────────────────────────────────────
 
 
+@pytest.fixture()
+def terminal(monkeypatch):
+    """Make the console a **real** terminal for rich, wherever this runs.
+
+    Rich returns a hardcoded 80x25 and *ignores an explicit width* whenever ``TERM`` is
+    empty or ``dumb`` -- it reads that as a dumb terminal (``Console.size`` branches on
+    ``is_dumb_terminal`` before it looks at ``_width``).  So the three width tests below
+    were asserting rich-against-a-terminal behaviour while relying on the ambient
+    environment to supply a terminal: they passed in the author's shell and failed
+    everywhere else (a CI runner, a sandbox, a cron job) with "assert 80 == 100".
+
+    The environment a test measures is part of what it has to control.  Pinning it here
+    is the whole fix -- the product code was never wrong.
+    """
+    monkeypatch.setenv("TERM", "xterm-256color")
+    # ...and rich prefers these over the size it was given, so a shell that happens to
+    # export them would leak into the measurement the same way.
+    monkeypatch.delenv("COLUMNS", raising=False)
+    monkeypatch.delenv("LINES", raising=False)
+
+
 def _tui(tmp_path, **kwargs):
     from agent.tui import TuiSession
 
@@ -2111,7 +2132,7 @@ def _tui(tmp_path, **kwargs):
     )
 
 
-def test_console_width_follows_terminal_resize(tmp_path, monkeypatch):
+def test_console_width_follows_terminal_resize(terminal, tmp_path, monkeypatch):
     """Rich wraps at print time, so a stale width mis-wraps every later line."""
     import os
     import agent.tui as tui_module
@@ -2134,7 +2155,7 @@ def test_console_width_follows_terminal_resize(tmp_path, monkeypatch):
     assert tui.console.width == 140
 
 
-def test_console_width_check_is_throttled(tmp_path, monkeypatch):
+def test_console_width_check_is_throttled(terminal, tmp_path, monkeypatch):
     import os
     import agent.tui as tui_module
 
@@ -2148,7 +2169,7 @@ def test_console_width_check_is_throttled(tmp_path, monkeypatch):
     assert tui.console.width == 100, "width was re-polled on every render"
 
 
-def test_explicit_console_width_is_pinned(tmp_path, monkeypatch):
+def test_explicit_console_width_is_pinned(terminal, tmp_path, monkeypatch):
     import os
     import agent.tui as tui_module
 
@@ -2162,7 +2183,7 @@ def test_explicit_console_width_is_pinned(tmp_path, monkeypatch):
     assert tui.console.width == 80
 
 
-def test_console_width_survives_a_failing_terminal_probe(tmp_path, monkeypatch):
+def test_console_width_survives_a_failing_terminal_probe(terminal, tmp_path, monkeypatch):
     import agent.tui as tui_module
 
     def _boom(*args):

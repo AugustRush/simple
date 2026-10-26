@@ -2208,18 +2208,32 @@ macOS detection ever breaks, those tests fail instead of quietly skipping while
 nothing is enforced. `tests/test_filesystem_sandbox.py` keeps what is genuinely
 seatbelt-specific: the generated `.sb` text and its cache key.
 
-Latest verification: `uv run pytest -q` → **3728 passed**, 3 failed, 1 skipped
-(`tests/test_functional_turns.py` on its own: 43 passed).
+Latest verification: `bash scripts/check.sh` → **4362 passed, 0 failed, 2 skipped**
+(the browser layer needs the `[e2e]` extra; without it those four skip).
 
-The 3 are the pinned baseline, and all of them are the same thing:
+**The suite is green here: 0 failed.** It used to carry a pinned baseline of three
+failures, all of them the same one —
 `tests/test_cli_ui.py::test_console_width_check_is_throttled`,
 `::test_console_width_follows_terminal_resize` and
-`::test_console_width_survives_a_failing_terminal_probe` — console-width
-behaviour under captured, non-terminal stdout. They fail on every run here, they
-are about the test's terminal rather than about the code, and none of them is
-about the change under test: **diff the `FAILED` set against the baseline rather
-than reading the pass count**, which is how every change described above was
-verified.
+`::test_console_width_survives_a_failing_terminal_probe` — and the honest description
+then was "they are about the test's terminal rather than about the code". That was
+true, and it was also the whole bug: `rich` treats an empty `TERM` as a **dumb
+terminal** and returns a hardcoded 80x25 *before* it looks at the width it was given,
+so the tests only ever passed in a shell that set `TERM`. Pinning the environment the
+test measures (a `terminal` fixture: `TERM=xterm-256color`, no `COLUMNS`/`LINES`)
+makes them deterministic everywhere, and the baseline is now empty.
+
+That baseline was not free: a permanently red set teaches everyone to read the pass
+count instead of the failures, which is precisely the reflex a CI run relies on. Which
+is why there is now one:
+
+```bash
+bash scripts/check.sh          # uv lock --check + the whole suite
+bash scripts/check.sh tests/   # ...or a slice, same gate
+```
+
+`.github/workflows/check.yml` calls that script (Python 3.11 and 3.13, plus a frontend
+typecheck), so "green locally" and "green on the runner" are one claim rather than two.
 
 A host that forbids nesting `sandbox-exec` adds failures of one shape — tests
 that ask the OS to spawn a nested sandbox, or to read the agent home from inside

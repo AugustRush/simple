@@ -7,7 +7,7 @@
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",
-    "build:release": "npm run typecheck && vite build --outDir ../agent/_builtin/web/dist --emptyOutDir",
+    "build:release": "npm run typecheck && vite build --outDir ../agent/_builtin/web/dist --emptyOutDir && python3 ../scripts/stamp_web_bundle.py",
     "preview": "vite preview"
   },
   "dependencies": {
