@@ -33,6 +33,29 @@ def _is_skill_version(leaf_name: str) -> bool:
     )
 
 
+#: The one frontmatter field that records *who authored* a bundle, and the value
+#: ``create_skill`` writes into it.  A SKILL.md is not just data: it is pasted into
+#: the system prompt, so rewriting one rewrites the agent's own instructions.  The
+#: boundary is therefore drawn on **ownership**, not on the verb: a bundle the agent
+#: made is its own to revise freely, while a bundle a person wrote (or installed)
+#: needs a stated reason before the agent may change it.
+#:
+#: This is in the frontmatter rather than a sidecar file because of how the loader
+#: reads a bundle: every file under the bundle directory other than SKILL.md is
+#: collected into ``supporting_files`` and advertised in the prompt as material to
+#: go and read.  A sidecar marker would either show up there as noise or need a
+#: loader special case, whereas frontmatter is already parsed, travels with the file
+#: when a bundle is copied or moved, and is visible in the same place a person would
+#: look to change it.
+#:
+#: Default-safe, and deliberately strict: only the exact value ``agent`` marks a
+#: bundle as the agent's.  Absent, misspelled, or any other value (``user``, a
+#: plugin's name) leaves the bundle protected -- an unrecognised marker can fail to
+#: unlock a bundle, but it can never be used to unlock one.
+_SKILL_ORIGIN_KEY = "created-by"
+_SKILL_ORIGIN_AGENT = "agent"
+
+
 def _resolve_within_bundle(bundle_root: Path, rel_path: Path) -> Optional[Path]:
     """Resolve *rel_path* only when it stays beneath the resolved bundle root.
 
@@ -67,6 +90,12 @@ class SkillBundle:
     versions: list[str] = field(default_factory=list)
     user_invocable: bool = True
     disable_model_invocation: bool = False
+    #: Whether the agent authored this bundle (see ``_SKILL_ORIGIN_KEY``).  Read from
+    #: the frontmatter when the bundle is loaded, never inferred from where it lives:
+    #: both agent-created and hand-written skills sit in the same user root, so a
+    #: path cannot tell them apart, and an inference is a rule that silently changes
+    #: answer when a directory is copied.
+    agent_authored: bool = False
 
 
 @dataclass
@@ -432,6 +461,8 @@ class SkillCatalog:
             disable_model_invocation=bool(
                 metadata.get("disable-model-invocation", False)
             ),
+            agent_authored=str(metadata.get(_SKILL_ORIGIN_KEY) or "").strip()
+            == _SKILL_ORIGIN_AGENT,
         )
 
     def _archive_skill_md(self, skill_file: Path) -> Optional[str]:
@@ -844,7 +875,17 @@ class SkillCatalog:
             instructions: str,
             user_invocable: bool = True,
             disable_model_invocation: bool = False,
+            created_by: str = "",
         ) -> str:
+            """Render a SKILL.md, carrying *created_by* through unchanged.
+
+            ``created_by`` is written verbatim and only when non-empty: updating a
+            bundle must not touch who authored it.  An agent-created bundle stays
+            the agent's after an edit, and -- the half that matters for the
+            boundary -- editing a hand-written bundle (which the gate only allows
+            with a stated intent) does not launder it into an agent-owned one that
+            could then be rewritten silently.
+            """
             lines = ["---"]
             lines.append(f"name: {name}")
             if description:
@@ -853,6 +894,8 @@ class SkillCatalog:
             lines.append(
                 f"disable-model-invocation: {'true' if disable_model_invocation else 'false'}"
             )
+            if created_by:
+                lines.append(f"{_SKILL_ORIGIN_KEY}: {created_by}")
             lines.append("---")
             lines.append("")
             lines.append(instructions)
@@ -884,6 +927,11 @@ class SkillCatalog:
                     instructions=instructions,
                     user_invocable=user_invocable,
                     disable_model_invocation=disable_model_invocation,
+                    # The persistent record of *why* this bundle may be rewritten
+                    # without asking.  It has to be written here, at creation, or
+                    # the next process would see an unmarked bundle in the user
+                    # root -- indistinguishable from one a person typed by hand.
+                    created_by=_SKILL_ORIGIN_AGENT,
                 )
                 # Create-only (guarded by the exists() check above), but use the
                 # durable primitive anyway so the rule needs no per-site reasoning.
@@ -913,7 +961,14 @@ class SkillCatalog:
             instructions: Optional[str] = None,
             user_invocable: Optional[bool] = None,
             disable_model_invocation: Optional[bool] = None,
+            intent: str = "",
         ) -> dict[str, Any]:
+            # ``intent`` is declared, not read: the gate that refuses an
+            # unwarranted rewrite runs as this tool's authorizer, before the
+            # handler is entered, and it is the only place that sees both the
+            # call and the bundle's ownership.  Accepting the parameter here is
+            # what stops a supplied intent from becoming a TypeError.
+            #
             # Management, not use: a skill switched off is still a skill
             # somebody may want to edit, rename, or throw away.  Only the
             # tools that *use* a bundle ask whether it is on.
@@ -957,6 +1012,9 @@ class SkillCatalog:
                     instructions=final_body,
                     user_invocable=final_user_inv,
                     disable_model_invocation=final_disable_model,
+                    # Carried through from the bundle being edited, not set to
+                    # "agent": an edit is not a claim of authorship.
+                    created_by=str(bundle.metadata.get(_SKILL_ORIGIN_KEY) or ""),
                 )
                 # Keep the version being replaced.  An edit is a hypothesis
                 # about what the skill should say, and a hypothesis needs a way
@@ -990,7 +1048,8 @@ class SkillCatalog:
             except Exception as e:
                 return {"ok": False, "error": f"Failed to update skill: {e}"}
 
-        def delete_skill(skill_id: str) -> dict[str, Any]:
+        def delete_skill(skill_id: str, intent: str = "") -> dict[str, Any]:
+            # ``intent``: declared, not read -- see ``update_skill``.
             bundle = self.find_any(skill_id)
             if bundle is None:
                 return {"ok": False, "error": f"Skill '{skill_id}' not found"}
@@ -1014,8 +1073,9 @@ class SkillCatalog:
                 return {"ok": False, "error": f"Failed to delete skill: {e}"}
 
         def write_skill_file(
-            skill_name: str, path: str, content: str
+            skill_name: str, path: str, content: str, intent: str = ""
         ) -> dict[str, Any]:
+            # ``intent``: declared, not read -- see ``update_skill``.
             bundle = self.find_any(skill_name)
             if bundle is None:
                 return {"ok": False, "error": f"Skill '{skill_name}' not found"}
@@ -1052,6 +1112,76 @@ class SkillCatalog:
             except Exception as e:
                 return {"ok": False, "error": f"Failed to write skill file: {e}"}
 
+        def _skill_write_authorizer(
+            tool_input: dict[str, Any], registry: ToolRegistry
+        ) -> Optional[dict[str, Any]]:
+            """Refuse to rewrite a bundle the agent does not own, without an intent.
+
+            The boundary this draws is on **ownership of the asset, not on the
+            verb**: a bundle ``create_skill`` made is the agent's own scratchpad
+            and stays freely editable -- that freedom is the point of a
+            self-extending agent -- while a bundle a person wrote by hand, or
+            copied in from somewhere, needs one sentence saying what is being
+            changed and why before the agent replaces instructions that are
+            pasted into its own system prompt.
+
+            It has to be call-aware, which is why it is an authorizer and not a
+            tool-level ``requires_intent`` capability.  The executor's capability
+            check is unconditional per tool, so declaring it on ``update_skill``
+            would demand a reason for editing the agent's *own* skills too and
+            delete exactly the freedom this boundary exists to preserve;
+            ownership is a property of the bundle named in the call, and only a
+            check that can look at both can tell the two cases apart.
+
+            ``registry`` is part of the authorizer contract and unused here: this
+            decision is about a file, not about the turn's context.  An unknown
+            id, a builtin/plugin bundle, and a bundle the agent authored are all
+            allowed through -- the first two so the handlers can give their own,
+            more specific answer ("not found", "built-in cannot be modified")
+            rather than a policy sentence that hides the real one.
+            """
+            ref = tool_input.get("skill_id") or tool_input.get("skill_name") or ""
+            bundle = self.find_any(str(ref))
+            if bundle is None or bundle.source != "user" or bundle.agent_authored:
+                return None
+            intent = str(tool_input.get("intent") or "").strip()
+            if intent:
+                # Borrowed rather than re-implemented: "specific enough to count
+                # as a stated reason" already has one definition (the executor's
+                # intent gate), and a second list of vague words here would be
+                # two answers to one question.  Deferred because only this gate
+                # needs the executor, and the catalog is loaded by paths -- the
+                # prompt, the CLI, the settings screen -- that never call a tool.
+                from agent.tools.executor import RegularToolExecutor
+
+                if RegularToolExecutor._intent_text_is_specific(intent):
+                    return None
+            return {
+                "ok": False,
+                # Same vocabulary the executor uses when it refuses a call for
+                # want of an intent, so the model reads one kind of refusal
+                # rather than two.
+                "intent_required": True,
+                "skill": bundle.id,
+                "error": (
+                    f"Refused: skill '{bundle.id}' is the user's, not the agent's "
+                    "-- it was written by hand (or installed from elsewhere), and "
+                    "a SKILL.md is injected into this agent's own instructions, so "
+                    "replacing it needs a stated reason on the record. If the user "
+                    "asked for this change, call again with input.intent saying "
+                    "what you are changing and why -- quote their words if you "
+                    "have them. If nobody asked, leave this bundle alone and "
+                    "propose the change in your reply. Bundles created with "
+                    f"create_skill carry '{_SKILL_ORIGIN_KEY}: {_SKILL_ORIGIN_AGENT}' "
+                    "and stay freely editable, so a new skill of your own is also "
+                    "an option."
+                ),
+            }
+
+        # ``create_skill`` gets no authorizer on purpose: creating a *new* bundle
+        # takes nothing from anyone, refuses an id that already exists, and is
+        # itself the freedom this boundary protects.  The three tools that
+        # overwrite or remove an existing bundle do get the ownership gate.
         registry.register(
             "create_skill",
             "Create a new user skill bundle with SKILL.md entrypoint.",
@@ -1097,9 +1227,11 @@ class SkillCatalog:
             "update_skill",
             (
                 "Update an existing user skill's metadata or instructions. Only "
-                "user skills can be modified. The SKILL.md being replaced is "
-                "archived inside the bundle first, so an edit can be undone by "
-                "reading the archived version and passing its instructions back."
+                "user skills can be modified. A bundle the agent created is "
+                "freely editable; one the user wrote needs input.intent. The "
+                "SKILL.md being replaced is archived inside the bundle first, so "
+                "an edit can be undone by reading the archived version and "
+                "passing its instructions back."
             ),
             {
                 "type": "object",
@@ -1128,17 +1260,29 @@ class SkillCatalog:
                         "type": "boolean",
                         "description": "Whether to prevent model auto-activation (omit to keep current)",
                     },
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Required only when the skill was not created by the "
+                            "agent (a hand-written or externally installed bundle): "
+                            "say what you are changing and why, specifically. A "
+                            "bundle the agent created needs no intent."
+                        ),
+                    },
                 },
                 "required": ["skill_id"],
             },
             update_skill,
             replace=True,
             source="runtime:skill",
+            authorizer=_skill_write_authorizer,
         )
 
         registry.register(
             "delete_skill",
-            "Delete a user skill bundle. Built-in skills cannot be deleted.",
+            "Delete a user skill bundle. Built-in skills cannot be deleted. A "
+            "bundle the agent created is freely deletable; one the user wrote "
+            "needs input.intent.",
             {
                 "type": "object",
                 "properties": {
@@ -1146,17 +1290,30 @@ class SkillCatalog:
                         "type": "string",
                         "description": "Skill ID, leaf name, or display name of the skill to delete",
                     },
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Required only when the skill was not created by the "
+                            "agent (a hand-written or externally installed bundle): "
+                            "why it is being deleted, and what it was for. A "
+                            "bundle the agent created needs no intent."
+                        ),
+                    },
                 },
                 "required": ["skill_id"],
             },
             delete_skill,
             replace=True,
             source="runtime:skill",
+            authorizer=_skill_write_authorizer,
         )
 
         registry.register(
             "write_skill_file",
-            "Write or update a supporting file inside a user skill bundle.",
+            "Write or update a supporting file inside a user skill bundle. A "
+            "bundle the agent created is freely writable; one the user wrote "
+            "needs input.intent. SKILL.md itself is not writable here -- use "
+            "update_skill.",
             {
                 "type": "object",
                 "properties": {
@@ -1172,12 +1329,22 @@ class SkillCatalog:
                         "type": "string",
                         "description": "File content to write",
                     },
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Required only when the skill was not created by the "
+                            "agent (a hand-written or externally installed bundle): "
+                            "what this file is for and why it is being written. A "
+                            "bundle the agent created needs no intent."
+                        ),
+                    },
                 },
                 "required": ["skill_name", "path", "content"],
             },
             write_skill_file,
             replace=True,
             source="runtime:skill",
+            authorizer=_skill_write_authorizer,
         )
 
     def _activation_payload(

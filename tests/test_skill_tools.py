@@ -9,6 +9,14 @@ from agent.tools.runtime import ToolRegistry
 
 
 def _catalog_with_files(tmp_path, skill_id: str, files: list[str]) -> SkillCatalog:
+    """A bundle the *agent* created, with supporting files.
+
+    ``created-by: agent`` is what ``create_skill`` writes, so the mechanics these
+    tests are about (path guards, archiving, durable writes) are exercised on a
+    bundle the agent owns and the ownership gate stays out of the way.  The
+    boundary itself -- a hand-written bundle needing a stated intent -- is
+    ``tests/test_skill_ownership.py``.
+    """
     root = tmp_path / "skills"
     skill_dir = root / skill_id
     skill_dir.mkdir(parents=True)
@@ -16,6 +24,7 @@ def _catalog_with_files(tmp_path, skill_id: str, files: list[str]) -> SkillCatal
         "---\n"
         f"name: {skill_id}\n"
         "user-invocable: true\n"
+        "created-by: agent\n"
         "---\n"
         "Instructions.\n",
         encoding="utf-8",
@@ -449,15 +458,31 @@ def test_a_switched_off_skill_can_still_be_edited_and_deleted(tmp_path):
     catalog.register_tools(registry)
     catalog.set_enabled("review", False)
 
+    # ``intent`` because ``_install_skill_on_disk`` writes an unmarked bundle:
+    # it stands for an externally installed one, whose contents are not the
+    # agent's to rewrite for free.  Switched-off is a *separate* question, and
+    # this test is about that one -- the intent below is what any management
+    # call on somebody else's bundle costs.
     renamed = _call(
         registry,
         "update_skill",
-        {"skill_id": "review", "description": "still editable"},
+        {
+            "skill_id": "review",
+            "description": "still editable",
+            "intent": "用户要求改一下这个技能的描述，说清楚它是做代码评审的",
+        },
     )
     assert renamed["ok"] is True
     assert catalog.find_any("review").description == "still editable"
 
-    removed = _call(registry, "delete_skill", {"skill_id": "review"})
+    removed = _call(
+        registry,
+        "delete_skill",
+        {
+            "skill_id": "review",
+            "intent": "用户要求把这份外部安装的评审技能删掉，改用新的那份",
+        },
+    )
     assert removed["ok"] is True
     assert catalog.find_any("review") is None
 
@@ -476,7 +501,14 @@ def test_deleting_a_skill_throws_its_switch_away_with_it(tmp_path):
     catalog.register_tools(registry)
     catalog.set_enabled("review", False)
 
-    _call(registry, "delete_skill", {"skill_id": "review"})
+    _call(
+        registry,
+        "delete_skill",
+        {
+            "skill_id": "review",
+            "intent": "用户要求删掉这份评审技能，重新装一版干净的开始",
+        },
+    )
     assert "review" not in switches
 
     _install_skill_on_disk(root, "review", body="A different review.")

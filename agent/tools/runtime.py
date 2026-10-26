@@ -444,6 +444,17 @@ class ToolRegistry:
         ("runtime:skill", "activate_skill"): frozenset({"read"}),
         ("runtime:skill", "list_skill_files"): frozenset({"read"}),
         ("runtime:skill", "read_skill_file"): frozenset({"read"}),
+        # The three tools that rewrite or remove an existing bundle are state
+        # writes, but deliberately **not** `requires_intent`: that capability is
+        # checked per tool and unconditionally, so putting it on `update_skill`
+        # would also demand a reason for editing a bundle the agent created
+        # itself -- the freedom this boundary exists to keep.  What actually
+        # costs an intent is the *ownership of the bundle named in the call*,
+        # which only a call-aware check can see; `SkillCatalog.register_tools`
+        # installs that check as each tool's `authorizer`, and it refuses an
+        # intent-less write to a hand-written or externally installed bundle.
+        # `create_skill` has no such gate: a new bundle takes nothing from
+        # anyone, and refuses an id that already exists.
         ("runtime:skill", "create_skill"): frozenset({"state_write"}),
         ("runtime:skill", "update_skill"): frozenset({"state_write"}),
         ("runtime:skill", "delete_skill"): frozenset({"state_write"}),

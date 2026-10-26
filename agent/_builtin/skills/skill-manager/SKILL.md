@@ -60,17 +60,26 @@ Instructions for the agent when this skill is activated.
 | `description` | string | "" | Triggering mechanism -- include both what and when |
 | `user-invocable` | bool | true | User can explicitly invoke via `/skill` |
 | `disable-model-invocation` | bool | false | Prevent model from auto-activating |
+| `created-by` | string | absent | `agent` on bundles `create_skill` made. Written by the tools, not by hand -- see "Whose skill is it?" |
 
 **Critical:** `description` is the primary triggering mechanism. "When to use" info must be here, not in the body (the body loads only after triggering).
 
 ## Management Tools
 
-- **`create_skill`** -- Create a new skill bundle
-- **`update_skill`** -- Update metadata or instructions (user skills only)
-- **`delete_skill`** -- Remove a skill bundle (user skills only)
-- **`write_skill_file`** -- Write/update a supporting file in a bundle
+- **`create_skill`** -- Create a new skill bundle; it is marked `created-by: agent`
+- **`update_skill`** -- Update metadata or instructions (user skills only). Free on a bundle you created; a hand-written one needs `intent`
+- **`delete_skill`** -- Remove a skill bundle (user skills only). Same ownership rule
+- **`write_skill_file`** -- Write/update a supporting file in a bundle. Same ownership rule; `SKILL.md` itself goes through `update_skill`
 
 After any mutation, the catalog hot-reloads automatically -- the new/updated skill is immediately available in the same session.
+
+### Whose skill is it?
+
+A `SKILL.md` is injected into the system prompt, so writing one rewrites the agent's own instructions. The rule is about **ownership, not about the verb**:
+
+- A bundle **you created** carries `created-by: agent` and stays freely editable, deletable, and writable. That is how you extend yourself.
+- A bundle **the user wrote** (or installed from elsewhere) has no such mark. Rewriting it is refused with `intent_required` unless the call carries `intent`.
+- If you get that refusal: it is the user's file. Retry with `intent` saying what you are changing and why -- quote their words if you have them -- or leave it alone and propose the change in your reply. Do not add `created-by: agent` by hand to get around this: that erases the distinction the field exists for.
 
 ## Bundled Scripts
 
@@ -126,6 +135,7 @@ python scripts/quick_validate.py <path/to/skill-directory>
 ## Rules
 
 - **Never modify built-in skills.** Only user skills (`~/.agent/skills/`) can be managed.
+- **A user's hand-written skill is theirs.** Bundles without `created-by: agent` need `intent`; treat a refusal as "this is somebody else's file", not as an obstacle to route around, and never write the mark by hand to unlock one.
 - **Confirm destructive operations** (delete) with the user.
 - **Avoid extraneous files.** No README.md, CHANGELOG.md, or auxiliary docs in skill bundles.
 - **Hot-reload is automatic.** After create/update/delete, changes take effect in the current session.
