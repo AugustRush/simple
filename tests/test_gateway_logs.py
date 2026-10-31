@@ -26,10 +26,22 @@ from agent import logs
 
 @pytest.fixture()
 def clean_root_logger():
-    """The root logger is process-wide, so a handler attached here must come back out."""
+    """A known process state: no file handler from an earlier test, and one at the end.
+
+    The root logger is process-wide and ``attach_file_log`` is *deliberately* attached
+    once per process, so a test that runs after another test started a gateway in-process
+    would otherwise find that gateway's handler and write into **its** file.  Found
+    exactly that way: these tests passed alone and three of them failed in the full run.
+    Detaching at setup is not papering over it -- the contract under test is "one handler
+    per process", and a test has to arrive at the process with none.
+    """
     root = logging.getLogger()
     before = list(root.handlers)
     before_level = root.level
+    for handler in list(root.handlers):
+        if getattr(handler, "name", "") == logs._HANDLER_NAME:
+            root.removeHandler(handler)
+            handler.close()
     yield root
     for handler in list(root.handlers):
         if handler not in before:
