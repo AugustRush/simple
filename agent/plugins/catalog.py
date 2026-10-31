@@ -1197,20 +1197,44 @@ class _CatalogPlugin:
 
 
 class PluginCatalog:
-    """Discovers, loads, and orchestrates agent plugins from disk.
+    """The plugin tree: what is on disk, what is mounted, and how it changes.
 
-    Built-in plugins are loaded from ``shared.PLUGINS_DIR`` (package builtin plugins).
-    User plugins are loaded from ``shared.USER_PLUGINS_DIR`` (~/.agent/plugins/).
+    One object owns the *ledger* -- discovered, admitted, mounted, enabled -- and every
+    operation that changes it, which is why this class is large.  The ledger used to be
+    spread across three modules plus a reload transaction that had to reconstruct it; one
+    owner is the smaller arrangement, even though it is the longer file.
 
-    Each plugin directory must contain ``__init__.py`` with a top-level
-    ``register() -> plugin`` function that returns an object implementing
-    any subset of the AgentPlugin protocol (duck-typed, no base class needed).
+    What a caller uses (the rest is internal)
+    -----------------------------------------
+    ``bind_composition(config_loader=, mount_core=)``
+        Hand over the two things only the composition root knows.  Binding performs the
+        first mount, and **returns** the core plugin names it mounted.
+    ``discover_and_load()``
+        Scan the builtin and user directories; activate what the config allows.
+    ``install_plugin`` / ``uninstall_plugin`` / ``set_plugin_enabled``
+        Change what is on disk, or whether it runs.
+    ``reload()``
+        Re-scan and re-activate the *discovered* plugins.  Cannot change which core
+        plugins are mounted -- it reports ``restart_required`` when the config asked for
+        that (see ``catch_up``).
+    ``catch_up(apply=)`` / ``recompose()``
+        Ask what a config change needs; perform the whole-composition rebuild a plugin
+        reload cannot.  The ladder is in ``catch_up``'s docstring.
+    ``list_plugins`` / ``pending_report`` / ``failed_report`` / ``who_provides``
+        Read-only views, for a page or a tool that reports state.
 
-    An optional ``plugin.json`` in the directory provides structured metadata
-    (name, version, description, skills path, mcp_servers).
-
-    User plugins with the same name as a built-in plugin override the built-in.
-    Plugins can be disabled in config.json via ``plugins.<name>.enabled = false``.
+    The discovery rules a plugin *author* needs
+    -------------------------------------------
+    * Builtin plugins come from ``shared.PLUGINS_DIR``, user plugins from
+      ``shared.USER_PLUGINS_DIR`` (~/.agent/plugins/); a user plugin with the same name
+      **overrides** the builtin one.
+    * A directory needs ``__init__.py`` with a top-level ``register() -> plugin``.  The
+      returned object implements any subset of the ``AgentPlugin`` protocol -- duck
+      typed, no base class.
+    * An optional ``plugin.json`` carries structured metadata (name, version,
+      description, skills path, mcp_servers).
+    * ``plugins.<name>.enabled = false`` in config.json switches one off without
+      deleting it.
     """
 
     def __init__(
