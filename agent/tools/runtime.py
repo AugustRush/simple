@@ -21,6 +21,7 @@ import mcp
 from agent import shared
 from agent.core.output import _active_sink
 from agent.tools import user_tools
+from agent.tools.scoped import as_registry
 
 _active_schedule_target: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("_active_schedule_target", default=None)
@@ -581,17 +582,13 @@ class ToolRegistry:
         try:
             fn = self._tools[tool_name].fn
             owner = getattr(fn, "__self__", None)
-            owner_registry = getattr(owner, "registry", None)
-            # A contributed tool holds a plugin-scoped *view* of the registry -- that is
-            # what makes its registrations reversible -- and the view names the registry
-            # behind it.  Unwrapped, because the merge below has to be installed on the
-            # object the tool implementation reads its context from
-            # (``ScopedTools._context_override``); a view that is not recognised as the
-            # owner installs nothing, and the tool silently reads the *composition's*
-            # context -- a sub-agent's narrowed write scope and a session's own workspace
-            # are both delivered this way.
-            if owner_registry is not None and owner_registry is not self:
-                owner_registry = getattr(owner_registry, "registry", owner_registry)
+            # The *owner's* registry, not this call's: the merge below has to be installed
+            # on the object the tool implementation reads its context from.  A view that
+            # is not recognised as the owner installs nothing, and the tool then silently
+            # reads the composition's context -- a sub-agent's narrowed write scope and a
+            # session's own workspace arrive exactly this way.  `as_registry` is the one
+            # place that unwraps (see its docstring).
+            owner_registry = as_registry(owner) if owner is not None else None
             if isinstance(owner_registry, ToolRegistry) and owner_registry is not self:
                 merged_context = dict(owner_registry._context)
                 merged_context.update(self._context)
@@ -813,17 +810,11 @@ class MCPClient:
     """
 
     def __init__(self, registry: ToolRegistry):
-        # The composition hands this client `ctx.get("registry")`, which is the
-        # **scoped view** a plugin gets (so its registrations come back out when it
-        # unloads).  A view contributes but is not the registry: it has no
-        # `unregister_by_source_prefix`, so `_forget_tools`' defensive `getattr` found
-        # nothing and a disconnected server's tools stayed registered against a closed
-        # session -- the quiet half of the failure, since the process really did stop.
-        # Unwrapped here, where it is one line, for the same reason
-        # `UserToolCatalog.load_into_registry` unwraps: the caller that passes a view is
-        # the one that cannot see the difference, and the view names the registry it
-        # wraps for exactly this kind of caller.
-        self.registry = getattr(registry, "registry", registry)
+        # This client *owns* a set of tools (by source prefix), so it needs the registry
+        # rather than a contribution to it: a view has no
+        # `unregister_by_source_prefix`, and `_forget_tools`' defensive `getattr` would
+        # then find nothing while a disconnected server's process really had stopped.
+        self.registry = as_registry(registry)
         #: Safe server name -> live state.  ``_server_key`` derives the name;
         #: ``_resolve`` maps a caller's spelling of it onto the same entry.
         self._servers: dict[str, _MCPServer] = {}
@@ -1562,15 +1553,10 @@ class UserToolCatalog:
         """
         self.root.mkdir(parents=True, exist_ok=True)
         user_tools.ensure_deps_on_path(self.root)
-        # A plugin's view is not the registry.  The composition hands the tools plugin a
-        # `ScopedTools` -- so that plugin's own registrations are undone when it unloads --
-        # and a view contributes but has no `unregister_by_source_prefix`, which is what
-        # replacing a module's tools needs.  Normalising here is what makes `create_tool`
-        # work at all from inside the running agent: without it the author writes the
-        # file, records its approval, and then raises, leaving a tool that exists on disk
-        # and nowhere else.  The view names the registry behind it (`ScopedTools.registry`)
-        # for exactly this kind of caller; `ToolRegistry.call` unwraps a view the same way.
-        registry = getattr(registry, "registry", registry)
+        # Replacing a module's tools needs `unregister_by_source_prefix`, which a view
+        # does not have: unwrapped, or `create_tool` writes the file, records its
+        # approval, and then raises -- a tool that exists on disk and nowhere else.
+        registry = as_registry(registry)
         registry.unregister_by_source_prefix("user_tool:")
         loaded: list[str] = []
         for tool_file in self.discover():

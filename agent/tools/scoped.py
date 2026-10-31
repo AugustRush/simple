@@ -36,7 +36,43 @@ from typing import Any, Callable
 
 from agent.kernel.service import ScopedContribution
 
-__all__ = ["ScopedTools"]
+__all__ = ["ScopedTools", "as_registry"]
+
+
+def as_registry(candidate: Any) -> Any:
+    """The registry behind a plugin's view -- or *candidate* itself when it is one.
+
+    The rule, stated once
+    ---------------------
+    The composition hands a plugin a **scoped view** (``ScopedTools``) so a registration
+    made through it comes back out when the plugin unloads.  The view *contributes*; it
+    is not the registry.  Two kinds of caller need the object behind it anyway:
+
+    * machinery that has to act on the registry itself -- installing a call's merged
+      context (``ToolRegistry.call``), replacing a module's tools by source prefix
+      (``UserToolCatalog``), owning a set of server tools (``MCPClient``);
+    * anything that must survive the plugin that happened to be standing nearest.
+
+    Before this function existed, each of those four sites re-derived the rule inline as
+    ``getattr(x, "registry", x)``, with a paragraph of justification apiece -- four copies
+    of one rule, and a fifth caller that *did not* derive it was this repository's worst
+    recurring bug (four separate defects in one session, each one "the view is not the
+    registry", each found by a test rather than by review).  ``tests/test_scoped_registry.py``
+    now fails if the idiom reappears anywhere else, so the rule lives here or nowhere.
+
+    "However many hops": a caller may pass the view itself (``as_registry(view)``) or the
+    object a tool is bound to (``as_registry(tool_owner)``, whose ``.registry`` is the
+    view).  Both mean the same thing, and the walk is bounded because a chain of views is
+    never more than two deep -- the bound is there so a cycle cannot hang a tool call,
+    which is a worse failure than an unmerged context.
+    """
+    current = candidate
+    for _hop in range(4):
+        inner = getattr(current, "registry", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return current
 
 
 class ScopedTools(ScopedContribution):
