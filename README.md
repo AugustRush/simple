@@ -1420,6 +1420,23 @@ blacklist, cwd escapes (`cd`/`pushd` inside a command), command substitution
 uv run simple
 ```
 
+### Where a long-running process keeps its trail
+
+`simple gateway` and `simple scheduler` run for days, so they also write to a rotating
+file under the agent home:
+
+```
+~/.agent/logs/gateway.log      # 5 MB per file, 3 generations
+~/.agent/logs/scheduler.log
+```
+
+The path is printed at startup next to the Web UI address. The console keeps writing the
+same lines; the file is what survives closing the terminal, a launchd/systemd start, or
+this morning. Three properties are deliberate: the handler is attached **once** (a second
+gateway start in the same process does not double every line), it is **bounded** (an
+unrotated log is how "I have logs" becomes "I have a full disk"), and a logging failure
+**never stops the process** -- an unwritable home yields a warning, not a dead gateway.
+
 ### Single-turn chat
 
 ```bash

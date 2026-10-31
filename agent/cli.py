@@ -31,6 +31,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 import agent as agent_module
 from agent import shared
+from agent import logs as logs_module
 from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.commands.composition import ensure_command_router
@@ -1250,6 +1251,8 @@ def gateway(
     home_lock = _acquire_home_lock_or_exit("gateway")
     cfg, first_run = agent_module.load_config()
     _configure_runtime_logging()
+    # A gateway runs for days; a terminal is not a durable place to keep its trail.
+    log_path = logs_module.attach_file_log("gateway")
     if first_run:
         if not agent_module._first_run_setup():
             raise typer.Exit(0)
@@ -1296,6 +1299,9 @@ def gateway(
             if web_channel is not None:
                 web_url = str(web_channel.public_url)
                 shared.CONSOLE.print(f"[dim]Web UI: {web_url}[/dim]")
+                shared.CONSOLE.print(
+                    f"[dim]Log: {logs_module.describe(log_path)}[/dim]"
+                )
                 if _should_open_browser(
                     no_open=no_open,
                     interactive=_stdout_is_interactive(),
@@ -1739,6 +1745,11 @@ def scheduler(
     if isinstance(name, str):
         agent_module._set_agent_home(shared.session_home(name))
     cfg, first_run = agent_module.load_config()
+    _configure_runtime_logging()
+    # Same reasoning as the gateway's: this process outlives the terminal it started in.
+    log_path = logs_module.attach_file_log("scheduler")
+    if first_run:
+        shared.CONSOLE.print(f"[dim]Log: {logs_module.describe(log_path)}[/dim]")
     if first_run:
         if not agent_module._first_run_setup():
             raise typer.Exit(0)
