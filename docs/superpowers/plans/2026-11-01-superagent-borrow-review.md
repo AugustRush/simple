@@ -26,9 +26,43 @@
 3. **不移植 TS 代码、不移植 Engine 分层**：单行为者的个人 agent 用不上多角色 `Pick`，收益不抵改动面。
 4. **设置收敛降级为小任务**：先把策略子集（`permissions` / `orchestration` / `notifications` / `evolution`，约 10 个）逐条问"默认值能替掉吗"，而不是大改 82 个。
 
+## 追加需求：workflow 与任务「合并统一」
+
+用户提出：自动化里的 workflow 和任务应该合并统一。查代码之后，这件事比听起来小得多——**领域模型早就是统一的**，分叉只在呈现层：
+
+| 证据 | 说明 |
+|---|---|
+| `models.py:1542` `WorkflowStep` 的 docstring | "**One step of a workflow: a task, plus what has to finish before it runs**"；无上游的入口步"就是一个普通 scheduled task" |
+| `tests/test_scheduler_workflows.py:11` | "**A step is a task that already exists.**" |
+| schema `workflow_runs.root_task_id` / `root_run_id` | 每一次链运行都锚定在一个任务运行上 |
+| `scheduled_tasks.workflow_id` / `step_key` | 步就是行，归属记在任务自己身上 |
+| `attention.py` 的 `latest_by_task` | 注意力/badge 已经是任务级的，链的注意力就是其步骤之和 |
+
+所以真正的重复在**三个面**：两套列表 API（`/api/schedules`、`/api/workflows`）、两套工具（`schedule_*` / `workflow_*`）、两个页签（任务 / 流程）。
+
+### 目标模型
+
+一个聚合 **Automation**：`{name, enabled, steps[], delivery, policies, next_run_at, …}`。
+
+- 普通任务 = **1 个步骤**的 Automation；
+- 流程 = **N 个步骤**的 Automation，边在 `depends_on` 上；
+- 第一步（入口步）带触发条件，其余步骤由上游完成触发——这条今天已经成立。
+
+### 分阶段（每阶段独立可验证、可回滚）
+
+| 阶段 | 内容 | 风险 | 验收 |
+|---|---|---|---|
+| **M0 · 读模型**（本次已做） | `agent/scheduler/automations.py` + `GET /api/automations`：一个列表，两种行（`kind: task\|chain`），**步骤永不单独成行**，注意力与 badge 用同一个 snapshot | 零（只读） | 3 个任务 + 1 链 → 2 行；`sum(rows.attention) == total`；7 条测试 |
+| **M0b · 一个列表页** | 自动化页默认一个列表，按 `kind` 过滤；行点开复用现有两个详情面板 | 低（前端） | 浏览器 e2e：一个列表能打开任务详情与链详情 |
+| **M1 · 一套工具** | `automation_create/update/delete/list/run`，`steps` 1..N；`schedule_*` / `workflow_*` 变薄别名（仍可用、仍测），**提示词只广告新面** | 中 | 旧的 10 个工具名仍绿；新工具能建 1 步与 N 步；模型可见的工具数**下降** |
+| **M2 · 一条写路径** | 一个编辑器：建任务 = 建 1 步；加步骤 = 链；`automation_update` 增删步骤 | 中 | 编辑一条链不动 `workflow_*` 路径；E2E |
+| **M3 · 折叠存储（可选）** | `workflows.graph_json` → `scheduled_tasks.steps_json`；`workflow_runs` → run 上的 `group_id`；迁移 v+1 | 高（迁移） | 迁移脚本把现有链完整搬过去；旧库升级后读模型输出不变 |
+
+**为什么不从 M3 开始**：M0–M2 能让用户与模型看到一件事，而 M3 只是让硬盘上少两张表。在活数据上做 schema 折叠，收益是"开发者少看两张表"，代价是迁移事故——这一轮已经反复证明，"看得见的重复"和"存储的重复"要分开处理。
+
 ## 迭代计划
 
-### P0 · 勘误与收尾（0.5 天）
+### P0 · 勘误与收尾（0.5 天，已完成）
 
 - 本文档入库；README 的 Roadmap 增补"排练模式"与"授权词汇"两条，删掉已完成的"重启墙"（上一轮已关）。
 - `bash scripts/check.sh` 绿（当前基线 4,380 passed / 0 failed / 2 skipped）。

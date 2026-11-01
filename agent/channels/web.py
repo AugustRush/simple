@@ -910,6 +910,39 @@ class WebChannel(Channel):
         finally:
             store.close()
 
+    async def _automations(self, request: Any) -> Any:
+        """Tasks and chains in one shape, from one snapshot.
+
+        The two existing endpoints stay: they carry the editors' fields, and the page's
+        detail panels still call them.  This one answers the *list* question -- what do I
+        have, what needs me, when does it next start -- where "task or workflow" was
+        never a real distinction to a reader.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import open_store
+        from agent.scheduler.automations import automation_rows
+        from agent.scheduler.profiles import profile_payloads
+
+        store = open_store()
+        try:
+            # One snapshot for the badge, the rows and the counts, for the reason the
+            # attention snapshot documents: a number the page cannot reproduce is worse
+            # than no number.
+            snapshot = store.attention_snapshot()
+            return JSONResponse(
+                {
+                    "automations": automation_rows(store, snapshot),
+                    "permission_profiles": profile_payloads(),
+                    "unseen_attention": snapshot["total"],
+                    "attention_runs": attention_rows(store, snapshot),
+                }
+            )
+        finally:
+            store.close()
+
     async def _schedule_runs(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2878,6 +2911,10 @@ class WebChannel(Channel):
                 methods=["POST"],
             ),
             Route("/api/skills/{skill_id:path}", self._delete_skill, methods=["DELETE"]),
+            # One list for 自动化: a standalone task and a chain are the same mechanism
+            # with one step or several (see agent/scheduler/automations.py).  Read-only
+            # for now; the write paths are still two until the tool surface is unified.
+            Route("/api/automations", self._automations, methods=["GET"]),
             Route("/api/schedules", self._schedules, methods=["GET"]),
             Route("/api/schedules", self._create_schedule, methods=["POST"]),
             Route("/api/schedules", self._bulk_schedules, methods=["PATCH"]),
