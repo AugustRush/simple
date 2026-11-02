@@ -470,3 +470,34 @@ def test_typing_on_home_starts_a_thread(page):
     page.wait_for_timeout(1200)
     assert "#/chat/" in page.url, page.url
     assert len(page.url) > before
+
+
+def test_a_new_conversation_shows_up_in_the_timeline(page):
+    """The home page's timeline is the record of what the agent did, so the thing
+    it just did has to appear in it.
+
+    This is the end-to-end version of the two bugs found while building the page:
+    the effect that loads `/api/home` had neither `loadHome` nor `loadSessions` in
+    its dependency list, so arriving at the view a second time kept the first
+    visit's answer -- and the sidebar showed "暂无会话" over sessions that existed.
+    """
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.wait_for_timeout(2500)
+    before = page.locator(".home-timeline-row").count()
+
+    box = page.wait_for_selector(".home-composer-input", timeout=20_000)
+    box.fill("帮我总结当前项目")
+    page.locator(".home-composer").locator("button[aria-label='发送']").click()
+    page.wait_for_selector("textarea", timeout=20_000)
+    page.wait_for_timeout(3500)
+    assert "#/chat/" in page.url
+
+    # Navigate the way a person does -- the sidebar entry, not a fresh page load.
+    page.locator(".sider-nav .ant-menu-item").first.click()
+    page.wait_for_timeout(2500)
+
+    after = page.locator(".home-timeline-row").count()
+    assert after > before, f"the timeline did not grow ({before} -> {after})"
+    top = page.locator(".home-timeline-row").first.inner_text()
+    assert "帮我总结当前项目" in top, top
+    assert page.errors == [], page.errors

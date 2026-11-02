@@ -133,16 +133,17 @@ export function useShell(deps: Deps) {
       loadSchedulerHealth()
     }
     if (view === 'home') {
-      loadHome()
-      // The sidebar's thread list is on every view, so the sessions have to load
-      // on the landing view too. They used to arrive as a side effect of the chat
-      // view's own mount -- which meant the first screen after a reload showed
-      // "暂无会话" over eleven of them.
-      loadSessions()
+      // Both are re-read on every arrival, not cached across it: the page's whole
+      // job is "what is true right now", and a home page showing a timeline from
+      // before the last conversation would be the one screen that lies about the
+      // agent's state. (`loadSessions` too: the sidebar is on every view, and it
+      // used to arrive as a side effect of the chat view's mount.)
+      void loadHome()
+      void loadSessions()
     }
     if (view === 'autonomy') loadAutonomy()
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings])
+  }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions, loadAutonomy])
 
   /** Move to another view, asking first if the settings page has unsaved edits.
    *
