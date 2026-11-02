@@ -417,6 +417,28 @@ it -- the asker is still there. `schedule_run` answers the same way, with three
 distinct words: `started` (running here, with a run id), `woken` (a scheduler on
 another loop took the request), `queued` (nothing is serving it yet).
 
+### The Automation page: one list, one creator
+
+The page used to greet you with two tabs -- 任务 and 流程 -- and two creators, which asked
+you to classify your own request before filling anything in. It is one list now, because
+it was always one thing:
+
+- **A task is a chain of one step**, and a chain is several steps with edges. The list
+  shows one row per thing you manage (`流程 · N 个步骤` or `任务`), with its next run, its
+  last status and what needs a person. `任务 / 流程 / 全部` is a **filter** in the toolbar.
+- **One `新建`.** It opens the task editor; **改成流程（多步）** inside it carries the draft
+  you already typed -- name, content, folder, trigger -- into a one-step chain, where
+  adding a step is an edit rather than a second form.
+- **One row, never two per step.** A chain's steps are tasks in the store (that is what
+  makes the two shapes one), and the list derives from `GET /api/automations`, whose rules
+  -- a step is never its own row, a chain's attention is its steps' -- live on the server
+  in `agent/scheduler/automations.py` rather than in the page's merge code.
+
+What is deliberately still two: the **editors**. A task is a form and a chain is a graph;
+one form that grows steps on demand is a form that hides the edge it is drawing. The
+maintenance verbs are still split for the same reason, and folding them is the next step
+(`docs/superpowers/plans/2026-11-01-superagent-borrow-review.md`, M2's remainder).
+
 ### Workflows: a chain of steps
 
 A workflow is a graph of scheduled tasks where each step runs only after the
