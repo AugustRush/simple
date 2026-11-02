@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
-import { defaultScheduleDraft, msUntilNextRun, scheduleDraftFromTask, scheduleRequestBody } from '../lib/schedule'
-import { checkWorkflowGraph, cleanStepKeys, defaultWorkflowDraft, defaultWorkflowStep, defaultWorkflowTrigger, describeChainTrigger, nextStepKey, planWorkflowStepMove, spliceWorkflowStep, stepContent, storedEntryStep, swapWorkflowSteps, workflowDownstreamKeys, workflowDraftFromInfo, workflowRequestBody } from '../lib/workflow'
-import type { AttentionRun, AutomationRow, PermissionProfileOption, ScheduleArtifact, ScheduleDraft, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, SignalInfo, WorkflowDraft, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
-import { Modal } from 'antd'
-import dayjs from 'dayjs'
+import { msUntilNextRun } from '../lib/schedule'
+import { stepContent } from '../lib/workflow'
+import type { AttentionRun, AutomationRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -14,7 +12,7 @@ import { useSettings } from './useSettings'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useApiClient> & ReturnType<typeof useConfirm> & ReturnType<typeof useConversations> & ReturnType<typeof useSettings>
 
 export function useAutomation(deps: Deps) {
-  const { api, apiHeaders, config, confirmResourceDeletion, feishuChatsLoaded, feishuChatsLoading, loadFeishuChats, messageApi, refreshJson, sessionState, setLoadingView, view } = deps
+  const { api, confirmResourceDeletion, messageApi, refreshJson, setLoadingView, view } = deps
 
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
   // Workflows whose "run now" request is in flight. The ref is the guard (a
@@ -23,9 +21,7 @@ export function useAutomation(deps: Deps) {
   const startingWorkflowRef = useRef<Set<string>>(new Set())
   const [startingWorkflowIds, setStartingWorkflowIds] = useState<string[]>([])
 
-  const [signals, setSignals] = useState<SignalInfo[]>([])
 
-  const [signalsWaiting, setSignalsWaiting] = useState<{ name: string; subscriber_count: number }[]>([])
 
   const [unseenFailures, setUnseenFailures] = useState(0)
 
@@ -50,17 +46,11 @@ export function useAutomation(deps: Deps) {
 
   const [selectedScheduleIds, setSelectedScheduleIds] = useState<string[]>([])
 
-  const [scheduleModalOpen, setScheduleModalOpen] = useState(false)
 
-  const [scheduleSaving, setScheduleSaving] = useState(false)
 
-  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(defaultScheduleDraft)
 
-  const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null)
 
-  const [schedulePreview, setSchedulePreview] = useState<string[]>([])
 
-  const [schedulePreviewError, setSchedulePreviewError] = useState('')
 
   const [schedulerHealth, setSchedulerHealth] = useState<SchedulerHealth>({ status: 'offline' })
 
@@ -109,25 +99,11 @@ export function useAutomation(deps: Deps) {
   const [automations, setAutomations] = useState<AutomationRow[]>([])
   const [automationQuery, setAutomationQuery] = useState('')
 
-  const [workflowModalOpen, setWorkflowModalOpen] = useState(false)
 
-  const [workflowSaving, setWorkflowSaving] = useState(false)
 
-  const [workflowDraft, setWorkflowDraft] = useState<WorkflowDraft>(defaultWorkflowDraft)
 
   const [editingWorkflowId, setEditingWorkflowId] = useState<string | null>(null)
 
-  //: The one step whose key is open for rewriting, and the key it started with.
-  //:
-  //: A step's key is its identity: the task behind it is found by that key, so
-  //: changing it does not rename anything -- it points the graph at a task that
-  //: does not exist yet and leaves the old one, with its run history, behind.
-  //: Renaming is therefore an explicit act rather than a text field to nudge,
-  //: and this holds the original key so the rest of the editor can keep
-  //: treating the step as the one that is stored.
-  const [workflowKeyRewrite, setWorkflowKeyRewrite] = useState<
-    { at: number; key: string } | null
-  >(null)
 
   const [workflowQuery, setWorkflowQuery] = useState('')
 
@@ -265,18 +241,6 @@ export function useAutomation(deps: Deps) {
     }
   }, [api])
 
-  const loadSignals = useCallback(async () => {
-    try {
-      const resp = await api('/api/signals')
-      const data = await resp.json()
-      setSignals(Array.isArray(data.signals) ? data.signals : [])
-      setSignalsWaiting(Array.isArray(data.waiting) ? data.waiting : [])
-    } catch {
-      // An unreachable list is not "no signals": leave the picker empty
-      // rather than telling the user that nothing has ever been emitted.
-    }
-  }, [api])
-
   const loadUnseenFailures = useCallback(async () => {
     try {
       const resp = await api('/api/schedules/attention')
@@ -287,116 +251,6 @@ export function useAutomation(deps: Deps) {
       // alone rather than clearing a badge the user has not acted on.
     }
   }, [api, applyAttention])
-
-  /**
-   * The step being edited, when the task editor was opened on one.
-   *
-   * A step that has upstreams does not own its timing, so the form must stop
-   * offering one, must not send one -- the server refuses a contradicting
-   * trigger, and would refuse the form's own default of "wait for a signal"
-   * since a fan-in has no single name to show -- and must not ask for a
-   * preview of times it does not have.
-   */
-  const editingStep = useMemo(() => {
-    if (!editingScheduleId) return null
-    const task = schedules.find(item => item.id === editingScheduleId)
-    if (!task?.workflow_id) return null
-    const flow = workflows.find(item => item.id === task.workflow_id)
-    const step = flow?.steps.find(item => item.key === task.step_key)
-    if (!step) return null
-    return { flow, step, followsUpstreams: step.depends_on.length > 0 }
-  }, [editingScheduleId, schedules, workflows])
-
-  // Folders a task has already run in are the folders most likely to be
-  // wanted again, so the form offers them as one-click answers instead of
-  // asking the user to type (or re-pick) a path they already trusted.
-  const recentWorkspaceRoots = useMemo(() => {
-    const roots: string[] = []
-    for (const task of schedules) {
-      if (task.workspace_root) roots.push(task.workspace_root)
-    }
-    for (const flow of workflows) {
-      for (const step of flow.steps) {
-        if (step.workspace_root) roots.push(step.workspace_root)
-      }
-    }
-    if (sessionState?.workspace_root) roots.push(sessionState.workspace_root)
-    if (config?.workspace_root) roots.push(config.workspace_root)
-    return Array.from(new Set(roots)).slice(0, 6)
-  }, [schedules, workflows, sessionState?.workspace_root, config?.workspace_root])
-
-  // The chat list is a network call against the user's Feishu app, so it is
-  // fetched only when the form can actually show it -- opening the editor on
-  // a channel task, or choosing 发到飞书 -- and not on every modal open.
-  //
-  // The guard has to test `feishuChatsLoaded`, not `feishuChats.length`. An
-  // empty list is a perfectly good answer, and `0` is falsy, so a length test
-  // reads "we have no chats" as "we have not asked": the effect re-fires the
-  // moment `feishuChatsLoading` drops back to false, and the picker spins
-  // forever on a successful response. It never settles because it never stops
-  // asking.
-  useEffect(() => {
-    if (!scheduleModalOpen) return
-    if (scheduleDraft.delivery_mode !== 'channel') return
-    if (feishuChatsLoaded || feishuChatsLoading) return
-    void loadFeishuChats()
-  }, [
-    scheduleModalOpen,
-    scheduleDraft.delivery_mode,
-    feishuChatsLoaded,
-    feishuChatsLoading,
-    loadFeishuChats,
-  ])
-
-  useEffect(() => {
-    if (!scheduleModalOpen) {
-      setSchedulePreview([])
-      setSchedulePreviewError('')
-      return
-    }
-    const taskContent = scheduleDraft.action_type === 'agent_task'
-      ? scheduleDraft.prompt.trim()
-      : scheduleDraft.message_text.trim()
-    if (!scheduleDraft.name.trim() || !taskContent || (
-      scheduleDraft.action_type === 'agent_task' && !scheduleDraft.workspace_root.trim()
-    )) {
-      setSchedulePreview([])
-      return
-    }
-    // A step that follows upstreams has no times to preview, and asking for
-    // them would come back as "pick a signal to wait for" -- an error about a
-    // question this form is not asking.
-    if (editingStep?.followsUpstreams) {
-      setSchedulePreview([])
-      setSchedulePreviewError('')
-      return
-    }
-    let cancelled = false
-    const timer = window.setTimeout(async () => {
-      try {
-        const resp = await fetch('/api/schedules/preview', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...apiHeaders() },
-          body: JSON.stringify(scheduleRequestBody(scheduleDraft)),
-        })
-        const data = await resp.json()
-        if (cancelled) return
-        if (!resp.ok) {
-          setSchedulePreview([])
-          setSchedulePreviewError(data.error || '无法预览执行时间')
-          return
-        }
-        setSchedulePreview(Array.isArray(data.occurrences) ? data.occurrences : [])
-        setSchedulePreviewError('')
-      } catch {
-        if (!cancelled) setSchedulePreviewError('无法连接调度服务')
-      }
-    }, 350)
-    return () => {
-      cancelled = true
-      window.clearTimeout(timer)
-    }
-  }, [apiHeaders, scheduleDraft, scheduleModalOpen, editingStep?.followsUpstreams])
 
   const loadScheduleRuns = useCallback(
     // `focusRunId` is for opening a task on the run somebody was actually
@@ -522,21 +376,6 @@ export function useAutomation(deps: Deps) {
     })
   }, [workflows, workflowQuery])
 
-  const workflowAttention = useMemo(
-    () => workflows.reduce((sum, item) => sum + (item.unseen_attention || 0), 0),
-    [workflows],
-  )
-
-  /**
-   * Which run to open for a task that has something waiting.
-   *
-   * The count shown on a card is the task's own `unseen_attention` -- that is
-   * the number the task carries, and it stays right even when the list behind
-   * the badge is long enough to be capped. This map only answers "and which
-   * one", which the count cannot -- and it comes from the server's snapshot
-   * rather than the capped list, so a task whose rows fell out of the list
-   * still opens on the run the count is about.
-   */
   const attentionByTask = useMemo(
     () => new Map(Object.entries(attentionLatestByTask)),
     [attentionLatestByTask],
@@ -545,13 +384,6 @@ export function useAutomation(deps: Deps) {
   const permissionProfileOptions = useMemo(
     () => (permissionProfiles.length > 0 ? permissionProfiles : KNOWN_PERMISSION_PROFILES),
     [permissionProfiles],
-  )
-
-  const activePermissionProfile = useMemo(
-    () => permissionProfileOptions.find(
-      item => item.key === scheduleDraft.permission_profile,
-    ),
-    [permissionProfileOptions, scheduleDraft.permission_profile],
   )
 
   const permissionProfileLabel = useCallback((key?: string) => (
@@ -736,287 +568,6 @@ export function useAutomation(deps: Deps) {
     }
   }
 
-  const workflowGraph = useMemo(() => checkWorkflowGraph(workflowDraft.steps), [workflowDraft])
-
-  // Whether the cards and the running order have come apart. They agree as long
-  // as steps are only ever added at the end, so a difference means somebody
-  // moved something -- and then the numbers stop reading 1, 2, 3, which needs
-  // saying rather than leaving the reader to work out why.
-  const workflowOrderDiffersFromArray =
-    workflowGraph.order.length === workflowDraft.steps.length
-    && workflowGraph.order.some(
-      (key, at) => key !== (workflowDraft.steps[at]?.key.trim() || ''),
-    )
-
-  const openEditWorkflow = (info: WorkflowInfo) => {
-    // Same reason as `convertScheduleToChain`: the editor lives in the chain view.
-    setAutomationKind('workflow')
-    setEditingWorkflowId(info.id)
-    setWorkflowDraft(workflowDraftFromInfo(info))
-    setWorkflowKeyRewrite(null)
-    setWorkflowModalOpen(true)
-  }
-
-  const patchWorkflowStep = (index: number, patch: Partial<WorkflowStepDraft>) => {
-    setWorkflowDraft(current => ({
-      ...current,
-      steps: current.steps.map((step, at) => (at === index ? { ...step, ...patch } : step)),
-    }))
-  }
-
-  /**
-   * Re-point a step's upstreams, and keep its trigger section telling the truth.
-   *
-   * A step that gains upstreams has no schedule of its own -- the rules say so
-   * and the server drops one on sight -- so nothing about a trigger may be sent
-   * for it, and a handover left over from an earlier edit has to go with it or
-   * the next save would name a step that no longer has a schedule to hand over.
-   *
-   * Clearing them makes this the step the chain starts from, and it needs a way
-   * to say when. A step that was already the entry keeps the stored schedule it
-   * has; one that never was has nothing to keep, so the form gets a trigger to
-   * fill in rather than a line claiming to hold one.
-   */
-  const changeWorkflowStepUpstreams = (index: number, upstreams: string[]) => {
-    setWorkflowDraft(current => ({
-      ...current,
-      steps: current.steps.map((step, at) => {
-        if (at !== index) return step
-        if (upstreams.length) {
-          return { ...step, depends_on: upstreams, trigger: null, triggerFrom: '' }
-        }
-        const stored = editingWorkflow?.steps.find(item => item.key === step.key.trim())
-        return {
-          ...step,
-          depends_on: upstreams,
-          trigger: step.trigger || (storedEntryStep(stored) ? null : defaultWorkflowTrigger()),
-          triggerFrom: step.triggerFrom,
-        }
-      }),
-    }))
-  }
-
-  /** A blank step for the chain, chained onto whatever it is put behind. */
-  const blankWorkflowStep = (
-    steps: WorkflowStepDraft[],
-    afterKey: string,
-    workspaceRoot: string,
-  ): WorkflowStepDraft => ({
-    ...defaultWorkflowStep(workspaceRoot),
-    key: nextStepKey(steps),
-    depends_on: afterKey ? [afterKey] : [],
-    // A step with an upstream is driven by it and carries no schedule; a step
-    // that ended up with no upstream at all -- because the step it was put
-    // behind has no key yet -- does need one.
-    trigger: afterKey ? null : defaultWorkflowTrigger(),
-    triggerFrom: '',
-  })
-
-  const addWorkflowStep = () => {
-    setWorkflowDraft(current => {
-      // The end of the *running* order, not the end of the array. The two agree
-      // until an edit makes them disagree, and the array is the one that means
-      // nothing -- chaining onto a step picked by array position is how a new
-      // step ends up waiting on something it has nothing to do with.
-      const order = checkWorkflowGraph(current.steps).order
-      const lastKey = order[order.length - 1] || ''
-      const at = current.steps.findIndex(step => step.key.trim() === lastKey)
-      const anchor = current.steps[at < 0 ? current.steps.length - 1 : at]
-      return {
-        ...current,
-        steps: spliceWorkflowStep(
-          current.steps,
-          at < 0 ? current.steps.length - 1 : at,
-          blankWorkflowStep(current.steps, anchor?.key?.trim() || '', anchor?.workspace_root || ''),
-          false,
-        ),
-      }
-    })
-  }
-
-  /**
-   * Put a new step behind the one at *index*, between it and whatever follows.
-   *
-   * Everything that waited on that step waits on the new one instead. That
-   * second half is the whole point: skipping it is how "in between" silently
-   * becomes "off to the side", and the two are indistinguishable afterwards
-   * because both are a valid graph. It re-points other steps though, so it is
-   * asked about first and the question names them.
-   */
-  const insertWorkflowStepAfter = (index: number) => {
-    const anchor = workflowDraft.steps[index]
-    const anchorKey = anchor?.key?.trim() || ''
-    const followers = anchorKey
-      ? workflowDownstreamKeys(workflowDraft.steps, anchorKey)
-      : []
-    const apply = (adoptFollowers: boolean) => {
-      setWorkflowDraft(current => {
-        const step = current.steps[index]
-        const key = step?.key?.trim() || ''
-        return {
-          ...current,
-          steps: spliceWorkflowStep(
-            current.steps,
-            index,
-            blankWorkflowStep(current.steps, key, step?.workspace_root || ''),
-            adoptFollowers,
-          ),
-        }
-      })
-    }
-    // Nothing waited on it: this is an ordinary append and there is nothing to
-    // ask about.
-    if (!followers.length) {
-      apply(false)
-      return
-    }
-    Modal.confirm({
-      title: `在「${anchor.name.trim() || anchorKey}」后面插入一步？`,
-      content: `现在「${followers.join('」「')}」接在它后面，插入后改接新步骤，仍然排在它后面。`,
-      okText: '插入',
-      cancelText: '取消',
-      centered: true,
-      onOk: () => apply(true),
-    })
-  }
-
-  /**
-   * Trade a step's place with the step it is linked to.
-   *
-   * Two steps and the edges around them get rewritten, and one of them may have
-   * to hand the chain's schedule over -- there is no undo, so the question says
-   * which way round they end up, who follows whom, and where the clock goes.
-   */
-  const moveWorkflowStep = (index: number, direction: 'earlier' | 'later') => {
-    const step = workflowDraft.steps[index]
-    const plan = planWorkflowStepMove(
-      workflowDraft.steps,
-      step?.key?.trim() || '',
-      direction,
-    )
-    if (!plan.pair) {
-      messageApi.warning(plan.problem || '这一步现在换不了位置')
-      return
-    }
-    const [earlierKey, laterKey] = plan.pair
-    const earlier = workflowDraft.steps.find(item => item.key.trim() === earlierKey)
-    const later = workflowDraft.steps.find(item => item.key.trim() === laterKey)
-    const label = (item?: WorkflowStepDraft) => item?.name.trim() || item?.key.trim() || ''
-    const followers = workflowDownstreamKeys(workflowDraft.steps, laterKey)
-    const becomesEntry = cleanStepKeys(earlier?.depends_on || []).length === 0
-    const clock = becomesEntry
-      ? describeChainTrigger(workflowDraft.steps, editingWorkflow?.steps, earlierKey)
-      : ''
-    Modal.confirm({
-      title: `把「${label(later)}」${direction === 'earlier' ? '上移' : '下移'}一位？`,
-      content: (
-        <div className="workflow-move-confirm">
-          <p>
-            {`「${label(earlier)}」和「${label(later)}」调换位置：`
-              + `${earlierKey} → ${laterKey} 变成 ${laterKey} → ${earlierKey}。`}
-          </p>
-          {followers.length > 0 && (
-            <p>{`「${followers.join('」「')}」改接在「${label(earlier)}」后面，仍然排在最后。`}</p>
-          )}
-          {clock && <p>{`入口触发方式（${clock}）会跟着入口移到「${label(later)}」上。`}</p>}
-        </div>
-      ),
-      okText: '换位',
-      cancelText: '取消',
-      centered: true,
-      onOk: () => {
-        setWorkflowDraft(current => ({
-          ...current,
-          steps: swapWorkflowSteps(current.steps, earlierKey, laterKey),
-        }))
-      },
-    })
-  }
-
-  const removeWorkflowStep = (index: number) => {
-    setWorkflowDraft(current => {
-      const removed = current.steps[index]?.key?.trim()
-      const steps = current.steps
-        .filter((_, at) => at !== index)
-        .map(step => ({
-          ...step,
-          depends_on: step.depends_on.filter(key => key.trim() !== removed),
-        }))
-      return { ...current, steps }
-    })
-  }
-
-  /**
-   * The task being edited, as a one-step chain.
-   *
-   * This is the "one creation entry" made real: the button that starts a task can
-   * continue into a chain without the person retyping anything. It moves the *draft*
-   * across -- name, content, folder, and the trigger it already chose -- and opens the
-   * chain editor with one step in it, so "add a second step" is an edit rather than a
-   * second form.
-   */
-  const saveWorkflow = async () => {
-    const check = checkWorkflowGraph(workflowDraft.steps)
-    if (!workflowDraft.name.trim()) {
-      messageApi.warning('请填写流程名称')
-      return
-    }
-    if (check.problems.length) {
-      messageApi.warning(check.problems[0])
-      return
-    }
-    // A step with no upstreams has to say when the chain starts. Checked here
-    // for an edit as well as for a new chain, because reordering is exactly the
-    // edit that changes which step is first: without this the save goes out,
-    // comes back refused, and names a step the user just moved. A step that was
-    // already the entry keeps the stored schedule it is not sending, and one
-    // taking over a schedule says so by name.
-    const missingTrigger = workflowDraft.steps.find(step => {
-      if (cleanStepKeys(step.depends_on).length) return false
-      if (step.trigger || step.triggerFrom) return false
-      const stored = editingWorkflow?.steps.find(item => item.key === step.key.trim())
-      return !storedEntryStep(stored)
-    })
-    if (missingTrigger) {
-      messageApi.warning(`步骤「${missingTrigger.key}」没有上游，需要指定触发方式`)
-      return
-    }
-    if (workflowDraft.steps.some(step => !step.content.trim())) {
-      messageApi.warning('每个步骤都要有执行内容')
-      return
-    }
-    setWorkflowSaving(true)
-    try {
-      const body = workflowRequestBody(workflowDraft)
-      const resp = await api(
-        editingWorkflowId
-          ? `/api/workflows/${encodeURIComponent(editingWorkflowId)}`
-          : '/api/workflows',
-        {
-          method: editingWorkflowId ? 'PUT' : 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        },
-      )
-      const data = await resp.json()
-      if (data.error) {
-        messageApi.error(String(data.error))
-        return
-      }
-      setWorkflowModalOpen(false)
-      setEditingWorkflowId(null)
-      messageApi.success(editingWorkflowId ? '流程已保存' : '流程已创建')
-      // Steps are tasks, so all three lists change: the graph gained or moved
-      // tasks, the task list is where they are shown, and the unified list
-      // shows the chain as one row.
-      await Promise.all([loadWorkflows(true), loadSchedules(true), loadAutomations(true)])
-    } catch {
-      // Surfaced by the api helper.
-    } finally {
-      setWorkflowSaving(false)
-    }
-  }
-
   const deleteWorkflow = (info: WorkflowInfo) => {
     confirmResourceDeletion('流程', info.name, async () => {
       const resp = await api(`/api/workflows/${encodeURIComponent(info.id)}`, { method: 'DELETE' })
@@ -1097,115 +648,6 @@ export function useAutomation(deps: Deps) {
       setStartingWorkflowIds(Array.from(startingWorkflowRef.current))
     }
   }
-
-  const openEditSchedule = (task: ScheduleInfo) => {
-    setEditingScheduleId(task.id)
-    const draft = scheduleDraftFromTask(task)
-    setScheduleDraft({
-      ...draft,
-      workspace_root: draft.workspace_root || sessionState?.workspace_root || config?.workspace_root || '',
-    })
-    void loadSignals()
-    setScheduleModalOpen(true)
-  }
-
-  const duplicateSchedule = (task: ScheduleInfo) => {
-    setEditingScheduleId(null)
-    const draft = scheduleDraftFromTask(task)
-    setScheduleDraft({
-      ...draft,
-      name: `${task.name} 副本`,
-      workspace_root: draft.workspace_root || sessionState?.workspace_root || config?.workspace_root || '',
-    })
-    void loadSignals()
-    setScheduleModalOpen(true)
-  }
-
-  const saveSchedule = async () => {
-    const taskContent = scheduleDraft.action_type === 'agent_task'
-      ? scheduleDraft.prompt.trim()
-      : scheduleDraft.message_text.trim()
-    if (!scheduleDraft.name.trim()) {
-      messageApi.warning('请填写任务名称')
-      return
-    }
-    if (!taskContent) {
-      messageApi.warning(scheduleDraft.action_type === 'agent_task' ? '请填写任务执行要求' : '请填写提醒内容')
-      return
-    }
-    const followsUpstreams = !!editingStep?.followsUpstreams
-    if (!followsUpstreams && scheduleDraft.trigger_type === 'once') {
-      if (!scheduleDraft.at || !dayjs(scheduleDraft.at).isValid()) {
-        messageApi.warning('请选择执行时间')
-        return
-      }
-      if (dayjs(scheduleDraft.at).valueOf() <= Date.now()) {
-        messageApi.warning('执行时间必须晚于当前时间')
-        return
-      }
-    }
-    if (!followsUpstreams && scheduleDraft.trigger_type === 'interval' && !scheduleDraft.anchor_at) {
-      messageApi.warning('请选择首次执行时间')
-      return
-    }
-    if (!followsUpstreams && ['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type) && !scheduleDraft.time_of_day) {
-      messageApi.warning('请选择每天的执行时间')
-      return
-    }
-    if (!followsUpstreams && scheduleDraft.trigger_type === 'signal' && !scheduleDraft.signal_name.trim()) {
-      messageApi.warning('请选择或填写要等待的信号')
-      return
-    }
-    if (scheduleDraft.delivery_mode === 'channel' && !scheduleDraft.delivery_chat_id.trim()) {
-      messageApi.warning('发到飞书需要选择一个会话')
-      return
-    }
-    try {
-      setScheduleSaving(true)
-      const target = editingScheduleId
-        ? `/api/schedules/${encodeURIComponent(editingScheduleId)}`
-        : '/api/schedules'
-      const body = scheduleRequestBody(scheduleDraft)
-      if (followsUpstreams) {
-        // Left out entirely rather than replaced: an omission keeps whatever
-        // the step already waits for, which is the only right answer here.
-        delete (body as Record<string, any>).trigger_type
-        delete (body as Record<string, any>).time_of_day
-        delete (body as Record<string, any>).day_of_week
-        delete (body as Record<string, any>).day_of_month
-        delete (body as Record<string, any>).at
-        delete (body as Record<string, any>).every
-        delete (body as Record<string, any>).unit
-        delete (body as Record<string, any>).anchor_at
-        delete (body as Record<string, any>).signal_name
-      }
-      const resp = await api(target, {
-        method: editingScheduleId ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const data = await resp.json()
-      if (data.error) {
-        messageApi.error(String(data.error))
-        return
-      }
-      setScheduleModalOpen(false)
-      setEditingScheduleId(null)
-      setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
-      await loadSchedules()
-      await loadAutomations(true)
-      // A step's edit was copied back into its graph, so the picture of that
-      // graph is stale until it is read again.
-      if (editingStep) await loadWorkflows(true)
-      if (selectedSchedule?.id === data.task.id) {
-        setSelectedSchedule(data.task)
-      }
-      messageApi.success(`任务“${data.task.name}”已${editingScheduleId ? '更新' : '创建'}`)
-    } catch { /* surfaced */ } finally {
-      setScheduleSaving(false)
-    }
-  }
-
   const runScheduleNow = async (task: ScheduleInfo) => {
     try {
       const resp = await api(`/api/schedules/${encodeURIComponent(task.id)}/run`, {
@@ -1310,17 +752,9 @@ export function useAutomation(deps: Deps) {
       await loadScheduleRuns(task.id, true, true)
     } catch { /* surfaced */ }
   }
-
   const editingWorkflow = useMemo(
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-
-  const openStepDetails = (step: WorkflowStepInfo) => {
-    const task = schedules.find(item => item.id === step.task_id)
-    if (task) openScheduleDetails(task)
-    else messageApi.info('这一步的任务暂时读不到，先刷新一下')
-  }
-
-  return { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
+  return { acknowledgeScheduleRun, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }

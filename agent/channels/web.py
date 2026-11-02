@@ -1241,26 +1241,6 @@ class WebChannel(Channel):
             store.close()
         return JSONResponse({"completed": completed, "skipped": skipped})
 
-    async def _schedule_preview(self, request: Any) -> Any:
-        from starlette.responses import JSONResponse
-
-        if not self._authorized(request):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        try:
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise ValueError("body must be an object")
-            spec = self._schedule_from_body(body)
-            trigger = spec.trigger
-            current = trigger.initial_run_at(datetime.now(timezone.utc))
-            occurrences: list[str] = []
-            while current is not None and len(occurrences) < 5:
-                occurrences.append(current.isoformat())
-                current = trigger.advance_after_claim(current, current)
-            return JSONResponse({"occurrences": occurrences})
-        except (KeyError, ValueError, TypeError) as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-
     async def _run_schedule_now(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2922,7 +2902,6 @@ class WebChannel(Channel):
             Route("/api/schedules", self._schedules, methods=["GET"]),
             Route("/api/schedules", self._create_schedule, methods=["POST"]),
             Route("/api/schedules", self._bulk_schedules, methods=["PATCH"]),
-            Route("/api/schedules/preview", self._schedule_preview, methods=["POST"]),
             # Registered before /api/schedules/{task_id}: a literal path that
             # lost the race would be read as a task id.
             Route(

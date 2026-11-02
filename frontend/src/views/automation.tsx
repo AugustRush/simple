@@ -2,9 +2,7 @@
 
 import type { AppCtx } from '../app/AppCtx'
 import { WorkflowGraph } from '../components/WorkflowGraph'
-import { WEEKDAY_OPTIONS } from '../constants'
 import {
-  compactWorkspacePath,
   formatDateTime,
   formatFileSize,
   formatScheduleDuration,
@@ -17,73 +15,49 @@ import {
   describeFreshness,
   describeNextRun,
   describeRunTrigger,
-  describeSignalName,
   scheduleDeliveryStatusLabel,
   scheduleRunAttentionReason,
   scheduleRunStatusIcon,
   scheduleRunStatusLabel,
   scheduleRunVerdictLabel,
   scheduleRunVerificationDetail,
-  scheduleTimeValue,
   scheduleTriggerLabel,
 } from '../lib/schedule'
 import {
-  cleanStepKeys,
-  defaultWorkflowTrigger,
-  describeChainTrigger,
   describeStepTrigger,
-  planWorkflowStepMove,
   stepsInRunningOrder,
-  storedEntryStep,
 } from '../lib/workflow'
-import type { WorkflowTriggerDraft } from '../types'
 import {
   ApartmentOutlined,
-  ArrowDownOutlined,
-  ArrowUpOutlined,
   CheckOutlined,
-  ClockCircleOutlined,
-  CopyOutlined,
   DeleteOutlined,
   EditOutlined,
   FileTextOutlined,
   FolderOpenOutlined,
   MessageOutlined,
   MoreOutlined,
-  PlusOutlined,
   ReloadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
-  SaveOutlined,
   SearchOutlined,
-  SendOutlined,
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import {
-  AutoComplete,
   Button,
   Card,
   Checkbox,
-  DatePicker,
   Drawer,
   Dropdown,
   Empty,
   Input,
-  InputNumber,
-  Modal,
-  Select,
   Skeleton,
   Space,
   Spin,
   Switch,
   Tag,
-  TimePicker,
   Tooltip,
 } from 'antd'
-import dayjs from 'dayjs'
-
-const { TextArea } = Input
 
 /** What a new automation conversation starts with: the questions it will ask anyway.
  *
@@ -96,8 +70,25 @@ const NEW_AUTOMATION_SEED = `帮我建一个自动化任务：
 - 什么时候做（一次 / 每天 / 每周 / 等某个信号）：
 - 在哪个项目目录里：`
 
+/** The same door, for a change instead of a creation.
+ *
+ * The id travels with it because the thing being edited is a row in a store, and
+ * "the task called 每天早上看看日志" stops being a unique description the moment somebody
+ * makes a second one. The agent still has to quote this request for `schedule_update`,
+ * which is why the sentence is a request and not a note.
+ */
+function editAutomationSeed(row: { kind: string; name: string; task_id: string; workflow_id: string }): string {
+  const ids = row.kind === 'chain'
+    ? `- 流程 id：${row.workflow_id}`
+    : `- 任务 id：${row.task_id}`
+  return `请修改这个自动化：
+- 名称：${row.name}
+${ids}
+- 要改的地方：`
+}
+
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startNewSession, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
+  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, startNewSession, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
 
 
   /**
@@ -180,106 +171,6 @@ export function renderSchedules(ctx: AppCtx) {
     )
   }
 
-  const renderWorkflowTriggerEditor = (index: number, trigger: WorkflowTriggerDraft) => (
-    <div className="workflow-step-trigger">
-      <span className="workflow-step-trigger-label">入口触发</span>
-      <Space wrap size={8}>
-        <Select
-          value={trigger.trigger_type}
-          onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, trigger_type: value } })}
-          options={[
-            { value: 'daily', label: '每天' },
-            { value: 'weekdays', label: '工作日' },
-            { value: 'weekly', label: '每周' },
-            { value: 'monthly', label: '每月' },
-            { value: 'interval', label: '固定间隔' },
-            { value: 'once', label: '指定时间' },
-            { value: 'signal', label: '等某个信号' },
-          ]}
-          style={{ width: 132 }}
-        />
-        {trigger.trigger_type === 'weekly' && (
-          <Select
-            value={trigger.day_of_week}
-            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, day_of_week: value } })}
-            options={WEEKDAY_OPTIONS}
-            style={{ width: 96 }}
-          />
-        )}
-        {trigger.trigger_type === 'monthly' && (
-          <Space.Compact>
-            <InputNumber
-              min={1}
-              max={31}
-              value={trigger.day_of_month || 1}
-              onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, day_of_month: Number(value || 1) } })}
-              style={{ width: 74 }}
-            />
-            <span className="workflow-step-trigger-suffix">日</span>
-          </Space.Compact>
-        )}
-        {['daily', 'weekdays', 'weekly', 'monthly'].includes(trigger.trigger_type) && (
-          // `needConfirm` defaults to true for every TimePicker and every
-          // DatePicker with `showTime`, so a cell click only moves the *pending*
-          // value and 确定 is the sole way to commit. Close the panel any other
-          // way and the selection is thrown away, which reads as the field
-          // jumping back to the old time. Off restores commit-on-close, which is
-          // what this field was written against. `minuteStep={5}` went with it —
-          // see the schedule picker for why.
-          <TimePicker
-            needConfirm={false}
-            format="HH:mm"
-            value={scheduleTimeValue(trigger.time_of_day)}
-            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, time_of_day: value?.format('HH:mm') || '' } })}
-            style={{ width: 104 }}
-          />
-        )}
-        {trigger.trigger_type === 'interval' && (
-          <Space.Compact>
-            <InputNumber
-              min={1}
-              max={999}
-              value={trigger.every}
-              onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, every: Number(value || 1) } })}
-              style={{ width: 72 }}
-            />
-            <Select
-              value={trigger.unit}
-              onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, unit: value } })}
-              options={[
-                { value: 'minutes', label: '分钟' },
-                { value: 'hours', label: '小时' },
-                { value: 'days', label: '天' },
-                { value: 'weeks', label: '周' },
-              ]}
-              style={{ width: 88 }}
-            />
-          </Space.Compact>
-        )}
-        {trigger.trigger_type === 'once' && (
-          <DatePicker
-            needConfirm={false}
-            showTime={{ format: 'HH:mm' }}
-            format="M月D日 HH:mm"
-            value={trigger.at ? dayjs(trigger.at) : null}
-            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, at: value?.toISOString() || '' } })}
-            disabledDate={current => !!current && current.endOf('day').valueOf() < Date.now()}
-            style={{ width: 176 }}
-          />
-        )}
-        {trigger.trigger_type === 'signal' && (
-          <AutoComplete
-            value={trigger.signal_name}
-            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, signal_name: String(value || '') } })}
-            placeholder="信号名"
-            options={signals.map(item => ({ value: item.name, label: describeSignalName(item.name, schedules) }))}
-            filterOption={(input, option) => String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())}
-            style={{ width: 220 }}
-          />
-        )}
-      </Space>
-    </div>
-  )
 
   /**
    * The landing list: one row per thing a person manages.
@@ -317,7 +208,7 @@ export function renderSchedules(ctx: AppCtx) {
           const chain = workflows.find(item => item.id === row.workflow_id)
           const open = () => {
             if (row.kind === 'chain') {
-              if (chain) openEditWorkflow(chain)
+              if (chain) setEditingWorkflowId(chain.id)
               return
             }
             if (task) openScheduleDetails(task)
@@ -359,6 +250,21 @@ export function renderSchedules(ctx: AppCtx) {
                   {row.last_status ? (
                     <Tag>{scheduleRunStatusLabel(row.last_status)}</Tag>
                   ) : null}
+                  {/* Editing is a conversation too: the row opens one seeded with
+                      this automation's name and id, so "改成每周一" is a sentence rather
+                      than a form the agent has to be transcribed into. */}
+                  <Tooltip title="在对话里修改">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<EditOutlined />}
+                      aria-label={`在对话里修改 ${row.name}`}
+                      onClick={event => {
+                        event.stopPropagation()
+                        void startNewSession(editAutomationSeed(row))
+                      }}
+                    />
+                  </Tooltip>
                   {/* The switch sits inside a clickable card, so the click has to
                       stop here: toggling a row must not also open it. */}
                   <Tooltip title={row.enabled === false ? '启用' : '暂停'}>
@@ -387,289 +293,7 @@ export function renderSchedules(ctx: AppCtx) {
 
   const renderWorkflows = () => (
     <>
-      <Modal
-        open={workflowModalOpen}
-        title={editingWorkflowId ? '编辑流程' : '新建流程'}
-        width={860}
-        okText={editingWorkflowId ? '保存流程' : '创建流程'}
-        cancelText="取消"
-        confirmLoading={workflowSaving}
-        okButtonProps={{ disabled: workflowGraph.problems.length > 0 }}
-        onCancel={() => {
-          setWorkflowModalOpen(false)
-          setEditingWorkflowId(null)
-        }}
-        onOk={saveWorkflow}
-        className="schedule-modal workflow-modal"
-      >
-        <div className="schedule-form">
-          <div className="schedule-field-grid">
-            <div className="schedule-field">
-              <label>流程名称</label>
-              <Input
-                maxLength={60}
-                placeholder="例如：夜间报告"
-                value={workflowDraft.name}
-                onChange={event => setWorkflowDraft({ ...workflowDraft, name: event.target.value })}
-              />
-            </div>
-            <div className="schedule-field">
-              <label>说明</label>
-              <Input
-                maxLength={200}
-                placeholder="这条链在做什么"
-                value={workflowDraft.description}
-                onChange={event => setWorkflowDraft({ ...workflowDraft, description: event.target.value })}
-              />
-            </div>
-          </div>
-
-          <div className="schedule-form-section-title">步骤与依赖</div>
-          <p className="workflow-editor-hint">
-            每一步都是一个任务。把「上游」留空的步骤是入口，它需要自己的触发方式；
-            填了上游的步骤等上游全部成功后才运行，所以不需要时间。
-            顺序由依赖决定，编号就是真正会跑的次序。
-          </p>
-
-          {workflowOrderDiffersFromArray && (
-            <p className="workflow-editor-order">
-              执行顺序：{workflowGraph.order.join(' → ')}
-            </p>
-          )}
-
-          <div className="workflow-step-editor">
-            {workflowDraft.steps.map((step, index) => {
-              const key = step.key.trim()
-              // While a key is being rewritten, the step is still the stored
-              // one for everything else: its task, its schedule, whether it was
-              // the entry. Otherwise opening the field to retype `step2` would
-              // make the editor forget what it is editing halfway.
-              const rewriting = workflowKeyRewrite?.at === index ? workflowKeyRewrite : null
-              const stored = editingWorkflow?.steps.find(
-                item => item.key === (rewriting ? rewriting.key : key),
-              )
-              // The card is numbered by when it runs, not by where it sits in
-              // the array. Those are the same thing until an edit separates
-              // them, and the number is the one people read as "order".
-              const position = workflowGraph.order.indexOf(key)
-              const isEntry = cleanStepKeys(step.depends_on).length === 0
-              const earlier = planWorkflowStepMove(workflowDraft.steps, key, 'earlier')
-              const later = planWorkflowStepMove(workflowDraft.steps, key, 'later')
-              const handoverWords = isEntry && step.triggerFrom
-                ? describeChainTrigger(workflowDraft.steps, editingWorkflow?.steps, key)
-                : ''
-              const optionKeys = workflowDraft.steps
-                .map((item, at) => ({ key: item.key.trim(), at }))
-                .filter(item => item.key && item.at !== index)
-              return (
-                <div className="workflow-step-card" key={`step-${index}`}>
-                  <div className="workflow-step-card-head">
-                    <span className="workflow-step-index">{position >= 0 ? position + 1 : index + 1}</span>
-                    {stored && !rewriting ? (
-                      <span className="workflow-step-key-static">
-                        <code>{key}</code>
-                        <Tooltip title="改 key 等于换一个任务，这一步的运行记录会留在旧任务上">
-                          <Button
-                            type="link"
-                            size="small"
-                            onClick={() => setWorkflowKeyRewrite({ at: index, key })}
-                          >
-                            重命名
-                          </Button>
-                        </Tooltip>
-                      </span>
-                    ) : (
-                      <Input
-                        className="workflow-step-key"
-                        maxLength={40}
-                        placeholder="key"
-                        value={step.key}
-                        onChange={event => patchWorkflowStep(index, { key: event.target.value })}
-                      />
-                    )}
-                    <Input
-                      className="workflow-step-name"
-                      maxLength={60}
-                      placeholder="步骤名称"
-                      value={step.name}
-                      onChange={event => patchWorkflowStep(index, { name: event.target.value })}
-                    />
-                    <Select
-                      value={step.kind}
-                      onChange={value => patchWorkflowStep(index, { kind: value })}
-                      options={[
-                        { value: 'agent_prompt', label: 'Agent 任务' },
-                        { value: 'message', label: '提醒' },
-                      ]}
-                      style={{ width: 124 }}
-                    />
-                    <Space size={2} className="workflow-step-tools">
-                      <Tooltip title="在它后面插入一步">
-                        <Button
-                          type="text"
-                          size="small"
-                          icon={<PlusOutlined />}
-                          onClick={() => insertWorkflowStepAfter(index)}
-                        />
-                      </Tooltip>
-                      {/* Wrapped in a span because a disabled button swallows the
-                          hover, and here the tooltip is the only place the reason
-                          it cannot move is written down. */}
-                      <Tooltip title={earlier.pair ? '和上一步换位' : earlier.problem}>
-                        <span className="workflow-step-tool">
-                          <Button
-                            type="text"
-                            size="small"
-                            icon={<ArrowUpOutlined />}
-                            disabled={!earlier.pair}
-                            onClick={() => moveWorkflowStep(index, 'earlier')}
-                          />
-                        </span>
-                      </Tooltip>
-                      <Tooltip title={later.pair ? '和下一步换位' : later.problem}>
-                        <span className="workflow-step-tool">
-                          <Button
-                            type="text"
-                            size="small"
-                            icon={<ArrowDownOutlined />}
-                            disabled={!later.pair}
-                            onClick={() => moveWorkflowStep(index, 'later')}
-                          />
-                        </span>
-                      </Tooltip>
-                      <Tooltip title={workflowDraft.steps.length > 1 ? '删除这一步' : '流程至少要有一个步骤'}>
-                        <Button
-                          type="text"
-                          danger
-                          icon={<DeleteOutlined />}
-                          disabled={workflowDraft.steps.length <= 1}
-                          onClick={() => removeWorkflowStep(index)}
-                        />
-                      </Tooltip>
-                    </Space>
-                  </div>
-                  {rewriting && (
-                    <p className="workflow-step-key-warning">
-                      改名不是换个写法：保存后会按新 key 建一个任务，
-                      这一步现在的运行记录留在旧任务上，不会跟过来。
-                    </p>
-                  )}
-                  <TextArea
-                    rows={3}
-                    maxLength={6000}
-                    placeholder={step.kind === 'message' ? '到这一步时发送的内容' : '这一步要完成的工作'}
-                    value={step.content}
-                    onChange={event => patchWorkflowStep(index, { content: event.target.value })}
-                  />
-                  <div className="workflow-step-card-foot">
-                    <label className="workflow-step-upstreams">
-                      <span>上游</span>
-                      <Select
-                        mode="multiple"
-                        allowClear
-                        placeholder="留空 = 入口步骤"
-                        value={step.depends_on}
-                        onChange={value => changeWorkflowStepUpstreams(index, value)}
-                        options={optionKeys.map(item => ({ value: item.key, label: item.key }))}
-                        optionFilterProp="label"
-                        style={{ minWidth: 220, flex: '1 1 220px' }}
-                      />
-                    </label>
-                    <Space.Compact className="workflow-step-workspace">
-                      <Input
-                        prefix={<FolderOpenOutlined />}
-                        placeholder="项目目录（留空跟随入口步骤）"
-                        value={step.workspace_root}
-                        onChange={event => patchWorkflowStep(index, { workspace_root: event.target.value })}
-                      />
-                      <Button
-                        loading={pickingDirectory}
-                        onClick={() => pickDirectory(path => patchWorkflowStep(index, { workspace_root: path }))}
-                      >
-                        浏览…
-                      </Button>
-                    </Space.Compact>
-                  </div>
-                  {isEntry && (
-                    step.trigger
-                      ? renderWorkflowTriggerEditor(index, step.trigger)
-                      : step.triggerFrom
-                        ? (
-                          <div className="workflow-step-trigger workflow-step-trigger-stored">
-                            <span className="workflow-step-trigger-label">入口触发</span>
-                            <span>
-                              {`沿用「${step.triggerFrom}」的触发方式`}
-                              {handoverWords ? `（${handoverWords}）` : ''}
-                            </span>
-                          </div>
-                        )
-                        : storedEntryStep(stored)
-                          ? (
-                            <div className="workflow-step-trigger workflow-step-trigger-stored">
-                              <span className="workflow-step-trigger-label">入口触发</span>
-                              <span>{describeStepTrigger(stored!)}</span>
-                              <Button
-                                type="link"
-                                size="small"
-                                onClick={() => {
-                                  const task = schedules.find(item => item.id === stored!.task_id)
-                                  if (task) {
-                                    setWorkflowModalOpen(false)
-                                    openEditSchedule(task)
-                                  }
-                                }}
-                              >
-                                改时间
-                              </Button>
-                            </div>
-                          )
-                          : (
-                            <div className="workflow-step-trigger workflow-step-trigger-stored">
-                              <span className="workflow-step-trigger-label">入口触发</span>
-                              <span>它现在没有上游，还没有触发方式</span>
-                              <Button
-                                type="link"
-                                size="small"
-                                onClick={() => patchWorkflowStep(index, { trigger: defaultWorkflowTrigger() })}
-                              >
-                                指定
-                              </Button>
-                            </div>
-                          )
-                  )}
-                </div>
-              )
-            })}
-          </div>
-
-          <Button type="dashed" block icon={<PlusOutlined />} onClick={addWorkflowStep}>
-            在最后一步后面添加步骤
-          </Button>
-
-          {workflowGraph.problems.length > 0 && (
-            <div className="workflow-problems" role="alert">
-              <strong>这条链还不能保存</strong>
-              <ul>{workflowGraph.problems.map(item => <li key={item}>{item}</li>)}</ul>
-            </div>
-          )}
-
-          {workflowDraft.steps.length > 0 && workflowGraph.problems.length === 0 && (
-            <>
-              <div className="schedule-form-section-title">依赖关系</div>
-              <WorkflowGraph
-                nodes={workflowDraft.steps.map((step, index) => ({
-                  key: step.key.trim() || `第${index + 1}步`,
-                  name: step.name.trim() || step.key.trim() || `第 ${index + 1} 步`,
-                  kind: step.kind,
-                  depends_on: step.depends_on,
-                }))}
-                title="将要保存的步骤依赖关系"
-              />
-            </>
-          )}
-        </div>
-      </Modal>
-
+      
       {loadingView && workflows.length === 0 ? (
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : filteredWorkflows.length === 0 ? (
@@ -717,7 +341,19 @@ export function renderSchedules(ctx: AppCtx) {
                     />
                   </Tooltip>
                   <Tooltip title="编辑流程">
-                    <Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${flow.name}`} onClick={() => openEditWorkflow(flow)} />
+                    <Tooltip title="在对话里修改">
+                        <Button
+                          type="text"
+                          icon={<EditOutlined />}
+                          aria-label={`在对话里修改 ${flow.name}`}
+                          onClick={() => void startNewSession(editAutomationSeed({
+                            kind: 'chain',
+                            name: flow.name,
+                            task_id: '',
+                            workflow_id: flow.id,
+                          }))}
+                        />
+                      </Tooltip>
                   </Tooltip>
                   <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteWorkflow(flow)}>删除</Button>
                 </Space>
@@ -735,7 +371,8 @@ export function renderSchedules(ctx: AppCtx) {
                 title={`流程「${flow.name}」的步骤依赖关系`}
                 onSelect={node => {
                   const step = flow.steps.find(item => item.key === node.key)
-                  if (step) openStepDetails(step)
+                  const task = step ? schedules.find(item => item.id === step.task_id) : undefined
+                  if (task) openScheduleDetails(task)
                 }}
               />
 
@@ -764,7 +401,12 @@ export function renderSchedules(ctx: AppCtx) {
                       size="small"
                       icon={<FileTextOutlined />}
                       disabled={!step.task_id}
-                      onClick={() => openStepDetails(step)}
+                      onClick={() => {
+                        // A step *is* a task, so its history is the task drawer the
+                        // rest of the page already opens.
+                        const task = schedules.find(item => item.id === step.task_id)
+                        if (task) openScheduleDetails(task)
+                      }}
                     >
                       运行记录
                     </Button>
@@ -971,555 +613,46 @@ export function renderSchedules(ctx: AppCtx) {
       {/* Not "定时任务" any more, because the form no longer only offers
           times -- calling it that while the user is choosing a signal to wait
           for would be the form contradicting itself. */}
-      <Modal
-        open={scheduleModalOpen}
-        title={editingScheduleId ? '编辑任务' : '新建任务'}
-        width={700}
-        okText={editingScheduleId ? '保存修改' : '创建任务'}
-        cancelText="取消"
-        confirmLoading={scheduleSaving}
-        onCancel={() => {
-          setScheduleModalOpen(false)
-          setEditingScheduleId(null)
-        }}
-        onOk={saveSchedule}
-        footer={[
-          <Button key="cancel" onClick={() => {
-            setScheduleModalOpen(false)
-            setEditingScheduleId(null)
-          }}>
-            取消
-          </Button>,
-          <Button key="ok" type="primary" loading={scheduleSaving} onClick={saveSchedule}>
-            {editingScheduleId ? '保存修改' : '创建任务'}
-          </Button>,
-        ]}
-        className="schedule-modal"
+            {/* A chain in this page is read-only: the steps it is made of, and when each
+          one runs. Changing it is a conversation -- the pencil on its row opens one
+          seeded with this chain's name and id -- because a graph editor is a second
+          way to describe the same thing, and the one that drifts. */}
+      <Drawer
+        open={!!editingWorkflow}
+        title={editingWorkflow ? `流程：${editingWorkflow.name}` : '流程'}
+        onClose={() => setEditingWorkflowId(null)}
+        width={560}
+        className="schedule-detail"
       >
-        <div className="schedule-form">
-          <div className="schedule-field">
-            <label>任务名称</label>
-            <Input
-              maxLength={80}
-              placeholder="例如：生成每日项目进展摘要"
-              value={scheduleDraft.name}
-              onChange={event => setScheduleDraft({ ...scheduleDraft, name: event.target.value })}
-            />
-          </div>
-
-          <div className="schedule-field">
-            <label>任务类型</label>
-            <div className="schedule-action-picker" role="radiogroup" aria-label="任务类型">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={scheduleDraft.action_type === 'agent_task'}
-                className={scheduleDraft.action_type === 'agent_task' ? 'active' : ''}
-                onClick={() => setScheduleDraft({ ...scheduleDraft, action_type: 'agent_task' })}
-              >
-                <RobotOutlined />
-                <span><strong>Agent 执行任务</strong><small>让 Agent 按要求完成具体工作</small></span>
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={scheduleDraft.action_type === 'message'}
-                className={scheduleDraft.action_type === 'message' ? 'active' : ''}
-                onClick={() => setScheduleDraft({ ...scheduleDraft, action_type: 'message' })}
-              >
-                <MessageOutlined />
-                <span><strong>定时提醒</strong><small>到时间后发送一条固定内容</small></span>
-              </button>
-            </div>
-          </div>
-
-          {scheduleDraft.action_type === 'agent_task' && (
-            <>
-              <div className="schedule-form-section-title">运行环境</div>
-              <div className="schedule-field">
-                <label>项目文件夹</label>
-                <Space.Compact block>
-                  <Input
-                    prefix={<FolderOpenOutlined />}
-                    placeholder="Agent 执行任务时使用的项目目录"
-                    value={scheduleDraft.workspace_root}
-                    onChange={event => setScheduleDraft({ ...scheduleDraft, workspace_root: event.target.value })}
-                  />
-                  <Button
-                    loading={pickingDirectory}
-                    onClick={() => pickDirectory(path => setScheduleDraft(current => ({ ...current, workspace_root: path })))}
-                  >
-                    浏览…
-                  </Button>
-                </Space.Compact>
-                {recentWorkspaceRoots.length > 0 && (
-                  <div className="schedule-workspace-recents">
-                    <span>最近使用：</span>
-                    {recentWorkspaceRoots.map(path => (
-                      <button
-                        key={path}
-                        type="button"
-                        className={scheduleDraft.workspace_root === path ? 'active' : ''}
-                        title={path}
-                        onClick={() => setScheduleDraft({ ...scheduleDraft, workspace_root: path })}
-                      >
-                        {compactWorkspacePath(path)}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <small className="schedule-field-hint">任务会固定使用此目录，不受当前会话切换影响。</small>
-              </div>
-              <div className="schedule-field-grid schedule-field-grid-three">
-                <div className="schedule-field">
-                  <label>模型</label>
-                  <Select
-                    allowClear
-                    showSearch
-                    placeholder="默认模型"
-                    value={scheduleDraft.model_override || undefined}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, model_override: value || '' })}
-                    options={modelOptions}
-                  />
-                </div>
-                <div className="schedule-field">
-                  <label>上下文</label>
-                  <Select
-                    value={scheduleDraft.context_policy}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, context_policy: value })}
-                    options={[
-                      { value: 'stateless', label: '每次独立（推荐）' },
-                      { value: 'task_history', label: '参考历史成功摘要' },
-                      { value: 'shared_memory', label: '共享任务长期上下文' },
-                    ]}
-                  />
-                </div>
-                <div className="schedule-field">
-                  <label>权限</label>
-                  <Select
-                    value={scheduleDraft.permission_profile}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, permission_profile: value })}
-                    options={permissionProfileOptions.map(item => ({
-                      value: item.key,
-                      label: item.label,
-                    }))}
-                  />
-                  {activePermissionProfile && (
-                    <small className="schedule-field-hint">
-                      {activePermissionProfile.detail || activePermissionProfile.summary}
-                    </small>
-                  )}
-                </div>
-              </div>
-              <div className="schedule-field">
-                <label>指定技能</label>
-                <Select
-                  mode="multiple"
-                  allowClear
-                  showSearch
-                  optionFilterProp="label"
-                  placeholder="不指定时由 Agent 自主选择"
-                  value={scheduleDraft.selected_skills}
-                  onChange={value => setScheduleDraft({ ...scheduleDraft, selected_skills: value })}
-                  options={skills.filter(item => item.user_invocable).map(item => ({
-                    value: item.id,
-                    label: item.name || item.id,
-                  }))}
-                />
-                <small className="schedule-field-hint">任务启动前会验证技能；被删除或停用的技能会让运行明确失败。</small>
-              </div>
-            </>
-          )}
-
-          {/* A step that follows upstreams has no schedule of its own: it runs
-              when they succeed. Showing a schedule picker here would offer a
-              choice the server refuses, and a wrong one would detach the step
-              from the chain it is part of. */}
-          {editingStep?.followsUpstreams ? (
-            <>
-              <div className="schedule-form-section-title">触发方式</div>
-              <div className="schedule-field">
-                <div className="schedule-step-trigger-note">
-                  <ApartmentOutlined />
-                  <span>
-                    这一步属于流程「{editingStep.flow?.name}」，在上游步骤
-                    {editingStep.step.depends_on.map(key => `「${key}」`).join('、')}
-                    成功后才运行，没有自己的执行时间。
-                  </span>
-                </div>
-                <small className="schedule-field-hint">
-                  依赖关系在「流程」里编辑；确认上游都成功是运行的前提。
-                </small>
-              </div>
-            </>
-          ) : (
-            <>
-          <div className="schedule-form-section-title">
-            {scheduleDraft.trigger_type === 'signal' ? '触发方式' : '执行时间'}
-          </div>
-
-          <div className="schedule-field">
-            <label>执行计划</label>
-            <Select
-              value={scheduleDraft.trigger_type}
-              onChange={value => setScheduleDraft({ ...scheduleDraft, trigger_type: value })}
-              options={[
-                { value: 'once', label: '指定日期和时间' },
-                { value: 'interval', label: '固定间隔' },
-                { value: 'daily', label: '每天' },
-                { value: 'weekly', label: '每周' },
-                { value: 'weekdays', label: '工作日（周一至周五）' },
-                { value: 'monthly', label: '每月指定日期' },
-                { value: 'signal', label: '当某个信号发生时' },
-              ]}
-            />
-          </div>
-
-          {scheduleDraft.trigger_type === 'signal' && (
-            <div className="schedule-field">
-              <label>等待的信号</label>
-              {/* Autocomplete rather than a plain select: the known names are
-                  the ones that can actually fire today, but a name nobody has
-                  emitted yet is legitimate when the emitter is being set up in
-                  the same breath. Matching is exact, so a near-miss never
-                  fires — which is exactly why the known names are offered
-                  instead of left to memory. */}
-              <AutoComplete
-                value={scheduleDraft.signal_name}
-                onChange={value => setScheduleDraft({ ...scheduleDraft, signal_name: String(value || '') })}
-                placeholder="选择已有信号，或填写一个将要发出的信号名"
-                options={signals.map(item => ({
-                  value: item.name,
-                  label: `${describeSignalName(item.name, schedules)}${item.subscriber_count > 0 ? `（已有 ${item.subscriber_count} 个任务等待）` : ''}`,
-                }))}
-                filterOption={(input, option) => String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())}
-                style={{ width: '100%' }}
-              />
-              {signalsWaiting.length > 0 && (
-                <div className="schedule-field-hint">
-                  还没有发出过的信号：{signalsWaiting.map(item => item.name).join('、')}
-                </div>
-              )}
-            </div>
-          )}
-
-          {scheduleDraft.trigger_type === 'once' && (
-            <div className="schedule-field">
-              <label>执行时间</label>
-              <DatePicker
-                needConfirm={false}
-                showTime={{ format: 'HH:mm' }}
-                format="YYYY年M月D日 HH:mm"
-                value={scheduleDraft.at ? dayjs(scheduleDraft.at) : null}
-                onChange={value => setScheduleDraft({ ...scheduleDraft, at: value?.toISOString() || '' })}
-                disabledDate={current => !!current && current.endOf('day').valueOf() < Date.now()}
-                style={{ width: '100%' }}
-              />
-            </div>
-          )}
-
-          {scheduleDraft.trigger_type === 'interval' && (
-            <div className="schedule-field-grid">
-              <div className="schedule-field">
-                <label>重复间隔</label>
-                <Space.Compact block>
-                  <InputNumber
-                    min={1}
-                    max={999}
-                    value={scheduleDraft.every}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, every: Number(value || 1) })}
-                    style={{ width: '45%' }}
-                  />
-                  <Select
-                    value={scheduleDraft.unit}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, unit: value })}
-                    options={[
-                      { value: 'minutes', label: '分钟' },
-                      { value: 'hours', label: '小时' },
-                      { value: 'days', label: '天' },
-                      { value: 'weeks', label: '周' },
-                    ]}
-                    style={{ width: '55%' }}
-                  />
-                </Space.Compact>
-              </div>
-              <div className="schedule-field">
-                <label>首次执行</label>
-                <DatePicker
-                  needConfirm={false}
-                  showTime={{ format: 'HH:mm' }}
-                  format="YYYY-MM-DD HH:mm"
-                  value={scheduleDraft.anchor_at ? dayjs(scheduleDraft.anchor_at) : null}
-                  onChange={value => setScheduleDraft({ ...scheduleDraft, anchor_at: value?.toISOString() || '' })}
-                  disabledDate={current => !!current && current.endOf('day').valueOf() < Date.now()}
-                  style={{ width: '100%' }}
-                />
-              </div>
-            </div>
-          )}
-
-          {(['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type)) && (
-            <div className={`schedule-field-grid ${['daily', 'weekdays'].includes(scheduleDraft.trigger_type) ? 'single' : ''}`}>
-              {scheduleDraft.trigger_type === 'weekly' && (
-                <div className="schedule-field">
-                  <label>星期</label>
-                  <Select
-                    value={scheduleDraft.day_of_week}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, day_of_week: value })}
-                    options={WEEKDAY_OPTIONS}
-                  />
-                </div>
-              )}
-              {scheduleDraft.trigger_type === 'monthly' && (
-                <div className="schedule-field">
-                  <label>日期</label>
-                  <InputNumber
-                    min={1}
-                    max={31}
-                    value={scheduleDraft.day_of_month}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, day_of_month: Number(value || 1) })}
-                    style={{ width: '100%' }}
-                  />
-                  <small className="schedule-field-hint">没有该日期的月份将自动跳过。</small>
-                </div>
-              )}
-              <div className="schedule-field">
-                <label>执行时间</label>
-                {/* Two things used to make this field refuse the time you picked.
-                    (1) `needConfirm` is not a no-op default: rc-picker sets it to
-                    `internalPicker === 'time' || internalPicker === 'datetime'`,
-                    i.e. true for every TimePicker and every DatePicker with
-                    `showTime`. While it is on, clicking a cell only moves the
-                    pending value and 确定 is the *only* way to commit; any other
-                    way of closing the panel — clicking the next field, Escape —
-                    drops the selection and the field snaps back to the previous
-                    time. Off restores commit-on-close, which is the behaviour
-                    this field was written against.
-                    (2) `minuteStep={5}` cut the minute column to 00…55, but
-                    `defaultScheduleDraft` seeds `time_of_day` from
-                    `dayjs().add(1, 'hour')` — an arbitrary minute — so the
-                    picker could open on 15:41 with no cell in its own column
-                    selected, and 41 was unselectable. The date-time picker
-                    above already offers all 60 minutes; this one now matches. */}
-                <TimePicker
-                  needConfirm={false}
-                  format="HH:mm"
-                  value={scheduleTimeValue(scheduleDraft.time_of_day)}
-                  onChange={value => setScheduleDraft({ ...scheduleDraft, time_of_day: value?.format('HH:mm') || '' })}
-                  style={{ width: '100%' }}
-                />
-              </div>
-            </div>
-          )}
-            </>
-          )}
-
-          <div className="schedule-field">
-            <label>{scheduleDraft.action_type === 'agent_task' ? '任务执行要求' : '提醒内容'}</label>
-            {scheduleDraft.action_type === 'agent_task' ? (
-              <TextArea
-                rows={5}
-                maxLength={6000}
-                placeholder="说明要完成的工作、涉及的范围和期望输出。任务会在独立运行环境中交给 Agent 执行。"
-                value={scheduleDraft.prompt}
-                onChange={event => setScheduleDraft({ ...scheduleDraft, prompt: event.target.value })}
-              />
-            ) : (
-              <TextArea
-                rows={4}
-                maxLength={2000}
-                placeholder="输入到时间后需要发送的提醒内容"
-                value={scheduleDraft.message_text}
-                onChange={event => setScheduleDraft({ ...scheduleDraft, message_text: event.target.value })}
-              />
-            )}
-            <div className="schedule-field-meta">
-              <small>时区：{Intl.DateTimeFormat().resolvedOptions().timeZone}</small>
-              <small>{scheduleDraft.action_type === 'agent_task'
-                ? `${scheduleDraft.prompt.length} / 6000`
-                : `${scheduleDraft.message_text.length} / 2000`}</small>
-            </div>
-          </div>
-
-          <div className="schedule-form-section-title">投递方式</div>
-          <div className="schedule-field">
-            <div className="schedule-action-picker" role="radiogroup" aria-label="投递方式">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={scheduleDraft.delivery_mode === 'standalone'}
-                className={scheduleDraft.delivery_mode === 'standalone' ? 'active' : ''}
-                onClick={() => setScheduleDraft({ ...scheduleDraft, delivery_mode: 'standalone' })}
-              >
-                <SaveOutlined />
-                <span><strong>存到本机</strong><small>
-                  {scheduleDraft.action_type === 'agent_task'
-                    ? '运行结果写入输出目录，在任务卡片和运行记录里查看'
-                    : '提醒内容写入输出目录，不会发到任何聊天'}
-                </small></span>
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={scheduleDraft.delivery_mode === 'channel'}
-                className={scheduleDraft.delivery_mode === 'channel' ? 'active' : ''}
-                onClick={() => setScheduleDraft({ ...scheduleDraft, delivery_mode: 'channel' })}
-              >
-                <SendOutlined />
-                <span><strong>发到飞书</strong><small>
-                  {scheduleDraft.action_type === 'agent_task'
-                    ? '运行结束后把执行摘要发到所选飞书会话'
-                    : '到时间后把提醒内容发到所选飞书会话'}
-                </small></span>
-              </button>
-            </div>
-            {scheduleDraft.delivery_mode === 'channel' && (
-              <>
-                <div className="schedule-field" style={{ marginTop: 10 }}>
-                  <label>发到哪个会话</label>
-                  <Space.Compact block>
-                    <Select
-                      showSearch
-                      optionFilterProp="label"
-                      loading={feishuChatsLoading}
-                      placeholder={feishuChatsLoading ? '正在获取会话列表…' : '选择机器人所在的飞书会话'}
-                      value={scheduleDraft.delivery_chat_id || undefined}
-                      onChange={value => setScheduleDraft({ ...scheduleDraft, delivery_chat_id: String(value || '') })}
-                      options={(() => {
-                        const options = feishuChats.map(chat => ({
-                          value: chat.chat_id,
-                          label: chat.name ? `${chat.name}（${chat.chat_id}）` : chat.chat_id,
-                        }))
-                        // A chat the task already targets must stay selectable
-                        // even when the list has not loaded or the bot has
-                        // since left it -- dropping the option would make the
-                        // form silently blank out a value it is about to save.
-                        if (
-                          scheduleDraft.delivery_chat_id
-                          && !options.some(item => item.value === scheduleDraft.delivery_chat_id)
-                        ) {
-                          options.push({
-                            value: scheduleDraft.delivery_chat_id,
-                            label: scheduleDraft.delivery_chat_id,
-                          })
-                        }
-                        return options
-                      })()}
-                    />
-                    <Button
-                      disabled={!scheduleDraft.delivery_chat_id}
-                      loading={feishuTesting}
-                      onClick={() => void sendFeishuTest(scheduleDraft.delivery_chat_id)}
-                    >
-                      发送测试
-                    </Button>
-                  </Space.Compact>
-                  {feishuChatsError ? (
-                    <div className="schedule-field-hint schedule-delivery-error">
-                      {feishuChatsError}
-                      <Button type="link" size="small" onClick={() => void loadFeishuChats()}>重新获取</Button>
+        {editingWorkflow && (
+          <div className="workflow-steps">
+            {(editingWorkflow.steps || []).map(step => (
+              <Card key={step.key} size="small" className="workflow-step-card">
+                <div className="schedule-card-head">
+                  <div className="schedule-card-title">
+                    <span className="schedule-card-icon"><ApartmentOutlined /></span>
+                    <div>
+                      <strong>{step.name || step.key}</strong>
+                      <span>
+                        {step.kind === 'agent_prompt' ? 'Agent 任务' : '提醒'}
+                        {step.depends_on.length
+                          ? ` · 在 ${step.depends_on.join('、')} 之后`
+                          : ' · 入口步骤'}
+                      </span>
                     </div>
-                  ) : (
-                    feishuChatsLoaded && !feishuChatsLoading && feishuChats.length === 0 && (
-                      /* A bot that is in no group yet is the normal first-run
-                         state, not an error -- but it left the field with zero
-                         options and no way out: the hint below told the user to
-                         press 重新获取 and 重新获取 only existed on the error
-                         branch. So the list could never be refreshed into a
-                         usable one, and "发到飞书" was a dead end. Carry the
-                         action here too, and keep the muted (not error) colour.
-
-                         Gate on `feishuChatsLoaded`, not just an empty array:
-                         "the bot is in no group" is a claim about the server's
-                         answer, and before the first request returns we have no
-                         answer to make it from.
-
-                         The second line exists because an empty picker reads as
-                         "the bot's chat is missing", and the obvious guess --
-                         that the bot's own 1:1 conversation should be in here --
-                         is wrong for a reason the user cannot see: 飞书's
-                         im/v1/chats returns groups only ("获取到的群列表中，
-                         不包含单聊（群模式为 p2p）"). Without saying so, the user
-                         keeps looking for a chat that can never be listed. */
-                      <div className="schedule-field-hint">
-                        机器人当前不在任何群里，所以没有可选的会话。把机器人拉进一个群，再点
-                        <Button type="link" size="small" onClick={() => void loadFeishuChats()}>重新获取</Button>
-                        <br />
-                        与机器人的单聊不会出现在这里：飞书的会话列表接口只返回群，不返回单聊。
-                      </div>
-                    )
+                  </div>
+                  {step.latest_run?.status && (
+                    <Tag>{scheduleRunStatusLabel(step.latest_run.status, step.latest_run)}</Tag>
                   )}
-                  <small className="schedule-field-hint">
-                    使用设置页里填写的飞书应用发消息；不确定是否可用时，先点「发送测试」验证。
-                  </small>
                 </div>
-              </>
-            )}
+              </Card>
+            ))}
+            <p className="schedule-detail-note">
+              流程由 agent 在对话里修改：点这一行的铅笔，或新建一个会话说明要改什么。
+            </p>
           </div>
-
-          {scheduleDraft.action_type === 'agent_task' && (
-            <>
-              <div className="schedule-form-section-title">失败与超时</div>
-              <div className="schedule-field-grid schedule-field-grid-three">
-                <div className="schedule-field">
-                  <label>超时（分钟）</label>
-                  <InputNumber
-                    min={1}
-                    max={10080}
-                    value={Math.ceil(scheduleDraft.timeout_seconds / 60)}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, timeout_seconds: Number(value || 1) * 60 })}
-                    style={{ width: '100%' }}
-                  />
-                </div>
-                <div className="schedule-field">
-                  <label>最大尝试次数</label>
-                  <InputNumber
-                    min={1}
-                    max={5}
-                    value={scheduleDraft.max_attempts}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, max_attempts: Number(value || 1) })}
-                    style={{ width: '100%' }}
-                  />
-                </div>
-                <div className="schedule-field">
-                  <label>重试间隔（秒）</label>
-                  <InputNumber
-                    min={0}
-                    max={86400}
-                    disabled={scheduleDraft.max_attempts <= 1}
-                    value={scheduleDraft.backoff_seconds}
-                    onChange={value => setScheduleDraft({ ...scheduleDraft, backoff_seconds: Number(value || 0) })}
-                    style={{ width: '100%' }}
-                  />
-                </div>
-              </div>
-            </>
-          )}
-
-          <div className="schedule-preview">
-            <div><ClockCircleOutlined /><strong>{editingStep?.followsUpstreams ? '触发条件' : scheduleDraft.trigger_type === 'signal' ? '触发条件' : '未来执行时间'}</strong></div>
-            {editingStep?.followsUpstreams ? (
-              <span>
-                上游步骤
-                {editingStep.step.depends_on.map(key => `「${key}」`).join('、')}
-                全部成功后才运行，没有固定时间。
-              </span>
-            ) : scheduleDraft.trigger_type === 'signal' ? (
-              // No list of times to show, and showing an empty one would read
-              // as "this will never run" rather than "this waits".
-              <span>
-                {scheduleDraft.signal_name.trim()
-                  ? `收到信号「${scheduleDraft.signal_name.trim()}」时运行一次，没有固定时间。`
-                  : '选择一个信号后，任务会在它被发出时运行。'}
-              </span>
-            ) : schedulePreview.length > 0 ? (
-              <ol>{schedulePreview.map(item => <li key={item}>{formatDateTime(item)}</li>)}</ol>
-            ) : (
-              <span>{schedulePreviewError || '填写完整任务信息后显示未来 5 次执行时间'}</span>
-            )}
-          </div>
-        </div>
-      </Modal>
+        )}
+      </Drawer>
       <Drawer
         open={scheduleDetailOpen}
         width="min(880px, calc(100vw - 20px))"
@@ -1529,10 +662,19 @@ export function renderSchedules(ctx: AppCtx) {
         extra={selectedSchedule && (
           <Space>
             <Button icon={<ThunderboltOutlined />} onClick={() => runScheduleNow(selectedSchedule)} disabled={schedulerHealth.status !== 'online' || !!selectedSchedule.active_run_id}>立即运行</Button>
-            <Button icon={<EditOutlined />} onClick={() => openEditSchedule(selectedSchedule)}>编辑</Button>
+            <Button
+              icon={<EditOutlined />}
+              onClick={() => void startNewSession(editAutomationSeed({
+                kind: 'task',
+                name: selectedSchedule.name,
+                task_id: selectedSchedule.id,
+                workflow_id: '',
+              }))}
+            >
+              在对话里改
+            </Button>
             <Dropdown
               menu={{ items: [
-                { key: 'duplicate', icon: <CopyOutlined />, label: '创建副本', onClick: () => duplicateSchedule(selectedSchedule) },
                 { key: 'delete', icon: <DeleteOutlined />, label: '删除任务', danger: true, disabled: !!selectedSchedule.active_run_id, onClick: () => deleteSchedule(selectedSchedule) },
               ] }}
             >
@@ -1874,7 +1016,7 @@ export function renderSchedules(ctx: AppCtx) {
                     />
                     <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
                     <Tooltip title={schedulerHealth.status === 'online' ? '立即运行' : '调度器离线'}><Button type="text" icon={<ThunderboltOutlined />} aria-label={`立即运行 ${task.name}`} disabled={schedulerHealth.status !== 'online' || !!task.active_run_id} onClick={() => runScheduleNow(task)} /></Tooltip>
-                    <Tooltip title="编辑"><Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${task.name}`} onClick={() => openEditSchedule(task)} /></Tooltip>
+                    <Tooltip title="在对话里修改"><Button type="text" icon={<EditOutlined />} aria-label={`在对话里修改 ${task.name}`} onClick={() => void startNewSession(editAutomationSeed({ kind: 'task', name: task.name, task_id: task.id, workflow_id: '' }))} /></Tooltip>
                     <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
                   </Space>
                 </div>

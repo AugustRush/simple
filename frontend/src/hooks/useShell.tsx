@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, loadAutomations, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, loadAutomations, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -126,10 +126,9 @@ export function useShell(deps: Deps) {
       loadWorkflows(true)
       loadSkills(true)
       loadSchedulerHealth()
-      loadSignals()
     }
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSignals, loadSettings])
+  }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings])
 
   /** Move to another view, asking first if the settings page has unsaved edits.
    *

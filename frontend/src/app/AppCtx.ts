@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, AutomationRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
+import type { AttachmentInfo, AttentionRun, AutomationRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -157,39 +157,19 @@ export interface AppCtx {
   clock: number
   openScheduleDetails: (task: ScheduleInfo, runId?: string | undefined) => void
   acknowledgeScheduleRun: (taskId: string, runId: string) => Promise<void>
-  patchWorkflowStep: (index: number, patch: Partial<WorkflowStepDraft>) => void
-  signals: SignalInfo[]
-  workflowModalOpen: boolean
   editingWorkflowId: string | null
-  workflowSaving: boolean
   // Workflows whose "run now" request has not come back yet.
   startingWorkflowIds: string[]
-  workflowGraph: WorkflowGraphCheck
-  setWorkflowModalOpen: Dispatch<SetStateAction<boolean>>
   setEditingWorkflowId: Dispatch<SetStateAction<string | null>>
-  saveWorkflow: () => Promise<void>
-  workflowDraft: WorkflowDraft
-  setWorkflowDraft: Dispatch<SetStateAction<WorkflowDraft>>
-  workflowOrderDiffersFromArray: boolean
-  workflowKeyRewrite: { at: number; key: string; } | null
   editingWorkflow: WorkflowInfo | null
-  setWorkflowKeyRewrite: Dispatch<SetStateAction<{ at: number; key: string; } | null>>
-  insertWorkflowStepAfter: (index: number) => void
-  moveWorkflowStep: (index: number, direction: "earlier" | "later") => void
-  removeWorkflowStep: (index: number) => void
-  changeWorkflowStepUpstreams: (index: number, upstreams: string[]) => void
   pickingDirectory: boolean
   pickDirectory: (apply: (path: string) => void) => Promise<void>
-  openEditSchedule: (task: ScheduleInfo) => void
-  addWorkflowStep: () => void
   workflows: WorkflowInfo[]
   filteredWorkflows: WorkflowInfo[]
   toggleWorkflow: (info: WorkflowInfo, enabled: boolean) => Promise<void>
   schedulerHealth: SchedulerHealth
   runWorkflowNow: (info: WorkflowInfo) => Promise<void>
-  openEditWorkflow: (info: WorkflowInfo) => void
   deleteWorkflow: (info: WorkflowInfo) => void
-  openStepDetails: (step: WorkflowStepInfo) => void
   schedulerRefreshedAt: number | null
   schedulerStale: boolean
   //: Two views: what needs a person, and everything they manage. "Task or workflow"
@@ -214,19 +194,6 @@ export interface AppCtx {
   setScheduleStatusFilter: Dispatch<SetStateAction<string>>
   selectedScheduleIds: string[]
   bulkScheduleAction: (action: "enable" | "disable" | "delete") => Promise<void>
-  scheduleModalOpen: boolean
-  editingScheduleId: string | null
-  scheduleSaving: boolean
-  setScheduleModalOpen: Dispatch<SetStateAction<boolean>>
-  setEditingScheduleId: Dispatch<SetStateAction<string | null>>
-  saveSchedule: () => Promise<void>
-  scheduleDraft: ScheduleDraft
-  setScheduleDraft: Dispatch<SetStateAction<ScheduleDraft>>
-  recentWorkspaceRoots: string[]
-  permissionProfileOptions: PermissionProfileOption[]
-  activePermissionProfile: PermissionProfileOption | undefined
-  editingStep: { flow: WorkflowInfo | undefined; step: WorkflowStepInfo; followsUpstreams: boolean; } | null
-  signalsWaiting: { name: string; subscriber_count: number; }[]
   feishuChatsLoading: boolean
   feishuChats: FeishuChatInfo[]
   feishuTesting: boolean
@@ -234,13 +201,10 @@ export interface AppCtx {
   feishuChatsError: string
   loadFeishuChats: () => Promise<void>
   feishuChatsLoaded: boolean
-  schedulePreview: string[]
-  schedulePreviewError: string
   scheduleDetailOpen: boolean
   selectedSchedule: ScheduleInfo | null
   setScheduleDetailOpen: Dispatch<SetStateAction<boolean>>
   runScheduleNow: (task: ScheduleInfo) => Promise<void>
-  duplicateSchedule: (task: ScheduleInfo) => void
   deleteSchedule: (task: ScheduleInfo) => void
   scheduleRunsLoading: boolean
   loadScheduleRuns: (taskId: string, selectLatest?: boolean, silent?: boolean, focusRunId?: string | undefined) => Promise<void>
@@ -256,7 +220,6 @@ export interface AppCtx {
   scheduleOutputLoading: boolean
   scheduleArtifacts: ScheduleArtifact[]
   filteredSchedules: ScheduleInfo[]
-  workflowsLoaded: boolean
   attentionByTask: Map<string, string>
   setSelectedScheduleIds: Dispatch<SetStateAction<string[]>>
   toggleSchedule: (task: ScheduleInfo, enabled: boolean) => Promise<void>

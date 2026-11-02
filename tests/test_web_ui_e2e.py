@@ -266,6 +266,58 @@ def test_the_automation_page_is_one_list(page, live_gateway):
     assert page.errors == [], page.errors
 
 
+def test_editing_an_automation_is_a_conversation_too(page, live_gateway):
+    """A row's edit action opens a conversation seeded with *this* automation.
+
+    The id travels with the sentence: "the task called 每天早上看看日志" stops being a
+    unique description the moment there are two, and the agent has to name the row it is
+    about to change. Seeded with a template rather than a filled-in request, because the
+    person is the one who knows what should change.
+    """
+    import json
+    import urllib.request
+
+    # One automation, created through the API the page itself uses.
+    payload = {
+        "name": "每晚复盘一下",
+        "action_type": "message",
+        "message_text": "晚上好",
+        "trigger_type": "interval",
+        "every": 24,
+        "unit": "hours",
+        "anchor_at": "2026-11-01T00:00:00+08:00",
+        "workspace_root": str(live_gateway["home"]),
+        "context_policy": "stateless",
+        "delivery_mode": "standalone",
+        "timeout_seconds": 1800,
+        "retry_policy": {"max_attempts": 1, "backoff_seconds": 30},
+        "selected_skills": [],
+        "permission_profile": "inherit",
+        "timezone_name": "Asia/Shanghai",
+    }
+    request = urllib.request.Request(
+        f"{live_gateway['base_url']}/api/schedules",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        assert response.status in (200, 201), response.status
+        created = json.loads(response.read().decode("utf-8"))
+    task_id = created["task"]["id"]
+
+    page.locator(".nav-label", has_text="自动化").first.click()
+    page.wait_for_selector("text=每晚复盘一下", timeout=20_000)
+
+    page.get_by_role("button", name="在对话里修改 每晚复盘一下").first.click()
+
+    composer = page.wait_for_selector("textarea", timeout=20_000)
+    value = composer.input_value()
+    assert "每晚复盘一下" in value, value
+    assert task_id in value, f"the row's id has to travel: {value!r}"
+    assert page.errors == [], page.errors
+
+
 def test_creating_an_automation_is_a_conversation(page):
     """The create entry is a new session with the first sentence in the box.
 

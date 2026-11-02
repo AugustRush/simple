@@ -462,14 +462,12 @@ def _assignments(toks: list[_Tok]) -> dict[str, tuple[list[_Tok], set[int]]]:
     return found
 
 
-def _frontend_sites() -> list[_Site]:
-    """Extract every ``/api/...`` call site from ``frontend/src``."""
+def _sites_in_source(rel: str, text: str) -> list[_Site]:
+    """Every ``/api/...`` call site in one source text."""
     sites: list[_Site] = []
-    for path in _frontend_files():
-        text = path.read_text(encoding="utf-8")
-        if "/api/" not in text:
-            continue
-        rel = str(path.relative_to(REPO_ROOT))
+    if "/api/" not in text:
+        return sites
+    if True:  # keeps the body's indentation after the extraction below
         toks = _tokenize(text)
         assignments = _assignments(toks)
         handled: set[int] = set()
@@ -541,6 +539,19 @@ def _frontend_sites() -> list[_Site]:
             sites.append(
                 _Site(file=rel, line=tok.line, call="url", methods=("GET",), paths=(norm,))
             )
+    return sites
+
+
+def _frontend_sites() -> list[_Site]:
+    """Extract every ``/api/...`` call site from ``frontend/src``."""
+    sites: list[_Site] = []
+    for path in _frontend_files():
+        sites.extend(
+            _sites_in_source(
+                str(path.relative_to(REPO_ROOT)),
+                path.read_text(encoding="utf-8"),
+            )
+        )
     return sites
 
 
@@ -740,25 +751,45 @@ def test_extractor_recognises_the_shapes_the_frontend_uses() -> None:
     assert has("useMemory.tsx", ("PATCH",), ("api", "memory", "entries", "*"))
     # query strings are stripped
     assert has("useConversations.tsx", ("GET",), ("api", "sessions", "*", "messages"))
-    # a fetch() with an explicit verb
-    assert has("useAutomation.tsx", ("POST",), ("api", "schedules", "preview"))
+    # an explicit verb in the call's options object. (This used to point at
+    # POST /api/schedules/preview, which was deleted with the create form; the bulk
+    # edit uses the same shape.)
+    assert has("useAutomation.tsx", ("PATCH",), ("api", "schedules"))
     # `a + b` concatenation across lines is one path
     assert has("useAutomation.tsx", ("GET",), ("api", "schedules", "*", "runs", "*", "output"))
-    # ternary path and ternary method in one call
-    assert has("useAutomation.tsx", ("PUT", "POST"), ("api", "workflows", "*"))
-    assert has("useAutomation.tsx", ("PUT", "POST"), ("api", "workflows"))
+    # The workflow switch: a plain PUT against one row.
+    assert has("useAutomation.tsx", ("PUT",), ("api", "workflows", "*"))
+
+    # Two shapes the *live* frontend no longer contains, kept under test on a snippet
+    # because the extractor still has to understand code written this way -- the inline
+    # editors that used them (a ternary verb, a path built in a variable) went with
+    # "creation is a conversation", and a tokenizer that quietly stopped handling them
+    # would only be noticed by the next feature that writes them.
+    snippet = """
+      const target = editing ? `/api/schedules/${id}` : '/api/schedules'
+      await api(target, { method: editing ? 'PUT' : 'POST', body })
+      const url = `/api/schedules/${encodeURIComponent(id)}`
+      await api(url, { method: 'DELETE' })
+    """
+    synthetic = _sites_in_source("snippet.tsx", snippet)
+    assert any(
+        set(("PUT", "POST")) <= set(site.methods)
+        and ("api", "schedules", "*") in site.paths
+        for site in synthetic
+    ), synthetic
+    assert any(
+        site.methods == ("DELETE",) and site.paths == (("api", "schedules", "*"),)
+        for site in synthetic
+    ), synthetic
     # WebSocket route behind a full ws:// URL; the trailing hole is the
     # optional ``?token=...`` query the socket appends
     assert has("useConversations.tsx", ("WS",), ("api", "sessions", "*", "stream*"))
-    # path built in a variable, verb read from the call that consumes it
-    target = [
-        site
-        for site in sites
-        if site.file.endswith("useAutomation.tsx")
-        and ("api", "schedules", "*") in site.paths
-        and "PUT" in site.methods
-    ]
-    assert target, "the `const target = ...; api(target, {method})` shape was not resolved"
+    # the variable-target shape is covered by `synthetic` above (the live page has no
+    # such call any more); assert it is still resolved there, not merely present
+    assert any(
+        ("api", "schedules", "*") in site.paths and {"PUT", "POST"} <= set(site.methods)
+        for site in synthetic
+    ), "the `const target = ...; api(target, {method})` shape was not resolved"
 
 
 def test_backend_route_table_is_non_trivial_and_its_unused_routes_reported() -> None:

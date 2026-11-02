@@ -438,10 +438,14 @@ it was always one thing:
   -- a step is never its own row, a chain's attention is its steps' -- live on the server
   in `agent/scheduler/automations.py` rather than in the page's merge code.
 
-What is deliberately still two: the **editors**. A task is a form and a chain is a graph;
-one form that grows steps on demand is a form that hides the edge it is drawing. The
-maintenance verbs are still split for the same reason, and folding them is the next step
-(`docs/superpowers/plans/2026-11-01-superagent-borrow-review.md`, M2's remainder).
+**Changing one is the same conversation.** The row's pencil (and the task drawer's
+button) opens a session seeded with that automation's name and id; the agent calls
+`schedule_update` / `workflow_update` with `intent`. The page therefore has no editor at
+all: it lists, opens a read-only drawer (a task's run history; a chain's steps), and
+starts conversations. The two inline editors and their ~1,200 lines of frontend state
+went with it, along with the dead `POST /api/schedules/preview` they were the only caller
+of. What still needs a person is exactly what a person is good at: saying what should be
+different.
 
 ### Workflows: a chain of steps
 
