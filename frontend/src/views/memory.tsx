@@ -238,15 +238,12 @@ export function renderMemory(ctx: AppCtx) {
       description={
         memoryQuery.trim() || memoryCategory
           ? '没有匹配的记忆'
-          : '还什么都没记住。可以在对话里说「记住……」，也可以在这里手写一条。'
+          // One entry, not two: the toolbar already has 新增记忆, and a second
+          // primary button here was the same action in a louder place. The
+          // sentence points at both ways in, which is what an empty state is for.
+          : '还什么都没记住。可以在对话里说「记住……」，也可以用右上角的「新增记忆」手写一条。'
       }
-    >
-      {!memoryQuery.trim() && !memoryCategory && (
-        <Button size="small" type="primary" onClick={openMemoryCreate}>
-          手写一条
-        </Button>
-      )}
-    </Empty>
+    />
   )
 
   const factList = memoryFacts.length ? (

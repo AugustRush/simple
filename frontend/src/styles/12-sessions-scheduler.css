@@ -202,6 +202,14 @@ html[data-theme='dark'] .settings-inline-save:disabled {
 .schedule-card-title > div { display:flex; flex-direction:column; min-width:0; gap:2px; }
 .schedule-card-title strong { overflow:hidden; color:var(--text); font-size:14px; text-overflow:ellipsis; white-space:nowrap; }
 .schedule-card-title span { color:var(--text-muted); font-size:10px; }
+/* The row's controls (edit, on/off) sit on a card that is itself clickable, so
+   they have to read as controls before the cursor arrives. A bare switch in a
+   dark row is a grey dot: the pair gets a shared hit area and a hover state. */
+.schedule-card-controls { display:flex; align-items:center; gap:2px; flex:0 0 auto; }
+.schedule-card-controls .ant-btn { color:var(--text-muted); }
+.schedule-card-controls .ant-btn:hover { color:var(--text); background:var(--surface-hover); }
+.schedule-card-controls .ant-switch { margin-left:2px; }
+.schedule-card:hover .schedule-card-controls .ant-btn { color:var(--text-secondary); }
 .schedule-card-description { display:-webkit-box; margin:14px 0 12px; overflow:hidden; color:var(--text-secondary); font-size:12px; line-height:1.65; white-space:pre-wrap; -webkit-box-orient:vertical; -webkit-line-clamp:3; }
 .schedule-card-footer { display:flex; align-items:center; flex-wrap:wrap; gap:8px 14px; padding-top:11px; border-top:1px solid var(--border); color:var(--text-muted); font-size:10px; }
 .schedule-card-footer .ant-tag { margin:0; }

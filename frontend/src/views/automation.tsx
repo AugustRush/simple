@@ -258,7 +258,7 @@ export function renderSchedules(ctx: AppCtx) {
                     </span>
                   </div>
                 </div>
-                <Space>
+                <Space className="schedule-card-controls">
                   {row.attention > 0 && (
                     <Tag color="error">{row.attention} 条待处理</Tag>
                   )}
