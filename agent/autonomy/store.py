@@ -220,6 +220,31 @@ class ProposalStore:
             ).fetchall()
         return {str(row["state"]): int(row["n"]) for row in rows}
 
+    def counts_since(self, since: datetime) -> dict[str, int]:
+        """How many proposals of each state were created at or after *since*.
+
+        This is the budget's only input. Counting in the store rather than in
+        the loop is what makes the cap survive a restart: a patrol that restarts
+        every hour and counts its own tick has no daily cap at all.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT state, COUNT(*) AS n FROM proposals "
+                "WHERE created_at >= ? GROUP BY state",
+                (_iso(since),),
+            ).fetchall()
+        return {str(row["state"]): int(row["n"]) for row in rows}
+
+    def acted_since(self, since: datetime) -> int:
+        """How many proposals were *acted on* since *since* -- the auto-action count."""
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM proposals "
+                "WHERE state = 'acted' AND decided_at >= ?",
+                (_iso(since),),
+            ).fetchone()
+        return int(row["n"] or 0)
+
     def already_decided(self, source: str, action: str) -> Optional[str]:
         """The state a matching proposal was last decided in, if any.
 

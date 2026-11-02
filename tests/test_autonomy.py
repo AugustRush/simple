@@ -55,7 +55,7 @@ def store(tmp_path):
 def _session(session_id: str = "s1", **facts) -> dict:
     base = {
         "session_id": session_id,
-        "title": "构建失败排查",
+        "title": f"会话 {session_id}",
         "last_activity": (NOW - timedelta(hours=2)).isoformat(),
     }
     base.update(facts)
@@ -471,3 +471,72 @@ def test_the_patrol_does_not_write_dropped_candidates(store) -> None:
     assert result["proposed"] == 0
     assert result["dropped"] == 1
     assert store.list_proposals() == []
+
+
+# ── the budget is a day, not a tick ─────────────────────────────────────────
+
+
+def test_the_daily_cap_counts_proposals_from_earlier_ticks(store) -> None:
+    """A loop that restarts hourly and counts its own pass has no daily cap.
+
+    Two ticks of two candidates each, with a cap of three, must write three and
+    drop one -- the second tick has to know what the first one wrote.
+    """
+    policy = AdmissionPolicy(max_proposals_per_day=3)
+    options = PatrolOptions(admission=policy)
+
+    first = patrol_tick(
+        store=store,
+        sessions=[_session("a", attention=1), _session("b", attention=1)],
+        now=NOW,
+        options=options,
+        suggest=rule_candidates,
+    )
+    second = patrol_tick(
+        store=store,
+        sessions=[_session("c", attention=1), _session("d", attention=1)],
+        now=NOW + timedelta(minutes=30),
+        options=options,
+        suggest=rule_candidates,
+    )
+
+    assert first["proposed"] == 2
+    assert second["proposed"] == 1, "the second tick must see the first tick's rows"
+    assert second["dropped"] == 1
+    assert len(store.list_proposals()) == 3
+
+
+def test_yesterday_s_proposals_do_not_count_against_today(store) -> None:
+    """The window is a day, not "ever"."""
+    policy = AdmissionPolicy(max_proposals_per_day=1)
+    options = PatrolOptions(admission=policy)
+
+    yesterday = patrol_tick(
+        store=store,
+        sessions=[_session("a", attention=1)],
+        now=NOW,
+        options=options,
+        suggest=rule_candidates,
+    )
+    today = patrol_tick(
+        store=store,
+        sessions=[_session("b", attention=1)],
+        now=NOW + timedelta(days=1),
+        options=options,
+        suggest=rule_candidates,
+    )
+
+    assert yesterday["proposed"] == 1
+    assert today["proposed"] == 1, "a new day starts with a full budget"
+
+
+def test_acted_is_the_number_the_auto_budget_spends(store) -> None:
+    """`acted` is what consumed the auto-action budget; `proposed` is attention."""
+    from agent.autonomy.admission import day_bounds
+
+    store.record(Proposal(source="s1", action="a"))
+    proposal_id = store.list_proposals()[0].id
+    store.decide(proposal_id, "acted", by="test")
+
+    start, _ = day_bounds(NOW)
+    assert store.acted_since(start) == 1

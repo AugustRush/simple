@@ -44,7 +44,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from .admission import AdmissionPolicy, decide_admission
+from .admission import AdmissionPolicy, decide_admission, day_bounds
 
 __all__ = [
     "AUTONOMY_STATES",
@@ -274,6 +274,19 @@ def patrol_tick(
     if options.max_sessions_per_tick <= 0:
         return result
 
+    # The day's totals, once. `counts_since` is the store's own view of "today",
+    # which is the only one that survives a restart.
+    try:
+        day_counts = store.counts_since(start_of_day(now))
+    except Exception:
+        day_counts = {}
+    _proposed_today = int(day_counts.get("proposed", 0) or 0)
+    _acted_today = 0
+    try:
+        _acted_today = int(store.acted_since(start_of_day(now)) or 0)
+    except Exception:
+        _acted_today = 0
+
     examined = 0
     for session in sessions[: options.max_sessions_per_tick]:
         examined += 1
@@ -324,8 +337,11 @@ def patrol_tick(
                 proposal,
                 now=now,
                 policy=options.admission,
-                auto_actions_today=result["proposed"],
-                proposals_today=result["proposed"],
+                # Today's totals, read from the store rather than counted in this
+                # tick: a loop that restarts hourly and counts its own pass has no
+                # daily cap at all.
+                auto_actions_today=_acted_today,
+                proposals_today=_proposed_today + result["proposed"],
                 prior_decision=prior,
             )
             if decision.answer == "drop":
@@ -349,6 +365,11 @@ def _as_list(raw: Any) -> list[Any]:
     if isinstance(raw, list):
         return raw
     return [raw]
+
+
+def start_of_day(now: datetime) -> datetime:
+    """Midnight UTC of *now*'s day -- the window the budget is about."""
+    return day_bounds(now)[0]
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
