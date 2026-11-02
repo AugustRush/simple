@@ -1826,7 +1826,10 @@ def _start_shadow_patrol(config: dict) -> Any:
 def autonomy(
     action: str = typer.Argument(
         "review",
-        help="review (list proposals) | tick (run one shadow pass) | decide | stats",
+        help=(
+            "review (list proposals) | tick (run one shadow pass) | decide | "
+            "stats | act (execute one approved reversible proposal)"
+        ),
     ),
     proposal_id: Optional[str] = typer.Argument(
         None, help="The proposal to answer, for `decide`"
@@ -1931,11 +1934,64 @@ def autonomy(
                 + "[/dim]"
             )
             return
+        if action == "act":
+            # A person's command, never the agent's decision. This is the line
+            # this whole delivery is drawn on: the agent proposes, a person acts.
+            if not proposal_id:
+                shared.CONSOLE.print("[red]act needs a proposal id[/red]")
+                raise typer.Exit(1)
+            from agent.autonomy.execute import execute_proposal
+            from agent.scheduler import open_store as open_scheduler_store
+
+            # A prefix, like `git`: `review` prints the first eight characters,
+            # so eight has to be enough to name one. An ambiguous prefix is
+            # refused rather than guessed -- picking the first match would act on
+            # a proposal the person did not mean.
+            matches = [
+                row for row in store.list_proposals(limit=500)
+                if row.id == proposal_id or row.id.startswith(proposal_id)
+            ]
+            if len(matches) > 1:
+                shared.CONSOLE.print(
+                    f"[red]{proposal_id} 匹配到 {len(matches)} 条提议，请给更长的前缀[/red]"
+                )
+                raise typer.Exit(1)
+            target = matches[0] if matches else None
+            if target is None:
+                shared.CONSOLE.print(f"[red]no such proposal: {proposal_id}[/red]")
+                raise typer.Exit(1)
+            scheduler_store = open_scheduler_store()
+            try:
+                outcome = execute_proposal(
+                    store=store,
+                    proposal=target,
+                    scheduler_store=scheduler_store,
+                )
+            finally:
+                scheduler_store.close()
+            if outcome["ok"]:
+                shared.CONSOLE.print(
+                    f"[green]已建任务[/green] {outcome['task_id'][:8]} "
+                    f"[dim](只读档；由 {outcome['runner']} 的调度器接手才真正运行)[/dim]"
+                )
+            else:
+                shared.CONSOLE.print(f"[yellow]{outcome['reason']}[/yellow]")
+                raise typer.Exit(1)
+            return
         if action == "decide":
             if not proposal_id:
                 shared.CONSOLE.print("[red]decide needs a proposal id[/red]")
                 raise typer.Exit(1)
-            ok = store.decide(proposal_id, state, by="cli")
+            matches = [
+                row for row in store.list_proposals(limit=500)
+                if row.id == proposal_id or row.id.startswith(proposal_id)
+            ]
+            if len(matches) != 1:
+                shared.CONSOLE.print(
+                    f"[red]{proposal_id} 匹配到 {len(matches)} 条提议[/red]"
+                )
+                raise typer.Exit(1)
+            ok = store.decide(matches[0].id, state, by="cli")
             shared.CONSOLE.print(
                 "[green]recorded[/green]" if ok else "[yellow]already decided[/yellow]"
             )

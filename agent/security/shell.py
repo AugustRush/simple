@@ -487,7 +487,12 @@ CONFIRMATION_TTL = timedelta(minutes=5)
 # options, and pipe patterns (plain operators still ask); ``high``
 # auto-allows everything except the blacklist and structural guards;
 # ``full`` is an alias of ``high`` for readability.
-PERMISSION_LEVELS: tuple[str, ...] = ("ask", "medium", "high", "full")
+#: ``deny`` is first, and it is a *level* rather than a special case on purpose: a
+#: posture that says "no shell at all" has to be expressible in the same
+#: vocabulary as the others, or it ends up as prose in a profile's `detail` --
+#: which is exactly where "the sandbox does not limit writes to the workspace"
+#: was written down and then relied on anyway.
+PERMISSION_LEVELS: tuple[str, ...] = ("deny", "ask", "medium", "high", "full")
 
 
 @dataclass(frozen=True)
@@ -1823,6 +1828,22 @@ def shell_command_check(
             allowed=False,
             risk_level="high",
             reason=structural_guard[1],
+        )
+
+    # ── The deny level: no shell, at all ──────────────────────────────────
+    # Checked before every other rule, because every other rule is a *permission*
+    # and this is the absence of one. A level that only suppressed confirmations
+    # would still run the command, which is what "deny" must not do -- an
+    # unattended run under it has nobody to confirm with, so a command that
+    # would have asked is a command that must not run.
+    if effective_level == "deny":
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=(
+                "shell is disabled at the deny permission level; this run may "
+                "read files but not execute commands"
+            ),
         )
 
     if not argv0:

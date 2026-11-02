@@ -133,6 +133,29 @@ PERMISSION_PROFILES: dict[str, PermissionProfile] = {
         shell_sandbox="read_all",
         requires_workspace_root=False,
     ),
+    # Internal: resolvable by the execution bridge, never offered in a dropdown.
+    # A profile a person can select is a profile that can be used to build a task
+    # with a weaker envelope than the bridge promises, and then the promise is
+    # about the bridge rather than about what runs.
+    "autonomy_read": PermissionProfile(
+        key="autonomy_read",
+        label="自主执行（只读）",
+        summary="自主提议执行时用的档：可读，不可写，不许跑命令。",
+        detail=(
+            "比 read_only 更窄，因为自主执行没有人在旁边看。"
+            "read_only 的 shell 在 ask 档：管道与重定向会问，但其余命令直接放行——"
+            "而沙箱并不把写入限制在工作区内，所以中低风险命令仍可能在别处写缓存。"
+            "一条被判定为 reversible 的提议如果真跑起来还能执行任意命令，"
+            "那个 reversible 就只是意图而不是保证。"
+            "所以这一档把 shell 直接置为 deny：这条链上唯一能保证『不会改变工作区之外』的，"
+            "是**不许跑命令**，不是档位语义的暗示。"
+        ),
+        overrides_config=True,
+        workspace_write=False,
+        shell_level="deny",
+        shell_sandbox="read_all",
+        requires_workspace_root=False,
+    ),
     "workspace_write": PermissionProfile(
         key="workspace_write",
         label="可在项目内写入",
@@ -179,9 +202,19 @@ def resolve_permission_profile(key: Any) -> PermissionProfile:
     )
 
 
+#: Profiles that exist for the runtime to apply and must not be offered to a
+#: person: selecting one would let somebody opt out of the constraint it exists
+#: to apply.  They still resolve -- the bridge asks for them by key.
+INTERNAL_PROFILE_KEYS: frozenset[str] = frozenset({"autonomy_read"})
+
+
 def profile_payloads() -> list[dict[str, Any]]:
-    """Profiles as API payloads, in offer order."""
-    return [profile.to_payload() for profile in PERMISSION_PROFILES.values()]
+    """Profiles as API payloads, in offer order, without the internal ones."""
+    return [
+        profile.to_payload()
+        for key, profile in PERMISSION_PROFILES.items()
+        if key not in INTERNAL_PROFILE_KEYS
+    ]
 
 
 def apply_profile_to_config(cfg: dict, profile: PermissionProfile) -> dict:
