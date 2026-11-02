@@ -2648,6 +2648,16 @@ class WebChannel(Channel):
         assert self._handler is not None
         service = self._service()
         service.touch_session(session_id, status="active")
+        # A conversation's first message is the best title it will ever have, and
+        # it is already paid for. Without this every row in the sidebar read
+        # "未命名会话" beside a session id -- twenty conversations nobody could
+        # tell apart. Set before the turn, so the sidebar is right while it runs;
+        # `ensure_auto_title` leaves a name somebody chose alone.
+        try:
+            service.ensure_auto_title(session_id, text)
+        except Exception:
+            # A title is a convenience: never let it be the reason a turn fails.
+            pass
         attachment_metadata = [
             {
                 "id": attachment.source_ref or attachment.local_path.name,

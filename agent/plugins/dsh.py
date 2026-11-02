@@ -270,8 +270,27 @@ def load_yaml_subset(text: str) -> Any:
     if not lines:
         return None
     value, index = _parse_block(lines, 0, lines[0].indent)
-    if index != len(lines):
-        raise YamlSubsetError(f"trailing content the subset reader cannot place (line {lines[index].number})")
+    # A patch file is a *sequence* of items, and the same key may legitimately appear
+    # more than once (`- insert:` twice is how two groups of MCP servers are added).
+    # Each top-level block is therefore read and appended, rather than the first
+    # block being taken and the rest called "trailing content" -- which is what a
+    # real profile did, and what made every server after the second `- insert:` vanish.
+    extra: list[Any] = []
+    while index < len(lines):
+        block, index = _parse_block(lines, index, lines[index].indent)
+        extra.append(block)
+    if extra:
+        # Only a *sequence* of sequences is a patch file. A mapping block appearing
+        # after a list (or the other way round) is a file this reader cannot place,
+        # and merging it silently would put an item where the author did not.
+        if isinstance(value, list) and all(isinstance(block, list) for block in extra):
+            for block in extra:
+                value.extend(block)
+        else:
+            raise YamlSubsetError(
+                "a block after the first one is not part of the same sequence "
+                f"(line {lines[0].number})"
+            )
     return value
 
 

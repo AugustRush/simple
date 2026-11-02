@@ -88,7 +88,7 @@ ${ids}
 }
 
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, startNewSession, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
+  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, startNewSession, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
 
 
   /**
@@ -187,7 +187,9 @@ export function renderSchedules(ctx: AppCtx) {
       ? automations.filter(row => row.name.toLowerCase().includes(needle) ||
           (row.description || '').toLowerCase().includes(needle))
       : automations
-    if (loadingView && automations.length === 0) {
+    // Not `loadingView`: that flag belongs to the task list, and the unified list has
+    // its own first load. An empty list is only empty once it has been read.
+    if (!automationsLoaded) {
       return <Skeleton active paragraph={{ rows: 6 }} />
     }
     if (visible.length === 0) {

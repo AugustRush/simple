@@ -726,6 +726,17 @@ class SessionService:
             }
 
         live = self._live_states.get(clean)
+        # The title the sidebar shows: the live copy when this session is open in
+        # this process (a rename is instant), else the stored one.
+        title = str(getattr(live, "title", "") or "") if live is not None else ""
+        if not title:
+            store_for_title = self._store_for_session(clean)
+            read_titles = getattr(store_for_title, "list_session_titles", None)
+            if callable(read_titles):
+                try:
+                    title = str((read_titles() or {}).get(clean, "") or "")
+                except Exception:
+                    title = ""
         from agent.runtime.contracts import describe_queued_messages
 
         live_ctx = getattr(live, "ctx", None) if live is not None else None
@@ -800,6 +811,7 @@ class SessionService:
 
         return {
             "session_id": clean,
+            "title": title,
             "live": live is not None,
             "operation_state": str(getattr(live, "operation_state", "idle")),
             "queue": {
@@ -916,6 +928,87 @@ class SessionService:
             if candidates:
                 return candidates
         return [state]
+
+    #: How long a title may be, in characters. Long enough for a sentence, short
+    #: enough that the sidebar row does not become the paragraph it summarises.
+    AUTO_TITLE_LIMIT = 40
+
+    @classmethod
+    def title_from_message(cls, text: str) -> str:
+        """A first title, from the words the person actually typed.
+
+        No model call. The first message of a conversation is the best summary it
+        will ever have, it is already paid for, and a model round-trip here would
+        add latency to every new conversation to produce a worse guess. What this
+        does instead is the mechanical part: one line, no markdown, no trailing
+        punctuation, cut at a word boundary rather than mid-character.
+
+        The result is a *default*, not a decision: ``rename_session`` overwrites
+        it the moment somebody types a better one.
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        # The first non-empty line: a pasted block, a code fence or a list should
+        # title the conversation by what it opens with, not by its whole body.
+        #
+        # A fence's *opening* line is the language tag (```python), which is not a
+        # title; its body is. So a fence is skipped and the line after it is read.
+        first = ""
+        skipping_fence = False
+        for line in raw.splitlines():
+            candidate = line.strip()
+            if candidate.startswith("```"):
+                skipping_fence = not skipping_fence
+                continue
+            if skipping_fence:
+                # The fence body is the content; read it like any other line.
+                pass
+            # Strip the markdown that would otherwise show as literal characters
+            # in the sidebar: headings, list markers, quotes, emphasis.
+            candidate = candidate.lstrip("#>-*` ").strip()
+            if candidate:
+                first = candidate
+                break
+        if not first:
+            first = raw.splitlines()[0].strip()
+        # Collapse whitespace: a title is one line, always.
+        first = " ".join(first.split())
+        if len(first) <= cls.AUTO_TITLE_LIMIT:
+            return first
+        cut = first[: cls.AUTO_TITLE_LIMIT]
+        # Prefer the last space in the window, then the last CJK boundary -- a
+        # title cut mid-word reads as broken rather than as abbreviated.
+        space = cut.rfind(" ")
+        if space > cls.AUTO_TITLE_LIMIT // 2:
+            cut = cut[:space]
+        return cut.rstrip("。.,、!！?？;；:： ") + "…"
+
+    def ensure_auto_title(self, session_id: str, first_message: str) -> str:
+        """Give a session its default title, if it does not have one yet.
+
+        Only when the title is still empty: a conversation somebody renamed must
+        not have its name overwritten by its own first message the next time the
+        title is recomputed. Returns the title in force afterwards (empty when
+        there is nothing to set).
+        """
+        clean = str(session_id or "").strip()
+        if not clean:
+            return ""
+        current = ""
+        target_store = self._store_for_session(clean)
+        titles = getattr(target_store, "list_session_titles", None)
+        if callable(titles):
+            try:
+                current = str((titles() or {}).get(clean, "") or "")
+            except Exception:
+                current = ""
+        if current:
+            return current
+        proposed = self.title_from_message(first_message)
+        if not proposed:
+            return ""
+        return proposed if self.rename_session(clean, proposed) else ""
 
     def rename_session(self, session_id: str, title: str) -> bool:
         clean = str(session_id or "").strip()

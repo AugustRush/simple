@@ -122,8 +122,13 @@ export function useShell(deps: Deps) {
       loadSkills()
     }
     if (view === 'schedules') {
+      // Three readers of the same facts: the task list, the chain list, and the
+      // unified list the page actually opens on. The last one used to load only
+      // from the poll, so the page greeted every visit with "还没有自动化" over
+      // automations that existed -- found by opening the page in a browser.
       loadSchedules()
       loadWorkflows(true)
+      loadAutomations()
       loadSkills(true)
       loadSchedulerHealth()
     }

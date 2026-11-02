@@ -178,6 +178,7 @@ export interface AppCtx {
   automationKind: "all" | "task" | "workflow"
   automationQuery: string
   automations: AutomationRow[]
+  automationsLoaded: boolean
   loadAutomations: (silent?: boolean) => Promise<void>
   loadSchedules: (silent?: boolean) => Promise<void>
   loadWorkflows: (silent?: boolean) => Promise<void>

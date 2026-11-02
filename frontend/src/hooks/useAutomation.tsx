@@ -97,6 +97,10 @@ export function useAutomation(deps: Deps) {
   // agent/scheduler/automations.py for the invariant and why it matters).
   const [automationKind, setAutomationKind] = useState<'all' | 'task' | 'workflow'>('all')
   const [automations, setAutomations] = useState<AutomationRow[]>([])
+  //: Whether this page has ever read the unified list. Without it, an empty
+  //: list and an unread list look the same -- which is what the page showed for
+  //: the first ten seconds after opening it: "还没有自动化" over data that existed.
+  const [automationsLoaded, setAutomationsLoaded] = useState(false)
   const [automationQuery, setAutomationQuery] = useState('')
 
 
@@ -191,6 +195,7 @@ export function useAutomation(deps: Deps) {
         return
       }
       setAutomations(Array.isArray(data.automations) ? data.automations : [])
+      setAutomationsLoaded(true)
       if (Array.isArray(data.permission_profiles) && data.permission_profiles.length) {
         setPermissionProfiles(data.permission_profiles)
       }
@@ -756,5 +761,5 @@ export function useAutomation(deps: Deps) {
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-  return { acknowledgeScheduleRun, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
+  return { acknowledgeScheduleRun, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }

@@ -220,3 +220,55 @@ def test_the_converted_shape_is_what_the_mcp_client_reads(tmp_path) -> None:
     assert set(converted) <= {"name", "command", "args", "env", "cwd"}
     assert converted["command"]
     assert DSH_MCP_PLUGIN.startswith("@deepseek-ai/")
+
+
+def test_the_reader_places_sibling_blocks_instead_of_refusing_them(tmp_path) -> None:
+    """A patch file is a sequence; the same key may appear twice.
+
+    A real ``cordis.patch.yml`` grew a second ``- insert:`` (two groups of MCP
+    servers added by different tools), and the reader called everything after the
+    first block "trailing content the subset reader cannot place" -- which made
+    **every server in the second group disappear** while the file looked fine. The
+    failure was reported as a warning, so a profile that half-parsed read as a
+    profile with fewer servers rather than as a profile that could not be read.
+    """
+    patch = tmp_path / "cordis.patch.yml"
+    patch.write_text(
+        "- id: first\n"
+        "  name: \"@deepseek-ai/dsh-base\"\n"
+        "- insert:\n"
+        "    - id: a\n"
+        "      name: \"@deepseek-ai/dsh-mcp-client\"\n"
+        "      config:\n"
+        "        serverName: \"alpha\"\n"
+        "        command: \"alpha-mcp\"\n"
+        "- insert:\n"
+        "    - id: b\n"
+        "      name: \"@deepseek-ai/dsh-mcp-client\"\n"
+        "      config:\n"
+        "        serverName: \"beta\"\n"
+        "        command: \"beta-mcp\"\n",
+        encoding="utf-8",
+    )
+    profile = read_dsh_profile(tmp_path)
+
+    assert [server["name"] for server in profile.mcp_servers] == ["alpha", "beta"]
+    assert profile.warnings == ()
+
+
+def test_a_mapping_after_a_sequence_is_still_refused() -> None:
+    """The relaxation is for a *sequence* of items, not for mixing shapes.
+
+    The reader now appends sibling list blocks instead of calling everything after
+    the first one "trailing content". A mapping block after a list is still outside
+    what it can place, and merging it would put an item where the author did not.
+    """
+    text = (
+        "- id: first\n"
+        "  name: \"@deepseek-ai/dsh-base\"\n"
+        "id: stray\n"
+        "  name: \"@deepseek-ai/dsh-web\"\n"
+    )
+
+    with pytest.raises(YamlSubsetError):
+        load_yaml_subset(text)
