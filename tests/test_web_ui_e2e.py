@@ -264,3 +264,27 @@ def test_the_automation_page_is_one_list(page, live_gateway):
     # The row says which shape it is, from the unified payload.
     assert page.locator(".schedule-list").first.inner_text().count("每天早上看看日志") == 1
     assert page.errors == [], page.errors
+
+
+def test_one_create_entry_continues_into_a_chain(page):
+    """One button, and the chain is the *next* step rather than a different form.
+
+    The page used to greet you with two creators -- one for a task, one for a chain --
+    which asked a person to classify their own request before filling anything in.
+    Now there is one, and "改成流程（多步）" continues the same draft into a one-step chain:
+    the name, the content and the trigger you already chose move across.
+    """
+    page.locator(".nav-label", has_text="自动化").first.click()
+    page.wait_for_selector(".schedule-tabs", timeout=20_000)
+
+    # One creator in the page head: neither "新建任务" nor "新建流程" is there to choose
+    # between any more -- the one button says what it does and the filter says the rest.
+    create = page.locator(".schedule-page-head button:has-text('新建')")
+    assert create.count() == 1, [create.nth(i).inner_text() for i in range(create.count())]
+    create.first.click()
+    page.wait_for_selector(".ant-modal-title:has-text('新建任务')", timeout=20_000)
+
+    page.get_by_role("button", name="改成流程（多步）").click()
+    page.wait_for_selector(".ant-modal-title:has-text('新建流程')", timeout=20_000)
+
+    assert page.errors == [], page.errors

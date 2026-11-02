@@ -86,7 +86,7 @@ import dayjs from 'dayjs'
 const { TextArea } = Input
 
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
+  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, convertScheduleToChain, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
 
 
   /**
@@ -814,16 +814,16 @@ export function renderSchedules(ctx: AppCtx) {
               }}
             />
           </Tooltip>
-          {automationTab === 'automation' && automationKind !== 'workflow' && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
-          )}
-          {automationTab === 'automation' && automationKind !== 'task' && (
+          {automationTab === 'automation' && (
+            // One entry. What it opens follows the filter you are looking at --
+            // and inside the task editor, "改成流程" continues the same draft into
+            // a chain, so "one step or several" is a next step, not a first choice.
             <Button
-              type={automationKind === 'all' ? 'default' : 'primary'}
-              icon={<ApartmentOutlined />}
-              onClick={openCreateWorkflow}
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={automationKind === 'workflow' ? openCreateWorkflow : openCreateSchedule}
             >
-              新建流程
+              新建
             </Button>
           )}
           {/* Nothing to create from the attention list: it is a list of things
@@ -969,6 +969,25 @@ export function renderSchedules(ctx: AppCtx) {
           setEditingScheduleId(null)
         }}
         onOk={saveSchedule}
+        footer={[
+          // The continuation, offered only where it means something: an existing
+          // task is already a task, and "turn it into a chain" is a different
+          // promise from the one this form makes.
+          !editingScheduleId ? (
+            <Button key="to-chain" onClick={convertScheduleToChain}>
+              改成流程（多步）
+            </Button>
+          ) : null,
+          <Button key="cancel" onClick={() => {
+            setScheduleModalOpen(false)
+            setEditingScheduleId(null)
+          }}>
+            取消
+          </Button>,
+          <Button key="ok" type="primary" loading={scheduleSaving} onClick={saveSchedule}>
+            {editingScheduleId ? '保存修改' : '创建任务'}
+          </Button>,
+        ]}
         className="schedule-modal"
       >
         <div className="schedule-form">

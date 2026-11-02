@@ -200,6 +200,7 @@ export interface AppCtx {
   loadAutomations: (silent?: boolean) => Promise<void>
   loadSchedules: (silent?: boolean) => Promise<void>
   loadWorkflows: (silent?: boolean) => Promise<void>
+  convertScheduleToChain: () => void
   openCreateSchedule: () => void
   openCreateWorkflow: () => void
   unseenFailures: number
