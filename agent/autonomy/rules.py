@@ -88,7 +88,15 @@ def rule_candidates(
             return "irreversible"
 
     # ── 1. runs that failed and nobody looked at ───────────────────────────
+    # "Attention" is a *task*-level fact (an unacknowledged failed run belongs to a
+    # task). A session carries it only when its tasks do, so the row is asked for
+    # the tasks it knows about, and the count is theirs. A session with no tasks
+    # has no failures to read -- which is different from zero failures.
     attention = int(session.get("attention") or 0)
+    for task in (session.get("tasks") or []):
+        if not isinstance(task, dict):
+            continue
+        attention += int(task.get("attention") or 0)
     if attention > 0:
         found.append(
             Proposal(

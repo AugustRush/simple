@@ -1743,13 +1743,23 @@ def _scheduler_services(components: dict) -> dict:
 
 
 def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
-    """What the shadow patrol may look at, per session.
+    """What the shadow patrol may look at, per session -- from the stores that hold it.
 
-    Facts only, from the two stores that hold them: the web session index (which
-    sessions exist, when they were last active, their titles) and each session's
-    working state (an unfinished task, a queue that has not moved). The rules are
-    written against exactly these keys; a missing one means the matching rule
-    cannot fire, which is the honest answer rather than a guess.
+    Three facts, three sources, and the reason each is where it is:
+
+    * **which sessions exist, and when they were last active** -- the web session
+      index (the same file the page reads);
+    * **an unfinished task** -- ``session_working_state``, which lives on the *memory*
+      store, not the scheduler's: it is a projection of the conversation, not of a
+      schedule;
+    * **a queue that has not moved** -- the live runtime state, which only exists
+      while the process serving it is running. A session nobody is serving has no
+      queue to be stuck in, so its absence is the honest answer rather than zero.
+
+    A missing fact means the matching rule cannot fire. What must not happen is
+    what happened before this was written: the rules were given *no* facts at all,
+    so "0 proposals" meant "the funnel is blind", and it read exactly like "there
+    is nothing to do".
     """
     from agent import shared
     from agent.session_service import _WebSessionRegistry
@@ -1761,33 +1771,81 @@ def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
     except Exception:
         return rows
 
-    for item in entries:
-        session_id = str(item.get("session_id") or "")
-        if not session_id:
-            continue
-        row: dict[str, object] = {
-            "session_id": session_id,
-            "title": str(item.get("title") or ""),
-            "last_activity": str(item.get("last_activity") or ""),
-            "status": str(item.get("status") or ""),
-            "turn_count": int(item.get("turn_count") or 0),
-        }
-        # The per-session facts. A session whose store cannot be opened is still
-        # a session -- it simply has no task and no queue to report.
-        try:
-            from agent.scheduler import open_store
+    # The memory store is where the working state lives; opening it once for the
+    # whole pass rather than per session, because it is one database.
+    # The scheduler's attention snapshot, read once: which tasks have failures
+    # nobody has acknowledged.
+    attention_counts: dict[str, int] = {}
+    session_task_ids: dict[str, set[str]] = {}
+    try:
+        from agent.scheduler import open_store as open_scheduler_store
 
-            store = open_store()
+        scheduler_store = open_scheduler_store()
+        try:
+            snapshot = scheduler_store.attention_snapshot()
+            attention_counts = {
+                str(key): int(value) for key, value in (snapshot.get("counts") or {}).items()
+            }
+            for task in scheduler_store.list_tasks():
+                owner = str(getattr(task, "request_quote", "") or "").strip()
+                if owner:
+                    session_task_ids.setdefault(owner, set()).add(task.id)
+        finally:
+            scheduler_store.close()
+    except Exception:
+        attention_counts = {}
+        session_task_ids = {}
+
+    memory_store = None
+    try:
+        from agent.memory.store import LTMStore
+
+        memory_store = LTMStore(shared.AGENT_HOME / "context" / "palace.db")
+    except Exception:
+        memory_store = None
+
+    try:
+        for item in entries:
+            session_id = str(item.get("session_id") or "")
+            if not session_id:
+                continue
+            row: dict[str, object] = {
+                "session_id": session_id,
+                "title": str(item.get("title") or ""),
+                "last_activity": str(item.get("last_activity") or ""),
+                "status": str(item.get("status") or ""),
+                "turn_count": int(item.get("turn_count") or 0),
+            }
+            # Tasks this session owns, with their unacknowledged failure counts.
+            # The attention snapshot is keyed by task id, so the join is here:
+            # "which tasks belong to this session" is a fact only the scheduler's
+            # task rows carry (`request_quote` / the session that created them).
             try:
-                state = store.load_session_working_state(session_id)
-                raw = getattr(state, "state", None) if state is not None else None
-                if isinstance(raw, dict):
-                    row["task"] = raw.get("task") or raw
-            finally:
-                store.close()
-        except Exception:
-            pass
-        rows.append(row)
+                if attention_counts:
+                    row["tasks"] = [
+                        {"task_id": task_id, "attention": count}
+                        for task_id, count in attention_counts.items()
+                        if task_id in session_task_ids.get(session_id, ())
+                    ]
+            except Exception:
+                pass
+            if memory_store is not None:
+                try:
+                    snapshot = memory_store.load_session_working_state(session_id)
+                    raw = getattr(snapshot, "state", None) if snapshot is not None else None
+                    if isinstance(raw, dict) and raw:
+                        # `task` when the record uses the newer collection shape,
+                        # the record itself when it is the older single-task one.
+                        row["task"] = raw.get("task") or raw
+                except Exception:
+                    pass
+            rows.append(row)
+    finally:
+        if memory_store is not None:
+            try:
+                memory_store.close()
+            except Exception:
+                pass
     return rows
 
 
@@ -1796,7 +1854,7 @@ def _start_shadow_patrol(config: dict) -> Any:
 
     Its session list comes from the same index the page reads (see
     ``_autonomy_session_rows``), so "which sessions exist" has one answer in this
-    process.  A patrol that cannot start is a feature that is off: nothing here
+    process. A patrol that cannot start is a feature that is off: nothing here
     raises into the gateway's startup.
     """
     try:
@@ -1814,7 +1872,7 @@ def _start_shadow_patrol(config: dict) -> Any:
             return None
         shared.CONSOLE.print(
             f"[dim]Autonomy patrol: shadow mode, every {settings.interval_minutes} min "
-            f"(0 auto-actions/day)[/dim]"
+            f"({settings.max_auto_actions_per_day} auto-actions/day)[/dim]"
         )
         return service
     except Exception as exc:  # noqa: BLE001 - never fail a gateway over this

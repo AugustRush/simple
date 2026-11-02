@@ -540,3 +540,32 @@ def test_acted_is_the_number_the_auto_budget_spends(store) -> None:
 
     start, _ = day_bounds(NOW)
     assert store.acted_since(start) == 1
+
+
+def test_attention_from_the_session_s_tasks_is_read(stores=None) -> None:
+    """The fact the rule fires on lives on *tasks*, not on the session.
+
+    An unacknowledged failed run belongs to a task; a session carries it only
+    through the tasks it owns. A rule that only looked at `session["attention"]`
+    could never fire on a real deployment -- which is what happened: the funnel
+    reported "0 proposals" for a day, and that read exactly like "nothing to do".
+    """
+    session = _session(
+        tasks=[{"task_id": "t1", "attention": 2}, {"task_id": "t2", "attention": 0}]
+    )
+
+    proposals = rule_candidates(session, now=NOW, capabilities_of=default_capabilities_of)
+
+    assert [p.context["rule"] for p in proposals] == ["failed-run-unreviewed"]
+    assert p_attention(proposals[0]) == 2
+
+
+def p_attention(proposal) -> int:
+    return int(proposal.context["attention"])
+
+
+def test_a_session_with_tasks_but_no_failures_proposes_nothing() -> None:
+    """Zero attention on every task is a fact; it is not the same as "no tasks"."""
+    session = _session(tasks=[{"task_id": "t1", "attention": 0}])
+
+    assert rule_candidates(session, now=NOW) == []
