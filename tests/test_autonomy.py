@@ -37,6 +37,7 @@ from agent.autonomy import (
     default_capabilities_of,
     patrol_tick,
 )
+from agent.autonomy.admission import AdmissionPolicy, decide_admission
 from agent.autonomy.rules import RULE_NAMES, rule_candidates
 from agent.autonomy.store import ProposalStore
 
@@ -364,3 +365,109 @@ def test_without_a_capability_source_nothing_is_called_reversible() -> None:
     assert proposals[0].tool == "schedule_runs", (
         "the tool is still named, so a reader can see what would have been called"
     )
+
+
+# ── admission: what may happen to a proposal ────────────────────────────────
+
+
+def _proposal(reversibility: str = "reversible", confidence: float = 0.8) -> Proposal:
+    return Proposal(
+        source="s1",
+        action="读一遍失败的运行",
+        tool="schedule_runs",
+        reversibility=reversibility,
+        confidence=confidence,
+    )
+
+
+def test_shadow_mode_prepares_everything() -> None:
+    """The default budget is zero: this delivery proposes, it does not act."""
+    decision = decide_admission(_proposal(), policy=AdmissionPolicy())
+
+    assert decision.answer == "prepare"
+    assert decision.prepared["tool"] == "schedule_runs"
+    assert "额度" in decision.reason
+
+
+def test_a_reversible_action_within_budget_is_automatic() -> None:
+    decision = decide_admission(
+        _proposal(), policy=AdmissionPolicy(max_auto_actions_per_day=3)
+    )
+
+    assert decision.answer == "auto"
+    assert decision.prepared is not None, "even an auto answer says what would run"
+
+
+def test_an_irreversible_action_is_never_automatic() -> None:
+    """No budget makes it automatic: there is no configuration for that."""
+    decision = decide_admission(
+        _proposal("irreversible"),
+        policy=AdmissionPolicy(max_auto_actions_per_day=999),
+    )
+
+    assert decision.answer == "prepare"
+    assert "工作区之外" in decision.reason
+
+
+def test_a_workspace_write_is_prepared_not_automatic() -> None:
+    """Writing files is undoable *by a person who can see them* -- so a person sees them."""
+    decision = decide_admission(
+        _proposal("workspace"),
+        policy=AdmissionPolicy(max_auto_actions_per_day=999),
+    )
+
+    assert decision.answer == "prepare"
+
+
+def test_a_low_confidence_proposal_is_dropped() -> None:
+    decision = decide_admission(_proposal(confidence=0.2))
+
+    assert decision.answer == "drop"
+    assert "置信度" in decision.reason
+
+
+def test_a_declined_proposal_is_dropped_even_when_it_would_be_automatic() -> None:
+    """The order of the checks: "somebody said no" outranks every budget."""
+    decision = decide_admission(
+        _proposal(),
+        policy=AdmissionPolicy(max_auto_actions_per_day=99),
+        prior_decision="declined",
+    )
+
+    assert decision.answer == "drop"
+    assert "拒过" in decision.reason
+
+
+def test_the_daily_proposal_cap_drops_rather_than_shows() -> None:
+    decision = decide_admission(
+        _proposal(), policy=AdmissionPolicy(max_proposals_per_day=2), proposals_today=2
+    )
+
+    assert decision.answer == "drop"
+    assert "上限" in decision.reason
+
+
+def test_the_patrol_records_the_verdict_on_the_row(store) -> None:
+    """A row without its admission answer cannot be audited."""
+    patrol_tick(store=store, sessions=[_session(attention=1)], now=NOW, suggest=rule_candidates)
+
+    row = store.list_proposals()[0]
+    assert row.context["admission"]["answer"] in {"auto", "prepare"}
+    assert row.context["admission"]["prepared"]["tool"] == row.tool
+
+
+def test_the_patrol_does_not_write_dropped_candidates(store) -> None:
+    """A dropped candidate is not written: the row would be the attention it saves."""
+    result = patrol_tick(
+        store=store,
+        sessions=[_session(attention=1)],
+        now=NOW,
+        options=PatrolOptions(
+            admission=AdmissionPolicy(min_confidence=0.99, max_proposals_per_day=10)
+        ),
+        suggest=rule_candidates,
+    )
+
+    assert result["proposed"] == 0
+    assert result["dropped"] == 1
+    assert store.list_proposals() == []

@@ -1835,9 +1835,12 @@ def autonomy(
                 f"duplicates {result['duplicates']}[/dim]"
             )
             for row in result["proposals"]:
+                verdict = (row.get("context_json") or {}).get("admission") or {}
                 shared.CONSOLE.print(
-                    f"[cyan]{row['reversibility']}[/cyan] {row['action']}"
+                    f"[cyan]{row['reversibility']}[/cyan] "
+                    f"[bold]{verdict.get('answer', '?')}[/bold] {row['action']}"
                     f"\n  [dim]because {row['reason']}[/dim]"
+                    f"\n  [dim]→ {verdict.get('reason', '')}[/dim]"
                 )
             return
         if action == "review":

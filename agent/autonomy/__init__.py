@@ -44,6 +44,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
+from .admission import AdmissionPolicy, decide_admission
+
 __all__ = [
     "AUTONOMY_STATES",
     "DEFAULT_EXPIRY_SECONDS",
@@ -206,6 +208,9 @@ class PatrolOptions:
     max_sessions_per_tick: int = 20
     #: How many proposals one tick may write (the store enforces its own cap too).
     max_proposals_per_tick: int = 5
+    #: What may be done without asking. Defaults to "nothing": shadow mode, which
+    #: is what this delivery is.
+    admission: Any = None
 
 
 def default_capabilities_of(tool: str) -> frozenset[str]:
@@ -248,6 +253,8 @@ def patrol_tick(
     """
     now = now or _now()
     options = options or PatrolOptions()
+    if options.admission is None:
+        options.admission = AdmissionPolicy()
     warm = timedelta(seconds=options.warm_window_seconds)
     stale = timedelta(seconds=options.stale_window_seconds)
     result: dict[str, Any] = {
@@ -258,6 +265,8 @@ def patrol_tick(
         "skipped_stale": 0,
         "proposed": 0,
         "duplicates": 0,
+        "dropped": 0,
+        "auto": 0,
         "over_cap": 0,
         "proposals": [],
     }
@@ -307,8 +316,28 @@ def patrol_tick(
             if prior:
                 result["duplicates"] += 1
                 continue
+            # Admission decides what may happen *to* the candidate, and it is asked
+            # here rather than at execution time so the row can carry the answer:
+            # a "prepare" row is the queue a person answers, and a "drop" row is
+            # not written at all.
+            decision = decide_admission(
+                proposal,
+                now=now,
+                policy=options.admission,
+                auto_actions_today=result["proposed"],
+                proposals_today=result["proposed"],
+                prior_decision=prior,
+            )
+            if decision.answer == "drop":
+                result["dropped"] += 1
+                continue
+            proposal.context["admission"] = decision.to_dict()
             if store.record(proposal):
                 result["proposed"] += 1
+                if decision.answer == "auto":
+                    # Even "auto" does not execute here: this delivery has no
+                    # execution path at all. The row records what *would* run.
+                    result["auto"] += 1
                 result["proposals"].append(proposal.to_row())
     result["examined"] = examined
     return result
