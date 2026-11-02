@@ -21,6 +21,7 @@ __all__ = [
     "list_tasks",
     "get_run",
     "list_runs",
+    "recent_runs",
 ]
 
 
@@ -55,6 +56,56 @@ def list_runs(
         (task_id,),
     ).fetchall()
     return [_run_from_row(row) for row in rows]
+
+
+def recent_runs(
+    conn,
+    limit: int = 20,
+) -> list[tuple[TaskRun, ScheduledTask]]:
+    """Runs across *all* tasks, newest first, with the task each belongs to.
+
+    The gap this fills
+    -----------------
+    Every existing reader is per-task (``list_runs(task_id)``) or per-problem
+    (``attention_snapshot`` returns only unacknowledged failures). So no caller
+    could answer "what has this agent done lately" -- the one question a person
+    opening the app has about the agent itself, as opposed to about a task they
+    already know the name of.
+
+    Two queries, not a JOIN: the two tables share column names (``id``,
+    ``created_at``, ``updated_at``), and a JOIN has to alias every one of them for
+    both row mappers to read their own record. Aliasing them all is longer, and a
+    forgotten alias fails at the mapper with a key error rather than here. Two
+    reads with one lookup table is the smaller thing.
+
+    Ordered with running runs first: a run that is still going is the most current
+    fact there is, and sorting it below finished work from yesterday would be
+    wrong twice.
+    """
+    rows = conn.execute(
+        """
+            SELECT * FROM scheduled_task_runs
+            WHERE status IN ('queued', 'running') OR finished_at IS NOT NULL
+            ORDER BY
+                CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END,
+                finished_at DESC,
+                created_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+        (max(1, int(limit)),),
+    ).fetchall()
+    if not rows:
+        return []
+    runs = [_run_from_row(row) for row in rows]
+    task_ids = {run.task_id for run in runs}
+    placeholders = ",".join("?" for _ in task_ids)
+    task_rows = conn.execute(
+        f"SELECT * FROM scheduled_tasks WHERE id IN ({placeholders})",
+        tuple(task_ids),
+    ).fetchall()
+    tasks = {row["id"]: _task_from_row(row) for row in task_rows}
+    return [(run, tasks[run.task_id]) for run in runs if run.task_id in tasks]
 
 
 def get_run(

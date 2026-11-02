@@ -423,15 +423,24 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
     # The box, and it says what it does.
     composer = page.locator(".home-composer-input")
     assert composer.count() == 1
-    assert "不用先新建会话" in composer.get_attribute("placeholder")
-    # Threads are listed by title, without the turn counts that made every row busy.
-    # A fresh gateway has none, so the *empty state* is what has to be right here --
-    # and it names the way in, which is the box above it.
-    if page.locator(".home-thread").count():
-        assert page.locator(".home-thread strong").first.inner_text().strip()
+    # The placeholder says both ways in: a sentence, or a standing instruction.
+    # "不用先新建会话" was the earlier wording; the box now also advertises that a
+    # task is created by *asking*, because that is the only creation path this
+    # product has (a form here would be a second one).
+    placeholder = composer.get_attribute("placeholder")
+    assert "说一句话就开始" in placeholder
+    assert "每天早上提醒我" in placeholder
+    # The timeline: runs and conversations together, and a fresh gateway has
+    # neither. So the *empty state* is what has to be right here -- and it names
+    # the way in, which is the box above it. Threads are not listed on this page
+    # any more: they are in the sidebar, and listing them twice said nothing new.
+    assert page.locator(".home-thread").count() == 0, "the sidebar owns the thread list"
+    if page.locator(".home-timeline-row").count():
+        assert page.locator(".home-timeline-row").first.inner_text().strip()
     else:
-        assert "还没有线程" in page.inner_text(".home-view")
-        assert "框" in page.inner_text(".home-view"), "the empty state names the way in"
+        text = page.inner_text(".home-view")
+        assert "还没有记录" in text
+        assert "框" in text, "the empty state names the way in"
     # The nav is about the agent, not about session records: 主页 leads, and
     # 会话管理 is no longer a place you work in.
     # The navigation entries are menu items, not a single class: only 自动化 carries

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
 import { msUntilNextRun } from '../lib/schedule'
 import { stepContent } from '../lib/workflow'
-import type { AttentionRun, AutomationRow, AutonomyFunnel, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
+import type { AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -236,6 +236,26 @@ export function useAutomation(deps: Deps) {
       if (!silent) setLoadingView(false)
     }
   }, [api, refreshJson])
+
+  // ── the home page ──────────────────────────────────────────────────────
+  //
+  // One request, because the page's question ("is anything waiting for me") must
+  // have one answer. Computing it here from five lists would be a second
+  // implementation of what the server already decides -- and the two would drift,
+  // starting with the failure count that the sidebar badge also shows.
+  const [home, setHome] = useState<HomeOverview | null>(null)
+  const [homeLoaded, setHomeLoaded] = useState(false)
+
+  const loadHome = useCallback(async () => {
+    try {
+      const data = await (await api('/api/home')).json()
+      if (data && typeof data === 'object') setHome(data as HomeOverview)
+      setHomeLoaded(true)
+    } catch {
+      // A failed read leaves the last known state on screen: an empty home page
+      // would read as "nothing is happening", which is a claim we cannot make.
+    }
+  }, [api])
 
   // ── the autonomy page ──────────────────────────────────────────────────
   //
@@ -808,5 +828,5 @@ export function useAutomation(deps: Deps) {
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-  return { acknowledgeScheduleRun, decideProposal, answeredProposals, funnel, loadAutonomy, proposalCounts, proposals, proposalsLoaded, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
+  return { acknowledgeScheduleRun, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadAutonomy, proposalCounts, proposals, proposalsLoaded, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }

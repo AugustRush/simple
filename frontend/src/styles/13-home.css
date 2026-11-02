@@ -103,3 +103,70 @@
 
 /* The sidebar's thread list: the home page's list, one level up. */
 .sider-threads-all { padding: 0 0 0 6px; height: auto; font-size: 10px; }
+
+/* ── what is happening now ───────────────────────────────────────────────── */
+.home-running-list { display: flex; flex-direction: column; gap: 4px; }
+.home-running-row {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.home-running-row.is-now { background: var(--surface-hover); }
+.home-running-row > :first-child { color: var(--text-muted); font-size: 11px; }
+.home-running-row.is-now > :first-child { color: var(--primary); }
+.home-running-row strong { color: var(--text); font-size: 12px; font-weight: 600; }
+.home-running-row span { color: var(--text-muted); font-size: 11px; }
+
+/* ── the timeline ────────────────────────────────────────────────────────── */
+.home-timeline { display: flex; flex-direction: column; gap: 1px; }
+.home-timeline-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  transition: background .14s ease;
+}
+.home-timeline-row:hover { background: var(--surface-hover); }
+.home-timeline-thread { cursor: pointer; }
+.home-timeline-thread:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 2px; }
+.home-timeline-icon {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  flex: 0 0 auto;
+  padding-top: 1px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.home-timeline-row.is-failed .home-timeline-icon { color: var(--red); }
+.home-timeline-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.home-timeline-body strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The detail line is where a run explains itself. Two lines maximum: a summary
+   that runs long belongs on the task's page, not on the way to the input box. */
+.home-timeline-body span {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.home-timeline-at {
+  flex: 0 0 auto;
+  padding-top: 1px;
+  color: var(--text-muted);
+  font-size: 10px;
+}

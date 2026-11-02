@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, loadAutonomy, loadAutomations, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -131,6 +131,14 @@ export function useShell(deps: Deps) {
       loadAutomations()
       loadSkills(true)
       loadSchedulerHealth()
+    }
+    if (view === 'home') {
+      loadHome()
+      // The sidebar's thread list is on every view, so the sessions have to load
+      // on the landing view too. They used to arrive as a side effect of the chat
+      // view's own mount -- which meant the first screen after a reload showed
+      // "暂无会话" over eleven of them.
+      loadSessions()
     }
     if (view === 'autonomy') loadAutonomy()
     if (view === 'settings') loadSettings()

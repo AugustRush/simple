@@ -277,6 +277,39 @@ export interface AutonomyFunnel {
   expired: number
 }
 
+//: One item of the home page's timeline: a run, or a conversation.
+//:
+//: `kind` decides which fields exist -- a run has a status and a summary, a thread
+//: has a turn count. Neither is padded into the other's shape, because "how did it
+//: end" and "how much was said" are different facts.
+export interface HomeActivity {
+  kind: 'run' | 'thread'
+  at: string
+  title: string
+  status?: string
+  summary?: string
+  error?: string
+  task_id?: string
+  run_id?: string
+  session_id?: string
+  turn_count?: number
+}
+
+//: `GET /api/home`: the landing page's one request.
+export interface HomeOverview {
+  needs: {
+    proposals: number
+    failures: number
+    newest_failure: { run_id: string; task_id: string; status: string } | null
+  }
+  running: {
+    in_flight: { task_id: string; name: string; started_at: string; status: string }[]
+    next_up: { task_id: string; name: string; next_run_at: string }[]
+  }
+  activity: HomeActivity[]
+  at: string
+}
+
 export interface ProposalRow {
   id: string
   source: string

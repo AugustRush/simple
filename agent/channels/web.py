@@ -12,7 +12,7 @@ from agent.channels import web_uploads
 from agent.channels import web_providers
 from agent.channels import web_requests
 from agent.channels import web_assets
-from agent.channels import web_autonomy, web_memory
+from agent.channels import web_autonomy, web_home, web_memory
 
 import asyncio
 import contextlib
@@ -561,6 +561,40 @@ class WebChannel(Channel):
             )
         self._bump_config_revision()
         return JSONResponse({"ok": True, "saved": True, "applied": True})
+
+    def _scheduler_store(self) -> Any:
+        """The scheduler's store, or None when this process has none.
+
+        None is a real answer: a home page with no scheduler is "nothing is
+        scheduled", not an error.
+        """
+        try:
+            from agent.scheduler import open_store
+
+            return open_store()
+        except Exception:
+            return None
+
+    async def _home_overview(self, request: Any) -> Any:
+        # The session list is the same one the sidebar reads, so "recent threads"
+        # has one answer in this process rather than two that can disagree.
+        sessions: list[dict[str, Any]] = []
+        try:
+            sessions = list(self._service().list_sessions(limit=20))
+        except Exception:
+            sessions = []
+        scheduler_store = self._scheduler_store()
+        try:
+            return await web_home._home_overview(
+                request,
+                authorized=self._authorized,
+                scheduler_store=scheduler_store,
+                proposal_store=self._proposal_store(),
+                sessions=sessions,
+            )
+        finally:
+            if scheduler_store is not None:
+                scheduler_store.close()
 
     async def _autonomy_overview(self, request: Any) -> Any:
         return await web_autonomy._autonomy_overview(
@@ -2841,6 +2875,9 @@ class WebChannel(Channel):
             Route("/api/commands", self._commands, methods=["GET"]),
             # The autonomy page: what the agent *would* do. Read and answer only --
             # this process has no execution path for a proposal.
+            # The landing page: needs / running / activity in one read, because the
+            # page's question ("is anything waiting for me") must have one answer.
+            Route("/api/home", self._home_overview, methods=["GET"]),
             Route("/api/autonomy", self._autonomy_overview, methods=["GET"]),
             Route("/api/autonomy/proposals", self._autonomy_proposals, methods=["GET"]),
             Route("/api/autonomy/decide", self._autonomy_decide, methods=["POST"]),

@@ -79,6 +79,19 @@ export function relativeTime(value?: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
   const diff = Date.now() - date.getTime()
+
+  // Future times get their own direction. Without it a next run three hours away
+  // computed a negative difference, fell into the `diff < 60_000` branch, and
+  // rendered "刚刚" -- which a caller then suffixed into "刚刚后". The home page's
+  // "正在做" block is mostly future times, so this is not an edge case there.
+  if (diff < 0) {
+    const ahead = -diff
+    if (ahead < 60_000) return '马上'
+    if (ahead < 3_600_000) return `${Math.floor(ahead / 60_000)} 分钟后`
+    if (ahead < 86_400_000) return `${Math.floor(ahead / 3_600_000)} 小时后`
+    return `${Math.floor(ahead / 86_400_000)} 天后`
+  }
+
   if (diff < 60_000) return '刚刚'
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`

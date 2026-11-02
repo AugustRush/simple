@@ -363,6 +363,11 @@ class SchedulerStore:
 
 
     @_synchronized
+    def recent_runs(self, limit: int = 20) -> list[tuple[Any, Any]]:
+        """Every task's runs, newest first -- see ``reads.recent_runs``."""
+        return reads.recent_runs(self._conn, limit=limit)
+
+    @_synchronized
     def list_runs(self, task_id: str) -> list[TaskRun]:
         return reads.list_runs(
             self._conn,
