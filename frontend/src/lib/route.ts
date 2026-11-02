@@ -7,12 +7,13 @@
  * -- no router dependency, no server route (the gateway serves the same
  * ``index.html`` for every path it does not own).
  *
- * Shapes: ``#/chat/<session>``, ``#/chat``, ``#/sessions``, ``#/extensions``,
- * ``#/memory``, ``#/schedules``, ``#/autonomy``, ``#/settings``. An unknown or empty hash means
- * chat: a URL someone typed by hand should not be an error page.
+ * Shapes: ``#/home``, ``#/chat/<session>``, ``#/chat``, ``#/sessions``,
+ * ``#/extensions``, ``#/memory``, ``#/schedules``, ``#/autonomy``, ``#/settings``. An unknown
+ * or empty hash means home: the app opens on the agent, not on whichever thread was
+ * last touched -- a URL someone typed by hand should not be an error page either.
  */
 
-export const VIEW_NAMES = ['chat', 'sessions', 'extensions', 'memory', 'schedules', 'autonomy', 'settings'] as const
+export const VIEW_NAMES = ['home', 'chat', 'sessions', 'extensions', 'memory', 'schedules', 'autonomy', 'settings'] as const
 
 export type ViewName = (typeof VIEW_NAMES)[number]
 
@@ -25,7 +26,7 @@ export function isViewName(value: string): value is ViewName {
 export function parseRoute(hash: string): { view: ViewName; sessionId: string | null } {
   const raw = String(hash || '').replace(/^#\/?/, '')
   const [head, ...rest] = raw.split('/')
-  const view = isViewName(head) ? head : 'chat'
+  const view = isViewName(head) ? head : 'home'
   const session = view === 'chat' ? rest.join('/') : ''
   return {
     view,
@@ -35,6 +36,6 @@ export function parseRoute(hash: string): { view: ViewName; sessionId: string | 
 
 
 export function routeFor(view: string, sessionId: string | null): string {
-  if (view !== 'chat') return `#/${view}`
+  if (view !== 'chat') return view === 'home' ? '#/' : `#/${view}`
   return sessionId ? `#/chat/${encodeURIComponent(sessionId)}` : '#/chat'
 }

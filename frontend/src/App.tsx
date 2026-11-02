@@ -1,4 +1,4 @@
-import { CloseOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MenuOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import { CloseOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MenuOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
 import { Button, ConfigProvider, Dropdown, Empty, Input, Layout, Menu, Modal, Skeleton, theme, Tooltip } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
@@ -7,6 +7,7 @@ import 'dayjs/locale/zh-cn'
 import './index.css'
 import type { AppCtx } from './app/AppCtx'
 import { renderChat } from './views/chat'
+import { renderHome } from './views/home'
 import { renderSessions } from './views/sessions'
 import { renderExtensions } from './views/extensions'
 import { renderMemory } from './views/memory'
@@ -381,6 +382,7 @@ function App() {
   const { renderSettings } = createSettingsView(ctx)
 
   const renderCurrentView = () => {
+    if (view === 'home') return renderHome(ctx)
     if (view === 'chat') return renderChat(ctx)
     if (view === 'sessions') return renderSessions(ctx)
     if (view === 'extensions') return renderExtensions(ctx)
@@ -388,7 +390,7 @@ function App() {
     if (view === 'schedules') return renderSchedules(ctx)
     if (view === 'autonomy') return renderAutonomy(ctx)
     if (view === 'settings') return renderSettings()
-    return renderChat(ctx)
+    return renderHome(ctx)
   }
 
   // The chat header is the only place a person can see *which* conversation is
@@ -484,20 +486,24 @@ function App() {
             />
           </div>
 
-          <div className="sider-actions">
-            <Button
-              type="primary"
-              block
-              icon={<PlusOutlined />}
-              loading={creatingSession}
-              onClick={createSession}
-            >
-              新建会话
-            </Button>
-          </div>
+          {/* Not a "新建会话" button. The way in is the box on 主页: a thread is
+              something a conversation creates, not a thing you create before
+              having one. What is left here is the list. */}
 
           <div className="session-panel">
-            <div className="session-panel-label">最近会话</div>
+            <div className="session-panel-label">
+              线程
+              {filteredSessions.length > 0 && (
+                <Button
+                  type="link"
+                  size="small"
+                  className="sider-threads-all"
+                  onClick={() => navigateTo('sessions')}
+                >
+                  全部 {filteredSessions.length}
+                </Button>
+              )}
+            </div>
             {loadingSessions ? (
               <Skeleton active paragraph={{ rows: 5 }} title={false} />
             ) : filteredSessions.length === 0 ? (
@@ -554,12 +560,10 @@ function App() {
                           />
                         </div>
                         <div className="session-item-meta">
-                          {/* The busy word rides with the counts because that
-                              row is the session's "what is it doing" line; a
-                              badge in the title row would fight the rename
-                              affordance for the same pixels.  Only busy states
-                              show one — "空闲" on every row would drown out
-                              the one row it matters on. */}
+                          {/* When it was last touched, and whether it is busy.
+                              The turn count is gone: "2 轮 · 6 小时前" on every row
+                              was the busiest text in the sidebar and answered a
+                              question nobody asks while choosing what to read. */}
                           {sessionStatusOf(item) && (
                             <span
                               className={`session-status-badge ${
@@ -569,7 +573,7 @@ function App() {
                               {sessionStatusOf(item)}
                             </span>
                           )}
-                          {item.turn_count || 0} 轮 · {relativeTime(item.last_activity)}
+                          {relativeTime(item.last_activity)}
                         </div>
                       </div>
                       {pendingDeleteSessionId === item.session_id ? (

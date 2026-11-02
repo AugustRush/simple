@@ -25,7 +25,11 @@ VIEWS = Path(__file__).resolve().parents[1] / "frontend" / "src" / "views"
 EMPTY_PREFIX = "还没有"
 
 #: What counts as naming the next step: the ways a list actually fills on this page.
-GUIDANCE = ("对话", "新建", "右上角", "agent", "在左边")
+#:
+#: "上面那个框" is on the list because the home page's empty state is *about* the
+#: composer above it -- the list has no button of its own, and the box is the only
+#: way in. A vocabulary that only accepts buttons would call that state unhelpful.
+GUIDANCE = ("对话", "新建", "右上角", "agent", "在左边", "上面")
 
 
 def _empty_descriptions(source: str) -> list[str]:

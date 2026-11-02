@@ -405,3 +405,59 @@ def test_the_autonomy_page_shows_what_it_would_do(page, live_gateway):
     page.wait_for_timeout(1200)
     assert page.locator(".proposal-card").count() == 1
     assert page.errors == [], page.errors
+
+
+def test_the_app_opens_on_the_agent_not_on_a_thread(page):
+    """The landing view answers "is anything waiting for me", not "which thread".
+
+    Opening on whichever conversation was last active was the right shape when the
+    product *was* a session manager. It is not any more: the agent has one
+    identity, and a thread is where some of its work happened. So the first screen
+    is a box, what needs a person, and five recent threads -- and typing in the
+    box starts a thread without a "new conversation" click first.
+    """
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+
+    assert page.locator(".home-view").count() == 1, "the landing view must be 主页"
+    assert page.locator(".page-title").inner_text() == "主页"
+    # The box, and it says what it does.
+    composer = page.locator(".home-composer-input")
+    assert composer.count() == 1
+    assert "不用先新建会话" in composer.get_attribute("placeholder")
+    # Threads are listed by title, without the turn counts that made every row busy.
+    # A fresh gateway has none, so the *empty state* is what has to be right here --
+    # and it names the way in, which is the box above it.
+    if page.locator(".home-thread").count():
+        assert page.locator(".home-thread strong").first.inner_text().strip()
+    else:
+        assert "还没有线程" in page.inner_text(".home-view")
+        assert "框" in page.inner_text(".home-view"), "the empty state names the way in"
+    # The nav is about the agent, not about session records: 主页 leads, and
+    # 会话管理 is no longer a place you work in.
+    # The navigation entries are menu items, not a single class: only 自动化 carries
+    # a `nav-label` span (it holds the failure badge), so reading them by that class
+    # finds one entry and calls the rest missing.
+    labels = [
+        page.locator(".sider-nav .ant-menu-item").nth(i).inner_text().strip()
+        for i in range(page.locator(".sider-nav .ant-menu-item").count())
+    ]
+    assert labels, "the navigation rendered nothing"
+    assert labels[0] == "主页", labels
+    assert "会话管理" not in labels, labels
+    assert page.errors == [], page.errors
+
+
+def test_typing_on_home_starts_a_thread(page):
+    """The first message *is* the thread: no create-then-send, no extra click."""
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    before = len(page.url)
+
+    box = page.wait_for_selector(".home-composer-input", timeout=20_000)
+    box.fill("帮我看看昨天的构建")
+    page.locator(".home-composer").locator("button[aria-label='发送']").click()
+
+    # It navigates into the conversation it just created.
+    page.wait_for_selector("textarea", timeout=20_000)
+    page.wait_for_timeout(1200)
+    assert "#/chat/" in page.url, page.url
+    assert len(page.url) > before

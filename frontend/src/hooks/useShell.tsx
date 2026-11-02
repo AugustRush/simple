@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, FolderOpenOutlined, HomeOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor } from '../lib/route'
@@ -270,8 +270,12 @@ export function useShell(deps: Deps) {
   }, [commands, paletteQuery])
 
   const navItems = [
+    // The landing view: one agent, one box, and what needs a person. 对话 is still
+    // a view (a thread you are reading), but it is no longer the *entrance* --
+    // opening on "whichever session was last active" answered a question nobody
+    // asked.
+    { key: 'home', icon: <HomeOutlined />, label: '主页' },
     { key: 'chat', icon: <MessageOutlined />, label: '对话' },
-    { key: 'sessions', icon: <FolderOpenOutlined />, label: '会话管理' },
     // One entry for both lists: plugins and skills answer the same question
     // ("what can the agent do beyond its own tools?") and each list on its
     // own is too short to justify a navigation slot of its own.
@@ -339,8 +343,11 @@ export function useShell(deps: Deps) {
   const paletteEntries = useMemo<PaletteEntry[]>(() => {
     const query = paletteQuery.trim().toLowerCase()
     const destinations = [
+      { view: 'home', label: '主页', icon: <HomeOutlined />, terms: 'home 主页 首页' },
       { view: 'chat', label: '对话', icon: <MessageOutlined />, terms: 'chat' },
-      { view: 'sessions', label: '会话管理', icon: <FolderOpenOutlined />, terms: 'sessions' },
+      // Still a destination, just not a navigation slot: the page exists for bulk
+      // delete and rename, which is maintenance rather than a place you work.
+      { view: 'sessions', label: '全部线程', icon: <FolderOpenOutlined />, terms: 'sessions threads 会话 线程' },
       { view: 'extensions', label: '扩展', icon: <AppstoreOutlined />, terms: '插件 技能 extensions plugins skills' },
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
       { view: 'autonomy', label: '自主', icon: <CompassOutlined />, terms: '自主 提议 proposals autonomy patrol' },
@@ -385,6 +392,12 @@ export function useShell(deps: Deps) {
   }
 
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
+    home: {
+      title: '主页',
+      // Not "welcome": the subtitle says what the page is for, which is the
+      // question a person opens the app with.
+      subtitle: '有需要你的事，也有一个输入框',
+    },
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',
       // The connection state is a status, not a session name, and it is the
