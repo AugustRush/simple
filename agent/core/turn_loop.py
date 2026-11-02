@@ -406,6 +406,18 @@ def prepare_turn(
         # that turn's authority, and the one case that must never pass is a turn
         # where nobody asked for anything.
         deps.registry.set_context("turn_request", user_message)
+        # Which conversation this turn belongs to, published for the same reason:
+        # a task created by a tool call has to record where it came from, and
+        # "which session owns this task" is a fact about creation that no later
+        # lookup can recover. Read from the same two places the usage event reads
+        # it from, so there is one answer.
+        try:
+            deps.registry.set_context(
+                "turn_session_id",
+                str(getattr(ctx, "metadata", {}).get("session_id") or ""),
+            )
+        except Exception:
+            pass
         # The interjections this turn answers, emptied at the boundary for the
         # same reason as `turn_request` above: `ctx.metadata` is the session's,
         # so a ledger left over from the previous turn would be journaled again

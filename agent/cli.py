@@ -1330,7 +1330,7 @@ def gateway(
             # typed finds nothing, because typing is the opposite of silence.
             # Its effect on the world is a row in `autonomy/proposals.db` -- this
             # delivery has no execution path at all.
-            patrol_service = _start_shadow_patrol(gateway_cfg)
+            patrol_service = _start_shadow_patrol(gateway_cfg, components)
             runner = ChannelRunner(channels, components, gateway_cfg)
             await runner.run()
         finally:
@@ -1742,7 +1742,9 @@ def _scheduler_services(components: dict) -> dict:
     }
 
 
-def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
+def _autonomy_session_rows(
+    limit: int = 50, *, live_sessions: Any = None
+) -> list[dict[str, object]]:
     """What the shadow patrol may look at, per session -- from the stores that hold it.
 
     Three facts, three sources, and the reason each is where it is:
@@ -1762,8 +1764,10 @@ def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
     is nothing to do".
     """
     from agent import shared
+    from agent.autonomy import live_queue_facts
     from agent.session_service import _WebSessionRegistry
 
+    queue_by_session = live_queue_facts(live_sessions)
     rows: list[dict[str, object]] = []
     try:
         registry = _WebSessionRegistry(shared.AGENT_HOME / "web" / "sessions" / "index.db")
@@ -1787,7 +1791,11 @@ def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
                 str(key): int(value) for key, value in (snapshot.get("counts") or {}).items()
             }
             for task in scheduler_store.list_tasks():
-                owner = str(getattr(task, "request_quote", "") or "").strip()
+                # The *session*, not the words. `request_quote` holds what the user
+                # typed ("每天早上九点提醒我写日报"); grepping it for a session id
+                # never matched anything, which is why the funnel was blind even
+                # after the other facts were wired.
+                owner = str(getattr(task, "session_id", "") or "").strip()
                 if owner:
                     session_task_ids.setdefault(owner, set()).add(task.id)
         finally:
@@ -1829,6 +1837,13 @@ def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
                     ]
             except Exception:
                 pass
+            # A queue only exists while something is serving it. The gateway
+            # hands its live states in; a CLI pass has none, which is the honest
+            # answer for a process that is not serving any session.
+            if live_sessions is not None:
+                queue = queue_by_session.get(session_id)
+                if queue:
+                    row["queue"] = queue
             if memory_store is not None:
                 try:
                     snapshot = memory_store.load_session_working_state(session_id)
@@ -1849,13 +1864,14 @@ def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
     return rows
 
 
-def _start_shadow_patrol(config: dict) -> Any:
+def _start_shadow_patrol(config: dict, components: dict | None = None) -> Any:
     """Start the patrol in this process, or return None when it is off.
 
     Its session list comes from the same index the page reads (see
     ``_autonomy_session_rows``), so "which sessions exist" has one answer in this
-    process. A patrol that cannot start is a feature that is off: nothing here
-    raises into the gateway's startup.
+    process. ``components`` is optional and is used for one thing: the live
+    sessions a queue only exists inside. A patrol that cannot start is a feature
+    that is off -- nothing here raises into the gateway's startup.
     """
     try:
         from agent.autonomy.patrol import PatrolSettings, open_patrol_service
@@ -1864,9 +1880,24 @@ def _start_shadow_patrol(config: dict) -> Any:
         if not settings.enabled:
             shared.CONSOLE.print("[dim]Autonomy patrol: off (autonomy.enabled=false)[/dim]")
             return None
+
+        def _live_sessions() -> Any:
+            """The runner's live sessions, if this process has a runner."""
+            if components is None:
+                return None
+            try:
+                from agent.runtime.services import resolve as _resolve
+
+                registry = _resolve(components, "registry")
+                return registry.get_context("live_sessions") if registry is not None else None
+            except Exception:
+                return None
+
         service = open_patrol_service(
             settings=settings,
-            sessions_provider=lambda: _autonomy_session_rows(limit=50),
+            sessions_provider=lambda: _autonomy_session_rows(
+                limit=50, live_sessions=_live_sessions()
+            ),
         )
         if not service.start():
             return None

@@ -569,3 +569,84 @@ def test_a_session_with_tasks_but_no_failures_proposes_nothing() -> None:
     session = _session(tasks=[{"task_id": "t1", "attention": 0}])
 
     assert rule_candidates(session, now=NOW) == []
+
+
+def test_answering_a_proposal_does_not_give_the_budget_back(store) -> None:
+    """A day where every suggestion was declined is still a day that spent attention."""
+    from agent.autonomy.admission import day_bounds
+
+    for index in range(3):
+        store.record(Proposal(source=f"s{index}", action=f"a{index}"))
+    for proposal in store.list_proposals():
+        store.decide(proposal.id, "declined", by="test")
+
+    start, _end = day_bounds(NOW)
+
+    assert store.written_since(start) == 3, "the cap counts what was written"
+    assert store.counts_since(start) == {"declined": 3}, (
+        "the state breakdown is still useful, it is just not the budget"
+    )
+
+
+# ── the queue fact: it only exists while something serves it ───────────────
+
+
+def test_a_live_queue_becomes_a_session_fact() -> None:
+    """A queue is not a database fact: it is memory in the process serving it."""
+    import time
+
+    from agent.autonomy import live_queue_facts
+
+    class _State:
+        pending_interjections = [
+            {"message_id": "m1", "text": "x", "arrived_at": time.time() - 2400}
+        ]
+        restart_queue: list = []
+
+    facts = live_queue_facts({"s1": _State()})
+
+    assert facts == {
+        "s1": {
+            "pending": 1,
+            "queued_since": facts["s1"]["queued_since"],
+        }
+    }
+    assert facts["s1"]["queued_since"], "the wait needs its own start time"
+
+
+def test_a_session_with_nothing_queued_has_no_fact() -> None:
+    """"No queue" and "an empty queue" are different, and neither is zero."""
+    from agent.autonomy import live_queue_facts
+
+    class _State:
+        pending_interjections: list = []
+        restart_queue: list = []
+
+    assert live_queue_facts({"s1": _State()}) == {}
+
+
+def test_no_live_sessions_means_no_queue_facts() -> None:
+    """A CLI pass is not serving any session; its honest answer is "unknown"."""
+    from agent.autonomy import live_queue_facts
+
+    assert live_queue_facts(None) == {}
+
+
+def test_the_queue_rule_reads_the_queue_s_own_age() -> None:
+    """A conversation somebody is typing in has a recent session and a stuck queue."""
+    from datetime import timedelta
+
+    from agent.autonomy.rules import rule_candidates
+
+    session = _session(
+        last_activity=(NOW - timedelta(minutes=2)).isoformat(),
+        queue={
+            "pending": 2,
+            "queued_since": (NOW - timedelta(hours=2)).isoformat(),
+        },
+    )
+
+    proposals = rule_candidates(session, now=NOW)
+
+    assert [p.context["rule"] for p in proposals] == ["stale-queue"]
+    assert "120" in proposals[0].reason, "the wait is what the reason names"

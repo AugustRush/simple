@@ -199,6 +199,27 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         readers=("agent/core/interjections.py",),
     ),
     ContextKey(
+        key="turn_session_id",
+        # One writer, one reader, and the reader is the reason the key exists: a
+        # task created by a tool call records the conversation that asked for it,
+        # so an unacknowledged failure can later be reported as a proposal *about
+        # that conversation*. A lookup cannot recover it -- the words in
+        # `request_quote` are not a session id, which is what the patrol's first
+        # attempt to join on them assumed.
+        writers=("agent/core/turn_loop.py",),
+        readers=("agent/tools/schedule_tools.py",),
+    ),
+    ContextKey(
+        key="live_sessions",
+        # One writer, one reader: the channel runner publishes the sessions it is
+        # serving, and the autonomy patrol asks for a session's *queue* -- which
+        # only exists in memory, in the process that is serving it. A patrol that
+        # read the database instead would answer "no queue" for every session,
+        # which is indistinguishable from "nothing is stuck".
+        writers=("agent/channels/base.py",),
+        readers=("agent/cli.py",),
+    ),
+    ContextKey(
         key="capability_profile",
         writers=(),
         readers=("agent/tools/file_tools.py",),

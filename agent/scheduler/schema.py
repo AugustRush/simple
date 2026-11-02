@@ -11,7 +11,7 @@ __all__ = [
 from agent.scheduler.migrations import (
     _migrate_to_1, _migrate_to_2, _migrate_to_3, _migrate_to_4, _migrate_to_5, _migrate_to_6,
     _migrate_to_7, _migrate_to_8, _migrate_to_9, _migrate_to_10, _migrate_to_11, _migrate_to_12,
-    _migrate_to_13, _migrate_to_14,
+    _migrate_to_13, _migrate_to_14, _migrate_to_15,
 )
 
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
@@ -29,6 +29,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     12: _migrate_to_12,
     13: _migrate_to_13,
     14: _migrate_to_14,
+    15: _migrate_to_15,
 }
 
 

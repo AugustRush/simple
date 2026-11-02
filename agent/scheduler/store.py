@@ -207,7 +207,7 @@ def scheduler_store() -> "SchedulerStore":
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 14
+    SCHEMA_VERSION = 15
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE

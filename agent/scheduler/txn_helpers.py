@@ -77,8 +77,8 @@ def _create_task_in_transaction(
                 produces_json,
                 next_run_at, lease_until,
                 active_run_id, last_run_at, last_success_at, created_at, updated_at,
-                workflow_id, step_key, request_quote
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                workflow_id, step_key, request_quote, session_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
             """,
         (
             task_id,
@@ -106,6 +106,7 @@ def _create_task_in_transaction(
             task.workflow_id,
             task.step_key,
             str(getattr(task, "request_quote", "") or ""),
+            str(getattr(task, "session_id", "") or ""),
         ),
     )
     return task_id

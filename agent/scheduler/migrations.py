@@ -316,3 +316,22 @@ def _migrate_to_14(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+
+def _migrate_to_15(conn: sqlite3.Connection) -> None:
+    """A task remembers the session that asked for it.
+
+    ``request_quote`` holds the user's *words* -- that is what it is for, and
+    grepping them for a session id was never going to work. The patrol needs the
+    real thing: "which session owns this task" is how an unacknowledged failure
+    becomes a proposal about a conversation. A column rather than a lookup, because
+    the answer is a fact about creation and cannot be recovered later.
+    """
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
+    }
+    if "session_id" not in columns:
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN "
+            "session_id TEXT NOT NULL DEFAULT ''"
+        )

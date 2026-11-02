@@ -76,6 +76,7 @@ def _task_from_row(row: sqlite3.Row) -> ScheduledTask:
         produces=normalize_products(json.loads(row["produces_json"] or "[]")),
         workflow_id=row["workflow_id"] or "",
         step_key=row["step_key"] or "",
+        session_id=row["session_id"] or "",
         request_quote=row["request_quote"] or "",
     )
 

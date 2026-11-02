@@ -1239,6 +1239,13 @@ class NewScheduledTask:
     #: person asked for one step by name, and a step that read "asked for by
     #: nobody" would be indistinguishable from a task that appeared unasked.
     request_quote: str = ""
+    #: The session that asked for this task, when one did.
+    #:
+    #: Not derivable from `request_quote`: that holds the user's *words*, which is
+    #: what it is for. "Which conversation does this failure belong to" is a fact
+    #: about creation, and a lookup cannot recover it -- which is why the patrol's
+    #: attempt to grep a session id out of the quote never matched anything.
+    session_id: str = ""
 
 
 @dataclass
@@ -1280,6 +1287,10 @@ class ScheduledTask:
     #: See :attr:`NewScheduledTask.request_quote`: the words that asked for
     #: this task, carried through to the stored row so the answer to "why does
     #: this exist" does not depend on anyone remembering.
+    #: The session that created this task, when one did. The patrol's join: an
+    #: unacknowledged failure is a fact about a *task*, and which conversation it
+    #: belongs to is a fact about creation that no lookup can recover.
+    session_id: str = ""
     request_quote: str = ""
 
 

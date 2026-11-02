@@ -421,6 +421,10 @@ class ScheduleTools:
             # nobody verified would be a claim about the past that nothing
             # backs up.
             request_quote=str(intent or "").strip(),
+            # The conversation that asked for it, so an unacknowledged failure can
+            # be reported as a proposal *about that conversation*. Not derivable
+            # from the quote: that holds the words, not the session.
+            session_id=str(self.registry.get_context("turn_session_id") or ""),
         )
         task = store.find_matching_task(new_task)
         existing = task is not None

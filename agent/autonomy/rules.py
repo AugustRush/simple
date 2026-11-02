@@ -143,7 +143,14 @@ def rule_candidates(
     if isinstance(queue, dict):
         pending = int(queue.get("pending") or 0)
         if pending > 0:
-            last_active = _parse(session.get("last_activity"))
+            # The wait is the *queue's* age, not the session's: a conversation
+            # somebody is typing in has a recent session and a queue that has not
+            # moved, and reporting the session's age as the wait would be a
+            # different claim. `queued_since` is when the oldest item arrived.
+            last_active = _parse(
+                queue.get("queued_since")
+                or session.get("last_activity")
+            )
             waited = now - last_active if last_active is not None else timedelta(0)
             if waited >= timedelta(minutes=30):
                 found.append(

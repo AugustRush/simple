@@ -361,6 +361,16 @@ class ChannelRunner:
             set_output_dir(components.get("output_dir"))
 
         sessions: dict[str, RuntimeSessionState] = {}
+        # Publish the live sessions, so anything that needs "what is running right
+        # now" can read it: the autonomy patrol asks for a session's queue, and a
+        # queue only exists while something is serving it. A component rather than
+        # an attribute because the patrol lives in the CLI's process, not this one.
+        registry_for_sessions = resolve(components, "registry")
+        if registry_for_sessions is not None:
+            try:
+                registry_for_sessions.set_context("live_sessions", sessions)
+            except Exception:
+                pass
         handler = self._make_message_handler(sessions)
         bind_runtime = getattr(channel, "bind_runtime", None)
         if callable(bind_runtime):

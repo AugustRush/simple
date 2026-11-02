@@ -276,11 +276,13 @@ def patrol_tick(
 
     # The day's totals, once. `counts_since` is the store's own view of "today",
     # which is the only one that survives a restart.
+    # Written, not still-open: answering a proposal does not un-spend the
+    # attention it cost, so a day where everything was declined must not read as
+    # a day with no proposals.
     try:
-        day_counts = store.counts_since(start_of_day(now))
+        _proposed_today = int(store.written_since(start_of_day(now)) or 0)
     except Exception:
-        day_counts = {}
-    _proposed_today = int(day_counts.get("proposed", 0) or 0)
+        _proposed_today = 0
     _acted_today = 0
     try:
         _acted_today = int(store.acted_since(start_of_day(now)) or 0)
@@ -357,6 +359,43 @@ def patrol_tick(
                 result["proposals"].append(proposal.to_row())
     result["examined"] = examined
     return result
+
+
+def live_queue_facts(live_sessions: Any, now: Optional[datetime] = None) -> dict[str, dict[str, Any]]:
+    """Per-session queue facts, from the process that is actually serving them.
+
+    A queue only exists while something is serving it: a session nobody is running
+    has nothing waiting *in memory*. So this is not a lookup -- the caller has the
+    live states or it does not, and a missing session means "no queue", which is
+    different from "an empty queue".
+
+    ``queued_since`` is the oldest waiting item's arrival, because the rule asks
+    "how long has this been waiting" and the session's last activity is a
+    different fact (a conversation somebody is typing in has a recent session and
+    a queue that has not moved).
+    """
+    facts: dict[str, dict[str, Any]] = {}
+    if not isinstance(live_sessions, dict):
+        return facts
+    for session_id, state in live_sessions.items():
+        interjections = list(getattr(state, "pending_interjections", []) or [])
+        restarts = list(getattr(state, "restart_queue", []) or [])
+        pending = len(interjections) + len(restarts)
+        if pending <= 0:
+            continue
+        arrivals = [
+            float(entry.get("arrived_at") or 0.0)
+            for entry in (*interjections, *restarts)
+            if isinstance(entry, dict) and entry.get("arrived_at")
+        ]
+        entry: dict[str, Any] = {"pending": pending}
+        if arrivals:
+            oldest = min(arrivals)
+            # arrived_at is an epoch float from `time.time()`; the rules compare
+            # datetimes, so convert once, here.
+            entry["queued_since"] = datetime.fromtimestamp(oldest, UTC).isoformat()
+        facts[str(session_id)] = entry
+    return facts
 
 
 def _as_list(raw: Any) -> list[Any]:
