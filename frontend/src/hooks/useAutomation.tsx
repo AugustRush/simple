@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
 import { defaultScheduleDraft, msUntilNextRun, scheduleDraftFromTask, scheduleRequestBody } from '../lib/schedule'
 import { checkWorkflowGraph, cleanStepKeys, defaultWorkflowDraft, defaultWorkflowStep, defaultWorkflowTrigger, describeChainTrigger, nextStepKey, planWorkflowStepMove, spliceWorkflowStep, stepContent, storedEntryStep, swapWorkflowSteps, workflowDownstreamKeys, workflowDraftFromInfo, workflowRequestBody } from '../lib/workflow'
-import type { AttentionRun, PermissionProfileOption, ScheduleArtifact, ScheduleDraft, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, SignalInfo, WorkflowDraft, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
+import type { AttentionRun, AutomationRow, PermissionProfileOption, ScheduleArtifact, ScheduleDraft, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, SignalInfo, WorkflowDraft, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
 import { Modal } from 'antd'
 import dayjs from 'dayjs'
 import { useUi } from './useUi'
@@ -99,7 +99,15 @@ export function useAutomation(deps: Deps) {
    */
   const [workflowsLoaded, setWorkflowsLoaded] = useState(false)
 
-  const [automationTab, setAutomationTab] = useState<'tasks' | 'workflows' | 'attention'>('tasks')
+  // Two views, not three: what needs a person, and everything they manage. The
+  // "task or workflow" split was a choice offered on arrival; it is a filter now.
+  const [automationTab, setAutomationTab] = useState<'automation' | 'attention'>('automation')
+  // The filter inside the list. `all` is the landing view: one row per thing a
+  // person manages, a step never listed beside its chain (see
+  // agent/scheduler/automations.py for the invariant and why it matters).
+  const [automationKind, setAutomationKind] = useState<'all' | 'task' | 'workflow'>('all')
+  const [automations, setAutomations] = useState<AutomationRow[]>([])
+  const [automationQuery, setAutomationQuery] = useState('')
 
   const [workflowModalOpen, setWorkflowModalOpen] = useState(false)
 
@@ -186,6 +194,41 @@ export function useAutomation(deps: Deps) {
       if (!silent) setLoadingView(false)
     }
   }, [api, applySchedules, refreshJson])
+
+  /**
+   * The list a person lands on: every automation in one shape.
+   *
+   * Its own endpoint (`GET /api/automations`) rather than two client-side merges,
+   * because the merge is a *rule* -- a step is never its own row, a chain's
+   * attention is its steps' attention -- and a rule kept in two places is the
+   * kind that drifts. The response also carries the badge, so the count and the
+   * rows are one read (the same contract `/api/schedules` makes).
+   */
+  const loadAutomations = useCallback(async (silent = false) => {
+    if (!silent) setLoadingView(true)
+    try {
+      const data = silent
+        ? await refreshJson('/api/automations')
+        : await (await api('/api/automations')).json()
+      if (data === null) {
+        setSchedulerStale(true)
+        return
+      }
+      setAutomations(Array.isArray(data.automations) ? data.automations : [])
+      if (Array.isArray(data.permission_profiles) && data.permission_profiles.length) {
+        setPermissionProfiles(data.permission_profiles)
+      }
+      applyAttention(data)
+      setSchedulerStale(false)
+      setSchedulerRefreshedAt(Date.now())
+    } catch {
+      // Same rule as the other lists: an unreachable list must not read as "you
+      // have nothing", so the last known one stands and is marked stale.
+      setSchedulerStale(true)
+    } finally {
+      if (!silent) setLoadingView(false)
+    }
+  }, [api, applyAttention, refreshJson])
 
   const loadWorkflows = useCallback(async (silent = false) => {
     if (!silent) setLoadingView(true)
@@ -647,6 +690,7 @@ export function useAutomation(deps: Deps) {
         setScheduleRuns([])
         setSelectedScheduleRunId(null)
       }
+      void loadAutomations(true)
       messageApi.success('任务已删除')
     })
   }
@@ -662,6 +706,7 @@ export function useAutomation(deps: Deps) {
       setSelectedSchedule(current => current?.id === task.id
         ? { ...current, enabled }
         : current)
+      void loadAutomations(true)
     } catch { /* surfaced */ }
   }
 
@@ -677,6 +722,7 @@ export function useAutomation(deps: Deps) {
       const completed = Array.isArray(data.completed) ? data.completed as string[] : []
       setSelectedScheduleIds(prev => prev.filter(id => !completed.includes(id)))
       await loadSchedules(true)
+      await loadAutomations(true)
       if (data.skipped?.length) {
         messageApi.warning(`${completed.length} 个任务已处理，${data.skipped.length} 个任务已跳过（运行中、属于流程或不存在）`)
       } else {
@@ -966,9 +1012,10 @@ export function useAutomation(deps: Deps) {
       setWorkflowModalOpen(false)
       setEditingWorkflowId(null)
       messageApi.success(editingWorkflowId ? '流程已保存' : '流程已创建')
-      // Steps are tasks, so both lists change: the graph gained or moved
-      // tasks, and the task list is where they are shown.
-      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+      // Steps are tasks, so all three lists change: the graph gained or moved
+      // tasks, the task list is where they are shown, and the unified list
+      // shows the chain as one row.
+      await Promise.all([loadWorkflows(true), loadSchedules(true), loadAutomations(true)])
     } catch {
       // Surfaced by the api helper.
     } finally {
@@ -984,7 +1031,7 @@ export function useAutomation(deps: Deps) {
         messageApi.error(String(data.error))
         return
       }
-      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+      await Promise.all([loadWorkflows(true), loadSchedules(true), loadAutomations(true)])
       messageApi.success('流程已删除，它的步骤已停止运行，可在任务列表里单独删除')
     })
   }
@@ -1004,7 +1051,7 @@ export function useAutomation(deps: Deps) {
         messageApi.error(String(data.error))
         return
       }
-      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+      await Promise.all([loadWorkflows(true), loadSchedules(true), loadAutomations(true)])
     } catch { /* surfaced */ }
   }
 
@@ -1152,6 +1199,7 @@ export function useAutomation(deps: Deps) {
       setEditingScheduleId(null)
       setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
       await loadSchedules()
+      await loadAutomations(true)
       // A step's edit was copied back into its graph, so the picture of that
       // graph is stale until it is read again.
       if (editingStep) await loadWorkflows(true)
@@ -1280,5 +1328,5 @@ export function useAutomation(deps: Deps) {
     else messageApi.info('这一步的任务暂时读不到，先刷新一下')
   }
 
-  return { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
+  return { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
 }

@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
+import type { AttachmentInfo, AttentionRun, AutomationRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -191,15 +191,22 @@ export interface AppCtx {
   openStepDetails: (step: WorkflowStepInfo) => void
   schedulerRefreshedAt: number | null
   schedulerStale: boolean
-  automationTab: "tasks" | "workflows" | "attention"
+  //: Two views: what needs a person, and everything they manage. "Task or workflow"
+  //: is a filter inside the second one -- see agent/scheduler/automations.py.
+  automationTab: "automation" | "attention"
+  automationKind: "all" | "task" | "workflow"
+  automationQuery: string
+  automations: AutomationRow[]
+  loadAutomations: (silent?: boolean) => Promise<void>
   loadSchedules: (silent?: boolean) => Promise<void>
   loadWorkflows: (silent?: boolean) => Promise<void>
   openCreateSchedule: () => void
   openCreateWorkflow: () => void
   unseenFailures: number
   clearScheduleAttention: (taskId?: string | undefined) => Promise<void>
-  setAutomationTab: Dispatch<SetStateAction<"tasks" | "workflows" | "attention">>
-  workflowAttention: number
+  setAutomationTab: Dispatch<SetStateAction<"automation" | "attention">>
+  setAutomationKind: Dispatch<SetStateAction<"all" | "task" | "workflow">>
+  setAutomationQuery: Dispatch<SetStateAction<string>>
   scheduleQuery: string
   setScheduleQuery: Dispatch<SetStateAction<string>>
   workflowQuery: string

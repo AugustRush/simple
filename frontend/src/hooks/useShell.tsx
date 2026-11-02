@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, loadAutomations, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -68,9 +68,12 @@ export function useShell(deps: Deps) {
     const refresh = () => {
       void loadSchedules(true)
       // The graph draws each step's liveness from the workflow payload, so a
-      // running workflow watched from this tab has to refresh that too --
-      // otherwise the steps sit still while the run behind them moves.
-      if (automationTab === 'workflows') void loadWorkflows(true)
+      // workflow watched from this view has to refresh that too -- otherwise the
+      // steps sit still while the run behind them moves.
+      if (automationTab === 'automation' && automationKind !== 'task') void loadWorkflows(true)
+      // The unified list is where a chain's status is read, so its own poll keeps
+      // it honest between mutations.
+      if (automationTab === 'automation' && automationKind === 'all') void loadAutomations(true)
       if (scheduleDetailOpen && selectedScheduleId) {
         void loadScheduleRuns(selectedScheduleId, false, true)
       }
@@ -78,7 +81,9 @@ export function useShell(deps: Deps) {
     const timer = window.setInterval(refresh, cadence)
     return () => window.clearInterval(timer)
   }, [
+    automationKind,
     automationTab,
+    loadAutomations,
     loadScheduleRuns,
     loadSchedules,
     loadWorkflows,

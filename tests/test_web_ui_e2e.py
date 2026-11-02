@@ -204,10 +204,63 @@ def test_a_second_route_renders_its_own_view(page):
     assert page.errors == [], page.errors
 
 
-def test_the_automation_page_is_reachable_from_the_navigation(page):
-    """A click, not a URL: the navigation is part of what can break."""
-    page.locator("text=自动化").first.click()
-    page.wait_for_selector(".schedule-tabs, .page-view", timeout=20_000)
+def test_the_automation_page_is_one_list(page, live_gateway):
+    """The merge, seen by a person: one page, one list, two tabs.
 
-    assert page.locator(".page-view").first.is_visible()
+    A task is created through the API rather than the form -- this test is about the
+    *list*, and driving the form would test the form. A fresh gateway has nothing, so
+    the empty state is asserted first, then a row is created and found.
+    """
+    import json
+    import urllib.request
+
+    page.locator(".nav-label", has_text="自动化").first.click()
+    page.wait_for_selector(".schedule-tabs", timeout=20_000)
+
+    # Two tabs, not three: what needs a person, and everything that exists.
+    tabs = page.locator(".schedule-tabs [role=tab]")
+    assert tabs.count() == 2, [tabs.nth(i).inner_text() for i in range(tabs.count())]
+    assert "自动化" in tabs.nth(1).inner_text()
+    # ...and the landing list says what it is when there is nothing in it.
+    page.wait_for_selector("text=还没有自动化", timeout=20_000)
+
+    # Create one task through the API the page itself uses.
+    # The same body the task form builds (`scheduleRequestBody` in the frontend):
+    # action_type names the payload shape, the trigger fields say when.
+    payload = {
+        "name": "每天早上看看日志",
+        "action_type": "agent_task",
+        "trigger_type": "interval",
+        "every": 24,
+        "unit": "hours",
+        # An interval counts from an anchor; the form sends one for the same reason.
+        "anchor_at": "2026-11-01T00:00:00+08:00",
+        "prompt": "读一遍日志，告诉我有没有异常",
+        "workspace_root": str(live_gateway["home"]),
+        "context_policy": "stateless",
+        "delivery_mode": "standalone",
+        "timeout_seconds": 1800,
+        "retry_policy": {"max_attempts": 1, "backoff_seconds": 30},
+        "selected_skills": [],
+        "permission_profile": "inherit",
+        "timezone_name": "Asia/Shanghai",
+    }
+    request = urllib.request.Request(
+        f"{live_gateway['base_url']}/api/schedules",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            assert response.status in (200, 201), response.status
+    except urllib.error.HTTPError as exc:  # the body names the field it refused
+        raise AssertionError(
+            f"creating a task through the API failed: {exc.code} {exc.read().decode()}"
+        ) from exc
+
+    page.reload(wait_until="networkidle")
+    page.wait_for_selector("text=每天早上看看日志", timeout=20_000)
+    # The row says which shape it is, from the unified payload.
+    assert page.locator(".schedule-list").first.inner_text().count("每天早上看看日志") == 1
     assert page.errors == [], page.errors

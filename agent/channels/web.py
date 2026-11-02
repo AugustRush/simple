@@ -938,6 +938,10 @@ class WebChannel(Channel):
                     "permission_profiles": profile_payloads(),
                     "unseen_attention": snapshot["total"],
                     "attention_runs": attention_rows(store, snapshot),
+                    # Sent for the same reason /api/schedules sends it: the client has
+                    # one writer for the badge and the rows behind it, and a second
+                    # response shape would give it a second, drifting one.
+                    "latest_run_by_task": snapshot["latest_by_task"],
                 }
             )
         finally:

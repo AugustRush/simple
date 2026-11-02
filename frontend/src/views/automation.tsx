@@ -86,7 +86,7 @@ import dayjs from 'dayjs'
 const { TextArea } = Input
 
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
+  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
 
 
   /**
@@ -269,6 +269,110 @@ export function renderSchedules(ctx: AppCtx) {
       </Space>
     </div>
   )
+
+  /**
+   * The landing list: one row per thing a person manages.
+   *
+   * A row is a chain when it has several steps and a task when it has one, which is the
+   * whole of the difference -- so the row says the shape and the count, and the click
+   * opens whichever editor that shape has. The numbers (attention, next run, last
+   * status) come from `GET /api/automations`, which computes them from the same
+   * snapshot the badge uses; a row that summed its own steps could disagree with it.
+   */
+  const renderAutomations = () => {
+    const needle = automationQuery.trim().toLowerCase()
+    const visible = needle
+      ? automations.filter(row => row.name.toLowerCase().includes(needle) ||
+          (row.description || '').toLowerCase().includes(needle))
+      : automations
+    if (loadingView && automations.length === 0) {
+      return <Skeleton active paragraph={{ rows: 6 }} />
+    }
+    if (visible.length === 0) {
+      return (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={needle
+            ? '没有符合条件的任务或流程'
+            : '还没有自动化。建一个任务（一步），或者把几个任务串成一条链（多步）。'}
+          className="page-empty"
+        />
+      )
+    }
+    return (
+      <div className="schedule-list">
+        {visible.map(row => {
+          const task = schedules.find(item => item.id === row.task_id)
+          const chain = workflows.find(item => item.id === row.workflow_id)
+          const open = () => {
+            if (row.kind === 'chain') {
+              if (chain) openEditWorkflow(chain)
+              return
+            }
+            if (task) openScheduleDetails(task)
+          }
+          return (
+            <Card
+              key={`${row.kind}:${row.id}`}
+              hoverable
+              role="button"
+              tabIndex={0}
+              aria-label={`打开 ${row.name}`}
+              className={`schedule-card ${row.enabled === false ? 'schedule-card-disabled' : ''}`}
+              onClick={open}
+              onKeyDown={event => {
+                if (event.target !== event.currentTarget) return
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  open()
+                }
+              }}
+            >
+              <div className="schedule-card-head">
+                <div className="schedule-card-title">
+                  <span className="schedule-card-icon">
+                    {row.kind === 'chain' ? <ApartmentOutlined /> : <RobotOutlined />}
+                  </span>
+                  <div>
+                    <strong>{row.name}</strong>
+                    <span>
+                      {row.kind === 'chain' ? `流程 · ${row.step_count} 个步骤` : '任务'}
+                      {row.next_run_at ? ` · 下次执行：${formatDateTime(row.next_run_at)}` : ''}
+                    </span>
+                  </div>
+                </div>
+                <Space>
+                  {row.attention > 0 && (
+                    <Tag color="error">{row.attention} 条待处理</Tag>
+                  )}
+                  {row.last_status ? (
+                    <Tag>{scheduleRunStatusLabel(row.last_status)}</Tag>
+                  ) : null}
+                  {/* The switch sits inside a clickable card, so the click has to
+                      stop here: toggling a row must not also open it. */}
+                  <Tooltip title={row.enabled === false ? '启用' : '暂停'}>
+                    <span onClick={event => event.stopPropagation()}>
+                      <Switch
+                        size="small"
+                        checked={row.enabled !== false}
+                        onChange={value => {
+                          if (row.kind === 'chain') {
+                            if (chain) void toggleWorkflow(chain, value)
+                            return
+                          }
+                          if (task) void toggleSchedule(task, value)
+                        }}
+                      />
+                    </span>
+                  </Tooltip>
+                </Space>
+              </div>
+            </Card>
+          )
+        })}
+      </div>
+    )
+  }
 
   const renderWorkflows = () => (
     <>
@@ -687,11 +791,13 @@ export function renderSchedules(ctx: AppCtx) {
             </Tooltip>
           </div>
           <p>
-            {automationTab === 'tasks'
-              ? '让 Agent 在指定时间执行，或等某个信号发生后接着执行。'
-              : automationTab === 'workflows'
-                ? '把几个任务串成一条链：上一步完成后，下一步才运行。'
-                : '这些运行结束得不好，或者中间有该跑却没跑成的次数，还没有人看过。'}
+            {automationTab === 'attention'
+              ? '这些运行结束得不好，或者中间有该跑却没跑成的次数，还没有人看过。'
+              : automationKind === 'task'
+                ? '让 Agent 在指定时间执行，或等某个信号发生后接着执行。'
+                : automationKind === 'workflow'
+                  ? '把几个任务串成一条链：上一步完成后，下一步才运行。'
+                  : '一件事，一步还是多步。一步是一个任务；多步就是一条链，上一步完成后下一步才运行。'}
           </p>
         </div>
         <Space>
@@ -700,16 +806,25 @@ export function renderSchedules(ctx: AppCtx) {
               aria-label="刷新运行状态"
               icon={<ReloadOutlined />}
               onClick={() => {
+                // One refresh for the page: the lists behind each filter, and the
+                // unified list, all read the same facts.
                 void loadSchedules()
-                if (automationTab === 'workflows') void loadWorkflows()
+                void loadWorkflows(true)
+                void loadAutomations()
               }}
             />
           </Tooltip>
-          {automationTab === 'tasks' && (
+          {automationTab === 'automation' && automationKind !== 'workflow' && (
             <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
           )}
-          {automationTab === 'workflows' && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={openCreateWorkflow}>新建流程</Button>
+          {automationTab === 'automation' && automationKind !== 'task' && (
+            <Button
+              type={automationKind === 'all' ? 'default' : 'primary'}
+              icon={<ApartmentOutlined />}
+              onClick={openCreateWorkflow}
+            >
+              新建流程
+            </Button>
           )}
           {/* Nothing to create from the attention list: it is a list of things
               that already happened, and a "new" button here would suggest that
@@ -744,32 +859,18 @@ export function renderSchedules(ctx: AppCtx) {
             </span>
           )}
         </button>
+        {/* One list. "Task or workflow" was a choice offered on arrival, and the two
+            answers were the same mechanism with one step or several (see
+            agent/scheduler/automations.py). The split survives as a filter in the
+            toolbar, where it belongs: it narrows a list rather than choosing a world. */}
         <button
           type="button"
           role="tab"
-          aria-selected={automationTab === 'tasks'}
-          className={automationTab === 'tasks' ? 'active' : ''}
-          onClick={() => setAutomationTab('tasks')}
+          aria-selected={automationTab === 'automation'}
+          className={automationTab === 'automation' ? 'active' : ''}
+          onClick={() => setAutomationTab('automation')}
         >
-          任务
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={automationTab === 'workflows'}
-          className={automationTab === 'workflows' ? 'active' : ''}
-          onClick={() => setAutomationTab('workflows')}
-        >
-          流程
-          {workflowAttention > 0 && (
-            // Scoped to this tab: attention belonging to a step of a workflow.
-            // A standalone task's failure is deliberately not counted here, and
-            // saying so is what keeps this from reading as a discrepancy
-            // against the 待处理 total.
-            <span className="schedule-tab-badge" title={`流程里有 ${workflowAttention} 次运行需要查看`}>
-              {workflowAttention}
-            </span>
-          )}
+          自动化
         </button>
       </div>
       <div className="schedule-toolbar">
@@ -782,7 +883,7 @@ export function renderSchedules(ctx: AppCtx) {
               ? `${unseenFailures} 次运行需要查看`
               : '没有需要查看的运行'}
           </span>
-        ) : automationTab === 'tasks' ? (
+        ) : automationKind === 'task' ? (
           <Input
             allowClear
             prefix={<SearchOutlined />}
@@ -791,7 +892,7 @@ export function renderSchedules(ctx: AppCtx) {
             onChange={event => setScheduleQuery(event.target.value)}
             className="workspace-search"
           />
-        ) : (
+        ) : automationKind === 'workflow' ? (
           <Input
             allowClear
             prefix={<SearchOutlined />}
@@ -800,8 +901,37 @@ export function renderSchedules(ctx: AppCtx) {
             onChange={event => setWorkflowQuery(event.target.value)}
             className="workspace-search"
           />
+        ) : (
+          <Input
+            allowClear
+            prefix={<SearchOutlined />}
+            placeholder="搜索任务或流程"
+            value={automationQuery}
+            onChange={event => setAutomationQuery(event.target.value)}
+            className="workspace-search"
+          />
         )}
-        {automationTab === 'tasks' && (
+        {/* The old tabs, as a filter: they narrow the one list instead of picking
+            which list exists. */}
+        {automationTab === 'automation' && (
+          <div className="schedule-filter" role="group" aria-label="自动化类型筛选">
+            {[
+              ['all', '全部'],
+              ['task', '任务'],
+              ['workflow', '流程'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={automationKind === value ? 'active' : ''}
+                onClick={() => setAutomationKind(value as 'all' | 'task' | 'workflow')}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+        {automationTab === 'automation' && automationKind === 'task' && (
           <>
             <div className="schedule-filter" role="group" aria-label="任务状态筛选">
               {[
@@ -1641,7 +1771,7 @@ export function renderSchedules(ctx: AppCtx) {
           </div>
         )}
       </Drawer>
-      {automationTab === 'attention' ? renderAttention() : automationTab === 'workflows' ? renderWorkflows() : (
+      {automationTab === 'attention' ? renderAttention() : automationKind === 'workflow' ? renderWorkflows() : automationKind === 'all' ? renderAutomations() : (
       loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={scheduleQuery.trim() || scheduleStatusFilter !== 'all'

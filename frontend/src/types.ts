@@ -257,6 +257,30 @@ export interface WorkflowStepInfo {
 }
 
 
+//: One row of `GET /api/automations`: a plain task and a chain in the same shape.
+//: `kind` is the only thing that differs, and `step_count` is 1 for a task -- so a
+//: list column never has to branch on which endpoint the row came from.
+export interface AutomationRow {
+  id: string
+  kind: 'task' | 'chain'
+  name: string
+  enabled: boolean
+  step_count: number
+  trigger_type: string
+  trigger: Record<string, any>
+  next_run_at?: string | null
+  last_run_at?: string | null
+  last_status: string
+  attention: number
+  //: The id an existing task endpoint is keyed by (the entry step's, for a chain).
+  task_id: string
+  //: Empty for a plain task; the chain's id otherwise.
+  workflow_id: string
+  description?: string
+  delivery_mode?: string
+  permission_profile?: string
+}
+
 export interface WorkflowInfo {
   id: string
   name: string
