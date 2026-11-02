@@ -179,6 +179,7 @@ export interface AppCtx {
   automationQuery: string
   automations: AutomationRow[]
   automationsLoaded: boolean
+  answeredProposals: ProposalRow[]
   funnel: AutonomyFunnel | null
   proposals: ProposalRow[]
   proposalsLoaded: boolean

@@ -292,6 +292,16 @@ export interface ProposalRow {
   decided_by: string
   admission: { answer: string; reason: string; prepared?: Record<string, any> } | null
   rule: string
+  //: What the run did, once one was started for this proposal. `status` "queued"
+  //: means a task exists and nothing has run it yet -- a placement, not a result.
+  outcome: {
+    task_id?: string
+    run_id?: string
+    status?: string
+    summary?: string
+    output_path?: string
+    runner?: string
+  } | null
 }
 
 //: One row of `GET /api/automations`: a plain task and a chain in the same shape.

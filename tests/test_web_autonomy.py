@@ -230,3 +230,28 @@ def test_the_list_filters_by_state(store) -> None:
     assert len(body["proposals"]) == 1
     assert body["proposals"][0]["state"] == "declined"
     assert body["counts"]["proposed"] == 1
+
+
+def test_the_overview_carries_what_was_answered_and_what_came_of_it(store) -> None:
+    """A page that only shows the queue makes approving a leap of faith repeated."""
+    from agent.autonomy import Proposal
+
+    proposal = Proposal(
+        source="s1", reason="r", action="读一遍失败的运行",
+        tool="schedule_runs", reversibility="reversible", confidence=0.8,
+    )
+    proposal.context["admission"] = {"answer": "prepare", "reason": "x"}
+    store.record(proposal)
+    store.decide(proposal.id, "acted", by="person")
+    store.note_outcome(
+        proposal.id, {"task_id": "t1", "status": "succeeded", "summary": "读完了"}
+    )
+
+    status, body = _call(web_autonomy._autonomy_overview, _Request(), store)
+
+    assert status == 200
+    assert body["live"] == [], "nothing is waiting"
+    (answered,) = body["answered"]
+    assert answered["state"] == "acted"
+    assert answered["outcome"]["status"] == "succeeded"
+    assert answered["outcome"]["summary"] == "读完了"

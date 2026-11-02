@@ -42,9 +42,21 @@ const ADMISSION_LABEL: Record<string, string> = {
   prepare: '本来会准备好等你',
 }
 
+const OUTCOME_LABEL: Record<string, string> = {
+  queued: '已建任务，等调度器接手',
+  running: '正在跑',
+  succeeded: '跑成功了',
+  failed: '失败了',
+  interrupted: '被打断',
+  cancelled: '已取消',
+  skipped: '被跳过',
+  unverified: '跑了但没判定',
+}
+
 export function renderAutonomy(ctx: AppCtx) {
   const {
-    decideProposal, loadAutonomy, proposalCounts, proposals, proposalsLoaded,
+    answeredProposals, decideProposal, loadAutonomy, proposalCounts, proposals,
+    proposalsLoaded,
   } = ctx
 
   const proposed = Number(proposalCounts.proposed || 0)
@@ -83,6 +95,15 @@ export function renderAutonomy(ctx: AppCtx) {
           {Object.keys(row.admission.prepared.arguments || {}).length
             ? '，参数已准备好'
             : ''}
+        </p>
+      )}
+      {/* What the run did, when there was one. A proposal that was approved and
+          then ran is only useful if the person who approved it can see how it
+          went -- otherwise approving is a leap of faith repeated every time. */}
+      {row.outcome && row.outcome.status && (
+        <p className={`proposal-outcome proposal-outcome-${row.outcome.status}`}>
+          执行结果：{OUTCOME_LABEL[row.outcome.status] || row.outcome.status}
+          {row.outcome.summary ? ` · ${row.outcome.summary}` : ''}
         </p>
       )}
       <div className="proposal-footer">
@@ -150,6 +171,26 @@ export function renderAutonomy(ctx: AppCtx) {
         />
       ) : (
         <div className="proposal-list">{proposals.map(renderRow)}</div>
+      )}
+      {/* What was answered, with what happened. Collapsed under the queue on
+          purpose: the live list is what needs a person, and this is the record. */}
+      {answeredProposals.length > 0 && (
+        <div className="proposal-answered">
+          <div className="proposal-answered-title">已答复</div>
+          {answeredProposals.map(row => (
+            <div key={row.id} className="proposal-answered-row">
+              <span className={`proposal-state proposal-state-${row.state}`}>
+                {row.state === 'acted' ? '已执行' : row.state === 'accepted' ? '同意' : '不要'}
+              </span>
+              <span className="proposal-answered-action">{row.action}</span>
+              {row.outcome?.status && (
+                <span className={`proposal-outcome proposal-outcome-${row.outcome.status}`}>
+                  {OUTCOME_LABEL[row.outcome.status] || row.outcome.status}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
       )}
       {/* The honest footnote: a page about autonomy has to say what it is not. */}
       <p className="proposal-footnote">

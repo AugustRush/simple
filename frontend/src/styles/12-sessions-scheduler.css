@@ -1405,3 +1405,17 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .proposal-footer { display:flex; align-items:center; justify-content:space-between; margin-top:12px; padding-top:10px; border-top:1px solid var(--border); color:var(--text-muted); font-size:11px; }
 .proposal-footnote { margin:0; color:var(--text-muted); font-size:11px; line-height:1.7; }
 .proposal-funnel { margin:6px 0 0; color:var(--text-muted); font-size:11px; }
+.proposal-outcome { margin:8px 0 0; color:var(--text-secondary); font-size:11px; line-height:1.6; }
+.proposal-outcome-failed,
+.proposal-outcome-interrupted { color:var(--red); }
+.proposal-outcome-succeeded { color:#2f7a57; }
+.proposal-outcome-queued,
+.proposal-outcome-running { color:var(--text-muted); }
+.proposal-answered { margin-top:4px; padding-top:12px; border-top:1px solid var(--border); }
+.proposal-answered-title { margin-bottom:8px; color:var(--text-muted); font-size:11px; font-weight:600; }
+.proposal-answered-row { display:flex; align-items:baseline; gap:10px; padding:4px 0; color:var(--text-secondary); font-size:11px; }
+.proposal-answered-action { flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.proposal-state { flex:0 0 auto; padding:1px 6px; border-radius:4px; background:var(--surface-hover); font-size:10px; }
+.proposal-state-declined { color:var(--text-muted); }
+.proposal-state-accepted { color:#2f7a57; }
+.proposal-state-acted { color:#4b76a8; }

@@ -65,6 +65,14 @@ async def _autonomy_overview(request: Any, *, authorized, store) -> Any:
     try:
         counts = _counts(store)
         live = store.list_proposals(state="proposed", limit=50)
+        # What was answered, and what happened to it. A page that only shows the
+        # queue is a page where approving is a leap of faith repeated every time:
+        # the run's result would exist and nobody would ever read it.
+        answered = [
+            item
+            for state in ("acted", "accepted", "declined")
+            for item in store.list_proposals(state=state, limit=20)
+        ]
         # The funnel's own numbers, read with the rows: a page about proposals
         # that cannot say how much was looked at to find them invites the reader
         # to guess whether "nothing proposed" means "nothing to do".
@@ -81,6 +89,7 @@ async def _autonomy_overview(request: Any, *, authorized, store) -> Any:
             # first is what a person reads, oldest first is what they act on.
             # Newest first here, because the page is a review queue, not an inbox.
             "live": [_proposal_payload(item) for item in live],
+            "answered": [_proposal_payload(item) for item in answered],
         }
     )
 
@@ -179,4 +188,10 @@ def _proposal_payload(proposal: Any) -> dict[str, Any]:
         "decided_by": proposal.decided_by,
         "admission": admission if isinstance(admission, dict) else None,
         "rule": (context.get("rule") if isinstance(context, dict) else "") or "",
+        # What happened after somebody approved it. Null while a proposal has not
+        # been acted on, and a run that is still queued reports "queued" rather
+        # than pretending to be an outcome.
+        "outcome": (
+            context.get("outcome") if isinstance(context, dict) else None
+        ),
     }
