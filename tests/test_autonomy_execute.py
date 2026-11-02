@@ -221,3 +221,84 @@ def test_execution_does_not_bypass_the_admission_answer(stores) -> None:
     )
 
     assert outcome["ok"] is True
+
+
+# ── the loop closes ────────────────────────────────────────────────────────
+
+
+def test_the_task_id_lands_on_the_proposal(stores) -> None:
+    """A task id that lives only in a CLI's stdout is a loop that never closes."""
+    proposals, scheduler = stores
+    proposal = _approved(proposals)
+
+    outcome = execute_proposal(
+        store=proposals, proposal=proposal, scheduler_store=scheduler, now=NOW
+    )
+
+    row = proposals.list_proposals()[0]
+    assert row.context["outcome"]["task_id"] == outcome["task_id"]
+
+
+def test_the_patrol_reads_the_run_result_back(stores) -> None:
+    """Without this, "acted on" is the last thing anybody knows."""
+    import asyncio
+
+    from agent.autonomy.patrol import PatrolService
+
+    proposals, scheduler = stores
+    proposal = _approved(proposals)
+    execute_proposal(
+        store=proposals, proposal=proposal, scheduler_store=scheduler, now=NOW
+    )
+
+    # The run has to reach a terminal status before the read-back is worth doing.
+    service = PatrolService(
+        store=proposals,
+        sessions_provider=lambda: [],
+        scheduler_store_provider=lambda: scheduler,
+    )
+    assert service.read_back_outcomes() == 0, "a queued run is not an outcome yet"
+
+    task_id = proposals.list_proposals()[0].context["outcome"]["task_id"]
+    # A run exists once the task is claimed -- that is the scheduler's first step,
+    # and a test that skipped it would be testing a state production never has.
+    claimed = scheduler.claim_task_now(task_id, now=NOW)
+    assert claimed is not None
+    scheduler.complete_run(
+        task_id,
+        claimed.run.id,
+        finished_at=NOW,
+        status="succeeded",
+        summary="读完了",
+    )
+
+    assert service.read_back_outcomes() == 1
+    row = proposals.list_proposals()[0]
+    assert row.context["outcome"]["status"] == "succeeded"
+    assert row.context["outcome"]["summary"] == "读完了"
+
+
+def test_reading_back_happens_once(stores) -> None:
+    """The second pass must not rewrite an outcome that has already been read."""
+    from agent.autonomy.patrol import PatrolService
+
+    proposals, scheduler = stores
+    proposal = _approved(proposals)
+    execute_proposal(
+        store=proposals, proposal=proposal, scheduler_store=scheduler, now=NOW
+    )
+    task_id = proposals.list_proposals()[0].context["outcome"]["task_id"]
+    claimed = scheduler.claim_task_now(task_id, now=NOW)
+    assert claimed is not None
+    scheduler.complete_run(
+        task_id, claimed.run.id, finished_at=NOW, status="succeeded", summary="第一次"
+    )
+
+    service = PatrolService(
+        store=proposals,
+        sessions_provider=lambda: [],
+        scheduler_store_provider=lambda: scheduler,
+    )
+    assert service.read_back_outcomes() == 1
+    assert service.read_back_outcomes() == 0
+    assert proposals.list_proposals()[0].context["outcome"]["summary"] == "第一次"

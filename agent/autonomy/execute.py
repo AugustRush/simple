@@ -182,6 +182,16 @@ def execute_proposal(
         return ExecutionOutcome.refused("这条提议刚刚被别处答复了")
 
     runner = _runner(proposal)
+    # The task id goes onto the proposal too: `read_back_outcomes` needs it to
+    # find the run, and a task id that lives only in a CLI's stdout is a loop that
+    # never closes.
+    try:
+        store.note_outcome(
+            proposal.id,
+            {"task_id": created.id, "status": "queued", "runner": runner},
+        )
+    except Exception:
+        pass
     return ExecutionOutcome.queued(created.id, proposal.id, runner)
 
 

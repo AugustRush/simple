@@ -129,6 +129,10 @@ class PatrolService:
     #: where it already is.
     sessions_provider: Optional[Callable[[], list[dict[str, Any]]]] = None
     on_result: Optional[Callable[[dict[str, Any]], None]] = None
+    #: How the run outcomes are read.  Injected for the same reason the session
+    #: list is: the service must not reach for a module-level store, or a test (and
+    #: a second agent home in the same process) would read somebody else's runs.
+    scheduler_store_provider: Optional[Callable[[], Any]] = None
     _task: Optional[asyncio.Task[None]] = None
     _stop: Optional[asyncio.Event] = None
 
@@ -195,6 +199,65 @@ class PatrolService:
 
     # -- one pass ----------------------------------------------------------
 
+    def read_back_outcomes(self) -> int:
+        """Attach each acted-on proposal's run result to the proposal. Returns how many.
+
+        Read from the scheduler's own store, not from a cache: the run's status is
+        the authority, and a proposal whose run is still running is left alone --
+        it will be read on the next pass.
+        """
+        pending = self.store.awaiting_outcome()
+        if not pending:
+            return 0
+        written = 0
+        scheduler_store = None
+        owns_store = False
+        try:
+            if self.scheduler_store_provider is not None:
+                scheduler_store = self.scheduler_store_provider()
+            else:
+                from agent.scheduler import open_store as open_scheduler_store
+
+                scheduler_store = open_scheduler_store()
+                owns_store = True
+        except Exception:  # noqa: BLE001 - no store means no outcomes to read
+            return 0
+        try:
+            for proposal in pending:
+                task_id = str(
+                    (proposal.context.get("outcome") or {}).get("task_id")
+                    or proposal.context.get("task_id")
+                    or ""
+                )
+                if not task_id:
+                    # `act` records the task id in the outcome it writes; a row
+                    # without one was acted on before this loop existed.
+                    continue
+                runs = scheduler_store.list_runs(task_id)
+                if not runs:
+                    continue
+                latest = runs[0]
+                status = str(getattr(latest, "status", "") or "")
+                if status in {"queued", "running"}:
+                    continue
+                self.store.note_outcome(
+                    proposal.id,
+                    {
+                        "task_id": task_id,
+                        "run_id": getattr(latest, "id", ""),
+                        "status": status,
+                        "summary": str(getattr(latest, "summary", "") or "")[:400],
+                        "output_path": str(getattr(latest, "output_path", "") or ""),
+                    },
+                )
+                written += 1
+        finally:
+            # Only a store this method opened is a store it may close. Closing the
+            # caller's is how a test's fixture dies halfway through the test.
+            if owns_store and scheduler_store is not None:
+                scheduler_store.close()
+        return written
+
     async def tick(self, now: Optional[datetime] = None) -> dict[str, Any]:
         """One pass: read the sessions, propose, write.  Nothing else."""
         sessions: list[dict[str, Any]] = []
@@ -217,6 +280,13 @@ class PatrolService:
             result["expired"] = self.store.expire_stale(now=now)
         except Exception:  # noqa: BLE001
             result["expired"] = 0
+        # Reading back what the runs did closes the loop: without it "acted on"
+        # is the last thing anybody knows, and whether acting was worth it is
+        # unknowable. The verdict is the calibration's most important input.
+        try:
+            result["outcomes_read"] = self.read_back_outcomes()
+        except Exception:  # noqa: BLE001 - a failed read is not a failed pass
+            result["outcomes_read"] = 0
         try:
             self.store.record_tick(result, at=now)
         except Exception:  # noqa: BLE001 - the history is not worth a failed pass

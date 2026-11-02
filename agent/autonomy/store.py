@@ -299,6 +299,65 @@ class ProposalStore:
             **sums,
         }
 
+    def note_outcome(self, proposal_id: str, outcome: dict[str, Any]) -> bool:
+        """Attach what the run did to the proposal that asked for it.
+
+        Without this the loop is open: a proposal is acted on and nobody -- not
+        the patrol, not the page -- can say whether acting on it was worth it.
+        The verdict is the calibration's most important input: "proposed 40,
+        acted 3, succeeded 1" is a different product from "proposed 40, acted
+        3, succeeded 3".
+
+        Stored in ``context_json`` rather than its own columns: the outcome is
+        free-form (a run reports status, summary, output path), and a table that
+        grows a column per field a run happens to report is a table that has to
+        be migrated whenever the run grows one.
+        """
+        clean = str(proposal_id or "").strip()
+        if not clean:
+            return False
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT context_json FROM proposals WHERE id = ?", (clean,)
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                context = json.loads(row["context_json"] or "{}")
+            except ValueError:
+                context = {}
+            if not isinstance(context, dict):
+                context = {}
+            context["outcome"] = dict(outcome or {})
+            conn.execute(
+                "UPDATE proposals SET context_json = ? WHERE id = ?",
+                (json.dumps(context, ensure_ascii=False), clean),
+            )
+        return True
+
+    def awaiting_outcome(self, limit: int = 50) -> list[Any]:
+        """Proposals that were acted on and whose run has not been read back yet."""
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM proposals WHERE state = 'acted' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        proposals = [self._row_to_proposal(row) for row in rows]
+        # "Queued" is a *placement*, not an outcome. The bridge writes the task id
+        # and a queued status when it creates the task; treating that as a result
+        # means the loop never reads the run it created -- found by a test that
+        # finished a run and got zero read-backs.
+        terminal = {"succeeded", "failed", "interrupted", "cancelled", "skipped", "unverified"}
+        return [
+            item for item in proposals
+            if not (
+                isinstance(item.context, dict)
+                and isinstance(item.context.get("outcome"), dict)
+                and str(item.context["outcome"].get("status") or "") in terminal
+            )
+        ]
+
     def counts_since(self, since: datetime) -> dict[str, int]:
         """How many proposals of each state were created at or after *since*.
 
