@@ -258,7 +258,11 @@ export function renderSessions(ctx: AppCtx) {
   const renderEmpty = () => {
     if (sessions.length === 0) {
       return (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有会话" className="page-empty">
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="还没有会话。新建一个，或者直接点左边的「新建会话」开始。"
+          className="page-empty"
+        >
           <Button type="primary" icon={<PlusOutlined />} loading={creatingSession} onClick={() => void createSession()}>
             新建会话
           </Button>

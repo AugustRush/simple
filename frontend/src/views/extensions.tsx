@@ -33,7 +33,13 @@ export function renderExtensions(ctx: AppCtx) {
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : filteredPlugins.length === 0 ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有插件" className="page-empty" />
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          // An empty list that only says "empty" leaves the reader to guess how it
+          // fills. Plugins arrive one of two ways, and both are one sentence away.
+          description="还没有插件。可以让 agent 在对话里装一个（它知道从哪里找），或者把插件目录放进 ~/.agent/plugins/。"
+          className="page-empty"
+        />
       ) : (
         <Row gutter={[16, 16]}>
           {filteredPlugins.map(item => (
@@ -111,7 +117,11 @@ export function renderExtensions(ctx: AppCtx) {
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : filteredSkills.length === 0 ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有技能" className="page-empty" />
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="还没有技能。在对话里说「帮我做一个能……的技能」，agent 会建好并立刻可用。"
+          className="page-empty"
+        />
       ) : (
         <div className="skills-list">
           {filteredSkills.map(item => {
