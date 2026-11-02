@@ -8,6 +8,7 @@ import { isSessionBusy, sessionStatusOf } from '../lib/tools'
 import { SessionTitle } from '../components/SessionTitle'
 import {
   ClockCircleOutlined,
+  CopyOutlined,
   DeleteOutlined,
   EditOutlined,
   FolderOpenOutlined,
@@ -186,6 +187,19 @@ export function renderSessions(ctx: AppCtx) {
                       onClick: () => setRenamingSession(cardKey),
                     },
                     {
+                      // Always reachable: the card hides the id once the
+                      // conversation has a name, and a log search or a CLI flag
+                      // still needs the exact string.
+                      key: 'copy-id',
+                      label: '复制会话 ID',
+                      icon: <CopyOutlined />,
+                      onClick: () => {
+                        void navigator.clipboard
+                          ?.writeText(item.session_id)
+                          .catch(() => undefined)
+                      },
+                    },
+                    {
                       key: 'delete',
                       label: '删除',
                       icon: <DeleteOutlined />,
@@ -205,17 +219,24 @@ export function renderSessions(ctx: AppCtx) {
               </Dropdown>
             )}
           </div>
-          <div className="session-card-id">
-            {/* Only the head of the id fits, so copy hands over all of it --
-                a truncated id is useless in a log search or a CLI flag. */}
-            <Typography.Text
-              code
-              title={item.session_id}
-              copyable={{ text: item.session_id, tooltips: ['复制会话 ID', '已复制'] }}
-            >
-              {item.session_id.slice(0, 18)}
-            </Typography.Text>
-          </div>
+          {/* The id is an *identifier*, not a description, and it sat in the most
+              prominent line of every card: twenty rows of `a774e1b7140441d08e` is
+              a wall a person cannot read. It stays where it is useful -- an
+              unnamed conversation has nothing else to tell it apart -- and the
+              menu offers the copy either way. */}
+          {!item.title && (
+            <div className="session-card-id">
+              {/* Only the head of the id fits, so copy hands over all of it --
+                  a truncated id is useless in a log search or a CLI flag. */}
+              <Typography.Text
+                code
+                title={item.session_id}
+                copyable={{ text: item.session_id, tooltips: ['复制会话 ID', '已复制'] }}
+              >
+                {item.session_id.slice(0, 18)}
+              </Typography.Text>
+            </div>
+          )}
           <div className="session-card-footer">
             {status && (
               <Tag color={item.status === 'queued' ? 'gold' : 'processing'}>

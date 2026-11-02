@@ -1,6 +1,7 @@
 /** The automation view. Rendered by the App container from its context object. */
 
 import type { AppCtx } from '../app/AppCtx'
+import type { ScheduleInfo } from '../types'
 import { WorkflowGraph } from '../components/WorkflowGraph'
 import {
   formatDateTime,
@@ -241,7 +242,19 @@ export function renderSchedules(ctx: AppCtx) {
                     <strong>{row.name}</strong>
                     <span>
                       {row.kind === 'chain' ? `流程 · ${row.step_count} 个步骤` : '任务'}
-                      {row.next_run_at ? ` · 下次执行：${formatDateTime(row.next_run_at)}` : ''}
+                      {/* A countdown, not a timestamp: the rest of the page says
+                          "还有 21 小时", and a row that says "2026-11-03 09:00"
+                          makes the reader do the subtraction. `describeNextRun`
+                          takes a ScheduleInfo, and the row already carries the two
+                          fields it reads. */}
+                      {row.next_run_at
+                        ? ` · 下次执行：${describeNextRun(
+                            { next_run_at: row.next_run_at, trigger_type: row.trigger_type } as ScheduleInfo,
+                            clock,
+                          )}`
+                        : row.trigger_type === 'signal'
+                          ? ' · 等待信号触发'
+                          : ''}
                     </span>
                   </div>
                 </div>

@@ -382,7 +382,19 @@ function App() {
     return renderChat(ctx)
   }
 
-  const currentMeta = pageMeta[view] || pageMeta.chat
+  // The chat header is the only place a person can see *which* conversation is
+  // open, and it used to say "当前对话" for all of them -- the title lived in the
+  // sidebar only, so the main area never answered the question. `sessionState`
+  // first: it is what the server just sent, while the list may be a poll behind.
+  const activeSessionTitle = String(
+    (sessionState as { title?: string } | null)?.title ||
+      sessions.find(item => item.session_id === activeSession)?.title ||
+      '',
+  ).trim()
+  const currentMeta =
+    view === 'chat' && activeSessionTitle
+      ? { title: activeSessionTitle, subtitle: pageMeta.chat.subtitle }
+      : pageMeta[view] || pageMeta.chat
 
   return (
     <ConfigProvider
