@@ -1961,6 +1961,14 @@ def autonomy(
                 options=PatrolOptions(),
                 suggest=rule_candidates,
             )
+            # The manual pass records itself too. Otherwise `autonomy stats` -- which
+            # exists precisely to answer "is the funnel finding anything" -- reads
+            # zero passes after any number of manual ones, and the two paths that
+            # run the same funnel would disagree about whether it ran.
+            try:
+                store.record_tick(result)
+            except Exception:
+                pass
             shared.CONSOLE.print(
                 f"[dim]shadow tick: examined {result['examined']}, "
                 f"eligible {result['eligible']}, warm {result['skipped_warm']}, "
