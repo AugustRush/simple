@@ -1733,6 +1733,145 @@ def _scheduler_services(components: dict) -> dict:
     }
 
 
+def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
+    """What the shadow patrol may look at, per session.
+
+    Facts only, from the two stores that hold them: the web session index (which
+    sessions exist, when they were last active, their titles) and each session's
+    working state (an unfinished task, a queue that has not moved). The rules are
+    written against exactly these keys; a missing one means the matching rule
+    cannot fire, which is the honest answer rather than a guess.
+    """
+    from agent import shared
+    from agent.session_service import _WebSessionRegistry
+
+    rows: list[dict[str, object]] = []
+    try:
+        registry = _WebSessionRegistry(shared.AGENT_HOME / "web" / "sessions" / "index.db")
+        entries = list(registry.list(limit=limit))
+    except Exception:
+        return rows
+
+    for item in entries:
+        session_id = str(item.get("session_id") or "")
+        if not session_id:
+            continue
+        row: dict[str, object] = {
+            "session_id": session_id,
+            "title": str(item.get("title") or ""),
+            "last_activity": str(item.get("last_activity") or ""),
+            "status": str(item.get("status") or ""),
+            "turn_count": int(item.get("turn_count") or 0),
+        }
+        # The per-session facts. A session whose store cannot be opened is still
+        # a session -- it simply has no task and no queue to report.
+        try:
+            from agent.scheduler import open_store
+
+            store = open_store()
+            try:
+                state = store.load_session_working_state(session_id)
+                raw = getattr(state, "state", None) if state is not None else None
+                if isinstance(raw, dict):
+                    row["task"] = raw.get("task") or raw
+            finally:
+                store.close()
+        except Exception:
+            pass
+        rows.append(row)
+    return rows
+
+
+@app.command()
+def autonomy(
+    action: str = typer.Argument(
+        "review", help="review (list proposals) | tick (run one shadow pass) | decide"
+    ),
+    proposal_id: Optional[str] = typer.Argument(
+        None, help="The proposal to answer, for `decide`"
+    ),
+    state: str = typer.Option(
+        "declined", "--state", help="accepted | declined | acted (for `decide`)"
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Session name (default: ~/.agent)"
+    ),
+):
+    """The shadow patrol: what the agent *would* do, and what you said about it.
+
+    There is no `run` here on purpose.  This delivery proposes and records; it does
+    not act.  `tick` walks the sessions once and writes the candidates it found, so
+    the numbers a later decision layer would be calibrated from exist before that
+    layer exists.  `review` is what a person reads, and `decide` is how a proposal
+    stops being live -- including "no", which is the answer worth keeping.
+    """
+    if isinstance(name, str):
+        agent_module._set_agent_home(shared.session_home(name))
+    from agent.autonomy import PatrolOptions, patrol_tick
+    from agent.autonomy.rules import rule_candidates
+    from agent.autonomy.store import open_proposal_store
+
+    store = open_proposal_store()
+    try:
+        if action == "tick":
+            # The sessions, read from the index the web channel writes.
+            #
+            # Not through `SessionService`: its registry is only built when the
+            # composition hands it a `store_factory`, and this command has no
+            # composition. The index file is the same truth the page reads, so
+            # reading it directly is the smaller dependency rather than a
+            # different answer.
+            sessions = _autonomy_session_rows(limit=50)
+            result = patrol_tick(
+                store=store,
+                sessions=sessions,
+                options=PatrolOptions(),
+                suggest=rule_candidates,
+            )
+            shared.CONSOLE.print(
+                f"[dim]shadow tick: examined {result['examined']}, "
+                f"eligible {result['eligible']}, warm {result['skipped_warm']}, "
+                f"stale {result['skipped_stale']}, proposed {result['proposed']}, "
+                f"duplicates {result['duplicates']}[/dim]"
+            )
+            for row in result["proposals"]:
+                shared.CONSOLE.print(
+                    f"[cyan]{row['reversibility']}[/cyan] {row['action']}"
+                    f"\n  [dim]because {row['reason']}[/dim]"
+                )
+            return
+        if action == "review":
+            counts = store.counts()
+            live = store.list_proposals(state="proposed", limit=20)
+            if not live:
+                shared.CONSOLE.print("[dim]没有待处理的提议。[/dim]")
+            for proposal in live:
+                shared.CONSOLE.print(
+                    f"[bold]{proposal.id[:8]}[/bold] {proposal.action}"
+                    f"\n  [dim]{proposal.reversibility} · 置信度 "
+                    f"{proposal.confidence:.2f} · {proposal.reason}[/dim]"
+                )
+            shared.CONSOLE.print(
+                "[dim]counts: "
+                + ", ".join(f"{key} {value}" for key, value in sorted(counts.items()))
+                + "[/dim]"
+            )
+            return
+        if action == "decide":
+            if not proposal_id:
+                shared.CONSOLE.print("[red]decide needs a proposal id[/red]")
+                raise typer.Exit(1)
+            ok = store.decide(proposal_id, state, by="cli")
+            shared.CONSOLE.print(
+                "[green]recorded[/green]" if ok else "[yellow]already decided[/yellow]"
+            )
+            return
+        shared.CONSOLE.print(f"[red]unknown action: {action}[/red]")
+        raise typer.Exit(1)
+    finally:
+        store.close()
+
+
 @app.command()
 def scheduler(
     poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),

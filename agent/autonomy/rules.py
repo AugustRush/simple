@@ -1,0 +1,168 @@
+"""v1 of "what would be worth doing": rules over what the store already knows.
+
+Why rules first
+---------------
+The patrol's job is to find candidates cheaply.  A model asked "is anything
+worth doing here" costs money per session per tick and answers in prose that
+cannot be audited; a rule costs nothing, and its answer is the same every time
+the same facts appear -- which is what makes a proposal's *reason* checkable.
+
+Every rule below fires on a fact that is already on disk.  None of them calls a
+model, and none of them guesses: if a rule cannot see the fact, it does not
+fire.  That is the opposite of "the model thinks something might be wrong", and
+it is what lets the shadow numbers be trusted.
+
+What the rules are not
+----------------------
+They are not the decision.  A rule firing produces a **proposal** -- "here is
+something I would do, and here is why" -- and nothing else happens.  The
+decision layer (a later step) reads these rows; a person reads them too, and
+that is the calibration.
+
+Why each rule names a tool
+--------------------------
+The reversibility class comes from the tool's declared capabilities, so a
+proposal without a tool cannot be classified and is treated as irreversible.
+That is deliberate: a rule that cannot name what it would call has not thought
+far enough to be allowed to act.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from . import (
+    Proposal,
+    classify_reversibility,
+    MAX_PROPOSAL_ACTION_CHARS,
+    MAX_PROPOSAL_REASON_CHARS,
+)
+
+__all__ = ["rule_candidates", "RULE_NAMES"]
+
+UTC = timezone.utc
+
+#: The rules, by name, so a proposal's ``context`` can say which one fired.
+RULE_NAMES = (
+    "failed-run-unreviewed",
+    "session-ended-mid-task",
+    "stale-queue",
+)
+
+
+def _iso(value: Optional[datetime]) -> str:
+    return value.astimezone(UTC).isoformat() if value is not None else ""
+
+
+def _ago(now: datetime, seconds: float) -> datetime:
+    return now - timedelta(seconds=seconds)
+
+
+def rule_candidates(
+    session: dict[str, Any],
+    *,
+    now: datetime,
+    capabilities_of: Any = None,
+) -> list[Proposal]:
+    """Every candidate the rules can see for one session.
+
+    ``session`` is the row the session list already publishes -- ``session_id``,
+    ``title``, ``last_activity``, ``turn_count``, ``status`` -- plus two optional
+    facts the caller may have: ``attention`` (unacknowledged failed runs) and
+    ``queue`` (pending items).  Missing facts mean the matching rule cannot
+    fire; nothing is invented.
+    """
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        return []
+    label = str(session.get("title") or "").strip() or session_id[:8]
+    found: list[Proposal] = []
+
+    def reversibility_for(tool: str) -> str:
+        if capabilities_of is None:
+            return "irreversible"
+        try:
+            return classify_reversibility(capabilities_of(tool))
+        except Exception:
+            return "irreversible"
+
+    # ── 1. runs that failed and nobody looked at ───────────────────────────
+    attention = int(session.get("attention") or 0)
+    if attention > 0:
+        found.append(
+            Proposal(
+                source=session_id,
+                reason=(
+                    f"「{label}」有 {attention} 次运行结束得不好，还没有人看过。"
+                )[:MAX_PROPOSAL_REASON_CHARS],
+                action=(
+                    f"读一遍「{label}」那几次失败的运行，写一句它们为什么失败"
+                )[:MAX_PROPOSAL_ACTION_CHARS],
+                # Reading is the whole of it: the proposal does not fix anything,
+                # which is what keeps it in the reversible class.
+                tool="schedule_runs",
+                reversibility=reversibility_for("schedule_runs"),
+                confidence=0.8,
+                context={"rule": "failed-run-unreviewed", "attention": attention},
+            )
+        )
+
+    # ── 2. a session that ended mid-task ───────────────────────────────────
+    task = session.get("task") or {}
+    if isinstance(task, dict):
+        status = str(task.get("status") or "").strip().lower()
+        goal = str(task.get("active_goal") or "").strip()
+        if status in {"running", "interrupted", "blocked"} and goal:
+            found.append(
+                Proposal(
+                    source=session_id,
+                    reason=(
+                        f"「{label}」上次停在「{goal}」，状态是 {status}，没有收尾。"
+                    )[:MAX_PROPOSAL_REASON_CHARS],
+                    action=(
+                        f"看一眼「{label}」停在哪一步，判断是接着做完还是该问一句"
+                    )[:MAX_PROPOSAL_ACTION_CHARS],
+                    tool="memory_read",
+                    reversibility=reversibility_for("memory_read"),
+                    confidence=0.6,
+                    context={"rule": "session-ended-mid-task", "status": status},
+                )
+            )
+
+    # ── 3. something has been waiting in the queue too long ────────────────
+    queue = session.get("queue") or {}
+    if isinstance(queue, dict):
+        pending = int(queue.get("pending") or 0)
+        if pending > 0:
+            last_active = _parse(session.get("last_activity"))
+            waited = now - last_active if last_active is not None else timedelta(0)
+            if waited >= timedelta(minutes=30):
+                found.append(
+                    Proposal(
+                        source=session_id,
+                        reason=(
+                            f"「{label}」有 {pending} 条排队消息等了 "
+                            f"{int(waited.total_seconds() // 60)} 分钟没动。"
+                        )[:MAX_PROPOSAL_REASON_CHARS],
+                        action=(
+                            f"检查「{label}」的队列，确认那 {pending} 条是不是卡住了"
+                        )[:MAX_PROPOSAL_ACTION_CHARS],
+                        tool="list_tools",
+                        reversibility=reversibility_for("list_tools"),
+                        confidence=0.5,
+                        context={"rule": "stale-queue", "pending": pending},
+                    )
+                )
+
+    return found
+
+
+def _parse(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
