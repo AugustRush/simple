@@ -262,6 +262,21 @@ export interface WorkflowStepInfo {
 //: `admission` is the verdict -- "auto" (would have run), "prepare" (would have
 //: waited for you), or null when the row predates the verdict. This delivery
 //: never executes, so even "auto" is a statement about what *would* happen.
+//: The patrol's own numbers over a window: how much was looked at, how much came
+//: out. Read with the proposals so "nothing proposed" cannot be mistaken for
+//: "nothing to do".
+export interface AutonomyFunnel {
+  passes: number
+  examined: number
+  eligible: number
+  skipped_warm: number
+  skipped_stale: number
+  proposed: number
+  dropped: number
+  duplicates: number
+  expired: number
+}
+
 export interface ProposalRow {
   id: string
   source: string

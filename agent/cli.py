@@ -1825,7 +1825,8 @@ def _start_shadow_patrol(config: dict) -> Any:
 @app.command()
 def autonomy(
     action: str = typer.Argument(
-        "review", help="review (list proposals) | tick (run one shadow pass) | decide"
+        "review",
+        help="review (list proposals) | tick (run one shadow pass) | decide | stats",
     ),
     proposal_id: Optional[str] = typer.Argument(
         None, help="The proposal to answer, for `decide`"
@@ -1882,6 +1883,36 @@ def autonomy(
                     f"\n  [dim]because {row['reason']}[/dim]"
                     f"\n  [dim]→ {verdict.get('reason', '')}[/dim]"
                 )
+            return
+        if action == "stats":
+            # The funnel's numbers, which are the point of the shadow period: a
+            # funnel that proposes nothing because it examines nothing looks
+            # exactly like one that proposes nothing because there is nothing to do.
+            from datetime import datetime, timedelta, timezone
+
+            # A week by default: long enough to have passes in it, short enough
+            # that the numbers are about the current rules rather than the last one.
+            window = 7
+            since = datetime.now(timezone.utc) - timedelta(days=window)
+            stats = store.tick_stats(since=since)
+            counts = store.counts()
+            examined = stats["examined"]
+            proposed = stats["proposed"]
+            rate = (proposed / examined) if examined else 0.0
+            shared.CONSOLE.print(
+                f"[bold]最近 {window} 天[/bold] {stats['passes']} 趟巡逻，"
+                f"看了 {examined} 个会话，产出 {proposed} 条提议"
+            )
+            shared.CONSOLE.print(
+                f"[dim]跳过：温 {stats['skipped_warm']} · 旧 {stats['skipped_stale']} · "
+                f"准入丢弃 {stats['dropped']} · 重复 {stats['duplicates']} · "
+                f"过期 {stats['expired']}[/dim]"
+            )
+            shared.CONSOLE.print(
+                f"[dim]每看一个会话产出 {rate:.3f} 条提议；"
+                f"当前待答复 {counts.get('proposed', 0)}，"
+                f"已答复 {counts.get('accepted', 0) + counts.get('declined', 0)}[/dim]"
+            )
             return
         if action == "review":
             counts = store.counts()

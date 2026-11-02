@@ -45,6 +45,25 @@ CREATE INDEX IF NOT EXISTS idx_proposals_state
     ON proposals(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_proposals_source
     ON proposals(source, created_at);
+
+-- One row per patrol pass.  The proposals table answers "what was found"; this
+-- answers "how much was looked at to find it", which is the other half of the
+-- calibration: a funnel that proposes nothing because it examines nothing looks
+-- exactly like a funnel that proposes nothing because there is nothing to do.
+CREATE TABLE IF NOT EXISTS patrol_ticks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tick_at TEXT NOT NULL,
+    examined INTEGER NOT NULL DEFAULT 0,
+    eligible INTEGER NOT NULL DEFAULT 0,
+    skipped_warm INTEGER NOT NULL DEFAULT 0,
+    skipped_stale INTEGER NOT NULL DEFAULT 0,
+    proposed INTEGER NOT NULL DEFAULT 0,
+    dropped INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    expired INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_patrol_ticks_at
+    ON patrol_ticks(tick_at);
 """
 
 
@@ -219,6 +238,66 @@ class ProposalStore:
                 "SELECT state, COUNT(*) AS n FROM proposals GROUP BY state"
             ).fetchall()
         return {str(row["state"]): int(row["n"]) for row in rows}
+
+    def record_tick(self, result: dict[str, Any], *, at: Optional[datetime] = None) -> None:
+        """Store one patrol pass.
+
+        Not a log line: the numbers are what the *next* decision is calibrated
+        from, and a log rotated out of existence cannot be queried.
+        """
+        moment = _iso(at or datetime.now(UTC))
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO patrol_ticks (
+                    tick_at, examined, eligible, skipped_warm, skipped_stale,
+                    proposed, dropped, duplicates, expired
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    moment,
+                    int(result.get("examined", 0) or 0),
+                    int(result.get("eligible", 0) or 0),
+                    int(result.get("skipped_warm", 0) or 0),
+                    int(result.get("skipped_stale", 0) or 0),
+                    int(result.get("proposed", 0) or 0),
+                    int(result.get("dropped", 0) or 0),
+                    int(result.get("duplicates", 0) or 0),
+                    int(result.get("expired", 0) or 0),
+                ),
+            )
+
+    def tick_stats(self, since: Optional[datetime] = None) -> dict[str, Any]:
+        """The funnel's numbers over a window: how much was looked at, how much came out.
+
+        ``passes`` and the sums are read together, so "20 passes examined 240
+        sessions" and "proposed 3" cannot disagree -- the same invariant the
+        attention snapshot makes for the badge.
+        """
+        window_start = _iso(since) if since is not None else ""
+        with self._transaction() as conn:
+            if window_start:
+                rows = conn.execute(
+                    "SELECT * FROM patrol_ticks WHERE tick_at >= ? ORDER BY tick_at DESC",
+                    (window_start,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM patrol_ticks ORDER BY tick_at DESC"
+                ).fetchall()
+        sums = {
+            key: sum(int(row[key] or 0) for row in rows)
+            for key in (
+                "examined", "eligible", "skipped_warm", "skipped_stale",
+                "proposed", "dropped", "duplicates", "expired",
+            )
+        }
+        return {
+            "passes": len(rows),
+            "first_at": str(rows[-1]["tick_at"]) if rows else "",
+            "last_at": str(rows[0]["tick_at"]) if rows else "",
+            **sums,
+        }
 
     def counts_since(self, since: datetime) -> dict[str, int]:
         """How many proposals of each state were created at or after *since*.

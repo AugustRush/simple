@@ -208,3 +208,44 @@ def test_a_pass_that_raises_does_not_kill_the_loop(store, monkeypatch) -> None:
         assert calls["n"] >= 2, "the loop stopped after the failing pass"
 
     asyncio.run(run())
+
+
+# ── the funnel's numbers ────────────────────────────────────────────────────
+
+
+def test_every_pass_records_itself_even_when_it_finds_nothing(store) -> None:
+    """A funnel that examines nothing looks exactly like one with nothing to do."""
+    service = PatrolService(store=store, sessions_provider=lambda: [])
+
+    asyncio.run(service.tick(now=NOW))
+
+    stats = store.tick_stats()
+    assert stats["passes"] == 1
+    assert stats["examined"] == 0
+    assert stats["proposed"] == 0
+
+
+def test_the_stats_sum_the_window(store) -> None:
+    service = PatrolService(
+        store=store,
+        sessions_provider=lambda: [_session("a", attention=1), _session("b")],
+    )
+    asyncio.run(service.tick(now=NOW))
+    asyncio.run(service.tick(now=NOW + timedelta(minutes=10)))
+
+    stats = store.tick_stats(since=NOW - timedelta(minutes=1))
+
+    assert stats["passes"] == 2
+    assert stats["examined"] == 4, "both passes looked at both sessions"
+    # One proposal, not two: only session `a` has the fact the rule fires on, and
+    # the second pass finds the same one already live.
+    assert stats["proposed"] == 1
+
+
+def test_the_window_excludes_older_passes(store) -> None:
+    service = PatrolService(store=store, sessions_provider=lambda: [_session()])
+    asyncio.run(service.tick(now=NOW))
+
+    stats = store.tick_stats(since=NOW + timedelta(hours=1))
+
+    assert stats["passes"] == 0

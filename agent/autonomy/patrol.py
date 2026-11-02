@@ -217,6 +217,10 @@ class PatrolService:
             result["expired"] = self.store.expire_stale(now=now)
         except Exception:  # noqa: BLE001
             result["expired"] = 0
+        try:
+            self.store.record_tick(result, at=now)
+        except Exception:  # noqa: BLE001 - the history is not worth a failed pass
+            logger.exception("patrol could not record its own pass")
         if result.get("proposed"):
             logger.info(
                 "patrol: %s proposals from %s sessions (dropped %s, duplicates %s)",

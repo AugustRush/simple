@@ -65,10 +65,17 @@ async def _autonomy_overview(request: Any, *, authorized, store) -> Any:
     try:
         counts = _counts(store)
         live = store.list_proposals(state="proposed", limit=50)
+        # The funnel's own numbers, read with the rows: a page about proposals
+        # that cannot say how much was looked at to find them invites the reader
+        # to guess whether "nothing proposed" means "nothing to do".
+        from datetime import datetime, timedelta, timezone
+
+        funnel = store.tick_stats(since=datetime.now(timezone.utc) - timedelta(days=7))
     except Exception as exc:
         return JSONResponse({"error": f"读取提议失败：{exc}"}, status_code=500)
     return JSONResponse(
         {
+            "funnel": funnel,
             "counts": counts,
             # The rows the badge counts, in the order they were raised: newest
             # first is what a person reads, oldest first is what they act on.

@@ -48,6 +48,7 @@ export function renderAutonomy(ctx: AppCtx) {
   } = ctx
 
   const proposed = Number(proposalCounts.proposed || 0)
+  const funnel = ctx.funnel
   const decided = Number(proposalCounts.accepted || 0) + Number(proposalCounts.declined || 0)
   const expired = Number(proposalCounts.expired || 0)
 
@@ -118,6 +119,15 @@ export function renderAutonomy(ctx: AppCtx) {
           <p>
             它找到的、<strong>还没有做</strong>的事。答复只是记录你的判断——这一版不会执行任何一条。
           </p>
+          {/* How much was looked at to find these. Without it, "nothing proposed"
+              invites the reader to guess whether there was nothing to do. */}
+          {funnel && funnel.passes > 0 && (
+            <p className="proposal-funnel">
+              最近 7 天巡逻 {funnel.passes} 趟，看了 {funnel.examined} 个会话，
+              跳过（有人在用 {funnel.skipped_warm} · 太久没动 {funnel.skipped_stale}），
+              产出 {funnel.proposed} 条提议。
+            </p>
+          )}
         </div>
         <Space>
           <Tooltip title="重新读一遍提议">
