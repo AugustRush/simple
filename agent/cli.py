@@ -1278,6 +1278,7 @@ def gateway(
         scheduler_task: Optional[asyncio.Task] = None
         browser_task: Optional[asyncio.Task] = None
         scheduler_store = None
+        patrol_service = None
         try:
             # From the composition, not from a tree of its own: the channel plugins
             # are mounted with everything else now, so a profile can disable or
@@ -1324,9 +1325,17 @@ def gateway(
             catalog.mount(SchedulerPlugin())
             service = require_service(components, "scheduler")
             scheduler_task = asyncio.create_task(service.run_forever())
+            # The shadow patrol runs here because its input is *silence*: it looks
+            # for sessions nobody is in. A patrol that only runs when a command is
+            # typed finds nothing, because typing is the opposite of silence.
+            # Its effect on the world is a row in `autonomy/proposals.db` -- this
+            # delivery has no execution path at all.
+            patrol_service = _start_shadow_patrol(gateway_cfg)
             runner = ChannelRunner(channels, components, gateway_cfg)
             await runner.run()
         finally:
+            if patrol_service is not None:
+                await patrol_service.stop()
             if browser_task is not None and not browser_task.done():
                 browser_task.cancel()
                 await asyncio.gather(browser_task, return_exceptions=True)
@@ -1780,6 +1789,37 @@ def _autonomy_session_rows(limit: int = 50) -> list[dict[str, object]]:
             pass
         rows.append(row)
     return rows
+
+
+def _start_shadow_patrol(config: dict) -> Any:
+    """Start the patrol in this process, or return None when it is off.
+
+    Its session list comes from the same index the page reads (see
+    ``_autonomy_session_rows``), so "which sessions exist" has one answer in this
+    process.  A patrol that cannot start is a feature that is off: nothing here
+    raises into the gateway's startup.
+    """
+    try:
+        from agent.autonomy.patrol import PatrolSettings, open_patrol_service
+
+        settings = PatrolSettings.from_config(config)
+        if not settings.enabled:
+            shared.CONSOLE.print("[dim]Autonomy patrol: off (autonomy.enabled=false)[/dim]")
+            return None
+        service = open_patrol_service(
+            settings=settings,
+            sessions_provider=lambda: _autonomy_session_rows(limit=50),
+        )
+        if not service.start():
+            return None
+        shared.CONSOLE.print(
+            f"[dim]Autonomy patrol: shadow mode, every {settings.interval_minutes} min "
+            f"(0 auto-actions/day)[/dim]"
+        )
+        return service
+    except Exception as exc:  # noqa: BLE001 - never fail a gateway over this
+        shared.CONSOLE.print(f"[yellow]Autonomy patrol did not start: {exc}[/yellow]")
+        return None
 
 
 @app.command()
