@@ -1,6 +1,6 @@
 ---
 name: Automation Manager
-description: Create and shape automation tasks and chains (定时任务、提醒、按信号触发的后续工作). Use when the user asks for something to happen later, repeatedly, or after another job finishes — "每天早上提醒我", "每周出一份报告", "这个跑完再跑那个".
+description: Create and shape automation tasks and chains (自动化任务、定时任务、提醒、按信号触发的后续工作). Use when the user asks for something to happen later, repeatedly, or after another job finishes — "帮我建一个自动化任务", "每天早上提醒我", "每周出一份报告", "这个跑完再跑那个".
 user-invocable: true
 disable-model-invocation: false
 ---

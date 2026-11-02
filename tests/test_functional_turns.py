@@ -3861,3 +3861,73 @@ def test_saving_a_config_with_a_new_profile_applies_it_without_restarting(home):
         assert "saved and applied" in answer, answer
     finally:
         provider.close()
+
+
+def test_a_conversation_creates_an_automation(home):
+    """The new creation entry, end to end: a sentence in, a scheduled task out.
+
+    The Automation page no longer has a form -- it opens a conversation and puts the
+    first sentence in the composer (see `NEW_AUTOMATION_SEED` in the frontend). So the
+    thing that has to work is exactly this: a turn where the model calls
+    `automation_create`, and the task really exists afterwards with the trigger the
+    user asked for. Everything below is production: the composition, the request gate
+    (`intent` quoting the user's words), the store, and the scheduler row.
+
+    The scripted reply is the shape a real turn takes when the skill is loaded: one tool
+    call, then a sentence to the person.
+    """
+    import asyncio
+
+    import agent as agent_module
+
+    provider = scripted(
+        {
+            "tool": (
+                "automation_create",
+                {
+                    "name": "每天早上看看日志",
+                    "action_type": "message",
+                    "message_text": "早上好，记得看一遍日志",
+                    "trigger_type": "daily",
+                    "time_of_day": "09:00",
+                    "intent": "每天早上九点提醒我看一眼日志",
+                },
+            )
+        },
+        {"text": "好，每天早上九点提醒你。"},
+    )
+    cfg = write_config(home, provider, channels=WEB_CHANNELS)
+    try:
+
+        async def run() -> str:
+            import websockets
+
+            components = await agent_module._build_components_async(cfg, announce=False)
+            server, serving, port = await _start_web_channel(components, cfg)
+            try:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/api/sessions/automation/stream"
+                ) as socket:
+                    return _answer(
+                        await _ask(socket, "每天早上九点提醒我看一眼日志", "m1")
+                    )
+            finally:
+                server.should_exit = True
+                await serving
+                await agent_module._close_components(components)
+
+        answer = asyncio.run(run())
+
+        assert "早上九点" in answer, answer
+        from agent.scheduler import open_store
+
+        store = open_store()
+        try:
+            tasks = store.list_tasks()
+            assert [task.name for task in tasks] == ["每天早上看看日志"], tasks
+            assert tasks[0].trigger.trigger_type == "daily"
+            assert tasks[0].trigger.payload.get("time_of_day") == "09:00"
+        finally:
+            store.close()
+    finally:
+        provider.close()

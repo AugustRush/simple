@@ -243,7 +243,11 @@ def test_the_creation_skill_ships_with_the_package_and_can_trigger():
     )
     # The trigger has to be in the description: that is the only part always in context.
     description = bundle.description.lower()
-    assert "定时任务" in bundle.description or "automation" in description
+    # The phrase the page puts in the composer has to be in here: a skill that only
+    # triggers on words the seed does not contain is a skill that never loads on the
+    # path it exists for.
+    assert "自动化" in bundle.description, "the page seeds 自动化任务; the trigger must match it"
+    assert "定时任务" in bundle.description
     assert "later" in description or "repeatedly" in description
 
 

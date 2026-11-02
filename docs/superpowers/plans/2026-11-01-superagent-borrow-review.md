@@ -114,6 +114,24 @@
 - 仓库最热的一条路径，动它之前先做**录制/回放**夹具：用现有 scripted provider 录一轮真实 turn 的事件序列，重构后逐事件比对。
 - 只在 P0–P4 完成后做；没有回放夹具就不动。
 
+### 追加：创建完全交给 agent（2026-11-02，已完成）
+
+用户决定：自动化任务的创建不再由页面承担——入口改为**新开会话**，创建的能力改为**一个技能**。
+
+| 面 | 之前 | 现在 |
+|---|---|---|
+| 入口 | 页头一个 `新建` → 任务表单 / 图编辑器 | 页头一个 `对话新建` → 新会话 + 输入框预填模板（要做什么 / 什么时候 / 哪个目录） |
+| 知识 | 表单字段本身 + 工具 schema | 技能 `agent/_builtin/skills/automation-manager/SKILL.md`（随包发布、model-invocable，已在提示词技能索引里） |
+| 能力 | `automation_create` | 不变：工具持契约，技能持判断 |
+| 编辑 | 表单 / 图编辑器 | 不变（本次只动创建，已说明理由：改一个已知字段，表单更快） |
+
+删除的死代码：`convertScheduleToChain`（M2 的「改成流程」——它从一个已不存在的创建草稿出发）、
+`openCreateSchedule` / `openCreateWorkflow`。
+
+验证：`tests/test_automation_create.py` 新增 2 条（技能随包发布且可触发、技能只教存在的
+工具名）；`tests/test_functional_turns.py` 新增 1 条**端到端**：一句人话 → 模型调
+`automation_create` → store 里真的有一条 daily 09:00 的任务。
+
 ### 明确不做
 
 - **outbox**：投递结果已记录，通知是刻意的 best-effort。
