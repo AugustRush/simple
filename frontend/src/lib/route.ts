@@ -8,11 +8,11 @@
  * ``index.html`` for every path it does not own).
  *
  * Shapes: ``#/chat/<session>``, ``#/chat``, ``#/sessions``, ``#/extensions``,
- * ``#/memory``, ``#/schedules``, ``#/settings``. An unknown or empty hash means
+ * ``#/memory``, ``#/schedules``, ``#/autonomy``, ``#/settings``. An unknown or empty hash means
  * chat: a URL someone typed by hand should not be an error page.
  */
 
-export const VIEW_NAMES = ['chat', 'sessions', 'extensions', 'memory', 'schedules', 'settings'] as const
+export const VIEW_NAMES = ['chat', 'sessions', 'extensions', 'memory', 'schedules', 'autonomy', 'settings'] as const
 
 export type ViewName = (typeof VIEW_NAMES)[number]
 

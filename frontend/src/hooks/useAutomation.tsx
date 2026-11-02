@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
 import { msUntilNextRun } from '../lib/schedule'
 import { stepContent } from '../lib/workflow'
-import type { AttentionRun, AutomationRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
+import type { AttentionRun, AutomationRow, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -236,6 +236,49 @@ export function useAutomation(deps: Deps) {
       if (!silent) setLoadingView(false)
     }
   }, [api, refreshJson])
+
+  // ── the autonomy page ──────────────────────────────────────────────────
+  //
+  // Separate state from the automation page's: proposals are a review queue, not
+  // a list of things that run, and the two pages never show the same row. The
+  // loader lives here because both pages are part of the same view family and the
+  // shell already threads this hook's functions.
+  const [proposals, setProposals] = useState<ProposalRow[]>([])
+  const [proposalCounts, setProposalCounts] = useState<Record<string, number>>({})
+  const [proposalsLoaded, setProposalsLoaded] = useState(false)
+
+  const loadAutonomy = useCallback(async () => {
+    try {
+      const data = await (await api('/api/autonomy')).json()
+      setProposals(Array.isArray(data.live) ? data.live : [])
+      setProposalCounts(
+        data && typeof data.counts === 'object' && data.counts ? data.counts : {},
+      )
+      setProposalsLoaded(true)
+    } catch {
+      // An unreachable list must not read as "the agent proposed nothing": the
+      // last known one stands, and the page says it is stale.
+    }
+  }, [api])
+
+  const decideProposal = async (id: string, state: 'accepted' | 'declined') => {
+    try {
+      const resp = await api('/api/autonomy/decide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, state }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!data.ok) {
+        messageApi.warning(String(data.reason || data.error || '没有记录这次答复'))
+      } else {
+        messageApi.success(state === 'accepted' ? '已记下：你会同意这件事' : '已记下：不做这件事')
+      }
+      await loadAutonomy()
+    } catch {
+      // surfaced by the api helper
+    }
+  }
 
   const loadSchedulerHealth = useCallback(async () => {
     try {
@@ -761,5 +804,5 @@ export function useAutomation(deps: Deps) {
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-  return { acknowledgeScheduleRun, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
+  return { acknowledgeScheduleRun, decideProposal, loadAutonomy, proposalCounts, proposals, proposalsLoaded, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }

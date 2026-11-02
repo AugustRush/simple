@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor } from '../lib/route'
@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, loadAutomations, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, loadAutonomy, loadAutomations, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -132,6 +132,7 @@ export function useShell(deps: Deps) {
       loadSkills(true)
       loadSchedulerHealth()
     }
+    if (view === 'autonomy') loadAutonomy()
     if (view === 'settings') loadSettings()
   }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings])
 
@@ -311,6 +312,11 @@ export function useShell(deps: Deps) {
         </span>
       ),
     },
+    // What the agent would do on its own. Last, because it is the page you
+    // check rather than the one you work in -- and first among the "about the
+    // agent itself" group, because it is the only one that can ask you a
+    // question (the proposals).
+    { key: 'autonomy', icon: <CompassOutlined />, label: '自主' },
     // Settings is deliberately absent from the main navigation: it is visited
     // rarely and briefly, so it lives as a small entry in the sidebar footer
     // next to the theme switch rather than taking a slot beside the pages
@@ -337,6 +343,7 @@ export function useShell(deps: Deps) {
       { view: 'sessions', label: '会话管理', icon: <FolderOpenOutlined />, terms: 'sessions' },
       { view: 'extensions', label: '扩展', icon: <AppstoreOutlined />, terms: '插件 技能 extensions plugins skills' },
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
+      { view: 'autonomy', label: '自主', icon: <CompassOutlined />, terms: '自主 提议 proposals autonomy patrol' },
       { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings' },
     ].filter(item => !query || `${item.label} ${item.terms}`.toLowerCase().includes(query))
     return [
@@ -413,6 +420,13 @@ export function useShell(deps: Deps) {
     // name that promises a time would be wrong for them. "自动化" is what the
     // page actually is -- work that runs without being asked each time.
     schedules: { title: '自动化', subtitle: '管理定时执行与等待信号的任务。' },
+    autonomy: {
+      title: '自主',
+      // Says what the page is *for*, in the words the design uses: proposals,
+      // not actions. A subtitle promising "what it does on its own" would be
+      // wrong twice -- nothing is executed, and the page is where you decide.
+      subtitle: 'agent 觉得可以做的事——它不执行，等你答复',
+    },
     settings: {
       title: '设置',
       subtitle: '管理访问令牌、模型与频道',

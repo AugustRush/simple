@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, AutomationRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
+import type { AttachmentInfo, AttentionRun, AutomationRow, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -179,6 +179,11 @@ export interface AppCtx {
   automationQuery: string
   automations: AutomationRow[]
   automationsLoaded: boolean
+  proposals: ProposalRow[]
+  proposalsLoaded: boolean
+  proposalCounts: Record<string, number>
+  loadAutonomy: () => Promise<void>
+  decideProposal: (id: string, state: "accepted" | "declined") => Promise<void>
   loadAutomations: (silent?: boolean) => Promise<void>
   loadSchedules: (silent?: boolean) => Promise<void>
   loadWorkflows: (silent?: boolean) => Promise<void>

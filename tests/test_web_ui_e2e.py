@@ -341,3 +341,67 @@ def test_creating_an_automation_is_a_conversation(page):
     assert "什么时候做" in value, value
 
     assert page.errors == [], page.errors
+
+
+def test_the_autonomy_page_shows_what_it_would_do(page, live_gateway):
+    """The page a person checks: proposals, not actions.
+
+    Seeded through the store the patrol writes, because the patrol itself runs on
+    a ten-minute clock -- waiting for it would make this test a slow test of the
+    scheduler rather than a test of the page.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from datetime import datetime, timezone
+
+    from agent.autonomy import Proposal
+    from agent.autonomy.store import open_proposal_store
+
+    # The gateway's home, so the page reads the store the test wrote.
+    os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
+    from agent import shared
+
+    shared.AGENT_HOME = live_gateway["home"]
+    store = open_proposal_store()
+    try:
+        for action, tool, reversibility, confidence in (
+            ("读一遍失败的运行", "schedule_runs", "reversible", 0.8),
+            ("检查卡住的队列", "send_file", "irreversible", 0.55),
+        ):
+            proposal = Proposal(
+                source="e2e-session",
+                reason="有一个事实值得看一眼",
+                action=action,
+                tool=tool,
+                reversibility=reversibility,
+                confidence=confidence,
+            )
+            proposal.context["admission"] = {
+                "answer": "prepare",
+                "reason": "今天自动执行的额度已用完",
+                "prepared": {"tool": tool, "arguments": {}},
+            }
+            store.record(proposal)
+    finally:
+        store.close()
+
+    page.goto(page.url.split("#")[0] + "#/autonomy", wait_until="networkidle")
+    page.wait_for_selector(".proposal-card", timeout=20_000)
+
+    assert page.locator(".proposal-card").count() == 2
+    text = page.inner_text(".autonomy-view")
+    # What it would do, why it would not just run, and the tool it would call.
+    assert "读一遍失败的运行" in text
+    assert "本来会准备好等你" in text
+    assert "schedule_runs" in text
+    assert "只读" in text and "不可逆" in text, "the reversibility class must be visible"
+    # The honest footnote, which is the page's promise.
+    assert "0 次自动执行" in text
+
+    # Answering one is the page's whole interaction, and the row goes away.
+    page.locator(".proposal-card").first.locator("button", has_text="不要").click()
+    page.wait_for_timeout(1200)
+    assert page.locator(".proposal-card").count() == 1
+    assert page.errors == [], page.errors

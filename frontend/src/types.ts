@@ -257,6 +257,28 @@ export interface WorkflowStepInfo {
 }
 
 
+//: One row of `GET /api/autonomy`: a proposal the patrol raised.
+//:
+//: `admission` is the verdict -- "auto" (would have run), "prepare" (would have
+//: waited for you), or null when the row predates the verdict. This delivery
+//: never executes, so even "auto" is a statement about what *would* happen.
+export interface ProposalRow {
+  id: string
+  source: string
+  reason: string
+  action: string
+  tool: string
+  reversibility: 'reversible' | 'workspace' | 'irreversible'
+  confidence: number
+  state: 'proposed' | 'accepted' | 'declined' | 'expired' | 'acted'
+  created_at: string
+  expires_at: string
+  decided_at: string
+  decided_by: string
+  admission: { answer: string; reason: string; prepared?: Record<string, any> } | null
+  rule: string
+}
+
 //: One row of `GET /api/automations`: a plain task and a chain in the same shape.
 //: `kind` is the only thing that differs, and `step_count` is 1 for a task -- so a
 //: list column never has to branch on which endpoint the row came from.

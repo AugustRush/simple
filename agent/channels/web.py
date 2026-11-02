@@ -12,7 +12,7 @@ from agent.channels import web_uploads
 from agent.channels import web_providers
 from agent.channels import web_requests
 from agent.channels import web_assets
-from agent.channels import web_memory
+from agent.channels import web_autonomy, web_memory
 
 import asyncio
 import contextlib
@@ -561,6 +561,34 @@ class WebChannel(Channel):
             )
         self._bump_config_revision()
         return JSONResponse({"ok": True, "saved": True, "applied": True})
+
+    async def _autonomy_overview(self, request: Any) -> Any:
+        return await web_autonomy._autonomy_overview(
+            request, authorized=self._authorized, store=self._proposal_store()
+        )
+
+    async def _autonomy_proposals(self, request: Any) -> Any:
+        return await web_autonomy._autonomy_proposals(
+            request, authorized=self._authorized, store=self._proposal_store()
+        )
+
+    async def _autonomy_decide(self, request: Any) -> Any:
+        return await web_autonomy._autonomy_decide(
+            request, authorized=self._authorized, store=self._proposal_store()
+        )
+
+    def _proposal_store(self) -> Any:
+        """The proposals store, or None when the patrol has never run.
+
+        A missing database is not an error: it means this process has not
+        patrolled yet, and the page's honest answer to that is "nothing yet".
+        """
+        try:
+            from agent.autonomy.store import open_proposal_store
+
+            return open_proposal_store()
+        except Exception:
+            return None
 
     async def _plugins(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -2811,6 +2839,11 @@ class WebChannel(Channel):
             Route("/", self._index, methods=["GET"]),
             Route("/api/health", self._health, methods=["GET"]),
             Route("/api/commands", self._commands, methods=["GET"]),
+            # The autonomy page: what the agent *would* do. Read and answer only --
+            # this process has no execution path for a proposal.
+            Route("/api/autonomy", self._autonomy_overview, methods=["GET"]),
+            Route("/api/autonomy/proposals", self._autonomy_proposals, methods=["GET"]),
+            Route("/api/autonomy/decide", self._autonomy_decide, methods=["POST"]),
             Route("/api/config", self._config_get, methods=["GET"]),
             Route("/api/config", self._config_save, methods=["POST"]),
             # Provider-level edits.  Separate from /api/config because the
