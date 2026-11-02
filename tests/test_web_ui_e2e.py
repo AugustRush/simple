@@ -266,25 +266,26 @@ def test_the_automation_page_is_one_list(page, live_gateway):
     assert page.errors == [], page.errors
 
 
-def test_one_create_entry_continues_into_a_chain(page):
-    """One button, and the chain is the *next* step rather than a different form.
+def test_creating_an_automation_is_a_conversation(page):
+    """The create entry is a new session with the first sentence in the box.
 
-    The page used to greet you with two creators -- one for a task, one for a chain --
-    which asked a person to classify their own request before filling anything in.
-    Now there is one, and "改成流程（多步）" continues the same draft into a one-step chain:
-    the name, the content and the trigger you already chose move across.
+    A form asked a person to know the tool's vocabulary -- trigger types, permission
+    profiles, whether their request was "one task" or "a chain". The agent knows all of
+    that and can ask one question at a time, so the entry opens a conversation and seeds
+    the composer with the three things it would ask anyway.
     """
     page.locator(".nav-label", has_text="自动化").first.click()
     page.wait_for_selector(".schedule-tabs", timeout=20_000)
 
-    # One creator in the page head: neither "新建任务" nor "新建流程" is there to choose
-    # between any more -- the one button says what it does and the filter says the rest.
-    create = page.locator(".schedule-page-head button:has-text('新建')")
-    assert create.count() == 1, [create.nth(i).inner_text() for i in range(create.count())]
+    # One entry, and it says what it does.
+    create = page.locator(".schedule-page-head button:has-text('对话新建')")
+    assert create.count() == 1, create.count()
     create.first.click()
-    page.wait_for_selector(".ant-modal-title:has-text('新建任务')", timeout=20_000)
 
-    page.get_by_role("button", name="改成流程（多步）").click()
-    page.wait_for_selector(".ant-modal-title:has-text('新建流程')", timeout=20_000)
+    # ...a new conversation, on the chat view, with the seed text editable in the box.
+    composer = page.wait_for_selector("textarea", timeout=20_000)
+    value = composer.input_value()
+    assert "帮我建一个自动化任务" in value, value
+    assert "什么时候做" in value, value
 
     assert page.errors == [], page.errors

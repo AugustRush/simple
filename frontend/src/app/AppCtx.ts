@@ -111,6 +111,7 @@ export interface AppCtx {
   stopStreaming: () => void
   composerSendable: boolean
   creatingSession: boolean
+  startNewSession: (seed?: string) => Promise<void>
   createSession: () => Promise<void>
   sendMessage: (overrideText?: string | undefined) => Promise<void>
   resolvedComposerText: string
@@ -200,9 +201,6 @@ export interface AppCtx {
   loadAutomations: (silent?: boolean) => Promise<void>
   loadSchedules: (silent?: boolean) => Promise<void>
   loadWorkflows: (silent?: boolean) => Promise<void>
-  convertScheduleToChain: () => void
-  openCreateSchedule: () => void
-  openCreateWorkflow: () => void
   unseenFailures: number
   clearScheduleAttention: (taskId?: string | undefined) => Promise<void>
   setAutomationTab: Dispatch<SetStateAction<"automation" | "attention">>

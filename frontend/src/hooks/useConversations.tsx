@@ -1747,6 +1747,33 @@ export function useConversations(deps: Deps) {
     }
   }
 
+  /**
+   * A new conversation, with the composer already holding *seed*.
+   *
+   * This is how a capability is offered now: the page does not know how to build the
+   * thing, so it opens a conversation about it and puts the first sentence in the box.
+   * The draft is keyed by the **new** session's id -- `setInput` writes to the *current*
+   * draft key, which is still the old session's at this point, so it would seed the
+   * conversation the person just left.
+   */
+  const startNewSession = async (seed?: string) => {
+    try {
+      setCreatingSession(true)
+      const resp = await api('/api/sessions', { method: 'POST' })
+      const data = await resp.json()
+      const sid = String(data.session_id || '')
+      if (sid && seed) setDrafts(prev => ({ ...prev, [sid]: seed }))
+      activeSessionRef.current = sid
+      await loadSessions()
+      selectSession(sid)
+      focusComposer()
+    } catch {
+      // Handled by api helper.
+    } finally {
+      setCreatingSession(false)
+    }
+  }
+
   // Which title is open for editing, as `${place}:${session_id}`: the sidebar
   // and the sessions page show the same session at once, and only the one the
   // person acted on should turn into an input.
@@ -2263,5 +2290,5 @@ export function useConversations(deps: Deps) {
     !isStreaming &&
     String(sessionState?.operation_state || 'idle') === 'idle'
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, startNewSession, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

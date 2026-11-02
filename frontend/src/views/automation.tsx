@@ -85,8 +85,19 @@ import dayjs from 'dayjs'
 
 const { TextArea } = Input
 
+/** What a new automation conversation starts with: the questions it will ask anyway.
+ *
+ * A template rather than a sentence, because the agent's next move is to ask these three
+ * things, and a person who can see them answers all three at once instead of one at a
+ * time. It is a draft in the composer, not a prompt: the agent may rewrite it.
+ */
+const NEW_AUTOMATION_SEED = `帮我建一个自动化任务：
+- 要做什么：
+- 什么时候做（一次 / 每天 / 每周 / 等某个信号）：
+- 在哪个项目目录里：`
+
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, convertScheduleToChain, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
+  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, startNewSession, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
 
 
   /**
@@ -294,7 +305,7 @@ export function renderSchedules(ctx: AppCtx) {
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={needle
             ? '没有符合条件的任务或流程'
-            : '还没有自动化。建一个任务（一步），或者把几个任务串成一条链（多步）。'}
+            : '还没有自动化。点「对话新建」，说清楚要它什么时候、做什么。'}
           className="page-empty"
         />
       )
@@ -666,7 +677,7 @@ export function renderSchedules(ctx: AppCtx) {
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={workflows.length
             ? '没有符合条件的流程'
-            : '还没有流程。流程把几个任务串成一条链：上一步成功，下一步才运行。'}
+            : '还没有流程。流程把几个任务串成一条链——在对话里说「先做这个再做那个」即可。'}
           className="page-empty"
         />
       ) : (
@@ -815,16 +826,19 @@ export function renderSchedules(ctx: AppCtx) {
             />
           </Tooltip>
           {automationTab === 'automation' && (
-            // One entry. What it opens follows the filter you are looking at --
-            // and inside the task editor, "改成流程" continues the same draft into
-            // a chain, so "one step or several" is a next step, not a first choice.
-            <Button
-              type="primary"
-              icon={<PlusOutlined />}
-              onClick={automationKind === 'workflow' ? openCreateWorkflow : openCreateSchedule}
-            >
-              新建
-            </Button>
+            // Creating is a conversation, not a form. The page does not know what an
+            // automation should look like for this person; the agent does, and it can
+            // ask one question at a time instead of showing eleven fields and hoping.
+            // So this opens a new session with the first sentence already in the box.
+            <Tooltip title="在对话里说清楚要什么，agent 会把任务或流程建好">
+              <Button
+                type="primary"
+                icon={<MessageOutlined />}
+                onClick={() => void startNewSession(NEW_AUTOMATION_SEED)}
+              >
+                对话新建
+              </Button>
+            </Tooltip>
           )}
           {/* Nothing to create from the attention list: it is a list of things
               that already happened, and a "new" button here would suggest that
@@ -970,14 +984,6 @@ export function renderSchedules(ctx: AppCtx) {
         }}
         onOk={saveSchedule}
         footer={[
-          // The continuation, offered only where it means something: an existing
-          // task is already a task, and "turn it into a chain" is a different
-          // promise from the one this form makes.
-          !editingScheduleId ? (
-            <Button key="to-chain" onClick={convertScheduleToChain}>
-              改成流程（多步）
-            </Button>
-          ) : null,
           <Button key="cancel" onClick={() => {
             setScheduleModalOpen(false)
             setEditingScheduleId(null)
@@ -1795,7 +1801,7 @@ export function renderSchedules(ctx: AppCtx) {
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={scheduleQuery.trim() || scheduleStatusFilter !== 'all'
             ? '没有符合条件的任务'
-            : '还没有任务。流程里的步骤在「流程」页签里。'}
+            : '还没有任务。任务由 agent 在对话里创建。'}
           className="page-empty"
         /> : (
         <div className="schedule-list">

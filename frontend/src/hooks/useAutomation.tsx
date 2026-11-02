@@ -736,16 +736,6 @@ export function useAutomation(deps: Deps) {
     }
   }
 
-  const openCreateSchedule = () => {
-    setEditingScheduleId(null)
-    setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
-    // Refreshed on open, not only when the page loaded: the signals worth
-    // waiting for are the ones emitted since, and a picker showing yesterday's
-    // list is how someone ends up typing a name by hand again.
-    void loadSignals()
-    setScheduleModalOpen(true)
-  }
-
   const workflowGraph = useMemo(() => checkWorkflowGraph(workflowDraft.steps), [workflowDraft])
 
   // Whether the cards and the running order have come apart. They agree as long
@@ -757,13 +747,6 @@ export function useAutomation(deps: Deps) {
     && workflowGraph.order.some(
       (key, at) => key !== (workflowDraft.steps[at]?.key.trim() || ''),
     )
-
-  const openCreateWorkflow = () => {
-    setEditingWorkflowId(null)
-    setWorkflowDraft(defaultWorkflowDraft(sessionState?.workspace_root || config?.workspace_root || ''))
-    setWorkflowKeyRewrite(null)
-    setWorkflowModalOpen(true)
-  }
 
   const openEditWorkflow = (info: WorkflowInfo) => {
     // Same reason as `convertScheduleToChain`: the editor lives in the chain view.
@@ -972,42 +955,6 @@ export function useAutomation(deps: Deps) {
    * chain editor with one step in it, so "add a second step" is an edit rather than a
    * second form.
    */
-  const convertScheduleToChain = () => {
-    const isMessage = scheduleDraft.action_type === 'message'
-    const step: WorkflowStepDraft = {
-      ...defaultWorkflowStep(scheduleDraft.workspace_root || ''),
-      key: 'step1',
-      name: scheduleDraft.name.trim() || '第 1 步',
-      kind: isMessage ? 'message' : 'agent_prompt',
-      content: isMessage ? scheduleDraft.message_text : scheduleDraft.prompt,
-      workspace_root: scheduleDraft.workspace_root || '',
-      trigger: {
-        trigger_type: scheduleDraft.trigger_type,
-        at: scheduleDraft.at || '',
-        every: scheduleDraft.every,
-        unit: scheduleDraft.unit,
-        anchor_at: scheduleDraft.anchor_at || '',
-        time_of_day: scheduleDraft.time_of_day || '',
-        day_of_week: scheduleDraft.day_of_week || '',
-        day_of_month: scheduleDraft.day_of_month,
-        signal_name: scheduleDraft.signal_name || '',
-      },
-    }
-    setWorkflowDraft({
-      name: scheduleDraft.name.trim(),
-      description: '',
-      steps: [step],
-    })
-    setEditingWorkflowId(null)
-    setScheduleModalOpen(false)
-    setEditingScheduleId(null)
-    // The chain editor is rendered by the chain view: opening it from the unified
-    // list has to move the filter there, or `workflowModalOpen` is a flag with no
-    // component behind it (found exactly that way, by the browser test).
-    setAutomationKind('workflow')
-    setWorkflowModalOpen(true)
-  }
-
   const saveWorkflow = async () => {
     const check = checkWorkflowGraph(workflowDraft.steps)
     if (!workflowDraft.name.trim()) {
@@ -1375,5 +1322,5 @@ export function useAutomation(deps: Deps) {
     else messageApi.info('这一步的任务暂时读不到，先刷新一下')
   }
 
-  return { acknowledgeScheduleRun, convertScheduleToChain, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
+  return { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
 }

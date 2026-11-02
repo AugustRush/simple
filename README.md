@@ -426,9 +426,13 @@ it was always one thing:
 - **A task is a chain of one step**, and a chain is several steps with edges. The list
   shows one row per thing you manage (`流程 · N 个步骤` or `任务`), with its next run, its
   last status and what needs a person. `任务 / 流程 / 全部` is a **filter** in the toolbar.
-- **One `新建`.** It opens the task editor; **改成流程（多步）** inside it carries the draft
-  you already typed -- name, content, folder, trigger -- into a one-step chain, where
-  adding a step is an edit rather than a second form.
+- **Creation is a conversation, not a form.** The page's one entry is **对话新建**: it
+  opens a new session with the first sentence already in the composer (*要做什么 / 什么时候
+  做 / 在哪个目录*). A form asked you to know the tool's vocabulary -- trigger types,
+  permission profiles, and whether your request was "one task" or "a chain"; the agent
+  knows all of that and can ask one question at a time. The knowledge lives in a
+  **skill** (`agent/_builtin/skills/automation-manager/SKILL.md`), the capability in one
+  tool (`automation_create`), and the page only lists and edits what exists.
 - **One row, never two per step.** A chain's steps are tasks in the store (that is what
   makes the two shapes one), and the list derives from `GET /api/automations`, whose rules
   -- a step is never its own row, a chain's attention is its steps' -- live on the server

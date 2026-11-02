@@ -207,3 +207,51 @@ def test_the_chain_shape_still_validates_its_graph_before_writing(tools):
         assert store.list_tasks() == []
     finally:
         store.close()
+
+
+# ── the capability's knowledge lives in a skill ─────────────────────────────
+
+
+def _builtin_skill(skill_id: str):
+    from pathlib import Path
+
+    from agent.skills.catalog import SkillCatalog
+
+    catalog = SkillCatalog(
+        user_root=Path("/tmp") / "automation-skill-test-user",
+        builtin_root=Path(__file__).resolve().parents[1] / "agent" / "_builtin" / "skills",
+    )
+    catalog.load_all()
+    return catalog.get(skill_id)
+
+
+def test_the_creation_skill_ships_with_the_package_and_can_trigger():
+    """Creation is knowledge, not a form: the skill is how the agent knows *when* and *how*.
+
+    The tool carries the contract (its schema decides what is accepted). The skill
+    carries the judgement: whether this should be an automation at all, one task or a
+    chain, and which of the eleven fields the request actually answered. Without it the
+    model has a schema and no vocabulary, which is how a "remind me tomorrow" becomes a
+    chain of three steps.
+    """
+    bundle = _builtin_skill("automation-manager")
+
+    assert bundle is not None, "the automation-manager skill is not in the package"
+    assert bundle.user_invocable is True
+    assert bundle.disable_model_invocation is False, (
+        "a skill the model may not invoke is a skill that never triggers on its own"
+    )
+    # The trigger has to be in the description: that is the only part always in context.
+    description = bundle.description.lower()
+    assert "定时任务" in bundle.description or "automation" in description
+    assert "later" in description or "repeatedly" in description
+
+
+def test_the_skill_names_the_one_tool_and_the_two_shapes():
+    """It documents the surface that exists, so a rename cannot leave it teaching an old one."""
+    body = _builtin_skill("automation-manager").body
+
+    assert "automation_create" in body
+    assert "steps" in body, "the chain shape is the thing most often got wrong"
+    assert "schedule_create" not in body, "the removed tool is being taught again"
+    assert "workflow_create" not in body, "the removed tool is being taught again"
