@@ -99,6 +99,13 @@
     "_readme": "How much one session may spend before the turn loop stops calling the model. max_session_tokens counts input + output tokens across every turn of the session (background consolidation and sub-agents included, because they are rows in the same ledger). 0 means no ceiling, which is the default and the historical behaviour -- max_steps bounds iterations, and iterations are not money. The check runs at each step boundary, next to cancellation, so a stopped turn never leaves a tool half-run; the user gets one sentence saying what was spent and which key to raise, and the web page shows the same number beside the composer.",
     "max_session_tokens": 0
   },
+  "autonomy": {
+    "enabled": true,
+    "interval_minutes": 10,
+    "max_auto_actions_per_day": 0,
+    "max_proposals_per_day": 20,
+    "min_confidence": 0.5
+  },
   "notifications": {
     "_readme": "How the system reaches you when no page is open. Only scheduled runs that need a person are announced -- the same runs the red badge on the navigation entry counts (failed / interrupted / unverified, plus a run that reports earlier occurrences were skipped while nothing was running). A banner per successful run would be noise, and noise is how the one that mattered gets dismissed unread. desktop=false silences it; on a machine with no notification centre (a headless Linux gateway) the channel is a silent no-op rather than an error.",
     "desktop": true

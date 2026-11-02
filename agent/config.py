@@ -141,6 +141,18 @@ DEFAULT_CONFIG: dict = {
     # loops nobody asked for; when it *is* on, a server that fails the probe gets one
     # automatic reconnect and then stays failed until something asks for it again.
     "mcp_health_check_seconds": 0.0,
+    # ── Autonomy: what the agent would do on its own ──────────────────────
+    # Shadow mode by default: the patrol writes proposals and executes nothing.
+    # `max_auto_actions_per_day: 0` is what makes that true, and it is the first
+    # number to raise once the proposal rows have been read for a while. When this
+    # can *act*, the default has to flip to disabled -- the line to change is here.
+    "autonomy": {
+        "enabled": True,
+        "interval_minutes": 10,
+        "max_auto_actions_per_day": 0,
+        "max_proposals_per_day": 20,
+        "min_confidence": 0.5,
+    },
     # ── Evolution / self-improvement ──────────────────────────────────────
     "evolution": {
         "enabled": True,  # set to false to disable session scoring and rule learning
@@ -514,6 +526,7 @@ _KNOWN_SECTIONS = frozenset({
     "active_provider", "providers", "model", "max_tokens", "output_reserve",
     "memory", "orchestration", "evolution", "scheduler", "audio",
     "mcp_servers", "mcp_connect_timeout_seconds", "mcp_health_check_seconds",
+    "autonomy",
     "context", "plugins", "skills", "channels", "user_tools",
     "system_prompt_file", "output_dir", "tavily_api_key",
     "assistant_identity", "shell_blocked_commands",

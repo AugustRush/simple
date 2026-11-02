@@ -684,6 +684,53 @@ worked (`restored`), rather than leaving a half-mounted tree that merely looks f
 What is *not* dynamic: the process's own identity (its home, its `--name`, its event
 buses). Those are what a restart is for.
 
+### Autonomy: what the agent would do
+
+The first version of autonomy here **proposes and records, and executes nothing**. That
+is not a limitation to be fixed later; it is the delivery. An agent whose first act is
+to *do* things has already spent the attention it was supposed to save, and the question
+worth answering first is "what would it have done, and would I have agreed".
+
+```bash
+uv run simple autonomy review   # the live proposals
+uv run simple autonomy tick     # one pass, now
+uv run simple autonomy stats    # the funnel's own numbers
+uv run simple autonomy decide <id> --state declined
+```
+
+It also runs on its own, every ten minutes, inside the gateway — because its input is
+*silence*: it looks for sessions nobody is in and failures nobody has read. A patrol that
+only runs when a command is typed finds nothing, since typing is the opposite of silence.
+
+**How a candidate is decided, and why in that order.** `auto` (reversible, within
+today's budget) / `prepare` (irreversible or over budget — write the exact call that
+*would* have been made and wait) / `drop` (already declined, or below the confidence
+floor). The checks can only make the answer more cautious, and **reversibility is read
+from the tool's declared capabilities** — `read` / `output_write` / `state_write` /
+`side_effect` / `shell` — never from prose a model wrote about itself. The party being
+supervised does not grade its own homework. There is no configuration that makes an
+irreversible action automatic.
+
+**The budget is a count, not a score.** "Expected value > cost" is the right idea and an
+untestable one: tokens are measurable, value is not, and a formula with an unmeasurable
+term gets tuned until it says yes. So: N auto-actions per day, M proposals per day, both
+counted in the store (a loop that restarts hourly and counts its own pass has no daily
+cap at all). The **calibration** is what replaces them, and it comes from the numbers the
+patrol keeps about itself:
+
+```
+最近 7 天巡逻 120 趟，看了 1440 个会话，跳过（有人在用 1300 · 太久没动 100），产出 3 条提议
+```
+
+A page (`自主`) shows the proposals, each with what it would do, why it would not just run,
+the tool it would call, and the reversibility class; answering it is one click, and **a
+decline is kept** — the same suggestion does not come back in new words, which is what
+happens when "somebody already said no" lives only in a context window.
+
+What is deliberately absent: **execution**. `acted` is a state the page cannot write and
+this process cannot reach. A form that could claim it would be a page promising something
+the process does not do.
+
 ### Browser-level tests (optional)
 
 ```bash
