@@ -87,7 +87,7 @@ def create_task(registry, **overrides) -> dict:
         "intent": "用户说每天要一份日报",
     }
     payload.update(overrides)
-    return call(registry, "schedule_create", payload)
+    return call(registry, "automation_create", payload)
 
 
 def control(registry, name: str, payload: dict, intent: str = "照着故障改") -> dict:
@@ -278,7 +278,7 @@ def test_membership_and_the_quote_cannot_be_written_by_a_body(tmp_path):
     _tools, registry, _workspace = make_tools(tmp_path)
     workflow = call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "日报链",
             "intent": "用户说每天要一份日报",
@@ -334,7 +334,7 @@ def test_a_steps_trigger_belongs_to_the_graph(tmp_path):
     _tools, registry, _workspace = make_tools(tmp_path)
     workflow = call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "两段链",
             "intent": "用户说要一条两段链",
@@ -387,7 +387,7 @@ def test_editing_a_step_reaches_the_workflow_that_rebuilds_it(tmp_path):
     _tools, registry, _workspace = make_tools(tmp_path)
     workflow = call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "单步链",
             "intent": "用户要一条链",
@@ -540,7 +540,7 @@ def test_a_stored_fan_in_survives_an_edit_that_does_not_touch_it(tmp_path):
     _tools, registry, _workspace = make_tools(tmp_path)
     workflow = call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "汇合链",
             "intent": "用户要两条支线汇合",
@@ -625,7 +625,7 @@ def test_a_live_workflows_step_refuses_its_own_switch(tmp_path):
     _tools, registry, _workspace = make_tools(tmp_path)
     workflow = call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "单步链",
             "intent": "用户要一条链",
@@ -765,7 +765,7 @@ def test_cancelling_nothing_names_the_switch_that_would_help(tmp_path):
 def _two_step_chain(registry, first_text: str = "第一步") -> dict:
     return call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "两段链",
             "intent": "用户要一条两段链",
@@ -840,7 +840,7 @@ def test_a_removed_step_is_disabled_rather_than_deleted(tmp_path):
     _tools, registry, _workspace = make_tools(tmp_path)
     created = call(
         registry,
-        "workflow_create",
+        "automation_create",
         {
             "name": "两步链",
             "intent": "用户要一条两步链",

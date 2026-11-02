@@ -238,7 +238,7 @@ def test_regular_tool_executor_rejects_vague_shell_intent():
 # ─── requires_request: the call has to quote the words that asked for it ─────
 
 
-def _request_required_registry(tool_name="schedule_create"):
+def _request_required_registry(tool_name="automation_create"):
     """A registry whose creator carries the real capability, with a spy tool.
 
     The capability is looked up by (source, name) from the runtime's own table,
@@ -273,14 +273,14 @@ def test_request_required_tool_is_refused_when_nothing_was_asked():
     # The capability the product relies on is declared by the runtime's own
     # table, read here rather than assumed, so a rename there fails this test
     # instead of silently disabling the guard.
-    assert "requires_request" in registry.tool_capabilities("schedule_create")
+    assert "requires_request" in registry.tool_capabilities("automation_create")
     registry.set_context("turn_request", "")
 
     payload = json.loads(
         asyncio.run(
             RegularToolExecutor(registry).run(
                 {
-                    "name": "schedule_create",
+                    "name": "automation_create",
                     "input": {
                         "name": "看盘",
                         "trigger_type": "daily",
@@ -309,7 +309,7 @@ def test_request_required_tool_refuses_a_paraphrase_of_the_request():
         asyncio.run(
             RegularToolExecutor(registry).run(
                 {
-                    "name": "schedule_create",
+                    "name": "automation_create",
                     "input": {
                         "name": "订单流程",
                         "trigger_type": "daily",
@@ -332,7 +332,7 @@ def test_request_required_tool_refuses_an_intent_that_is_missing_entirely():
     payload = json.loads(
         asyncio.run(
             RegularToolExecutor(registry).run(
-                {"name": "schedule_create", "input": {"name": "看盘"}}
+                {"name": "automation_create", "input": {"name": "看盘"}}
             )
         )
     )
@@ -350,7 +350,7 @@ def test_request_required_tool_runs_when_the_intent_quotes_the_request():
         asyncio.run(
             RegularToolExecutor(registry).run(
                 {
-                    "name": "schedule_create",
+                    "name": "automation_create",
                     "input": {
                         "name": "看盘",
                         "trigger_type": "daily",
@@ -382,7 +382,7 @@ def test_request_required_tool_accepts_a_quote_that_was_re_wrapped():
         asyncio.run(
             RegularToolExecutor(registry).run(
                 {
-                    "name": "schedule_create",
+                    "name": "automation_create",
                     "input": {
                         "name": "看盘",
                         "trigger_type": "daily",
@@ -410,7 +410,7 @@ def test_a_short_request_is_quotable_in_full():
         asyncio.run(
             RegularToolExecutor(registry).run(
                 {
-                    "name": "schedule_create",
+                    "name": "automation_create",
                     "input": {
                         "name": "任务",
                         "trigger_type": "daily",
@@ -434,7 +434,7 @@ def test_a_short_request_quoted_in_part_is_refused():
         asyncio.run(
             RegularToolExecutor(registry).run(
                 {
-                    "name": "schedule_create",
+                    "name": "automation_create",
                     "input": {
                         "name": "任务",
                         "trigger_type": "daily",

@@ -54,7 +54,7 @@
 |---|---|---|---|
 | **M0 · 读模型**（本次已做） | `agent/scheduler/automations.py` + `GET /api/automations`：一个列表，两种行（`kind: task\|chain`），**步骤永不单独成行**，注意力与 badge 用同一个 snapshot | 零（只读） | 3 个任务 + 1 链 → 2 行；`sum(rows.attention) == total`；7 条测试 |
 | **M0b · 一个列表页** | 自动化页默认一个列表，按 `kind` 过滤；行点开复用现有两个详情面板 | 低（前端） | 浏览器 e2e：一个列表能打开任务详情与链详情 |
-| **M1 · 一套工具** | `automation_create/update/delete/list/run`，`steps` 1..N；`schedule_*` / `workflow_*` 变薄别名（仍可用、仍测），**提示词只广告新面** | 中 | 旧的 10 个工具名仍绿；新工具能建 1 步与 N 步；模型可见的工具数**下降** |
+| **M1 · 一套工具**（已完成创建部分） | `automation_create`：无 `steps` = 一个任务，有 `steps` = 一条链；`schedule_create` / `workflow_create` **从工具面移除**（方法保留给内部与测试），维护类工具（update/delete/run…）暂留 | 中 | 工具面上旧的两个名字**不存在**；新工具能建 1 步与 N 步；链仍然先校验图再写 |
 | **M2 · 一条写路径** | 一个编辑器：建任务 = 建 1 步；加步骤 = 链；`automation_update` 增删步骤 | 中 | 编辑一条链不动 `workflow_*` 路径；E2E |
 | **M3 · 折叠存储（可选）** | `workflows.graph_json` → `scheduled_tasks.steps_json`；`workflow_runs` → run 上的 `group_id`；迁移 v+1 | 高（迁移） | 迁移脚本把现有链完整搬过去；旧库升级后读模型输出不变 |
 
@@ -75,7 +75,7 @@
 设计：
 
 - `PermissionProfile` 增加 `rehearsal`。在排练档下，`state_write` / `side_effect` 类调用**不执行**，返回 `{"rehearsed": true, "would_have": {...}}` 并记账。关键区别：不是拒绝（任务继续跑完），是替身返回值。
-- `schedule_create` / `workflow_create` 由 **agent 创建时**默认 `first_run="rehearsal"`；人创建时默认 live（人已经在对话里决定了）。
+- `automation_create` 由 **agent 创建时**默认 `first_run="rehearsal"`；人创建时默认 live（人已经在对话里决定了）。
 - run 状态新增 `rehearsed`：与 `succeeded` / `failed` 并列，不触发重试、不计入失败、不做投递。
 - 报告写进 run 输出目录的 `rehearsal.md`，复用 `unattended-audit.md` 的表格形态：每一行是一条"如果执行会做的事"，带完整命令/参数/目标路径。
 - 晋升：`schedule_update(first_run="live")`，或自动化页一个按钮；晋升后第一次真实运行照常通知。

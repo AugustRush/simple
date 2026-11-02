@@ -2035,7 +2035,7 @@ def test_feishu_sink_tool_start_suppresses_internal_scheduler_hints():
             ) as mock_hint:
                 sink.on_tool_start("current_time", {})
                 sink.on_tool_start(
-                    "schedule_create",
+                    "automation_create",
                     {"name": "测试提醒", "trigger_type": "once"},
                 )
                 await sink.drain()

@@ -78,7 +78,7 @@ async def _create_task(registry) -> str:
     """A task that is due in two hours: only a manual run may start it now."""
     created = await _call(
         registry,
-        "schedule_create",
+        "automation_create",
         {
             "name": "nightly",
             "action_type": "agent_task",
@@ -580,7 +580,7 @@ def test_creating_a_task_where_nothing_schedules_says_so(tmp_path):
     """
     tools, registry, _ = make_tools(tmp_path)
 
-    created = asyncio.run(_call(registry, "schedule_create", {
+    created = asyncio.run(_call(registry, "automation_create", {
         "name": "nightly",
         "action_type": "agent_task",
         "prompt": "写一份日报",
@@ -601,7 +601,7 @@ def test_creating_a_task_under_a_live_scheduler_does_not_hedge(tmp_path):
     tools, registry, _ = make_tools(tmp_path)
     registry.set_context("scheduler_wake", lambda *a, **k: None)
 
-    created = asyncio.run(_call(registry, "schedule_create", {
+    created = asyncio.run(_call(registry, "automation_create", {
         "name": "nightly",
         "action_type": "agent_task",
         "prompt": "写一份日报",

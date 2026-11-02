@@ -37,7 +37,7 @@ def _tools(*names: str) -> list[dict]:
 ALL_TOOLS = _tools(
     "read_file",
     "write_file",
-    "schedule_create",
+    "automation_create",
     "schedule_delete",
     "memory_index",
     "spawn_agent",
@@ -113,7 +113,7 @@ def test_explicitly_named_tools_are_always_available():
     because losing it would remove capability with no error surfacing.
     """
     names = set(_selected_names(ContextAssembler()))
-    assert {"schedule_create", "install_plugin"} <= names
+    assert {"automation_create", "install_plugin"} <= names
 
 
 def test_report_outcome_is_shipped_only_inside_a_run():

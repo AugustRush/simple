@@ -1865,7 +1865,7 @@ def test_builtin_tools_register_scheduler_runtime_tools(tmp_path):
 
     tool_names = registry.list_tools()
 
-    assert "schedule_create" in tool_names
+    assert "automation_create" in tool_names
     assert "schedule_list" in tool_names
     assert "schedule_delete" in tool_names
     assert "send_file" in tool_names
@@ -1887,7 +1887,7 @@ def test_schedule_create_uses_active_delivery_target_for_channel_messages(tmp_pa
     try:
         result = asyncio.run(
             registry.call(
-                "schedule_create",
+                "automation_create",
                 {
                     "name": "reminder",
                     "trigger_type": "once",
@@ -1922,7 +1922,7 @@ def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
 
     result = asyncio.run(
         registry.call(
-            "schedule_create",
+            "automation_create",
             {
                 "name": "reminder",
                 "trigger_type": "once",
@@ -1946,7 +1946,7 @@ def test_schedule_create_uses_isolated_scheduler_db_in_tests(tmp_path):
 
     result = asyncio.run(
         registry.call(
-            "schedule_create",
+            "automation_create",
             {
                 "name": "isolated-reminder",
                 "trigger_type": "once",
@@ -2069,7 +2069,7 @@ def test_schedule_create_supports_agent_task_action_type(tmp_path):
 
     result = asyncio.run(
         registry.call(
-            "schedule_create",
+            "automation_create",
             {
                 "name": "summary-task",
                 "trigger_type": "once",
@@ -2100,7 +2100,7 @@ def test_schedule_create_supports_system_job_action_type(tmp_path):
 
     result = asyncio.run(
         registry.call(
-            "schedule_create",
+            "automation_create",
             {
                 "name": "memory-tidy",
                 "trigger_type": "daily",
@@ -2137,8 +2137,8 @@ def test_schedule_create_is_idempotent_for_same_task_signature(tmp_path):
         "timezone_name": "Asia/Shanghai",
     }
 
-    first = json.loads(asyncio.run(registry.call("schedule_create", args)))
-    second = json.loads(asyncio.run(registry.call("schedule_create", args)))
+    first = json.loads(asyncio.run(registry.call("automation_create", args)))
+    second = json.loads(asyncio.run(registry.call("automation_create", args)))
 
     store = SchedulerStore(db_path=Path(first["task"]["db_path"]))
     try:
@@ -2220,7 +2220,7 @@ def _create_scheduled_task(registry, **overrides):
         "timezone_name": "Asia/Shanghai",
     }
     payload.update(overrides)
-    return json.loads(asyncio.run(registry.call("schedule_create", payload)))
+    return json.loads(asyncio.run(registry.call("automation_create", payload)))
 
 
 def _stored_task(payload):
@@ -2467,7 +2467,7 @@ def test_a_question_cannot_leave_a_task_behind(tmp_path):
 
     payload = _run_through_executor(
         registry,
-        "schedule_create",
+        "automation_create",
         {
             "name": "订单流程",
             "trigger_type": "once",
@@ -2496,7 +2496,7 @@ def test_the_words_that_asked_are_kept_on_the_task(tmp_path):
 
     payload = _run_through_executor(
         registry,
-        "schedule_create",
+        "automation_create",
         {
             "name": "看盘",
             "trigger_type": "daily",
@@ -2674,7 +2674,7 @@ def _record_run(
 def _create_workflow(registry, steps, **overrides):
     payload = {"name": "chain", "steps": steps, "intent": "建一条链"}
     payload.update(overrides)
-    return json.loads(asyncio.run(registry.call("workflow_create", payload)))
+    return json.loads(asyncio.run(registry.call("automation_create", payload)))
 
 
 def test_schedule_list_carries_how_the_last_run_ended(tmp_path):

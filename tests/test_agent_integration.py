@@ -321,7 +321,7 @@ user-invocable: true
     assert "activate_skill" in registry.list_tools()
     assert "list_skill_files" in registry.list_tools()
     assert "read_skill_file" in registry.list_tools()
-    assert "schedule_create" in registry.list_tools()
+    assert "automation_create" in registry.list_tools()
     assert "schedule_list" in registry.list_tools()
     assert "send_file" in registry.list_tools()
     assert "Available skills:" in prompt
@@ -329,7 +329,7 @@ user-invocable: true
     assert "Review code changes" in prompt
     assert skill_body not in prompt
     assert "Loaded skill tools" not in prompt
-    assert "schedule_create" in prompt
+    assert "automation_create" in prompt
     assert "use the schedule tools instead of saying you cannot act in the future" in prompt
     assert "Do not pretend the scheduled action has already run" in prompt
     assert "use `send_file` with the resolved file path" in prompt
@@ -5056,7 +5056,7 @@ def test_send_message_synthesizes_schedule_confirmation_when_model_returns_empty
         agent_module._OAITC(
             "call-2",
             agent_module._OAIFunc(
-                "schedule_create",
+                "automation_create",
                 json.dumps(
                     {
                         "name": "测试消息",
@@ -5086,7 +5086,7 @@ def test_send_message_synthesizes_schedule_confirmation_when_model_returns_empty
     async def fake_call(tool_name, tool_input):
         if tool_name == "current_time":
             return json.dumps({"ok": True, "local_time": "2026-04-20T10:00:00+08:00"})
-        if tool_name == "schedule_create":
+        if tool_name == "automation_create":
             return json.dumps(
                 {
                     "ok": True,
@@ -11139,7 +11139,7 @@ def test_two_turns_of_one_session_offer_the_same_tool_schemas(monkeypatch):
         source="builtin",
     )
     registry.register(
-        "schedule_create", "Create a scheduled task.",
+        "automation_create", "Create a scheduled task.",
         {"type": "object", "properties": {}}, _noop, source="builtin",
     )
     registry.register(

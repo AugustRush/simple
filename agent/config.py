@@ -1393,7 +1393,11 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "a reason why the task would be useful reads as a paraphrase "
                 "and does not pass."
             )
-        if "schedule_create" in builtin_names:
+        # The creation verb is `automation_create` now -- one task or a chain (see
+        # ScheduleTools.automation_create). The old names are kept in this check only
+        # so a composition that substitutes an older tool set still gets the paragraph;
+        # the prompt below names the behaviour, not the tool.
+        if {"automation_create", "schedule_create"} & set(builtin_names):
             lines.append(
                 "If the user asks for a reminder, delayed follow-up, or recurring future message, "
                 "use the schedule tools instead of saying you cannot act in the future."

@@ -79,7 +79,7 @@ def create_settlement(registry, **overrides):
         "time_of_day": "08:00",
     }
     body.update(overrides)
-    return json.loads(asyncio.run(registry.call("schedule_create", body)))
+    return json.loads(asyncio.run(registry.call("automation_create", body)))
 
 
 def stored_task(payload):
@@ -184,7 +184,7 @@ def test_no_tool_schema_says_an_omitted_zone_means_utc(tmp_path, in_shanghai):
     schemas = {
         tool["name"]: tool["input_schema"] for tool in registry.to_anthropic_format()
     }
-    assert "timezone_name" in schemas["schedule_create"]["properties"]
+    assert "timezone_name" in schemas["automation_create"]["properties"]
 
     offenders = sorted(
         name

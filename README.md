@@ -46,7 +46,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | Capability | How |
 |---|---|
 | **Intent-before-action** | Write/shell tools require the assistant to declare what it will do before executing |
-| **Nothing gets created unasked** | Creators (`schedule_create`, `workflow_create`, `emit_signal`) must quote the user's own words from this turn, or the call is refused |
+| **Nothing gets created unasked** | Creators (`automation_create`, `emit_signal`) must quote the user's own words from this turn, or the call is refused |
 | **Workflows** | Chain scheduled tasks into a graph, each step judged by its own acceptance check |
 | **Declared work products** | `produces` names the files a task has to leave behind: the run is told where to write, the steps below are handed what actually exists, and a promised file that is missing fails the run on its own |
 | **Run outcomes** | `succeeded` / `failed` / `unverified` / `skipped` — "we could not tell" is not "it failed" |
@@ -406,7 +406,7 @@ task has to fire at that hour regardless of where the machine is.
 
 The CLI covers `once`, `interval`, `daily` and `weekly`. The scheduler itself
 also understands `weekdays`, `monthly` and `signal` triggers; those, and chains
-of tasks, are built through [`workflow_create`](#workflows-a-chain-of-steps) or
+of tasks, are built through [`automation_create`](#workflows-a-chain-of-steps) or
 the Automation page.
 
 **A task is stored where you made it, but it runs where a clock is.** Creating a task
@@ -427,7 +427,7 @@ by whether the model replied.
 ```text
 You: 帮我建一条流水线：先抓数据，再清洗，最后生成周报发我
 
-Agent: [workflow_create]
+Agent: [automation_create]
        fetch    → 抓取原始数据     produces: ["data/raw.csv"]
        clean    → 清洗并落盘       depends_on: [fetch]
                                    produces: ["data/clean.csv"]
@@ -582,8 +582,8 @@ model at runtime, and four take effect without a restart:
 |---|---|---|
 | Tool | `create_tool` / `update_tool` / `delete_tool` | the next turn, in this session |
 | Skill | `create_skill` / `update_skill` / `write_skill_file` | the next turn (catalog reloads, prompt is republished) |
-| Scheduled task | `schedule_create` | the next scheduler poll (≤ 30 s) |
-| Workflow | `workflow_create` | the next trigger tick |
+| Scheduled task | `automation_create` (no `steps`) | the next scheduler poll (≤ 30 s) |
+| Workflow (chain) | `automation_create` (with `steps`) | the next trigger tick |
 | Plugin | `install_plugin` (git / https / local path) | the same call — the catalog hot-reloads |
 
 Two knobs set how much freedom that is:
@@ -1667,8 +1667,8 @@ output sink.
 | Media | `transcribe_audio` |
 | Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index`, `memory_clear`, `set_identity` |
 | Context | `context_retrieve`, `clear_context` |
-| Scheduling | `schedule_create`, `schedule_list`, `schedule_runs`, `schedule_update`, `schedule_set_enabled`, `schedule_run`, `schedule_cancel`, `schedule_delete` |
-| Workflows | `workflow_create`, `workflow_list`, `workflow_update`, `workflow_delete` |
+| Scheduling | `automation_create` (task or chain), `schedule_list`, `schedule_runs`, `schedule_update`, `schedule_set_enabled`, `schedule_run`, `schedule_cancel`, `schedule_delete` |
+| Workflows | `workflow_list`, `workflow_update`, `workflow_delete` (creation is `automation_create` with `steps`) |
 | Signals | `emit_signal`, `list_signals` |
 | Runs | `read_step_output`, `report_outcome` |
 | Web | `web_search`, `web_fetch`, `tavily_search` |
@@ -1678,8 +1678,8 @@ output sink.
 | Plugins | `install_plugin`, `uninstall_plugin`, `list_installed_plugins` |
 | User tools | `create_tool`, `update_tool`, `delete_tool`, `list_tools`, `install_tool_dependency` |
 
-Three of these are gated on the request, not on the tool: `schedule_create`,
-`workflow_create` and `emit_signal` create something that outlives the
+Two of these are gated on the request, not on the tool: `automation_create`
+(a task or a chain) and `emit_signal` create something that outlives the
 conversation, so each must carry an `intent` quoting the user's own words from
 this turn (at least six characters, verbatim) and a call whose `intent` cannot
 be found in the request is refused. `read_step_output` and `report_outcome`
@@ -1694,8 +1694,8 @@ delete-and-recreate the only repair — which is what these tools exist to end.
 Every one of them keeps the task id, and with it the run history and every
 downstream step subscribed to its signal.
 
-`schedule_create` and `workflow_create` are also how a task declares what it
-has to produce (`produces`), and `schedule_list`, `workflow_list` and
+`automation_create` is also how a task declares what it has to produce
+(`produces`), and `schedule_list`, `workflow_list` and
 `schedule_runs` are how that declaration is read back: the creation half and
 the observation half are one pair, because a task is created in a conversation
 and then runs in none. A task the agent built that has been failing every night
@@ -2079,8 +2079,8 @@ Key properties:
   and `context_rolled_back` carrying the dropped roles and token estimate, so
   "never retrieved" stays distinguishable from "retrieved, then dropped"
 - **Intent-before-action**: write/shell tools require the assistant to declare intent first
-- **Request-before-creation**: the three creators (`schedule_create`,
-  `workflow_create`, `emit_signal`) must quote the user's words from the current
+- **Request-before-creation**: the two creators (`automation_create`,
+  `emit_signal`) must quote the user's words from the current
   turn, while the maintenance tools (`schedule_update`, `schedule_set_enabled`,
   `schedule_run`, `schedule_cancel`, `workflow_update`) state what they are
   doing; both gates are capabilities on the tool (`requires_intent`,
@@ -2102,7 +2102,7 @@ calls for it:
 
 | Held back by default | Opened by |
 |---|---|
-| `schedule_create`, `schedule_delete`, `schedule_update`, `schedule_set_enabled`, `schedule_run`, `schedule_cancel`, `workflow_create`, `workflow_delete`, `workflow_update` | Naming or describing scheduled work **and** asking for it |
+| `automation_create`, `schedule_delete`, `schedule_update`, `schedule_set_enabled`, `schedule_run`, `schedule_cancel`, `workflow_delete`, `workflow_update` | Naming or describing scheduled work **and** asking for it |
 | `schedule_runs` | Never — the answer to "did it actually run" is phrased in the user's own words, which name no cadence |
 | `emit_signal` | A scheduled run, or an ask that names scheduled work |
 | `report_outcome` | Being inside a scheduled run — no sentence in a conversation makes it usable |

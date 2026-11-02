@@ -387,7 +387,11 @@ class ToolRegistry:
         ("builtin", "memory_write"): frozenset({"state_write"}),
         ("builtin", "set_identity"): frozenset({"state_write"}),
         ("builtin", "memory_clear"): frozenset({"state_write"}),
-        ("builtin", "schedule_create"): frozenset({"state_write", "requires_request"}),
+        # The one creation verb: a task, or a chain of them (see
+        # `ScheduleTools.automation_create`). It replaced `schedule_create` and
+        # `workflow_create`, whose overlap made "which tool?" a question the model
+        # had to answer by guessing.
+        ("builtin", "automation_create"): frozenset({"state_write", "requires_request"}),
         # Declared at the registration site rather than here, like the rest of
         # the schedule maintenance half: see the note below on why a destructive
         # schedule tool declares its intent.  The default here has to agree with
@@ -417,7 +421,6 @@ class ToolRegistry:
         # request requirement, and a group where half the entries exist is how
         # the next reader concludes the other half was considered.
         ("builtin", "workflow_list"): frozenset({"read"}),
-        ("builtin", "workflow_create"): frozenset({"state_write", "requires_request"}),
         ("builtin", "workflow_delete"): frozenset({"state_write", "requires_intent"}),
         # Same reasoning as `schedule_update`: rebuilding a chain instead of
         # editing it is what leaves steps behind whose run history is stranded,

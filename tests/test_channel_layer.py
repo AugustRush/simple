@@ -1835,7 +1835,7 @@ def test_channel_runner_exposes_feishu_delivery_target_to_scheduler_tools(
 
         async def send_message(self, ctx, user_message, stream_callback=None):
             result = await registry.call(
-                "schedule_create",
+                "automation_create",
                 {
                     "name": "reminder",
                     "trigger_type": "once",

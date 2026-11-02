@@ -3,11 +3,13 @@
 Why this module exists
 ----------------------
 Twenty-one methods of ``BuiltinTools`` -- a 4854-line class -- are about one
-thing: a graph of timed tasks.  ``schedule_create`` / ``list`` / ``runs`` /
-``update`` / ``set_enabled`` / ``run`` / ``cancel`` / ``delete`` write and read
-its rows; ``workflow_create`` / ``update`` / ``list`` / ``delete`` write and
-read the chain those rows belong to; and the ``describe_*`` /
-``action_payload`` helpers are the sentences both of them show a person.
+thing: a graph of timed tasks.  ``automation_create`` is the one creation verb
+(one task, or a chain of them -- see its docstring);
+``schedule_list`` / ``runs`` / ``update`` / ``set_enabled`` / ``run`` /
+``cancel`` / ``delete`` write and read the rows; ``workflow_update`` /
+``list`` / ``delete`` write and read the chain those rows belong to; and the
+``describe_*`` / ``action_payload`` helpers are the sentences both of them show
+a person.
 
 They could not be split from each other.  The workflow methods read five of the
 scheduler's own helpers (``schedule_store``, ``schedule_target``,
@@ -1167,6 +1169,10 @@ class ScheduleTools:
                 "trigger_type": raw.get("trigger_type"),
                 "signal_name": raw.get("signal_name"),
                 "at": raw.get("at"),
+                # A single task spells an interval's start `anchor_at`; a step used to
+                # spell it `at` only. One creation verb should not have two words for
+                # the same moment, so a step accepts both (see the schema).
+                "anchor_at": raw.get("anchor_at"),
                 "every": raw.get("every"),
                 "unit": raw.get("unit"),
                 "time_of_day": raw.get("time_of_day"),
@@ -1212,7 +1218,11 @@ class ScheduleTools:
                         timezone_name=str(
                             raw.get("timezone_name") or LOCAL_TIMEZONE
                         ),
-                        at=raw.get("at"),
+                        at=(
+                            raw.get("at")
+                            if raw.get("at") is not None
+                            else raw.get("anchor_at")
+                        ),
                         every=raw.get("every"),
                         unit=raw.get("unit"),
                         time_of_day=raw.get("time_of_day"),
@@ -1315,6 +1325,37 @@ class ScheduleTools:
                 )
             )
         return built
+
+    def automation_create(self, **body: Any) -> dict[str, Any]:
+        """Create an automation: one step, or several chained by their edges.
+
+        The two shapes this used to be two tools for are the same thing, and the
+        difference is `steps`:
+
+        * **no `steps`** -- one task on a clock or a signal. This is what
+          ``schedule_create`` did, and the body is that body.
+        * **`steps`** -- a chain, where each step runs after the ones it depends on.
+          This is what ``workflow_create`` did, and the body is that body.
+
+        One entry point, because the question "task or chain?" is answered by the
+        request, not by which tool the model happened to remember: "remind me at 9"
+        has no steps in it, and "fetch, then summarise, then post" has nothing but.
+        The two implementations stay separate behind this, because they differ where
+        it matters -- a chain validates a graph before writing anything, and a single
+        task has no graph to validate.
+        """
+        steps = body.get("steps")
+        if steps:
+            allowed = {"name", "description", "workspace_root", "intent", "steps"}
+            return self.workflow_create(
+                **{key: value for key, value in body.items() if key in allowed}
+            )
+        task_fields = {
+            key: value
+            for key, value in body.items()
+            if key not in {"description", "steps"}
+        }
+        return self.schedule_create(**task_fields)
 
     def workflow_create(
         self,

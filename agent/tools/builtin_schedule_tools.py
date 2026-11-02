@@ -59,7 +59,18 @@ _WORKFLOW_STEP_SCHEMA: dict[str, Any] = {
             ),
         },
         "signal_name": {"type": "string"},
-        "at": {"type": "string", "description": "ISO datetime for once"},
+        "at": {
+            "type": "string",
+            "description": (
+                "ISO datetime for once. For interval it is the anchor -- the moment "
+                "the cadence counts from -- and `anchor_at` is accepted as the same "
+                "thing, because a single task spells it that way."
+            ),
+        },
+        "anchor_at": {
+            "type": "string",
+            "description": "The interval's anchor, spelled as a single task spells it",
+        },
         "every": {"type": "integer"},
         "unit": {"type": "string", "description": "minutes|hours|days|weeks"},
         "time_of_day": {"type": "string", "description": "HH:MM"},
@@ -130,9 +141,17 @@ def register_schedule_tools(
     schedule_tools,
 ) -> None:
         r.register(
-            "schedule_create",
+            "automation_create",
             (
-                "Create a persistent scheduled task. Use when the user asks for a reminder, "
+                "Create an automation: one task, or a chain of tasks. "
+                "**One task** (no `steps`): a reminder, a delayed follow-up, or recurring "
+                "work -- the `trigger_type` fields say when. "
+                "**A chain** (`steps` given): several jobs in an order, where each step "
+                "runs only after the steps it depends on have succeeded -- fetch, then "
+                "transform, then report. Use a chain rather than several `trigger_type=signal` "
+                "tasks: only a chain records the edges, so only a chain knows which steps a "
+                "failure must stop. "
+                "Use when the user asks for a reminder, "
                 "a delayed follow-up, or a recurring future message. "
                 "The user has to ask: a question about how something works, or about the "
                 "process behind it, is answered in the reply and is not a request to add a "
@@ -305,10 +324,27 @@ def register_schedule_tools(
                             "'..'. Omit for a task whose only output is its answer."
                         ),
                     },
+                    "steps": {
+                        "type": "array",
+                        "description": (
+                            "Give this to create a CHAIN instead of one task. Each step "
+                            "runs only after the steps in its `depends_on` have "
+                            "succeeded. Every step needs a `key`; a step with no "
+                            "upstreams is where the chain starts and must carry its own "
+                            "`trigger_type` (the same vocabulary as a single task), and "
+                            "a step with upstreams must NOT have one -- its upstreams "
+                            "are what starts it. The graph is validated before anything "
+                            "is written: a cycle, a missing upstream, or a step that can "
+                            "never be judged is refused with the step named."
+                        ),
+                        "items": _WORKFLOW_STEP_SCHEMA,
+                    },
                 },
-                "required": ["name", "trigger_type"],
+                # A single task needs a trigger; a chain's entry step carries its own,
+                # so requiring it here would refuse the chain shape outright.
+                "required": ["name"],
             },
-            schedule_tools.schedule_create,
+            schedule_tools.automation_create,
             source="builtin",
         )
     
@@ -332,7 +368,7 @@ def register_schedule_tools(
                 "`delivery_mode`, `delivery_target` and `request_quote`, which are "
                 "reported for reading only because the graph, "
                 "schedule_set_enabled and the channel own them. Use it after "
-                "schedule_create or workflow_create to find out what actually "
+                "automation_create (or list_installed_plugins) to find out what actually "
                 "happened, and whenever the user asks whether a task ran, whether "
                 "it worked, or what went wrong with it. A scheduled run happens "
                 "with nobody watching and its outcome exists nowhere else, so this "
@@ -445,7 +481,7 @@ def register_schedule_tools(
                     },
                     "instruction": {
                         "type": "string",
-                        "description": "Same as `prompt`; accepted for symmetry with workflow_create",
+                        "description": "Same as `prompt`; accepted for symmetry with the chain shape",
                     },
                     "message_text": {
                         "type": "string",
@@ -692,71 +728,6 @@ def register_schedule_tools(
             schedule_tools.schedule_cancel,
             source="builtin",
             capabilities=("state_write", "requires_intent"),
-        )
-    
-        r.register(
-            "workflow_create",
-            (
-                "Create a chain of scheduled tasks, where each step runs only after the "
-                "steps it depends on have succeeded. Use this when the user asks for "
-                "several jobs to run in an order -- fetch, then transform, then report -- "
-                "rather than one job; describing an existing process is not asking for a "
-                "new one to be built, so propose the chain instead of creating it. "
-                "Do not chain steps with schedule_create and signals "
-                "instead: a chain built that way has no recorded edges, so nothing knows "
-                "which steps a failure should stop. "
-                "Give every step a `key`, and list its upstreams in `depends_on`. A step "
-                "with no upstreams is where the chain starts and must carry its own "
-                "`trigger_type` (the same vocabulary as schedule_create); a step with "
-                "upstreams must NOT have one, because its upstreams are what starts it. "
-                "Give each step `criteria` saying what has to be true for it to count as "
-                "done, and a `verify_command` whenever that is mechanically checkable -- "
-                "that check is what decides whether the next step runs. The graph is "
-                "validated before anything is written: a cycle, a missing upstream, or a "
-                "step that can never be judged is refused with the step named. "
-                "The chain outlives this conversation, so `intent` has to carry the "
-                "user's own words: it is checked against the request that commissioned "
-                "this turn, and a call whose intent cannot be found in it is refused."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "intent": {
-                        "type": "string",
-                        "description": (
-                            "Fill this in, or the call is refused. Quote the "
-                            "user, verbatim -- at least six characters copied "
-                            "from what they actually typed this turn, the "
-                            "sentence that asked for this chain. It is matched "
-                            "against this turn's request, so a paraphrase or a "
-                            "sentence about why the chain would be useful is "
-                            "refused. If nothing in this turn asked for one, do "
-                            "not call this at all: propose the chain in your reply."
-                        ),
-                    },
-                    "name": {"type": "string", "description": "Short workflow name"},
-                    "description": {
-                        "type": "string",
-                        "description": "What this chain is for, in one line",
-                        "default": "",
-                    },
-                    "workspace_root": {
-                        "type": "string",
-                        "description": (
-                            "Absolute path of the project folder the chain works in. "
-                            "Steps that do not name their own folder use this one."
-                        ),
-                    },
-                    "steps": {
-                        "type": "array",
-                        "description": "The steps, in any order; `depends_on` gives the order.",
-                        "items": _WORKFLOW_STEP_SCHEMA,
-                    },
-                },
-                "required": ["name", "steps"],
-            },
-            schedule_tools.workflow_create,
-            source="builtin",
         )
     
         r.register(
