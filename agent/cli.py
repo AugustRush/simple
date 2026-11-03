@@ -1955,25 +1955,23 @@ def autonomy(
             # reading it directly is the smaller dependency rather than a
             # different answer.
             sessions = _autonomy_session_rows(limit=50)
-            result = patrol_tick(
+            # Through the service, not `patrol_tick`, so a manual pass does exactly
+            # what a scheduled one does -- including acting on what admission
+            # allowed. Two paths that run "the same" funnel and behave differently
+            # is how a person ends up debugging behaviour the gateway never has.
+            from agent.autonomy.patrol import PatrolService
+
+            service = PatrolService(
                 store=store,
-                sessions=sessions,
-                options=PatrolOptions(),
-                suggest=rule_candidates,
+                sessions_provider=lambda: sessions,
             )
-            # The manual pass records itself too. Otherwise `autonomy stats` -- which
-            # exists precisely to answer "is the funnel finding anything" -- reads
-            # zero passes after any number of manual ones, and the two paths that
-            # run the same funnel would disagree about whether it ran.
-            try:
-                store.record_tick(result)
-            except Exception:
-                pass
+            result = asyncio.run(service.tick())
             shared.CONSOLE.print(
                 f"[dim]tick: examined {result['examined']}, "
                 f"eligible {result['eligible']}, warm {result['skipped_warm']}, "
                 f"stale {result['skipped_stale']}, proposed {result['proposed']}, "
-                f"duplicates {result['duplicates']}[/dim]"
+                f"duplicates {result['duplicates']}, "
+                f"[bold]did {result.get('executed', 0)}[/bold][/dim]"
             )
             for row in result["proposals"]:
                 verdict = (row.get("context_json") or {}).get("admission") or {}
