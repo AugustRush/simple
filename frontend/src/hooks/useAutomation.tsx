@@ -298,7 +298,11 @@ export function useAutomation(deps: Deps) {
       } else {
         messageApi.success(state === 'accepted' ? '已记下：你会同意这件事' : '已记下：不做这件事')
       }
-      await loadAutonomy()
+      // Both surfaces show this row: 自主 lists proposals, and the home board's
+      // "等你处理" column holds the same ones. Refreshing only the page the
+      // request came from is how the other one keeps a card the server has
+      // already removed.
+      await Promise.all([loadAutonomy(), loadHome()])
     } catch {
       // surfaced by the api helper
     }
@@ -769,6 +773,9 @@ export function useAutomation(deps: Deps) {
       )
       const data = await resp.json()
       const consumed = data.acknowledged ? 1 : 0
+      // The failure was in the home board's "等你处理" column; acknowledging it
+      // is what makes the column drop it.
+      void loadHome()
       setScheduleRuns(prev => prev.map(item => item.id === runId
         ? { ...item, needs_attention: false, acknowledged_at: new Date().toISOString() }
         : item))

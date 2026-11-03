@@ -501,3 +501,66 @@ def test_a_new_conversation_shows_up_in_the_timeline(page):
     top = page.locator(".home-timeline-row").first.inner_text()
     assert "帮我总结当前项目" in top, top
     assert page.errors == [], page.errors
+
+
+def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
+    """The card that asks you to decide is the card you decide on.
+
+    A board that shows a blocking proposal and then makes you navigate to 自主 to
+    answer it is a page that knows what to do and refuses to do it. The answer is
+    the same endpoint either way; only the distance differs.
+
+    Also pins the refresh: answering changes the column, and the page has to be
+    told. The first version refreshed only 自主, so the card the server had already
+    dropped sat on the board until a reload.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from agent.autonomy import Proposal
+    from agent.autonomy.store import open_proposal_store
+
+    os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
+    from agent import shared
+
+    shared.AGENT_HOME = live_gateway["home"]
+    store = open_proposal_store()
+    try:
+        proposal = Proposal(
+            source="e2e-board",
+            reason="有 2 次运行结束得不好，还没有人看过",
+            action="读一遍那 2 次失败的运行",
+            tool="schedule_runs",
+            reversibility="reversible",
+            confidence=0.8,
+        )
+        proposal.context["admission"] = {"answer": "prepare", "reason": "额度已用完"}
+        store.record(proposal)
+    finally:
+        store.close()
+
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.wait_for_selector(".home-card-proposal", timeout=20_000)
+
+    # Three columns, in attention order: the column that needs a person leads.
+    titles = [
+        page.locator(".home-column-title").nth(i).inner_text().strip()
+        for i in range(page.locator(".home-column-title").count())
+    ]
+    assert titles == ["等你处理", "正在跑", "已排期"], titles
+
+    # By text, not by position: the autonomy page's test seeds its own proposals
+    # into the same gateway home, so "the first card" is whichever ran first.
+    card = page.locator(".home-card-proposal").filter(has_text="读一遍那 2 次失败的运行")
+    assert card.count() == 1, "the proposal this test seeded is not on the board"
+    assert "有 2 次运行结束得不好" in card.first.inner_text(), (
+        "the reason is what a decision needs"
+    )
+
+    before = page.locator(".home-card-proposal").count()
+    card.first.locator("button").first.click()
+    page.wait_for_timeout(2500)
+    after = page.locator(".home-card-proposal").count()
+    assert after == before - 1, f"the answered card was not dropped ({before} -> {after})"
+    assert page.errors == [], page.errors
