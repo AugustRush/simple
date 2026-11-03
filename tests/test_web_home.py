@@ -138,7 +138,7 @@ def test_a_failed_run_counts_and_names_the_newest(stores) -> None:
 # ── what is happening now ──────────────────────────────────────────────────
 
 
-def test_a_running_run_appears_in_flight(stores) -> None:
+def test_a_running_run_appears_in_the_running_column(stores) -> None:
     scheduler, proposals = stores
     task = _task(scheduler, "收集")
     scheduler.claim_task_now(task.id, now=NOW)
@@ -147,10 +147,12 @@ def test_a_running_run_appears_in_flight(stores) -> None:
         scheduler_store=scheduler, proposal_store=proposals, now=NOW
     )
 
-    assert [item["task_id"] for item in payload["running"]["in_flight"]] == [task.id]
+    (card,) = payload["board"]["running"]
+    assert card["task_id"] == task.id
+    assert card["at_kind"] == "started"
 
 
-def test_a_scheduled_task_appears_in_next_up(stores) -> None:
+def test_a_scheduled_task_appears_in_the_scheduled_column(stores) -> None:
     scheduler, proposals = stores
     later = NOW + timedelta(hours=3)
     task = _task(scheduler, "每天整理并汇报", at=later)
@@ -159,8 +161,91 @@ def test_a_scheduled_task_appears_in_next_up(stores) -> None:
         scheduler_store=scheduler, proposal_store=proposals, now=NOW
     )
 
-    assert [item["task_id"] for item in payload["running"]["next_up"]] == [task.id]
-    assert payload["running"]["in_flight"] == []
+    (card,) = payload["board"]["scheduled"]
+    assert card["task_id"] == task.id
+    assert card["at_kind"] == "next"
+    assert payload["board"]["running"] == []
+
+
+def test_a_failed_unread_run_appears_in_the_waiting_column(stores) -> None:
+    scheduler, proposals = stores
+    task = _task(scheduler, "构建检查")
+    _run(scheduler, task, status="failed", error="provider 429")
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    (card,) = payload["board"]["waiting"]
+    assert card["name"] == "构建检查"
+    assert card["status"] == "failed"
+    assert card["detail"] == "provider 429"
+    assert card["at_kind"] == "finished"
+
+
+def test_an_acknowledged_failure_leaves_the_waiting_column(stores) -> None:
+    """Acknowledging is the act of having read it. A board that kept showing read
+    failures would teach people to ignore the column."""
+    scheduler, proposals = stores
+    task = _task(scheduler, "构建检查")
+    run = _run(scheduler, task, status="failed", error="429")
+    scheduler.acknowledge_run(task.id, run.id)
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    assert payload["board"]["waiting"] == []
+
+
+def test_a_proposal_waits_in_the_same_column_as_a_failure(stores) -> None:
+    """Both are blocked on a person; the difference is what the person does."""
+    scheduler, proposals = stores
+    proposals.record(Proposal(source="s", action="读一遍失败的运行", reason="有 2 次"))
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    (card,) = payload["board"]["waiting"]
+    assert card["kind"] == "proposal"
+    assert card["name"] == "读一遍失败的运行"
+    assert card["detail"] == "有 2 次", "the reason is what a decision needs"
+    assert card["id"]
+
+
+def test_proposals_are_not_counted_twice(stores) -> None:
+    """The waiting column holds them; `needs` must not be a second copy.
+
+    A strip above the board saying "1 次运行结束得不好" over a column showing that
+    same failure is the page saying one thing twice, which is the exact fault the
+    thread list had before it moved to the sidebar.
+    """
+    scheduler, proposals = stores
+    proposals.record(Proposal(source="s", action="读一遍失败的运行"))
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    assert len(payload["board"]["waiting"]) == 1
+    # `needs` stays as the count for anything that wants a badge, but the board is
+    # the one place that renders the rows.
+    assert payload["needs"]["proposals"] == 1
+
+
+def test_the_scheduled_column_is_a_preview(stores) -> None:
+    """A board is glanced at; thirty cards in the third column is a list."""
+    scheduler, proposals = stores
+    for index in range(6):
+        _task(scheduler, f"task {index}", at=NOW + timedelta(hours=index + 1))
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    assert len(payload["board"]["scheduled"]) == web_home.BOARD_SCHEDULED_PREVIEW
+    assert payload["board"]["scheduled_total"] == 6, "the rest is one click away"
 
 
 def test_a_disabled_task_is_not_shown_as_coming(stores) -> None:
@@ -174,7 +259,7 @@ def test_a_disabled_task_is_not_shown_as_coming(stores) -> None:
         scheduler_store=scheduler, proposal_store=proposals, now=NOW
     )
 
-    assert payload["running"]["next_up"] == []
+    assert payload["board"]["scheduled"] == []
 
 
 # ── what happened ──────────────────────────────────────────────────────────
@@ -273,7 +358,7 @@ def test_the_endpoint_returns_the_payload(stores) -> None:
     )
 
     assert status == 200
-    assert set(body) == {"needs", "running", "activity", "at"}
+    assert set(body) == {"needs", "board", "activity", "at"}
 
 
 def test_no_stores_is_an_empty_page_not_a_crash() -> None:
@@ -284,7 +369,9 @@ def test_no_stores_is_an_empty_page_not_a_crash() -> None:
 
     assert status == 200
     assert body["needs"]["failures"] == 0
-    assert body["running"] == {"in_flight": [], "next_up": []}
+    assert body["board"] == {
+        "running": [], "waiting": [], "scheduled": [], "scheduled_total": 0
+    }
     assert body["activity"] == []
 
 

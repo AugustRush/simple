@@ -7,10 +7,10 @@
 .home-view {
   display: flex;
   flex-direction: column;
-  gap: 28px;
-  max-width: 760px;
+  gap: 20px;
+  max-width: 860px;
   margin: 0 auto;
-  padding: 8px 0 24px;
+  padding: 4px 0 24px;
 }
 
 .home-section-title {
@@ -47,20 +47,25 @@
 .home-card-arrow { margin-left: auto; color: var(--text-muted); }
 
 /* ── the agent ───────────────────────────────────────────────────────────── */
-.home-agent { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 12px 0 4px; }
+/* The composer is compact on purpose. It was a hero -- a 46px mark over a 24px
+   title over a tall box, a third of the page -- when the landing view had nothing
+   else on it. It now sits under a board, and a hero in the middle of a status
+   page reads as the page's main point, which it is not: the board is what you
+   came to look at, and the box is how you change it. */
+.home-agent { display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 2px 0; }
 .home-agent-mark {
   display: grid;
   place-items: center;
-  width: 46px;
-  height: 46px;
+  width: 34px;
+  height: 34px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 10px;
   color: var(--text-secondary);
   background: var(--surface-hover);
-  font-size: 17px;
+  font-size: 14px;
   font-weight: 700;
 }
-.home-agent-title { margin: 0; color: var(--text); font-size: 24px; font-weight: 700; }
+.home-agent-title { margin: 0; color: var(--text); font-size: 18px; font-weight: 700; }
 .home-composer {
   width: 100%;
   padding: 10px 10px 8px;
@@ -170,3 +175,87 @@
   color: var(--text-muted);
   font-size: 10px;
 }
+
+/* ── the board ─────────────────────────────────────────────────────────────
+   Three columns, ordered by distance from needing a person: waiting on you
+   (needs a person now) -> running (nothing needed, just alive) -> scheduled
+   (nothing needed yet). The order is not "progress left to right" -- it is
+   "act to ignore", which is the direction attention travels on opening the
+   page, and the urgent column must not sit behind two that need nothing. */
+.home-board-columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+.home-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 10px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.home-column-head { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+.home-column-title { color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+/* The count is a badge only when there is something to count: a "0" beside a
+   heading is a number that answers nothing. */
+.home-column-count { color: var(--text-muted); font-size: 10px; }
+.home-column-body { display: flex; flex-direction: column; gap: 6px; min-height: 44px; }
+.home-column-empty { color: var(--text-muted); font-size: 11px; line-height: 1.6; }
+.home-column-more { padding: 0; height: auto; align-self: flex-start; font-size: 10px; }
+
+.home-card-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-hover);
+}
+/* A left edge per column: the tone is legible before the label is read. */
+.home-card-running { border-left: 2px solid var(--primary); }
+.home-card-waiting { border-left: 2px solid var(--red); }
+.home-card-scheduled { border-left: 2px solid var(--border-strong, var(--border)); }
+.home-card-tile strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-tile-meta { color: var(--text-muted); font-size: 10px; }
+/* A failure's own words, clamped: the card is a pointer to the task, not the
+   place the failure is diagnosed. */
+.home-tile-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+@media (max-width: 900px) {
+  .home-board-columns { grid-template-columns: 1fr; }
+}
+
+/* A proposal card carries an answer, so it is taller than the others and has its
+   own tone: it is the one card on the board that is *blocked* on the reader. */
+.home-card-proposal {
+  border-left: 2px solid var(--primary);
+  background: var(--surface);
+}
+.home-tile-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+}
+.home-tile-tag { margin: 0; font-size: 10px; line-height: 16px; }

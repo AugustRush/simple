@@ -18,6 +18,13 @@
  *    the thread. Tasks are created the same way, by asking: `schedule_create` is
  *    a tool, and a form on this page would be a second path to the same act.
  *
+ * Then the **board**: three columns -- 等你处理 / 正在跑 / 已排期 -- ordered by how
+ * close each is to needing a person, so reading left to right is reading from
+ * "act" to "ignore". The urgent column is leftmost on purpose: a column that
+ * needs a person must not sit behind two that do not. There is no "done" column:
+ * finished work that needs nobody is the timeline's job, and a board with a done
+ * column is a log with worse scanning.
+ *
  * Then **最近做了什么**: one timeline of runs and conversations, newest first,
  * because "what has it done lately" is a question about the agent, not about a
  * table. Splitting them would answer a question about the schema.
@@ -31,20 +38,34 @@
  */
 
 import type { AppCtx } from '../app/AppCtx'
-import type { HomeActivity } from '../types'
+import type { BoardCard, HomeActivity } from '../types'
 import { formatDateTime, relativeTime } from '../lib/format'
-import { Button, Card, Empty, Input, Skeleton } from 'antd'
+import { Button, Empty, Input, Skeleton, Space, Tag } from 'antd'
 import {
-  ArrowRightOutlined,
   CheckCircleOutlined,
-  ClockCircleOutlined,
   CloseCircleOutlined,
-  CompassOutlined,
   LoadingOutlined,
   MessageOutlined,
   SendOutlined,
-  WarningOutlined,
 } from '@ant-design/icons'
+
+/** How a trigger repeats, in one word. The card shows this instead of a status
+ *  for scheduled items, because "daily" is the fact that matters there: it says
+ *  it will come back, which "next run in 11 hours" alone does not. */
+const TRIGGER_LABEL: Record<string, string> = {
+  daily: '每天',
+  weekly: '每周',
+  interval: '间隔',
+  once: '一次',
+  cron: '定时',
+  signal: '等信号',
+}
+
+const REVERSIBILITY_LABEL: Record<string, string> = {
+  reversible: '只读',
+  workspace: '改工作区',
+  irreversible: '不可逆',
+}
 
 const RUN_STATUS_LABEL: Record<string, string> = {
   succeeded: '成功',
@@ -57,22 +78,107 @@ const RUN_STATUS_LABEL: Record<string, string> = {
   queued: '排队中',
 }
 
+/** One board column: a heading, its cards, and what to say when it is empty.
+ *
+ * The empty line is not decoration. A column that vanishes reads as "this part of
+ * the page is broken"; a column that says "没有卡住的" while the one beside it is
+ * full reads as "checked, nothing wrong", which is the whole point of looking.
+ */
+function BoardColumn({
+  cards, empty, more, onDecide, onMore, title, tone,
+}: {
+  cards: BoardCard[]
+  empty: string
+  more?: string
+  onDecide?: (id: string, state: 'accepted' | 'declined') => void
+  onMore?: () => void
+  title: string
+  tone: 'running' | 'waiting' | 'scheduled'
+}) {
+  return (
+    <div className={`home-column home-column-${tone}`}>
+      <div className="home-column-head">
+        <span className="home-column-title">{title}</span>
+        <span className="home-column-count">{cards.length || ''}</span>
+      </div>
+      <div className="home-column-body">
+        {cards.length === 0 ? (
+          <span className="home-column-empty">{empty}</span>
+        ) : (
+          cards.map(card =>
+            /* A proposal is a *candidate* task blocked on a person, so its card
+               carries the answer instead of a status line: making somebody
+               navigate to 自主 to answer the thing this page just showed them
+               would be the page knowing what to do and refusing to do it. */
+            card.kind === 'proposal' ? (
+              <div key={`proposal:${card.id}`} className="home-card-tile home-card-proposal">
+                <strong title={card.name}>{card.name}</strong>
+                {card.detail && <span className="home-tile-detail">{card.detail}</span>}
+                <div className="home-tile-actions">
+                  <Tag className="home-tile-tag">
+                    {REVERSIBILITY_LABEL[card.reversibility || ''] || '未知'}
+                  </Tag>
+                  <Space size={4}>
+                    <Button
+                      size="small"
+                      onClick={() => onDecide?.(card.id || '', 'accepted')}
+                    >
+                      同意
+                    </Button>
+                    <Button
+                      size="small"
+                      onClick={() => onDecide?.(card.id || '', 'declined')}
+                    >
+                      不要
+                    </Button>
+                  </Space>
+                </div>
+              </div>
+            ) : (
+              <div key={card.task_id} className={`home-card-tile home-card-${tone}`}>
+                <strong title={card.name}>{card.name}</strong>
+                <span className="home-tile-meta">
+                  {/* One formatter for all three columns: `relativeTime` already
+                      handles both directions ("3 小时后" / "2 分钟前"), and the
+                      column already says which tense the card is in. */}
+                  {relativeTime(card.at)}
+                  {card.at ? ' · ' : ''}
+                  {card.at_kind === 'next'
+                    ? TRIGGER_LABEL[card.trigger_type] || '排期中'
+                    : RUN_STATUS_LABEL[card.status] || card.status}
+                </span>
+                {card.detail && <span className="home-tile-detail">{card.detail}</span>}
+              </div>
+            ),
+          )
+        )}
+      </div>
+      {more ? (
+        <Button type="link" size="small" className="home-column-more" onClick={onMore}>
+          {more}
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
 export function renderHome(ctx: AppCtx) {
   const {
-    attentionRuns, composerRef, creatingSession, home, homeLoaded, input,
+    composerRef, creatingSession, decideProposal, home, homeLoaded, input,
     navigateTo, selectSession, sendMessage, setInput,
   } = ctx
 
-  const needs = home?.needs
-  const running = home?.running
+  const board = home?.board
   const activity = home?.activity ?? []
 
-  const proposals = Number(needs?.proposals || 0)
-  const failures = Number(needs?.failures || 0)
-  const inFlight = running?.in_flight ?? []
-  const nextUp = running?.next_up ?? []
-  const needsPerson = proposals + failures > 0
+  const inFlight = board?.running ?? []
+  const waiting = board?.waiting ?? []
+  const scheduled = board?.scheduled ?? []
+  const scheduledTotal = Number(board?.scheduled_total || 0)
+  const waitingOnYou = waiting.length
   const busy = inFlight.length > 0
+  const boardEmpty = inFlight.length + waiting.length + scheduledTotal === 0
+  const needsPerson = waitingOnYou > 0
 
   const submit = () => {
     if (!input.trim() || creatingSession) return
@@ -81,9 +187,6 @@ export function renderHome(ctx: AppCtx) {
     // make this page's box a two-step flow for no reason.
     void sendMessage()
   }
-
-  /** The newest failure's task name, for the one line the card shows. */
-  const newestFailureName = attentionRuns[0]?.task_name || ''
 
   const renderActivity = (item: HomeActivity) => {
     if (item.kind === 'thread') {
@@ -140,88 +243,42 @@ export function renderHome(ctx: AppCtx) {
 
   return (
     <div className="page-view home-view">
-      {/* ── what needs a person ─────────────────────────────────────────── */}
-      {needsPerson && (
-        <section className="home-needs">
-          <div className="home-section-title">需要你</div>
-          {proposals > 0 && (
-            <Card
-              className="home-card home-card-action"
-              hoverable
-              role="button"
-              tabIndex={0}
-              onClick={() => navigateTo('autonomy')}
-              onKeyDown={event => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                  event.preventDefault()
-                  navigateTo('autonomy')
-                }
-              }}
-            >
-              <div className="home-card-head">
-                <span className="home-card-icon"><CompassOutlined /></span>
-                <div>
-                  <strong>{proposals} 条自主提议等你答复</strong>
-                  <span>它不会自己动手——同意或拒绝都是一句话的事</span>
-                </div>
-                <ArrowRightOutlined className="home-card-arrow" />
-              </div>
-            </Card>
-          )}
-          {failures > 0 && (
-            <Card
-              className="home-card home-card-action"
-              hoverable
-              role="button"
-              tabIndex={0}
-              onClick={() => navigateTo('schedules')}
-              onKeyDown={event => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                  event.preventDefault()
-                  navigateTo('schedules')
-                }
-              }}
-            >
-              <div className="home-card-head">
-                <span className="home-card-icon home-card-icon-warn"><WarningOutlined /></span>
-                <div>
-                  <strong>{failures} 次运行结束得不好</strong>
-                  <span>{newestFailureName ? `最近一次：${newestFailureName}` : '还没有人看过'}</span>
-                </div>
-                <ArrowRightOutlined className="home-card-arrow" />
-              </div>
-            </Card>
-          )}
-        </section>
-      )}
-
-      {/* ── what is happening now ───────────────────────────────────────── */}
-      {(busy || nextUp.length > 0) && (
-        <section className="home-running">
-          <div className="home-section-title">正在做</div>
-          <div className="home-running-list">
-            {inFlight.map(item => (
-              <div key={`fly:${item.task_id}`} className="home-running-row is-now">
-                <LoadingOutlined />
-                <strong>{item.name}</strong>
-                <span>
-                  {RUN_STATUS_LABEL[item.status] || item.status}
-                  {item.started_at ? ` · 开始于 ${relativeTime(item.started_at)}` : ''}
-                </span>
-              </div>
-            ))}
-            {nextUp.map(item => (
-              <div key={`next:${item.task_id}`} className="home-running-row">
-                <ClockCircleOutlined />
-                <strong>{item.name}</strong>
-                {/* `relativeTime` already says the direction ("3 小时后"), so no
-                    suffix here: appending one produced "刚刚后" before the
-                    formatter knew about future times. */}
-                <span title={formatDateTime(item.next_run_at, true)}>
-                  {relativeTime(item.next_run_at)}
-                </span>
-              </div>
-            ))}
+      {/* ── the board ───────────────────────────────────────────────────── */}
+      {!boardEmpty && (
+        <section className="home-board">
+          <div className="home-section-title">任务看板</div>
+          <div className="home-board-columns">
+            {/* Ordered act -> watch -> ignore. The urgent column is leftmost
+                because reading order is attention order, and a column that needs
+                a person must not sit behind two that do not. */}
+            <BoardColumn
+              title="等你处理"
+              tone="waiting"
+              cards={waiting}
+              empty="没有卡住的"
+              onDecide={(id, state) => void decideProposal(id, state)}
+            />
+            <BoardColumn
+              title="正在跑"
+              tone="running"
+              cards={inFlight}
+              empty="没有在跑的"
+            />
+            <BoardColumn
+              title="已排期"
+              tone="scheduled"
+              cards={scheduled}
+              empty="没有排期的"
+              more={
+                scheduledTotal > scheduled.length
+                  ? /* The rest is one click away: a board is glanced at, and
+                       thirty cards in this column is a list wearing a board's
+                       clothes. */
+                    `还有 ${scheduledTotal - scheduled.length} 个 · 全部`
+                  : ''
+              }
+              onMore={() => navigateTo('schedules')}
+            />
           </div>
         </section>
       )}

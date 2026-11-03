@@ -325,6 +325,18 @@ def patrol_tick(
                 continue
             if not proposal.action.strip():
                 continue
+            # The pass stamps its own findings.
+            #
+            # `rule_candidates` builds each proposal with `datetime.now()`, which
+            # is right when a rule is called directly and wrong when a pass runs
+            # at a time somebody chose: a replayed or backfilled pass would write
+            # timestamps from whenever it happened to execute. That is not
+            # cosmetic -- the daily budget windows on `created_at`, so a pass
+            # running "yesterday" would spend today's allowance. Found by a test
+            # that passed on the day it was written and failed the next morning,
+            # which is the signature of a clock leaking into policy.
+            proposal.created_at = now
+            proposal.expires_at = now + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
             # Declined is a fact, not a gap: a suggestion somebody already
             # answered must not come back in new words.
             prior = store.already_decided(proposal.source, proposal.action)

@@ -295,16 +295,41 @@ export interface HomeActivity {
   turn_count?: number
 }
 
+//: One card on the board. `at_kind` says what `at` means, because the three
+//: columns use it for three different facts (when it started / when it failed /
+//: when it will fire) and a single unlabelled timestamp would be ambiguous.
+export interface BoardCard {
+  task_id: string
+  //: Set only for proposals: a candidate task has no task id yet, and the board
+  //: still has to be able to act on it.
+  id?: string
+  name: string
+  kind: string
+  status: string
+  at: string
+  at_kind: 'started' | 'finished' | 'next' | 'created'
+  trigger_type: string
+  detail: string
+  session_id: string
+  reversibility?: string
+}
+
 //: `GET /api/home`: the landing page's one request.
+//:
+//: Three columns and a timeline. "Done" is deliberately not a column: finished
+//: work that needs nobody belongs in `activity`, and a board with a done column
+//: is a log with worse scanning.
 export interface HomeOverview {
   needs: {
     proposals: number
     failures: number
     newest_failure: { run_id: string; task_id: string; status: string } | null
   }
-  running: {
-    in_flight: { task_id: string; name: string; started_at: string; status: string }[]
-    next_up: { task_id: string; name: string; next_run_at: string }[]
+  board: {
+    running: BoardCard[]
+    waiting: BoardCard[]
+    scheduled: BoardCard[]
+    scheduled_total: number
   }
   activity: HomeActivity[]
   at: string

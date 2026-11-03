@@ -650,3 +650,65 @@ def test_the_queue_rule_reads_the_queue_s_own_age() -> None:
 
     assert [p.context["rule"] for p in proposals] == ["stale-queue"]
     assert "120" in proposals[0].reason, "the wait is what the reason names"
+
+
+def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
+    """Not with the wall clock.
+
+    The rules build proposals with `datetime.now()`, which is right when a rule is
+    called directly and wrong when a pass runs at a time somebody chose. The daily
+    budget windows on `created_at`, so a pass replaying "yesterday" would spend
+    today's allowance -- and a backfilled pass would carry timestamps from
+    whenever it happened to execute.
+
+    This is what caught it: `test_yesterday_s_proposals_do_not_count_against_today`
+    passed on the day it was written and failed the next morning, which is the
+    signature of a clock leaking into policy.
+    """
+    long_ago = NOW - timedelta(days=30)
+    session = _session(
+        "a",
+        attention=1,
+        last_activity=(long_ago - timedelta(hours=2)).isoformat(),
+    )
+
+    patrol_tick(
+        store=store,
+        sessions=[session],
+        now=long_ago,
+        options=PatrolOptions(),
+        suggest=rule_candidates,
+    )
+
+    row = store.list_proposals()[0]
+    assert row.created_at == long_ago, "the pass's own time, not the wall clock's"
+    assert row.expires_at == long_ago + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
+
+
+def test_a_replayed_pass_does_not_spend_a_later_day_s_budget(store) -> None:
+    """The consequence of the stamping, stated as the behaviour it protects."""
+    policy = AdmissionPolicy(max_proposals_per_day=1)
+    options = PatrolOptions(admission=policy)
+    long_ago = NOW - timedelta(days=30)
+    session = _session(
+        "a",
+        attention=1,
+        last_activity=(long_ago - timedelta(hours=2)).isoformat(),
+    )
+
+    patrol_tick(
+        store=store,
+        sessions=[session],
+        now=long_ago,
+        options=options,
+        suggest=rule_candidates,
+    )
+    today = patrol_tick(
+        store=store,
+        sessions=[_session("b", attention=1)],
+        now=NOW,
+        options=options,
+        suggest=rule_candidates,
+    )
+
+    assert today["proposed"] == 1, "a pass thirty days ago must not spend today's"

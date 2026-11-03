@@ -80,7 +80,7 @@ def build_home_overview(
     moment = now or datetime.now(UTC)
     return {
         "needs": _needs(scheduler_store, proposal_store),
-        "running": _running(scheduler_store),
+        "board": _board(scheduler_store, proposal_store=proposal_store, now=moment),
         "activity": _activity(scheduler_store, sessions, moment=moment),
         "at": moment.isoformat(),
     }
@@ -129,62 +129,188 @@ def _needs(scheduler_store: Any, proposal_store: Any) -> dict[str, Any]:
     }
 
 
-# ── what is happening now ──────────────────────────────────────────────────
+# ── the board: what is running, what is waiting, what is next ─────────────
 
 
-def _running(scheduler_store: Any) -> dict[str, Any]:
-    """Runs in flight, and what is next -- two different tenses of "busy".
+#: How many scheduled cards the board shows before saying "还有 N 个".
+#:
+#: A board is glanced at. Thirty cards in the third column is a list wearing a
+#: board's clothes -- the value of the column is "nothing surprising is coming",
+#: and that is answered by the three soonest plus a count.
+BOARD_SCHEDULED_PREVIEW = 3
 
-    ``in_flight`` is the backend's answer (see ``web_payloads.task_in_flight``),
-    not something derived here: a signal-woken run is written down as ``queued``
-    with no ``active_run_id`` until a tick claims it, so a reader that looked at
-    ``active_run_id`` alone would report "nothing running" in exactly the window
-    somebody is watching.
+
+def _board(
+    scheduler_store: Any, *, proposal_store: Any = None, now: datetime
+) -> dict[str, Any]:
+    """Three columns: 正在跑 / 等你处理 / 已排期.
+
+    Why these three and not four
+    ----------------------------
+    "已完成" is not a column here: finished work that needs nobody is the
+    *timeline*'s job (see ``_activity``), and the difference between a board and a
+    log is exactly that the board holds only what is still open. A board with a
+    "done" column is a log with worse scanning.
+
+    Why the order is running -> waiting -> waiting-on-you is *not* the order
+    ------------------------------------------------------------------------
+    The columns are ordered by how distant they are from needing a person:
+    something running needs nothing, something scheduled needs nothing yet, and
+    something that failed needs *you*. Reading left to right is reading from
+    "ignore" to "act", which is the direction attention actually travels.
+
+    Two queries, not N
+    ------------------
+    One ``list_tasks`` and one ``recent_runs``, then a group-by in memory. The
+    per-task ``list_runs`` version was a query per card, and a board is read on
+    every visit to the landing page.
     """
-    in_flight: list[dict[str, Any]] = []
-    next_up: list[dict[str, Any]] = []
+    empty: dict[str, Any] = {
+        "running": [],
+        "waiting": [],
+        "scheduled": [],
+        "scheduled_total": 0,
+    }
+    if scheduler_store is None:
+        return empty
     try:
-        if scheduler_store is None:
-            return {"in_flight": [], "next_up": []}
-        tasks = list(scheduler_store.list_tasks())
+        tasks = {task.id: task for task in scheduler_store.list_tasks()}
+        recent = scheduler_store.recent_runs(limit=200)
     except Exception:
-        return {"in_flight": [], "next_up": []}
+        return empty
 
-    for task in tasks:
+    # The newest run of each task. `recent_runs` leads with the running ones and
+    # then orders by finish time, so the first occurrence per task is its latest
+    # -- which is the one the card is about.
+    latest_by_task: dict[str, Any] = {}
+    for run, _task in recent:
+        latest_by_task.setdefault(str(run.task_id), run)
+
+    running: list[dict[str, Any]] = []
+    waiting: list[dict[str, Any]] = []
+    scheduled: list[dict[str, Any]] = []
+
+    # Proposals first in the waiting column: a proposal is *blocked* (it will not
+    # run without an answer), while a failed run has already happened and is only
+    # waiting to be read. Blocked work outranks read-later work.
+    waiting.extend(_proposal_cards(proposal_store))
+
+    for task_id, task in tasks.items():
         if not getattr(task, "enabled", True):
+            # A paused task is not "next": it will not run until somebody says so,
+            # and showing it in the scheduled column would be a promise it cannot
+            # keep. It is visible on 自动化, which is where it can be resumed.
             continue
-        try:
-            runs = scheduler_store.list_runs(task.id)
-        except Exception:
-            runs = []
-        latest = runs[-1] if runs else None
-        active = bool(getattr(task, "active_run_id", None)) or (
-            latest is not None and str(getattr(latest, "status", "")) in {"queued", "running"}
-        )
-        if active:
-            in_flight.append(
-                {
-                    "task_id": task.id,
-                    "name": task.name,
-                    "started_at": (
-                        latest.started_at.isoformat()
-                        if latest is not None and latest.started_at
-                        else ""
-                    ),
-                    "status": str(getattr(latest, "status", "") or "running") if latest else "running",
-                }
-            )
-        elif getattr(task, "next_run_at", None) is not None:
-            next_up.append(
-                {
-                    "task_id": task.id,
-                    "name": task.name,
-                    "next_run_at": task.next_run_at.isoformat(),
-                }
-            )
+        latest = latest_by_task.get(task_id)
+        status = str(getattr(latest, "status", "") or "") if latest is not None else ""
+        card = _card(task, latest)
 
-    next_up.sort(key=lambda item: item["next_run_at"])
-    return {"in_flight": in_flight, "next_up": next_up[:3]}
+        if status in {"queued", "running"} or getattr(task, "active_run_id", None):
+            running.append(card)
+        elif status in {"failed", "interrupted"} and getattr(
+            latest, "acknowledged_at", None
+        ) is None:
+            # Failed *and* nobody has looked. The acknowledgement is what makes a
+            # failure stop waiting: acknowledging is the act of having read it,
+            # and a board that kept showing read failures would teach people to
+            # ignore the column.
+            waiting.append(card)
+        elif getattr(task, "next_run_at", None) is not None:
+            scheduled.append(card)
+
+    running.sort(key=lambda item: item.get("at") or "")
+    # Oldest first in both: the thing that has been waiting longest is the one to
+    # deal with first. Proposals carry `created_at` as their `at`, so the two
+    # kinds sort together by how long they have been waiting.
+    waiting.sort(key=lambda item: item.get("at") or "")
+    scheduled.sort(key=lambda item: item.get("at") or "")
+
+    return {
+        "running": running,
+        "waiting": waiting,
+        "scheduled": scheduled[:BOARD_SCHEDULED_PREVIEW],
+        "scheduled_total": len(scheduled),
+    }
+
+
+def _proposal_cards(proposal_store: Any) -> list[dict[str, Any]]:
+    """Unanswered proposals, as board cards.
+
+    A proposal is not a task -- it is a *candidate* task, blocked on a person --
+    so it uses the board's card shape without pretending to have a run status.
+    ``status`` is empty and ``kind`` is ``proposal``; the renderer shows the
+    answer buttons for that kind and a status line for the others.
+    """
+    if proposal_store is None:
+        return []
+    try:
+        proposals = proposal_store.list_proposals(state="proposed", limit=10)
+    except Exception:
+        return []
+    cards: list[dict[str, Any]] = []
+    for proposal in proposals:
+        cards.append(
+            {
+                "task_id": "",  # not a task yet: `id` is the proposal's id
+                "id": str(getattr(proposal, "id", "") or ""),
+                "name": str(getattr(proposal, "action", "") or ""),
+                "kind": "proposal",
+                "status": "",
+                "at": (
+                    proposal.created_at.isoformat()
+                    if getattr(proposal, "created_at", None)
+                    else ""
+                ),
+                "at_kind": "created",
+                "trigger_type": "",
+                # The reason *is* the card: a person deciding on a proposal needs
+                # to know what was observed, and the action alone does not say.
+                "detail": str(getattr(proposal, "reason", "") or "")[:160],
+                "session_id": str(getattr(proposal, "source", "") or ""),
+                "reversibility": str(getattr(proposal, "reversibility", "") or ""),
+            }
+        )
+    return cards
+
+
+def _card(task: Any, latest: Any) -> dict[str, Any]:
+    """One board card: what it is, how it is doing, and when.
+
+    ``at`` means different things in different columns -- when it started for a
+    running card, when it failed for a waiting one, when it will fire for a
+    scheduled one. One field rather than three because a card is rendered by one
+    component, and three optional timestamps would make every card carry two
+    nulls it never uses. ``at_kind`` says which it is, so the label can be honest.
+    """
+    status = str(getattr(latest, "status", "") or "") if latest is not None else ""
+    started = getattr(latest, "started_at", None) if latest is not None else None
+    finished = getattr(latest, "finished_at", None) if latest is not None else None
+    next_run = getattr(task, "next_run_at", None)
+
+    if status in {"queued", "running"}:
+        at, at_kind = started, "started"
+    elif status in {"failed", "interrupted"}:
+        at, at_kind = finished or started, "finished"
+    else:
+        at, at_kind = next_run, "next"
+
+    return {
+        "task_id": str(getattr(task, "id", "") or ""),
+        "name": str(getattr(task, "name", "") or ""),
+        "kind": str(getattr(task, "kind", "") or ""),
+        "status": status,
+        "at": at.isoformat() if at is not None else "",
+        "at_kind": at_kind,
+        "trigger_type": str(getattr(getattr(task, "trigger", None), "trigger_type", "") or ""),
+        # The line under the title. A failure explains itself; everything else is
+        # silent, because a card that always carries a sentence becomes noise.
+        "detail": (
+            str(getattr(latest, "error", "") or getattr(latest, "summary", "") or "")[:160]
+            if status in {"failed", "interrupted"}
+            else ""
+        ),
+        "session_id": str(getattr(task, "session_id", "") or ""),
+    }
 
 
 # ── what happened ──────────────────────────────────────────────────────────
@@ -204,11 +330,19 @@ def _activity(
     """
     items: list[dict[str, Any]] = []
 
+    #: The timeline is "what happened", so a run that has not finished has not
+    #: happened yet. It is on the board (that is what the board is for), and
+    #: listing it here too made the same three in-flight tasks appear twice on the
+    #: same page -- once as work, once as history, in the same visit.
+    _still_running = {"queued", "running"}
+
     try:
         if scheduler_store is not None:
-            for run, task in scheduler_store.recent_runs(limit=ACTIVITY_LIMIT):
+            for run, task in scheduler_store.recent_runs(limit=ACTIVITY_LIMIT * 2):
                 # Prefer when it finished; a running one has no finish, so its start
                 # is the most recent thing true about it.
+                if str(getattr(run, "status", "") or "") in _still_running:
+                    continue
                 stamp = getattr(run, "finished_at", None) or getattr(run, "started_at", None)
                 items.append(
                     {
