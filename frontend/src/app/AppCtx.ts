@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
+import type { AttachmentInfo, AttentionRun, AutomationRow, AutonomyFunnel, HomeActivity, HomeOverview, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -180,6 +180,11 @@ export interface AppCtx {
   automations: AutomationRow[]
   automationsLoaded: boolean
   answeredProposals: ProposalRow[]
+  activityCursor: string
+  activityExhausted: boolean
+  activityLoading: boolean
+  olderActivity: HomeActivity[]
+  loadMoreActivity: () => Promise<void>
   home: HomeOverview | null
   homeLoaded: boolean
   loadHome: () => Promise<void>

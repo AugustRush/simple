@@ -633,3 +633,72 @@ def test_a_board_card_opens_its_task(page, live_gateway):
     assert "#/schedules" in page.url
     assert "看板测试任务" in page.locator(".ant-drawer-title").first.inner_text()
     assert page.errors == [], page.errors
+
+
+def test_the_timeline_can_load_older_pages(page, live_gateway):
+    """The home timeline is a preview; the history is behind "加载更早".
+
+    It used to offer "全部任务" instead, which sends somebody who asked "what
+    happened" into the screen where tasks are *managed*. Different question, so the
+    history now continues in place.
+
+    Seeded because the e2e gateway's home starts empty: a first page shorter than
+    the limit carries no cursor, which is the correct behaviour and the wrong
+    fixture.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path as _Path
+
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
+
+    now = datetime.now(timezone.utc)
+    # Explicit path: `open_store()` resolves a module-level default that is only
+    # rewritten by `_set_agent_home`, so it would point at the developer's home.
+    store = SchedulerStore(db_path=_Path(live_gateway["home"]) / "tasks" / "scheduler.db")
+    try:
+        for index in range(11):
+            moment = now - timedelta(hours=index + 1)
+            task = store.create_task(
+                NewScheduledTask(
+                    name=f"历史任务 {index}",
+                    kind="agent_prompt",
+                    trigger=TriggerSpec.once(moment.isoformat(), "UTC"),
+                    payload={"prompt": "p"},
+                    delivery_mode="standalone",
+                    delivery_target=DeliveryTarget.standalone(),
+                )
+            )
+            claimed = store.claim_task_now(task.id, now=moment)
+            if claimed is not None:
+                store.complete_run(
+                    task.id,
+                    claimed.run.id,
+                    finished_at=moment,
+                    status="succeeded",
+                    summary=f"第 {index} 次",
+                )
+    finally:
+        store.close()
+
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.wait_for_selector(".home-timeline-row", timeout=20_000)
+    before = page.locator(".home-timeline-row").count()
+
+    more = page.wait_for_selector(".home-timeline-more", timeout=20_000)
+    more.click()
+    page.wait_for_timeout(2000)
+
+    after = page.locator(".home-timeline-row").count()
+    assert after > before, f"the timeline did not grow ({before} -> {after})"
+    assert page.errors == [], page.errors

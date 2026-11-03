@@ -10,7 +10,7 @@ decorator: the lock is the store's, and a module function decorated with it woul
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from agent.scheduler.rows import _run_from_row, _task_from_row
 
@@ -61,6 +61,8 @@ def list_runs(
 def recent_runs(
     conn,
     limit: int = 20,
+    *,
+    before: Optional[str] = None,
 ) -> list[tuple[TaskRun, ScheduledTask]]:
     """Runs across *all* tasks, newest first, with the task each belongs to.
 
@@ -82,10 +84,18 @@ def recent_runs(
     fact there is, and sorting it below finished work from yesterday would be
     wrong twice.
     """
+    # ``before`` is a cursor, not an offset: the feed is append-only at the front,
+    # so an offset would repeat or skip rows whenever a run finished between two
+    # page loads -- exactly while somebody is reading the page.
+    where = "status IN ('queued', 'running') OR finished_at IS NOT NULL"
+    params: list[Any] = []
+    if before:
+        where += " AND finished_at IS NOT NULL AND finished_at < ?"
+        params.append(str(before))
     rows = conn.execute(
-        """
+        f"""
             SELECT * FROM scheduled_task_runs
-            WHERE status IN ('queued', 'running') OR finished_at IS NOT NULL
+            WHERE {where}
             ORDER BY
                 CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END,
                 finished_at DESC,
@@ -93,7 +103,7 @@ def recent_runs(
                 id DESC
             LIMIT ?
             """,
-        (max(1, int(limit)),),
+        (*params, max(1, int(limit))),
     ).fetchall()
     if not rows:
         return []

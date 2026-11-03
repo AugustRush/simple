@@ -49,7 +49,8 @@ def stores(tmp_path):
 
 
 class _Request:
-    query_params: dict = {}
+    def __init__(self, query: dict | None = None) -> None:
+        self.query_params = query or {}
 
     async def json(self) -> dict:
         return {}
@@ -358,7 +359,7 @@ def test_the_endpoint_returns_the_payload(stores) -> None:
     )
 
     assert status == 200
-    assert set(body) == {"needs", "board", "activity", "at"}
+    assert set(body) == {"needs", "board", "activity", "activity_next", "at"}
 
 
 def test_no_stores_is_an_empty_page_not_a_crash() -> None:
@@ -485,3 +486,90 @@ def test_a_waiting_card_does_not_say_it_succeeded(stores) -> None:
 
     (card,) = payload["board"]["waiting"]
     assert card["status"] == "failed", "the card is about the unread failure"
+
+
+# ── the timeline is a feed, not a fixed window ─────────────────────────────
+
+
+def test_the_first_page_publishes_a_cursor(stores) -> None:
+    """Without one, "加载更早" can never appear on the first visit.
+
+    The link was written to show only when the client held a cursor -- and the
+    client only got one *after* loading a second page, which it could not ask
+    for. A full first page has to say so.
+    """
+    scheduler, proposals = stores
+    for index in range(web_home.ACTIVITY_LIMIT + 2):
+        task = _task(scheduler, f"task {index}", at=NOW - timedelta(minutes=index))
+        _run(scheduler, task, status="succeeded", at=NOW - timedelta(minutes=index))
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    assert payload["activity_next"], "a full page must carry a cursor"
+
+
+def test_a_short_page_publishes_no_cursor(stores) -> None:
+    """Nothing older to ask for, so the link must not be offered."""
+    scheduler, proposals = stores
+    task = _task(scheduler, "只跑过一次")
+    _run(scheduler, task, status="succeeded")
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    assert payload["activity_next"] == ""
+
+
+def test_the_feed_pages_backwards_without_repeating(stores) -> None:
+    """A cursor, not an offset: the feed grows at the front, and an offset would
+    repeat or skip rows whenever a run finished between two page loads."""
+    scheduler, proposals = stores
+    for index in range(6):
+        task = _task(scheduler, f"task {index}", at=NOW - timedelta(minutes=index))
+        _run(scheduler, task, status="succeeded", at=NOW - timedelta(minutes=index))
+
+    first = asyncio.run(
+        web_home._activity_feed(
+            _Request(query={"limit": "3"}),
+            authorized=lambda r: True,
+            scheduler_store=scheduler,
+        )
+    )
+    first_body = json.loads(first.body)
+    assert len(first_body["activity"]) == 3
+    assert first_body["next_before"]
+
+    second = asyncio.run(
+        web_home._activity_feed(
+            _Request(query={"limit": "3", "before": first_body["next_before"]}),
+            authorized=lambda r: True,
+            scheduler_store=scheduler,
+        )
+    )
+    second_body = json.loads(second.body)
+
+    first_titles = [item["title"] for item in first_body["activity"]]
+    second_titles = [item["title"] for item in second_body["activity"]]
+    assert not set(first_titles) & set(second_titles), "pages must not overlap"
+    assert len(second_titles) == 3
+
+
+def test_the_feed_stops_at_the_end(stores) -> None:
+    scheduler, proposals = stores
+    task = _task(scheduler, "只有一个")
+    _run(scheduler, task, status="succeeded")
+
+    response = asyncio.run(
+        web_home._activity_feed(
+            _Request(query={"limit": "10"}),
+            authorized=lambda r: True,
+            scheduler_store=scheduler,
+        )
+    )
+
+    body = json.loads(response.body)
+    assert len(body["activity"]) == 1
+    assert body["next_before"] == "", "a short page is the last page"

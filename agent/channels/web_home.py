@@ -31,7 +31,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-__all__ = ["_home_overview", "build_home_overview"]
+__all__ = ["_activity_feed", "_home_overview", "build_home_overview"]
 
 UTC = timezone.utc
 
@@ -64,6 +64,40 @@ async def _home_overview(
     return JSONResponse(payload)
 
 
+async def _activity_feed(
+    request: Any, *, authorized, scheduler_store, sessions=None
+) -> Any:
+    """Older activity, for the "加载更早" link under the home timeline.
+
+    A cursor rather than a page number: the feed grows at the *front*, so an
+    offset would repeat or skip rows whenever a run finished between two page
+    loads -- which is exactly what happens while somebody is reading it.
+    """
+    from starlette.responses import JSONResponse
+
+    if not authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    before = str(request.query_params.get("before") or "").strip() or None
+    try:
+        limit = max(1, min(50, int(str(request.query_params.get("limit") or "20"))))
+    except ValueError:
+        limit = 20
+    try:
+        items = _activity(
+            scheduler_store, sessions, moment=datetime.now(UTC), before=before, limit=limit
+        )
+    except Exception as exc:
+        return JSONResponse({"error": f"读取活动失败：{exc}"}, status_code=500)
+    return JSONResponse(
+        {
+            "activity": items,
+            # The next cursor is the oldest item on this page. Empty when the page
+            # came back short, which is how the client knows to stop asking.
+            "next_before": items[-1]["at"] if len(items) >= limit else "",
+        }
+    )
+
+
 def build_home_overview(
     *,
     scheduler_store: Any = None,
@@ -78,10 +112,16 @@ def build_home_overview(
     configuration, not an error.
     """
     moment = now or datetime.now(UTC)
+    activity = _activity(scheduler_store, sessions, moment=moment)
     return {
         "needs": _needs(scheduler_store, proposal_store),
         "board": _board(scheduler_store, proposal_store=proposal_store, now=moment),
-        "activity": _activity(scheduler_store, sessions, moment=moment),
+        "activity": activity,
+        # A full first page means there *may* be more, so the page needs a cursor
+        # to ask with. Without this the "加载更早" link could never appear on the
+        # first visit -- the client had no cursor until after it had already
+        # loaded a second page, which it could not ask for.
+        "activity_next": activity[-1]["at"] if len(activity) >= ACTIVITY_LIMIT else "",
         "at": moment.isoformat(),
     }
 
@@ -379,6 +419,8 @@ def _activity(
     sessions: Optional[list[dict[str, Any]]],
     *,
     moment: datetime,
+    before: Optional[str] = None,
+    limit: int = ACTIVITY_LIMIT,
 ) -> list[dict[str, Any]]:
     """One timeline: runs and conversations, newest first.
 
@@ -396,7 +438,9 @@ def _activity(
 
     try:
         if scheduler_store is not None:
-            for run, task in scheduler_store.recent_runs(limit=ACTIVITY_LIMIT * 2):
+            for run, task in scheduler_store.recent_runs(
+                limit=max(limit * 2, ACTIVITY_LIMIT * 2), before=before
+            ):
                 # Prefer when it finished; a running one has no finish, so its start
                 # is the most recent thing true about it.
                 if str(getattr(run, "status", "") or "") in _still_running:
@@ -422,6 +466,11 @@ def _activity(
         raw = str(session.get("last_activity") or "")
         if not raw:
             continue
+        # A page asking for what happened *before* a moment must not be handed
+        # conversations from after it: the cursor applies to both kinds, or the
+        # second page repeats the first one's threads.
+        if before and raw >= before:
+            continue
         items.append(
             {
                 "kind": "thread",
@@ -440,7 +489,7 @@ def _activity(
         return stamp.timestamp() if stamp else 0.0
 
     items.sort(key=_key, reverse=True)
-    return items[:ACTIVITY_LIMIT]
+    return items[:limit]
 
 
 def _parse(raw: Any) -> Optional[datetime]:

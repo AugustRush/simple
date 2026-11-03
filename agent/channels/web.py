@@ -575,6 +575,24 @@ class WebChannel(Channel):
         except Exception:
             return None
 
+    async def _activity_feed(self, request: Any) -> Any:
+        sessions: list[dict[str, Any]] = []
+        try:
+            sessions = list(self._service().list_sessions(limit=50))
+        except Exception:
+            sessions = []
+        scheduler_store = self._scheduler_store()
+        try:
+            return await web_home._activity_feed(
+                request,
+                authorized=self._authorized,
+                scheduler_store=scheduler_store,
+                sessions=sessions,
+            )
+        finally:
+            if scheduler_store is not None:
+                scheduler_store.close()
+
     async def _home_overview(self, request: Any) -> Any:
         # The session list is the same one the sidebar reads, so "recent threads"
         # has one answer in this process rather than two that can disagree.
@@ -2878,6 +2896,8 @@ class WebChannel(Channel):
             # The landing page: needs / running / activity in one read, because the
             # page's question ("is anything waiting for me") must have one answer.
             Route("/api/home", self._home_overview, methods=["GET"]),
+            # Older activity for the timeline's "加载更早" link.
+            Route("/api/activity", self._activity_feed, methods=["GET"]),
             Route("/api/autonomy", self._autonomy_overview, methods=["GET"]),
             Route("/api/autonomy/proposals", self._autonomy_proposals, methods=["GET"]),
             Route("/api/autonomy/decide", self._autonomy_decide, methods=["POST"]),

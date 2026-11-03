@@ -188,12 +188,15 @@ function BoardColumn({
 
 export function renderHome(ctx: AppCtx) {
   const {
-    composerRef, creatingSession, decideProposal, home, homeLoaded, input,
-    navigateTo, openScheduleDetails, schedules, selectSession, sendMessage, setInput,
+    activityCursor, activityExhausted, activityLoading, composerRef, creatingSession, decideProposal,
+    home, homeLoaded, input, loadMoreActivity, navigateTo, olderActivity,
+    openScheduleDetails, schedules, selectSession, sendMessage, setInput,
   } = ctx
 
   const board = home?.board
-  const activity = home?.activity ?? []
+  // The first page plus whatever "加载更早" has pulled in. Kept separate from
+  // `home` so refreshing the landing view starts from the top again.
+  const activity = [...(home?.activity ?? []), ...olderActivity]
 
   const inFlight = board?.running ?? []
   const waiting = board?.waiting ?? []
@@ -365,11 +368,9 @@ export function renderHome(ctx: AppCtx) {
       <section className="home-activity">
         <div className="home-section-title">
           最近做了什么
-          {activity.length > 0 && (
-            <Button type="link" size="small" onClick={() => navigateTo('schedules')}>
-              全部任务
-            </Button>
-          )}
+          {/* No "全部任务" link any more: that page is where tasks are *managed*,
+              and sending somebody who asked "what happened" into a management
+              screen answers a different question. The history is below. */}
         </div>
         {!homeLoaded ? (
           <Skeleton active paragraph={{ rows: 4 }} title={false} />
@@ -381,7 +382,20 @@ export function renderHome(ctx: AppCtx) {
             className="page-empty"
           />
         ) : (
-          <div className="home-timeline">{activity.map(renderActivity)}</div>
+          <>
+            <div className="home-timeline">{activity.map(renderActivity)}</div>
+            {!activityExhausted && (activityCursor || home?.activity_next) && (
+              <Button
+                type="link"
+                size="small"
+                className="home-timeline-more"
+                loading={activityLoading}
+                onClick={() => void loadMoreActivity()}
+              >
+                加载更早
+              </Button>
+            )}
+          </>
         )}
       </section>
     </div>

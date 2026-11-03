@@ -336,6 +336,9 @@ export interface HomeOverview {
     scheduled_total: number
   }
   activity: HomeActivity[]
+  //: Cursor for the next page of the timeline. Empty when the first page came
+  //: back short -- which is how the page knows there is nothing older.
+  activity_next: string
   at: string
 }
 

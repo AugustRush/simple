@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
 import { msUntilNextRun } from '../lib/schedule'
 import { stepContent } from '../lib/workflow'
-import type { AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
+import type { AttentionRun, AutomationRow, AutonomyFunnel, HomeActivity, HomeOverview, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -246,16 +246,57 @@ export function useAutomation(deps: Deps) {
   const [home, setHome] = useState<HomeOverview | null>(null)
   const [homeLoaded, setHomeLoaded] = useState(false)
 
+  // Older pages of the timeline, kept beside `home` rather than inside it: the
+  // first page comes from `/api/home` and the rest are appended here, so a refresh
+  // of the landing view starts from the top again instead of re-playing every
+  // "加载更早" the reader ever clicked.
+  const [olderActivity, setOlderActivity] = useState<HomeActivity[]>([])
+  const [activityCursor, setActivityCursor] = useState('')
+  const [activityLoading, setActivityLoading] = useState(false)
+  //: Set once a page came back short. Without it the button stays forever: the
+  //: first page always carries a cursor (it is full), so "there is a cursor" and
+  //: "there is more" stop being the same statement after the first click.
+  const [activityExhausted, setActivityExhausted] = useState(false)
+
   const loadHome = useCallback(async () => {
     try {
       const data = await (await api('/api/home')).json()
       if (data && typeof data === 'object') setHome(data as HomeOverview)
+      setOlderActivity([])
+      setActivityCursor('')
+      setActivityExhausted(false)
       setHomeLoaded(true)
     } catch {
       // A failed read leaves the last known state on screen: an empty home page
       // would read as "nothing is happening", which is a claim we cannot make.
     }
   }, [api])
+
+  const loadMoreActivity = useCallback(async () => {
+    if (activityLoading) return
+    const before = activityCursor || home?.activity_next || ''
+    if (!before) return
+    setActivityLoading(true)
+    try {
+      const data = await (
+        await api(`/api/activity?before=${encodeURIComponent(before)}&limit=20`)
+      ).json()
+      const page: HomeActivity[] = Array.isArray(data.activity) ? data.activity : []
+      if (!page.length) {
+        setActivityCursor('')
+        setActivityExhausted(true)
+      } else {
+        setOlderActivity(prev => [...prev, ...page])
+        setActivityCursor(String(data.next_before || ''))
+        // A short page is the last page; a full one may have more behind it.
+        if (!data.next_before) setActivityExhausted(true)
+      }
+    } catch {
+      // Keep the button: the reader can try again.
+    } finally {
+      setActivityLoading(false)
+    }
+  }, [activityCursor, activityLoading, api, home])
 
   // ── the autonomy page ──────────────────────────────────────────────────
   //
@@ -835,5 +876,5 @@ export function useAutomation(deps: Deps) {
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-  return { acknowledgeScheduleRun, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadAutonomy, proposalCounts, proposals, proposalsLoaded, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
+  return { acknowledgeScheduleRun, activityCursor, activityExhausted, activityLoading, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadMoreActivity, olderActivity, loadAutonomy, proposalCounts, proposals, proposalsLoaded, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }
