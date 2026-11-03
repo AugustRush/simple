@@ -27,6 +27,7 @@ import {
 import {
   AutoComplete,
   Button,
+  Checkbox,
   Empty,
   Input,
   Modal,
@@ -106,8 +107,7 @@ export function renderMemory(ctx: AppCtx) {
     sessions,
     setMemoryTab,
     toggleMemoryPin,
-    updateMemoryDraft,
-  } = ctx
+    updateMemoryDraft, clearAllMemory, clearMemorySelection, deleteSelectedMemoryEntries, selectedMemoryIds, toggleMemorySelected } = ctx
 
   const categoryOptions = [
     { value: '', label: '全部分类' },
@@ -145,8 +145,32 @@ export function renderMemory(ctx: AppCtx) {
     </Empty>
   ) : null
 
+  const selectionBar = selectedMemoryIds.length > 0 ? (
+    <div className="memory-selection-bar">
+      <span>已选 {selectedMemoryIds.length} 条</span>
+      <div className="memory-selection-actions">
+        <Button size="small" onClick={clearMemorySelection}>
+          取消选择
+        </Button>
+        <Popconfirm
+          title={`删除选中的 ${selectedMemoryIds.length} 条记忆？`}
+          description="它们会从库里消失，之后不会再被检索到。"
+          okText="删除"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+          onConfirm={() => void deleteSelectedMemoryEntries()}
+        >
+          <Button size="small" danger loading={memoryBusy}>
+            删除所选
+          </Button>
+        </Popconfirm>
+      </div>
+    </div>
+  ) : null
+
   const entryList = memoryEntries.length ? (
     <div className="memory-list">
+      {selectionBar}
       {memoryEntries.map((entry: MemoryEntry) => {
         const pinned = Boolean(entry.pinned)
         const source = sourceLabel(entry.source_session, sessions)
@@ -156,6 +180,12 @@ export function renderMemory(ctx: AppCtx) {
           sessions.some(item => item.session_id === entry.source_session)
         return (
           <div className={`memory-row${pinned ? ' is-pinned' : ''}`} key={entry.id}>
+            <Checkbox
+              className="memory-row-check"
+              checked={selectedMemoryIds.includes(entry.id)}
+              onChange={() => toggleMemorySelected(entry.id)}
+              aria-label={`选择记忆 ${entry.content.slice(0, 16)}`}
+            />
             <div className="memory-row-main">
               <div className="memory-row-text">{entry.content}</div>
               <div className="memory-row-meta">
@@ -323,6 +353,27 @@ export function renderMemory(ctx: AppCtx) {
         <Button type="primary" icon={<PlusOutlined />} onClick={openMemoryCreate}>
           新增记忆
         </Button>
+        {/* The one irreversible button on this page, so it is the one that asks a
+            second time. Deleting entries one at a time can be undone by saying the
+            thing again; this removes the facts derived from them too. */}
+        <Popconfirm
+          title="清空全部记忆？"
+          description={
+            <span>
+              笔记和从它们推出来的事实都会被删除，之后它不再记得任何事。
+              <br />
+              这个操作不能撤销。
+            </span>
+          }
+          okText="清空"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+          onConfirm={() => void clearAllMemory()}
+        >
+          <Button size="small" danger icon={<DeleteOutlined />} disabled={memoryBusy}>
+            清空
+          </Button>
+        </Popconfirm>
       </div>
     </div>
   )

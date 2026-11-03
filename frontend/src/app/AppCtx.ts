@@ -120,10 +120,6 @@ export interface AppCtx {
   // "none match the search".
   sessions: SessionInfo[]
   filteredSessions: SessionInfo[]
-  allFilteredSessionsSelected: boolean
-  selectedSessionIds: string[]
-  setSelectedSessionIds: Dispatch<SetStateAction<string[]>>
-  deleteSelectedSessions: () => void
   sessionSearch: string
   setSessionSearch: Dispatch<SetStateAction<string>>
   loadingSessions: boolean
@@ -180,6 +176,8 @@ export interface AppCtx {
   automations: AutomationRow[]
   automationsLoaded: boolean
   answeredProposals: ProposalRow[]
+  boardOpen: boolean
+  setBoardOpen: (next: boolean) => void
   activityCursor: string
   activityExhausted: boolean
   activityLoading: boolean
@@ -299,6 +297,11 @@ export interface AppCtx {
   closeMemoryEditor: () => void
   updateMemoryDraft: (patch: Partial<MemoryDraft>) => void
   saveMemoryEntry: () => Promise<void>
+  clearAllMemory: () => Promise<void>
+  clearMemorySelection: () => void
+  deleteSelectedMemoryEntries: () => Promise<void>
+  selectedMemoryIds: string[]
+  toggleMemorySelected: (entryId: string) => void
   deleteMemoryEntry: (entry: MemoryEntry) => Promise<void>
   toggleMemoryPin: (entry: MemoryEntry) => Promise<void>
   forgetMemoryFact: (fact: MemoryFact) => Promise<void>

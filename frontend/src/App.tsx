@@ -1,5 +1,5 @@
 import { CloseOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MenuOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
-import { Button, ConfigProvider, Dropdown, Empty, Input, Layout, Menu, Modal, Skeleton, theme, Tooltip } from 'antd'
+import { Badge, Button, ConfigProvider, Drawer, Dropdown, Empty, Input, Layout, Menu, Modal, Skeleton, theme, Tooltip } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
 import React from 'react'
@@ -8,7 +8,7 @@ import './index.css'
 import type { AppCtx } from './app/AppCtx'
 import { renderChat } from './views/chat'
 import { renderHome } from './views/home'
-import { renderSessions } from './views/sessions'
+import { renderBoardPanel } from './views/board'
 import { renderExtensions } from './views/extensions'
 import { renderMemory } from './views/memory'
 import { renderAutonomy } from './views/autonomy'
@@ -84,13 +84,13 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { clock, collapsed, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setSearchOpen, setThemeMode, themeMode, view } = ui
+  const { boardOpen, clock, collapsed, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setSearchOpen, setThemeMode, themeMode, view } = ui
 
   const { contextHolder, messageApi, token } = apiClient
 
   const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
-  const { activateTurnIndex, activeSession, startNewSession, activity, allFilteredSessionsSelected, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
+  const { activateTurnIndex, activeSession, startNewSession, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSendShortcut, setSessionSearch, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
@@ -245,10 +245,6 @@ function App() {
     pageMeta,
     sessions,
     filteredSessions,
-    allFilteredSessionsSelected,
-    selectedSessionIds,
-    setSelectedSessionIds,
-    deleteSelectedSessions,
     sessionSearch,
     setSessionSearch,
     loadingSessions,
@@ -309,6 +305,8 @@ function App() {
     automationsLoaded,
     answeredProposals,
     funnel,
+    boardOpen,
+    setBoardOpen,
     activityCursor,
     activityExhausted,
     activityLoading,
@@ -389,10 +387,15 @@ function App() {
 
   const { renderSettings } = createSettingsView(ctx)
 
+  /** How many things the board's first group is holding, for the badge.
+   *
+   * Read from the same `home` payload the panel renders: a badge counting its own
+   * way is the two-numbers-disagree bug that already cost a round. */
+  const boardWaiting = Number((home as { board?: { waiting?: unknown[] } })?.board?.waiting?.length || 0)
+
   const renderCurrentView = () => {
     if (view === 'home') return renderHome(ctx)
     if (view === 'chat') return renderChat(ctx)
-    if (view === 'sessions') return renderSessions(ctx)
     if (view === 'extensions') return renderExtensions(ctx)
     if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)
@@ -501,16 +504,10 @@ function App() {
           <div className="session-panel">
             <div className="session-panel-label">
               线程
-              {filteredSessions.length > 0 && (
-                <Button
-                  type="link"
-                  size="small"
-                  className="sider-threads-all"
-                  onClick={() => navigateTo('sessions')}
-                >
-                  全部 {filteredSessions.length}
-                </Button>
-              )}
+              {/* No "全部 N" link. It opened a page whose only unique job was
+                  bulk delete, and the row menu already renames and deletes; a
+                  screen that lists the same threads as this list, one click
+                  deeper, was the page saying nothing twice. */}
             </div>
             {loadingSessions ? (
               <Skeleton active paragraph={{ rows: 5 }} title={false} />
@@ -707,10 +704,43 @@ function App() {
                 <div className="page-subtitle">{currentMeta.subtitle}</div>
               </div>
             </div>
+            {/* The board lives behind this button, on every page: it is a *state*
+                panel rather than one page's content, and a person watching a task
+                run should be able to open it without losing where they were. The
+                badge is the only thing here that speaks up -- a count over zero. */}
+            <div className="header-right">
+              <Badge count={boardWaiting} size="small" offset={[-2, 4]}>
+                <Button
+                  type="text"
+                  className="header-board"
+                  aria-label={boardOpen ? '收起看板' : '打开看板'}
+                  aria-expanded={boardOpen}
+                  onClick={() => setBoardOpen(!boardOpen)}
+                >
+                  看板
+                </Button>
+              </Badge>
+            </div>
           </Header>
           <Content className="app-content">{renderCurrentView()}</Content>
         </Layout>
       </Layout>
+
+      {/* No mask: the panel is a control you keep open while working, not a modal
+          that stops the page until answered. Closing is the same button that
+          opened it. */}
+      <Drawer
+        placement="right"
+        width={380}
+        open={boardOpen}
+        onClose={() => setBoardOpen(false)}
+        mask={false}
+        rootClassName="board-drawer"
+        title="任务看板"
+        styles={{ body: { padding: '8px 12px 16px' } }}
+      >
+        {renderBoardPanel(ctx)}
+      </Drawer>
 
       {/* Not the bar itself: an approval is answerable only in the conversation
           that raised it, and a full-width alertdialog over 设置 or 任务 takes the

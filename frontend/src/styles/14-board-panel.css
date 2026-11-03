@@ -1,0 +1,117 @@
+/* The board panel: a right rail you pull out, not a block on the page.
+ *
+ * Width is fixed at 380px because the three groups stack here instead of sitting
+ * side by side: three columns need ~700px, and a rail that wide is a second main
+ * column rather than a panel. Stacked, the same information reads top to bottom
+ * in the same order -- 等你处理 (a person is blocked), 正在跑 (alive), 已排期
+ * (future). Same argument as the wide board, turned ninety degrees. */
+
+.board-drawer .ant-drawer-body { display: flex; flex-direction: column; }
+.panel-body { display: flex; flex-direction: column; gap: 18px; }
+
+.panel-group { display: flex; flex-direction: column; gap: 6px; }
+.panel-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-group-title { color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+/* A count is a badge only when there is something to count: "0" beside a heading
+   is a number that answers nothing. */
+.panel-group-count { color: var(--text-muted); font-size: 10px; }
+.panel-group-empty { padding: 2px 0; color: var(--text-muted); font-size: 11px; line-height: 1.6; }
+.panel-group-more { padding: 0; height: auto; align-self: flex-start; font-size: 10px; }
+
+.panel-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+/* The left edge says which group the card is in before the heading is read. */
+.panel-group-waiting .panel-card { border-left: 2px solid var(--red); }
+.panel-group-running .panel-card { border-left: 2px solid var(--primary); }
+.panel-group-scheduled .panel-card { border-left: 2px solid var(--border-strong, var(--border)); }
+.panel-card strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.panel-card-meta { color: var(--text-muted); font-size: 10px; }
+/* A failure's own words, clamped: the card is a pointer to the task, not the
+   place the failure is diagnosed. */
+.panel-card-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.panel-card-open { cursor: pointer; transition: background .14s ease; }
+.panel-card-open:hover { background: var(--surface-hover); }
+.panel-card-open:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+/* A proposal carries the answer, so it is the one card that is taller and the one
+   whose buttons must not be mistaken for the card's own click. */
+.panel-card-proposal { background: var(--surface-raised, var(--surface)); }
+.panel-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 5px;
+}
+.panel-card-tag { margin: 0 auto 0 0; font-size: 10px; line-height: 16px; }
+
+.panel-empty { padding: 12px 2px; color: var(--text-secondary); font-size: 12px; }
+.panel-empty p { margin: 0 0 6px; }
+.panel-empty-hint { color: var(--text-muted); font-size: 11px; line-height: 1.7; }
+
+/* ── the header control ───────────────────────────────────────────────────── */
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.header-board { color: var(--text-secondary); font-size: 12px; }
+.header-board:hover { color: var(--text); }
+.header-board:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+/* The one line on 主页 that says a panel has something in it. A line, not cards:
+   the page's job is to be out of the way of asking something, and the detail is
+   one click away in the panel. */
+.home-needs-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--primary-border);
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.home-needs-line:hover { color: var(--text); border-color: var(--focus-ring); }
+.home-needs-line:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.home-needs-line span { color: var(--text-muted); }
+
+/* The panel starts below the app header, not over it.
+ *
+ * A drawer that covers the whole height hides the control that opens it: the
+ * header's 看板 button ends up under the panel's own title bar, so the same button
+ * cannot close what it opened -- and the aria-label says it can. Offsetting the
+ * wrapper keeps the toggle reachable and the two ways out (this button, the
+ * panel's own ×) both honest.
+ */
+.board-drawer .ant-drawer-content-wrapper {
+  top: 68px !important;
+  height: calc(100% - 68px) !important;
+}

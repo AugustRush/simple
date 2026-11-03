@@ -6,7 +6,6 @@ import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
 import { compareSessions, isInTurnUserMessage, isSessionBusy, sessionStateBusy } from '../lib/tools'
 import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState } from '../types'
-import { Modal } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
@@ -34,7 +33,6 @@ export function useConversations(deps: Deps) {
 
   const [sessions, setSessions] = useState<SessionInfo[]>([])
 
-  const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([])
 
   const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null)
 
@@ -359,9 +357,6 @@ export function useConversations(deps: Deps) {
       )
       sessionsLoadedRef.current = true
       setSessions(nextSessions)
-      setSelectedSessionIds(current =>
-        current.filter(id => nextSessions.some((item: SessionInfo) => item.session_id === id)),
-      )
       return nextSessions as SessionInfo[]
     } catch {
       // API errors are surfaced by the shared request helper.
@@ -1910,54 +1905,6 @@ export function useConversations(deps: Deps) {
     selectSession(sid)
   }
 
-  const deleteSelectedSessions = () => {
-    const ids = selectedSessionIds.filter(id => sessions.some(item => item.session_id === id))
-    if (!ids.length) return
-    Modal.confirm({
-      title: `删除选中的 ${ids.length} 个会话？`,
-      content: '历史记录将被永久删除，此操作无法撤销。',
-      okText: '批量删除',
-      okButtonProps: { danger: true },
-      cancelText: '取消',
-      onOk: async () => {
-        try {
-          const resp = await api('/api/sessions', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_ids: ids }),
-          })
-          const data = await resp.json()
-          for (const id of data.deleted || []) {
-            try { localStorage.removeItem(`chat_messages:${id}`) } catch { /* ignore */ }
-          }
-          try {
-            const raw = localStorage.getItem('chat_messages:index')
-            const index = raw ? (JSON.parse(raw) as string[]).filter(id => !(data.deleted || []).includes(id)) : []
-            localStorage.setItem('chat_messages:index', JSON.stringify(index))
-          } catch { /* ignore */ }
-          if (activeSession && (data.deleted || []).includes(activeSession)) {
-            activeSessionRef.current = null
-            setActiveSession(null)
-            setMessages([])
-            messagesRef.current = []
-            streamIdRef.current = null
-            queuedMessagesRef.current = []
-            setQueuedMessages([])
-            setSessionState(null)
-          }
-          setSelectedSessionIds([])
-          await loadSessions()
-          const failed = (data.failed || []).length
-          messageApi[failed ? 'warning' : 'success'](
-            failed ? `已删除 ${data.deleted?.length || 0} 个，${failed} 个失败` : `已删除 ${data.deleted?.length || 0} 个会话`,
-          )
-        } catch {
-          // api() surfaces the server error.
-        }
-      },
-    })
-  }
-
   const updateSessionPermissions = async (patch: { level?: string; sandbox?: string }) => {
     if (!activeSession) {
       messageApi.info('请先选择或新建会话')
@@ -2000,8 +1947,6 @@ export function useConversations(deps: Deps) {
     return [...filtered].sort(compareSessions)
   }, [sessions, sessionSearch])
 
-  const allFilteredSessionsSelected = filteredSessions.length > 0 &&
-    filteredSessions.every(item => selectedSessionIds.includes(item.session_id))
 
   const filteredCommands = useMemo(() => {
     const query = input.startsWith('/')
@@ -2322,5 +2267,5 @@ export function useConversations(deps: Deps) {
     !isStreaming &&
     String(sessionState?.operation_state || 'idle') === 'idle'
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, startNewSession, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, startNewSession, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

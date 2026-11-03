@@ -176,96 +176,20 @@
   font-size: 10px;
 }
 
-/* ── the board ─────────────────────────────────────────────────────────────
-   Three columns, ordered by distance from needing a person: waiting on you
-   (needs a person now) -> running (nothing needed, just alive) -> scheduled
-   (nothing needed yet). The order is not "progress left to right" -- it is
-   "act to ignore", which is the direction attention travels on opening the
-   page, and the urgent column must not sit behind two that need nothing. */
-.home-board-columns {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  align-items: start;
-}
-.home-column {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-  padding: 10px 10px 8px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-}
-.home-column-head { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
-.home-column-title { color: var(--text-secondary); font-size: 11px; font-weight: 600; }
-/* The count is a badge only when there is something to count: a "0" beside a
-   heading is a number that answers nothing. */
-.home-column-count { color: var(--text-muted); font-size: 10px; }
-.home-column-body { display: flex; flex-direction: column; gap: 6px; min-height: 44px; }
-.home-column-empty { color: var(--text-muted); font-size: 11px; line-height: 1.6; }
-.home-column-more { padding: 0; height: auto; align-self: flex-start; font-size: 10px; }
-
-.home-card-tile {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 8px 9px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-hover);
-}
-/* A left edge per column: the tone is legible before the label is read. */
-.home-card-running { border-left: 2px solid var(--primary); }
-.home-card-waiting { border-left: 2px solid var(--red); }
-.home-card-scheduled { border-left: 2px solid var(--border-strong, var(--border)); }
-.home-card-tile strong {
-  overflow: hidden;
-  color: var(--text);
-  font-size: 11px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.home-tile-meta { color: var(--text-muted); font-size: 10px; }
-/* A failure's own words, clamped: the card is a pointer to the task, not the
-   place the failure is diagnosed. */
-.home-tile-detail {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--text-secondary);
-  font-size: 10px;
-  line-height: 1.5;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-@media (max-width: 900px) {
-  .home-board-columns { grid-template-columns: 1fr; }
-}
-
-/* A proposal card carries an answer, so it is taller than the others and has its
-   own tone: it is the one card on the board that is *blocked* on the reader. */
-.home-card-proposal {
-  border-left: 2px solid var(--primary);
-  background: var(--surface);
-}
-.home-tile-actions {
+/* ── memory: ticks, the selection bar, and the one irreversible button ──── */
+.memory-row { display: flex; align-items: flex-start; gap: 8px; }
+.memory-row-check { margin-top: 4px; flex: 0 0 auto; }
+.memory-selection-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-top: 4px;
+  gap: 12px;
+  margin-bottom: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--primary-border);
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--text-secondary);
+  font-size: 11px;
 }
-.home-tile-tag { margin: 0; font-size: 10px; line-height: 16px; }
-
-/* A task card is a way in, so it has to look like one: the pointer and the hover
-   are the whole affordance, and without them a clickable card is a secret. */
-.home-card-open { cursor: pointer; }
-.home-card-open:hover { background: var(--surface-hover); filter: brightness(1.15); }
-.home-card-open:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-
-/* The history's own continuation. Left-aligned under the list so it reads as the
-   list's next page rather than as a section of its own. */
-.home-timeline-more { align-self: flex-start; padding: 2px 0; font-size: 11px; }
+.memory-selection-actions { display: flex; gap: 6px; }

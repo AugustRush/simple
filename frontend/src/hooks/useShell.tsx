@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, FolderOpenOutlined, HomeOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, HomeOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor } from '../lib/route'
@@ -358,9 +358,6 @@ export function useShell(deps: Deps) {
     const destinations = [
       { view: 'home', label: '主页', icon: <HomeOutlined />, terms: 'home 主页 首页' },
       { view: 'chat', label: '对话', icon: <MessageOutlined />, terms: 'chat' },
-      // Still a destination, just not a navigation slot: the page exists for bulk
-      // delete and rename, which is maintenance rather than a place you work.
-      { view: 'sessions', label: '全部线程', icon: <FolderOpenOutlined />, terms: 'sessions threads 会话 线程' },
       { view: 'extensions', label: '扩展', icon: <AppstoreOutlined />, terms: '插件 技能 extensions plugins skills' },
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
       { view: 'autonomy', label: '自主', icon: <CompassOutlined />, terms: '自主 提议 proposals autonomy patrol' },

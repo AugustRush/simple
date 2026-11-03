@@ -1633,6 +1633,16 @@ class WebChannel(Channel):
             request, authorized=self._authorized, store=self._memory_store()
         )
 
+    async def _memory_delete_entries(self, request: Any) -> Any:
+        return await web_memory._memory_delete_entries(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
+    async def _memory_clear(self, request: Any) -> Any:
+        return await web_memory._memory_clear(
+            request, authorized=self._authorized, store=self._memory_store()
+        )
+
     async def _memory_delete_entry(self, request: Any) -> Any:
         return await web_memory._memory_delete_entry(
             request, authorized=self._authorized, store=self._memory_store()
@@ -2951,6 +2961,15 @@ class WebChannel(Channel):
                 self._memory_delete_entry,
                 methods=["DELETE"],
             ),
+            # Bulk delete and clear. Both are one request because a page that
+            # looped single deletes could stop halfway and leave a memory that is
+            # neither cleared nor intact.
+            Route(
+                "/api/memory/entries/delete",
+                self._memory_delete_entries,
+                methods=["POST"],
+            ),
+            Route("/api/memory/clear", self._memory_clear, methods=["POST"]),
             Route("/api/memory/facts", self._memory_facts, methods=["GET"]),
             Route(
                 "/api/memory/facts/forget",

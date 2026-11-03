@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 __all__ = [
+    "_memory_clear",
+    "_memory_delete_entries",
     "_memory_overview",
     "_memory_entries",
     "_memory_create_entry",
@@ -324,6 +326,74 @@ async def _memory_delete_entry(request: Any, *, authorized, store) -> Any:
     if not removed:
         return JSONResponse({"error": "没有这条记忆（可能已被删除）"}, status_code=404)
     return JSONResponse({"ok": True, "id": entry_id})
+
+
+async def _memory_delete_entries(request: Any, *, authorized, store) -> Any:
+    """Delete several entries in one request.
+
+    Multi-select is not a UI convenience here: the entries are independent rows
+    with no relations, so running twelve deletes from the page would be twelve
+    round trips that can half-fail -- and a half-cleaned memory is the worst of
+    the three outcomes. One request reports what it removed *and* what it could
+    not, so the page can say which.
+    """
+    from starlette.responses import JSONResponse
+
+    if not authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if store is None:
+        return _unavailable()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid json body"}, status_code=400)
+    raw = body.get("ids")
+    if not isinstance(raw, list) or not raw:
+        return JSONResponse({"error": "ids must be a non-empty list"}, status_code=400)
+    ids = [str(item).strip() for item in raw if str(item).strip()]
+    if not ids:
+        return JSONResponse({"error": "ids must be a non-empty list"}, status_code=400)
+
+    removed: list[str] = []
+    missing: list[str] = []
+    for entry_id in ids:
+        try:
+            if store.delete_entry(entry_id):
+                removed.append(entry_id)
+            else:
+                missing.append(entry_id)
+        except Exception:
+            missing.append(entry_id)
+    return JSONResponse({"ok": True, "removed": removed, "missing": missing})
+
+
+async def _memory_clear(request: Any, *, authorized, store) -> Any:
+    """Erase everything the model can retrieve about the person.
+
+    Separate from the bulk delete because it is a different act, not a longer
+    list: this one removes *facts* as well as notes, and the store's own method is
+    what decides how far that reaches -- a page that reimplemented "clear" with a
+    loop over entries would leave every resolved belief behind.
+    """
+    from starlette.responses import JSONResponse
+
+    if not authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if store is None:
+        return _unavailable()
+    try:
+        deleted = store.clear_persistent_memory()
+    except Exception as exc:
+        return JSONResponse({"error": f"清空记忆失败：{exc}"}, status_code=500)
+    return JSONResponse(
+        {
+            "ok": True,
+            "deleted": int(sum((deleted or {}).values())),
+            "deleted_by_store": deleted or {},
+        }
+    )
 
 
 async def _memory_facts(request: Any, *, authorized, store) -> Any:

@@ -157,8 +157,25 @@ def test_an_irreversible_proposal_is_never_acted_on(store, tmp_path) -> None:
 
 
 def test_a_pass_expires_what_nobody_answered(store) -> None:
-    """Expiry belongs to the pass: the table is what the next pass reads."""
-    store.record(Proposal(source="old", action="a"))
+    """Expiry belongs to the pass: the table is what the next pass reads.
+
+    The proposal is built with its own timestamps rather than letting the dataclass
+    fill them from the wall clock. It used to rely on that, which made the test pass
+    in the morning and fail in the evening: the pass runs at a fixed simulated
+    ``NOW + 2 days``, and whether the default expiry had already passed by then
+    depended on what time of day the suite happened to run.
+    """
+    from agent.autonomy import DEFAULT_EXPIRY_SECONDS
+
+    created = NOW - timedelta(seconds=DEFAULT_EXPIRY_SECONDS + 60)
+    store.record(
+        Proposal(
+            source="old",
+            action="a",
+            created_at=created,
+            expires_at=created + timedelta(seconds=DEFAULT_EXPIRY_SECONDS),
+        )
+    )
     service = PatrolService(store=store, sessions_provider=lambda: [])
 
     result = asyncio.run(service.tick(now=NOW + timedelta(days=2)))

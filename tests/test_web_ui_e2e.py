@@ -437,6 +437,8 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
     # the way in, which is the box above it. Threads are not listed on this page
     # any more: they are in the sidebar, and listing them twice said nothing new.
     assert page.locator(".home-thread").count() == 0, "the sidebar owns the thread list"
+    # The board is a panel now, so the page itself carries no board groups.
+    assert page.locator(".panel-group").count() == 0, "the board belongs to the panel"
     if page.locator(".home-timeline-row").count():
         assert page.locator(".home-timeline-row").first.inner_text().strip()
     else:
@@ -543,27 +545,31 @@ def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
         store.close()
 
     page.goto(page.url.split("#")[0], wait_until="networkidle")
-    page.wait_for_selector(".home-card-proposal", timeout=20_000)
+    # The board is behind the header's 看板 button now, closed by default: a 380px
+    # rail that appears before anybody asks takes a quarter of the window from the
+    # thing they came for.
+    page.locator(".header-board").click()
+    page.wait_for_selector(".panel-card-proposal", timeout=20_000)
 
-    # Three columns, in attention order: the column that needs a person leads.
+    # Three groups, in attention order: the one that needs a person leads.
     titles = [
-        page.locator(".home-column-title").nth(i).inner_text().strip()
-        for i in range(page.locator(".home-column-title").count())
+        page.locator(".panel-group-title").nth(i).inner_text().strip()
+        for i in range(page.locator(".panel-group-title").count())
     ]
     assert titles == ["等你处理", "正在跑", "已排期"], titles
 
     # By text, not by position: the autonomy page's test seeds its own proposals
     # into the same gateway home, so "the first card" is whichever ran first.
-    card = page.locator(".home-card-proposal").filter(has_text="读一遍那 2 次失败的运行")
+    card = page.locator(".panel-card-proposal").filter(has_text="读一遍那 2 次失败的运行")
     assert card.count() == 1, "the proposal this test seeded is not on the board"
     assert "有 2 次运行结束得不好" in card.first.inner_text(), (
         "the reason is what a decision needs"
     )
 
-    before = page.locator(".home-card-proposal").count()
+    before = page.locator(".panel-card-proposal").count()
     card.first.locator("button").first.click()
     page.wait_for_timeout(2500)
-    after = page.locator(".home-card-proposal").count()
+    after = page.locator(".panel-card-proposal").count()
     assert after == before - 1, f"the answered card was not dropped ({before} -> {after})"
     assert page.errors == [], page.errors
 
@@ -626,14 +632,20 @@ def test_a_board_card_opens_its_task(page, live_gateway):
         store.close()
 
     page.goto(page.url.split("#")[0], wait_until="networkidle")
-    card = page.locator(".home-card-open").filter(has_text="看板测试任务")
+    page.locator(".header-board").click()
+    page.wait_for_timeout(600)
+    card = page.locator(".panel-card-open").filter(has_text="看板测试任务")
     card.first.wait_for(timeout=20_000)
     card.first.click()
 
     # The drawer lives on 自动化, so arriving there is part of opening it.
     page.wait_for_selector(".ant-drawer-open", timeout=20_000)
     assert "#/schedules" in page.url
-    assert "看板测试任务" in page.locator(".ant-drawer-title").first.inner_text()
+    # The open drawer only. antd keeps a closed drawer's DOM, so `.ant-drawer-title`
+    # also matches the board panel that this click just folded away -- and reading
+    # the first one would report the panel's title as the task's.
+    title = page.locator(".ant-drawer-open .ant-drawer-title").first.inner_text()
+    assert "看板测试任务" in title, title
     assert page.errors == [], page.errors
 
 

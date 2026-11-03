@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { parseRoute } from '../lib/route'
 
 export function useUi() {
@@ -11,6 +11,30 @@ export function useUi() {
   //: a page that asked for 设置, and the address-bar writer would then record
   //: the wrong address before the correction.
   const [view, setView] = useState<string>(() => parseRoute(window.location.hash).view)
+  //: Whether the board panel is pulled out. Shell state, not page state, because
+  //: pages here are plain render functions rather than components: a `useState`
+  //: inside one runs only while that view is current, and React counts hooks per
+  //: component -- a varying count is error #300, a blank page.
+  //:
+  //: **Closed by default.** A 380px rail that appears before anybody asks takes a
+  //: quarter of the window from the thing they came for; the header button carries
+  //: a count when there is something to see, so "nothing is hidden" does not depend
+  //: on the panel being open. Once opened, the choice is remembered.
+  const [boardOpen, setBoardOpenState] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('simple.board.panelOpen') === '1'
+    } catch {
+      return false
+    }
+  })
+  const setBoardOpen = useCallback((next: boolean) => {
+    setBoardOpenState(next)
+    try {
+      window.localStorage.setItem('simple.board.panelOpen', next ? '1' : '0')
+    } catch {
+      // Storage refused; the toggle still works for this visit.
+    }
+  }, [])
 
   //: A clock for the two things on this page that are about the present moment
   //: rather than about the data: how long until the next run, and how long ago
@@ -76,5 +100,5 @@ export function useUi() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  return { clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, setThemeMode, setView, themeMode, view } as const
+  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, setThemeMode, setView, themeMode, view } as const
 }

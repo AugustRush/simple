@@ -199,6 +199,79 @@ export function useMemory(deps: Deps) {
     }
   }, [api, loadMemory, memoryDraft, memoryEditing, messageApi])
 
+  /** The ids the page has ticked. Kept here so the bar and the rows agree. */
+  const [selectedMemoryIds, setSelectedMemoryIds] = useState<string[]>([])
+
+  const toggleMemorySelected = useCallback((entryId: string) => {
+    setSelectedMemoryIds(current =>
+      current.includes(entryId)
+        ? current.filter(id => id !== entryId)
+        : [...current, entryId],
+    )
+  }, [])
+
+  const clearMemorySelection = useCallback(() => setSelectedMemoryIds([]), [])
+
+  /** Delete every ticked entry in one request.
+   *
+   * One request, not one per row: the rows are independent, so a loop can stop
+   * halfway -- and a half-cleaned memory is worse than either end state. The
+   * server reports what it could not remove, and the selection keeps the stragglers
+   * so the next attempt is a retry rather than a re-selection.
+   */
+  const deleteSelectedMemoryEntries = useCallback(async () => {
+    if (selectedMemoryIds.length === 0) return
+    setMemoryBusy(true)
+    try {
+      const resp = await api('/api/memory/entries/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: selectedMemoryIds }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      const removed: string[] = Array.isArray(data.removed) ? data.removed : []
+      const missing: string[] = Array.isArray(data.missing) ? data.missing : []
+      const gone = new Set(removed)
+      setMemoryEntries(current => current.filter(item => !gone.has(item.id)))
+      setMemoryEntryTotal(current => Math.max(0, current - removed.length))
+      setSelectedMemoryIds(missing)
+      if (removed.length) messageApi.success(`已删除 ${removed.length} 条`)
+      if (missing.length) {
+        messageApi.warning(`${missing.length} 条没能删除，已保留选中`)
+      }
+      await loadMemory({ silent: true })
+    } catch {
+      // Reported by `api`; the selection survives so the retry is one click.
+    } finally {
+      setMemoryBusy(false)
+    }
+  }, [api, loadMemory, messageApi, selectedMemoryIds])
+
+  /** Erase everything the model can retrieve.
+   *
+   * Not a longer version of the bulk delete: this also drops facts resolved from
+   * the assertion ledger, which is why the server's own `clear` is the only thing
+   * that should run it. A page that looped entries would leave every belief.
+   */
+  const clearAllMemory = useCallback(async () => {
+    setMemoryBusy(true)
+    try {
+      const resp = await api('/api/memory/clear', { method: 'POST' })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok) {
+        messageApi.warning(String(data.error || '清空失败'))
+        return
+      }
+      setSelectedMemoryIds([])
+      messageApi.success(`已清空 ${Number(data.deleted || 0)} 项`)
+      await loadMemory({ silent: true })
+    } catch {
+      // Reported by `api`.
+    } finally {
+      setMemoryBusy(false)
+    }
+  }, [api, loadMemory, messageApi])
+
   const deleteMemoryEntry = useCallback(
     async (entry: MemoryEntry) => {
       setMemoryBusy(true)
@@ -287,7 +360,12 @@ export function useMemory(deps: Deps) {
     applyMemoryCategory,
     applyMemorySearch,
     closeMemoryEditor,
+    clearAllMemory,
+    clearMemorySelection,
     deleteMemoryEntry,
+    deleteSelectedMemoryEntries,
+    selectedMemoryIds,
+    toggleMemorySelected,
     forgetMemoryFact,
     loadMemory,
     loadMoreMemory,
