@@ -140,6 +140,10 @@ export function useShell(deps: Deps) {
       // used to arrive as a side effect of the chat view's mount.)
       void loadHome()
       void loadSessions()
+      // The board's cards are task ids; opening one needs the task record, and
+      // that list is this side's. Loading it here keeps the page from rendering
+      // cards it cannot act on -- a board that is all doors and no handles.
+      loadSchedules()
     }
     if (view === 'autonomy') loadAutonomy()
     if (view === 'settings') loadSettings()

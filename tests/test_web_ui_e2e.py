@@ -564,3 +564,72 @@ def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
     after = page.locator(".home-card-proposal").count()
     assert after == before - 1, f"the answered card was not dropped ({before} -> {after})"
     assert page.errors == [], page.errors
+
+
+def test_a_board_card_opens_its_task(page, live_gateway):
+    """The first column is entirely things that need a person, so each card has to
+    be a way in.
+
+    A board that shows a failure and cannot open it is a notice board bolted shut:
+    the reader learns something is wrong and is then sent to find it themselves.
+
+    Seeded through the scheduler's store, because the e2e gateway's home starts
+    empty and waiting ten minutes for its own patrol is not a test of the page.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from datetime import datetime, timedelta, timezone
+
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        TriggerSpec,
+        open_store,
+    )
+
+    os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
+
+    now = datetime.now(timezone.utc)
+    # An explicit path, not the module-level default: `open_store()` resolves
+    # `shared.SCHEDULER_DB_FILE`, which is computed at import and only rewritten
+    # by `_set_agent_home`. Assigning `AGENT_HOME` alone leaves the store pointing
+    # at the developer's real home -- which is the kind of mistake that passes
+    # locally and fails in CI.
+    from pathlib import Path as _Path
+
+    store = open_store(db_path=_Path(live_gateway["home"]) / "tasks" / "scheduler.db")
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name="看板测试任务",
+                kind="agent_prompt",
+                trigger=TriggerSpec.once((now - timedelta(minutes=5)).isoformat(), "UTC"),
+                payload={"prompt": "检查一次"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+        claimed = store.claim_task_now(task.id, now=now - timedelta(minutes=5))
+        assert claimed is not None
+        store.complete_run(
+            task.id,
+            claimed.run.id,
+            finished_at=now - timedelta(minutes=4),
+            status="failed",
+            error="看板测试：故意失败",
+        )
+    finally:
+        store.close()
+
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    card = page.locator(".home-card-open").filter(has_text="看板测试任务")
+    card.first.wait_for(timeout=20_000)
+    card.first.click()
+
+    # The drawer lives on 自动化, so arriving there is part of opening it.
+    page.wait_for_selector(".ant-drawer-open", timeout=20_000)
+    assert "#/schedules" in page.url
+    assert "看板测试任务" in page.locator(".ant-drawer-title").first.inner_text()
+    assert page.errors == [], page.errors

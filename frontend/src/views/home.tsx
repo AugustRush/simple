@@ -85,13 +85,14 @@ const RUN_STATUS_LABEL: Record<string, string> = {
  * full reads as "checked, nothing wrong", which is the whole point of looking.
  */
 function BoardColumn({
-  cards, empty, more, onDecide, onMore, title, tone,
+  cards, empty, more, onDecide, onMore, onOpen, title, tone,
 }: {
   cards: BoardCard[]
   empty: string
   more?: string
   onDecide?: (id: string, state: 'accepted' | 'declined') => void
   onMore?: () => void
+  onOpen?: (taskId: string) => void
   title: string
   tone: 'running' | 'waiting' | 'scheduled'
 }) {
@@ -135,7 +136,24 @@ function BoardColumn({
                 </div>
               </div>
             ) : (
-              <div key={card.task_id} className={`home-card-tile home-card-${tone}`}>
+              /* A card on the board is a way into the task, not a picture of it.
+                 The first column is entirely things that need a person, and
+                 showing them without a way to act on them makes the column a
+                 notice board bolted shut. */
+              <div
+                key={card.task_id}
+                className={`home-card-tile home-card-${tone} home-card-open`}
+                role="button"
+                tabIndex={0}
+                aria-label={`打开任务 ${card.name}`}
+                onClick={() => onOpen?.(card.task_id)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    onOpen?.(card.task_id)
+                  }
+                }}
+              >
                 <strong title={card.name}>{card.name}</strong>
                 <span className="home-tile-meta">
                   {/* One formatter for all three columns: `relativeTime` already
@@ -171,7 +189,7 @@ function BoardColumn({
 export function renderHome(ctx: AppCtx) {
   const {
     composerRef, creatingSession, decideProposal, home, homeLoaded, input,
-    navigateTo, selectSession, sendMessage, setInput,
+    navigateTo, openScheduleDetails, schedules, selectSession, sendMessage, setInput,
   } = ctx
 
   const board = home?.board
@@ -185,6 +203,20 @@ export function renderHome(ctx: AppCtx) {
   const busy = inFlight.length > 0
   const boardEmpty = inFlight.length + waiting.length + scheduledTotal === 0
   const needsPerson = waitingOnYou > 0
+
+  /** Open a task's detail: the drawer lives on 自动化, so arriving there is part
+   *  of opening it. The board knows the task by id; the drawer wants the record. */
+  const openTask = (taskId: string) => {
+    const task = schedules.find(item => item.id === taskId)
+    if (!task) {
+      // The list has not loaded yet (or the task was deleted elsewhere). Landing
+      // on the page that owns it is still better than doing nothing.
+      navigateTo('schedules')
+      return
+    }
+    openScheduleDetails(task)
+    navigateTo('schedules')
+  }
 
   const submit = () => {
     if (!input.trim() || creatingSession) return
@@ -263,18 +295,21 @@ export function renderHome(ctx: AppCtx) {
               cards={waiting}
               empty="没有卡住的"
               onDecide={(id, state) => void decideProposal(id, state)}
+              onOpen={openTask}
             />
             <BoardColumn
               title="正在跑"
               tone="running"
               cards={inFlight}
               empty="没有在跑的"
+              onOpen={openTask}
             />
             <BoardColumn
               title="已排期"
               tone="scheduled"
               cards={scheduled}
               empty="没有排期的"
+              onOpen={openTask}
               more={
                 scheduledTotal > scheduled.length
                   ? /* The rest is one click away: a board is glanced at, and
