@@ -386,3 +386,102 @@ def test_unauthorized_is_401(stores) -> None:
         )
     )
     assert response.status_code == 401
+
+
+def test_a_task_whose_later_run_succeeded_still_waits_if_a_failure_is_unread(
+    stores,
+) -> None:
+    """Acknowledging is the act of having read it -- not of the next run working.
+
+    This is what made the badge and the board disagree: the badge counts unread
+    *runs*, and the board counted only tasks whose *latest* run failed. A retry
+    that succeeded left its earlier failure unread and unlisted, so the number on
+    the sidebar could not be cleared from the page that claims to show what is
+    waiting.
+    """
+    scheduler, proposals = stores
+    task = _task(scheduler, "每天早上看日志")
+    _run(scheduler, task, status="failed", error="429", at=NOW - timedelta(hours=1))
+    # A retry that worked. The failure above is still unread.
+    claimed = scheduler.claim_task_now(task.id, now=NOW)
+    assert claimed is not None
+    scheduler.complete_run(
+        task.id, claimed.run.id, finished_at=NOW, status="succeeded", summary="ok"
+    )
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    (card,) = payload["board"]["waiting"]
+    assert card["name"] == "每天早上看日志"
+    assert card["unread"] == 1
+    # The card quotes the failure it is about, not the run that replaced it.
+    assert card["detail"] == "429"
+    # ...and its time is that failure's, not the next run's. A card in the column
+    # called "等你处理" that reads "22 小时后" is answering a question nobody
+    # asked while hiding the one being asked.
+    assert card["at_kind"] == "finished"
+    assert card["at"] == (NOW - timedelta(hours=1)).isoformat()
+
+
+def test_the_waiting_column_adds_up_to_the_badge(stores) -> None:
+    """Two numbers on one screen answering one question must agree.
+
+    The badge counts runs; the column counts tasks. The card carries its own
+    count so the sum is the badge's number -- otherwise opening the app shows "6"
+    above a column holding two cards and nobody can tell which is lying.
+    """
+    scheduler, proposals = stores
+    for name, failures in (("任务甲", 3), ("任务乙", 2)):
+        task = _task(scheduler, name)
+        claimed = scheduler.claim_task_now(task.id, now=NOW)
+        assert claimed is not None
+        scheduler.complete_run(
+            task.id, claimed.run.id, finished_at=NOW, status="failed", error="429"
+        )
+        # Plus older unread failures on the same task.
+        for index in range(failures - 1):
+            run = scheduler.claim_task_now(task.id, now=NOW)
+            if run is None:
+                break
+            scheduler.complete_run(
+                task.id,
+                run.run.id,
+                finished_at=NOW - timedelta(minutes=index + 1),
+                status="failed",
+                error="429",
+            )
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    total = sum(card["unread"] for card in payload["board"]["waiting"])
+    assert total == payload["needs"]["failures"], (
+        f"the column says {total}, the badge says {payload['needs']['failures']}"
+    )
+
+
+def test_a_waiting_card_does_not_say_it_succeeded(stores) -> None:
+    """The column and the card must not contradict each other.
+
+    A task whose retry succeeded has a waiting failure; a card reading "成功" in
+    the column called "等你处理" is the page arguing with itself, and the reader
+    has no way to tell which half is wrong.
+    """
+    scheduler, proposals = stores
+    task = _task(scheduler, "每天早上看日志")
+    _run(scheduler, task, status="failed", error="429", at=NOW - timedelta(hours=1))
+    claimed = scheduler.claim_task_now(task.id, now=NOW)
+    assert claimed is not None
+    scheduler.complete_run(
+        task.id, claimed.run.id, finished_at=NOW, status="succeeded", summary="ok"
+    )
+
+    payload = web_home.build_home_overview(
+        scheduler_store=scheduler, proposal_store=proposals, now=NOW
+    )
+
+    (card,) = payload["board"]["waiting"]
+    assert card["status"] == "failed", "the card is about the unread failure"

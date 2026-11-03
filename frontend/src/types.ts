@@ -312,6 +312,10 @@ export interface BoardCard {
   detail: string
   session_id: string
   reversibility?: string
+  //: How many unread failures this card stands for. The sidebar badge counts
+  //: *runs*; a card per task would disagree with it unless the card says how
+  //: many it holds.
+  unread: number
 }
 
 //: `GET /api/home`: the landing page's one request.

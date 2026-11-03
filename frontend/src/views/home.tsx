@@ -145,7 +145,13 @@ function BoardColumn({
                   {card.at ? ' · ' : ''}
                   {card.at_kind === 'next'
                     ? TRIGGER_LABEL[card.trigger_type] || '排期中'
-                    : RUN_STATUS_LABEL[card.status] || card.status}
+                    : card.unread > 1
+                      /* Status *and* count: the badge counts runs while a card
+                         counts a task, so the number is what makes the two agree
+                         -- and the status is what says what went wrong. Showing
+                         only one of them throws away half the card. */
+                      ? `${RUN_STATUS_LABEL[card.status] || card.status} · ${card.unread} 次未查看`
+                      : RUN_STATUS_LABEL[card.status] || card.status}
                 </span>
                 {card.detail && <span className="home-tile-detail">{card.detail}</span>}
               </div>

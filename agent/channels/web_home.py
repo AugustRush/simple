@@ -176,6 +176,15 @@ def _board(
     try:
         tasks = {task.id: task for task in scheduler_store.list_tasks()}
         recent = scheduler_store.recent_runs(limit=200)
+        # Unread failures per task, not just the newest one. The sidebar badge
+        # counts *runs* that nobody has read; a column that only showed tasks
+        # whose latest run failed disagreed with that number -- and made the
+        # other failures unreachable from the page that is supposed to be the
+        # answer to "is anything waiting for me".
+        unread_by_task = {
+            str(key): int(value or 0)
+            for key, value in (scheduler_store.attention_snapshot().get("counts") or {}).items()
+        }
     except Exception:
         return empty
 
@@ -183,8 +192,18 @@ def _board(
     # then orders by finish time, so the first occurrence per task is its latest
     # -- which is the one the card is about.
     latest_by_task: dict[str, Any] = {}
+    # The newest *unread failure* of each task. A waiting card is about that run,
+    # not about the task's latest one: a task whose retry succeeded has a waiting
+    # failure from yesterday, and a card that showed its next run would answer
+    # "when will this happen" when the reader asked "what went wrong".
+    unread_failure_by_task: dict[str, Any] = {}
     for run, _task in recent:
-        latest_by_task.setdefault(str(run.task_id), run)
+        task_key = str(run.task_id)
+        latest_by_task.setdefault(task_key, run)
+        if str(getattr(run, "status", "") or "") in {"failed", "interrupted"} and (
+            getattr(run, "acknowledged_at", None) is None
+        ):
+            unread_failure_by_task.setdefault(task_key, run)
 
     running: list[dict[str, Any]] = []
     waiting: list[dict[str, Any]] = []
@@ -203,17 +222,23 @@ def _board(
             continue
         latest = latest_by_task.get(task_id)
         status = str(getattr(latest, "status", "") or "") if latest is not None else ""
-        card = _card(task, latest)
+        unread = int(unread_by_task.get(task_id, 0) or 0)
+        card = _card(
+            task,
+            latest,
+            unread=unread,
+            failure=unread_failure_by_task.get(task_id),
+        )
 
         if status in {"queued", "running"} or getattr(task, "active_run_id", None):
             running.append(card)
-        elif status in {"failed", "interrupted"} and getattr(
-            latest, "acknowledged_at", None
-        ) is None:
-            # Failed *and* nobody has looked. The acknowledgement is what makes a
-            # failure stop waiting: acknowledging is the act of having read it,
-            # and a board that kept showing read failures would teach people to
-            # ignore the column.
+        elif unread > 0:
+            # Any *unread* failure, not only a failed latest run. Acknowledging is
+            # the act of having read it, so a failure stops waiting when somebody
+            # reads it -- not when a later run happens to succeed. A board that
+            # kept showing read failures would teach people to ignore the column;
+            # one that dropped unread failures because a retry worked would hide
+            # the very thing the badge counts.
             waiting.append(card)
         elif getattr(task, "next_run_at", None) is not None:
             scheduled.append(card)
@@ -231,6 +256,22 @@ def _board(
         "scheduled": scheduled[:BOARD_SCHEDULED_PREVIEW],
         "scheduled_total": len(scheduled),
     }
+
+
+def _detail(latest: Any, *, failure: Any, status: str, unread: int) -> str:
+    if failure is not None:
+        return str(
+            getattr(failure, "error", "") or getattr(failure, "summary", "") or ""
+        )[:160]
+    if latest is None:
+        return ""
+    if status in {"failed", "interrupted"}:
+        return str(
+            getattr(latest, "error", "") or getattr(latest, "summary", "") or ""
+        )[:160]
+    if unread > 0:
+        return f"{unread} 次运行结束得不好，还没有人看过"
+    return ""
 
 
 def _proposal_cards(proposal_store: Any) -> list[dict[str, Any]]:
@@ -268,12 +309,15 @@ def _proposal_cards(proposal_store: Any) -> list[dict[str, Any]]:
                 "detail": str(getattr(proposal, "reason", "") or "")[:160],
                 "session_id": str(getattr(proposal, "source", "") or ""),
                 "reversibility": str(getattr(proposal, "reversibility", "") or ""),
+                "unread": 0,
             }
         )
     return cards
 
 
-def _card(task: Any, latest: Any) -> dict[str, Any]:
+def _card(
+    task: Any, latest: Any, *, unread: int = 0, failure: Any = None
+) -> dict[str, Any]:
     """One board card: what it is, how it is doing, and when.
 
     ``at`` means different things in different columns -- when it started for a
@@ -289,26 +333,40 @@ def _card(task: Any, latest: Any) -> dict[str, Any]:
 
     if status in {"queued", "running"}:
         at, at_kind = started, "started"
+    elif failure is not None:
+        # This card is waiting on a person, so its time is the failure's -- even
+        # when a later run succeeded. Showing the next run instead ("22 小时后")
+        # would answer a question nobody asked while hiding the one being asked.
+        at, at_kind = (
+            getattr(failure, "finished_at", None) or getattr(failure, "started_at", None),
+            "finished",
+        )
     elif status in {"failed", "interrupted"}:
         at, at_kind = finished or started, "finished"
     else:
         at, at_kind = next_run, "next"
 
+    # The status describes the run the card is about, which for a waiting card is
+    # the unread failure -- not the retry that replaced it. A card reading
+    # "成功" in the column called "等你处理" is the page contradicting itself.
+    shown = failure if failure is not None else latest
+    shown_status = str(getattr(shown, "status", "") or "")
+
     return {
         "task_id": str(getattr(task, "id", "") or ""),
         "name": str(getattr(task, "name", "") or ""),
         "kind": str(getattr(task, "kind", "") or ""),
-        "status": status,
+        "status": shown_status,
         "at": at.isoformat() if at is not None else "",
         "at_kind": at_kind,
         "trigger_type": str(getattr(getattr(task, "trigger", None), "trigger_type", "") or ""),
         # The line under the title. A failure explains itself; everything else is
         # silent, because a card that always carries a sentence becomes noise.
-        "detail": (
-            str(getattr(latest, "error", "") or getattr(latest, "summary", "") or "")[:160]
-            if status in {"failed", "interrupted"}
-            else ""
-        ),
+        # What the card says under the title. A failed run explains itself; a task
+        # whose *earlier* failures are unread while its latest run succeeded has
+        # no failing run to quote, so it says how many there are instead.
+        "detail": _detail(latest, failure=failure, status=status, unread=unread),
+        "unread": unread,
         "session_id": str(getattr(task, "session_id", "") or ""),
     }
 
