@@ -836,7 +836,7 @@ html[data-theme='light'] .tool-trace-items {
 }
 
 .thinking-note-head:focus-visible {
-  outline: 2px solid var(--primary-border);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -942,7 +942,7 @@ html[data-theme='light'] .tool-trace-items {
 }
 
 .subagent-note-head:focus-visible {
-  outline: 2px solid var(--primary-border);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -1075,7 +1075,7 @@ html[data-theme='light'] .tool-trace-items {
 }
 
 .chat-jump-latest:focus-visible {
-  outline: 2px solid var(--primary-border);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 

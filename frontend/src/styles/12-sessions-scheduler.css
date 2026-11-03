@@ -194,7 +194,7 @@ html[data-theme='dark'] .settings-inline-save:disabled {
 .schedule-list { display:grid; gap:10px; }
 .schedule-card .ant-card-body { padding:16px 18px; }
 .schedule-card { border-radius:8px; cursor:pointer; transition:opacity .16s ease, border-color .16s ease, box-shadow .16s ease; }
-.schedule-card:focus-visible { outline:2px solid var(--primary-border); outline-offset:2px; }
+.schedule-card:focus-visible { outline: 2px solid var(--focus-ring); outline-offset:2px; }
 .schedule-card-disabled { opacity:.62; }
 .schedule-card-head { display:flex; justify-content:space-between; align-items:center; gap:16px; }
 .schedule-card-title { display:flex; align-items:center; gap:10px; min-width:0; }
@@ -1139,8 +1139,8 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
 .workflow-node rect { fill:var(--surface-raised); stroke:var(--border); stroke-width:1px; transition:stroke .15s ease, fill .15s ease; }
 .workflow-node:hover rect { stroke:var(--border-strong); }
 .workflow-node:focus-visible { outline:none; }
-.workflow-node:focus-visible rect { stroke:var(--primary-border); }
-.workflow-node.active rect { stroke:var(--primary-border); }
+.workflow-node:focus-visible rect { stroke:var(--focus-ring); }
+.workflow-node.active rect { stroke:var(--focus-ring); }
 .workflow-node-dot { fill:currentColor; }
 .workflow-node-name { fill:var(--text); font-size:12px; font-weight:600; }
 .workflow-node-key { fill:var(--text-muted); font-size:10px; }
@@ -1323,7 +1323,7 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .composer-attachment-remove:focus-visible,
 .session-item-delete-actions:focus-visible,
 .settings-inline-save:focus-visible {
-  outline: 2px solid var(--primary-border);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 

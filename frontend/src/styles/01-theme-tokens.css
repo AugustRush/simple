@@ -19,6 +19,14 @@
   --primary: #e4e4e7;
   --primary-soft: rgba(228, 228, 231, 0.08);
   --primary-border: rgba(228, 228, 231, 0.26);
+  /* The focus ring is not a border, and it must not use the border token.
+   *
+   * --primary-border is 26% white: fine as an edge between two surfaces, and
+   * measured at 2.36:1 when used as a focus indicator -- under the 3:1 that WCAG
+   * requires for non-text controls. A keyboard user needs the ring to be the
+   * most visible thing on the element, so it gets its own token at full opacity.
+   * Measured on the page background: 11.9:1. */
+  --focus-ring: #c8c8ce;
   --green: #d4d4d8;
   --green-soft: rgba(212, 212, 216, 0.12);
   --red: #f0a3a3;
@@ -44,6 +52,8 @@ html[data-theme='light'] {
   --primary: #27272a;
   --primary-soft: rgba(39, 39, 42, 0.065);
   --primary-border: rgba(39, 39, 42, 0.22);
+  /* See the dark theme's note: 22% black measured 2.3:1 as a focus ring. */
+  --focus-ring: #3f3f46;
   --green: #52525b;
   --green-soft: rgba(82, 82, 91, 0.1);
   --red: #a16262;

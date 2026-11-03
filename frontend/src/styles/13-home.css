@@ -91,7 +91,7 @@
   transition: background .14s ease;
 }
 .home-thread:hover { background: var(--surface-hover); }
-.home-thread:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 2px; }
+.home-thread:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .home-thread.active { background: var(--surface-hover); }
 .home-thread-icon { display: grid; place-items: center; width: 22px; color: var(--text-muted); }
 .home-thread-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
@@ -138,7 +138,7 @@
 }
 .home-timeline-row:hover { background: var(--surface-hover); }
 .home-timeline-thread { cursor: pointer; }
-.home-timeline-thread:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 2px; }
+.home-timeline-thread:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .home-timeline-icon {
   display: grid;
   place-items: center;
@@ -264,7 +264,7 @@
    are the whole affordance, and without them a clickable card is a secret. */
 .home-card-open { cursor: pointer; }
 .home-card-open:hover { background: var(--surface-hover); filter: brightness(1.15); }
-.home-card-open:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 2px; }
+.home-card-open:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 /* The history's own continuation. Left-aligned under the list so it reads as the
    list's next page rather than as a section of its own. */
