@@ -60,7 +60,12 @@ CREATE TABLE IF NOT EXISTS patrol_ticks (
     proposed INTEGER NOT NULL DEFAULT 0,
     dropped INTEGER NOT NULL DEFAULT 0,
     duplicates INTEGER NOT NULL DEFAULT 0,
-    expired INTEGER NOT NULL DEFAULT 0
+    expired INTEGER NOT NULL DEFAULT 0,
+    -- How many of this pass's proposals actually ran without asking. The
+    -- difference between "proposed 40, executed 0" and "proposed 40, executed 3"
+    -- is whether the loop is doing anything, and only one of those numbers was
+    -- being recorded.
+    executed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_patrol_ticks_at
     ON patrol_ticks(tick_at);
@@ -90,6 +95,7 @@ class ProposalStore:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._add_missing_columns()
         self._conn.commit()
 
     # -- lifetime ----------------------------------------------------------
@@ -239,6 +245,32 @@ class ProposalStore:
             ).fetchall()
         return {str(row["state"]): int(row["n"]) for row in rows}
 
+    def _add_missing_columns(self) -> None:
+        """Bring a database written by an earlier version up to this schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already
+        exists, so a column added later is missing from every install that has
+        ever run -- and the first insert that names it fails with "no such
+        column", on somebody else's machine. Additive columns only: a rename or a
+        drop would need a real migration, and this file has not earned one.
+
+        Runs on the connection that just applied the schema, before its commit:
+        a second connection would take a write lock this one holds.
+        """
+        wanted = {"executed": "INTEGER NOT NULL DEFAULT 0"}
+        try:
+            present = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(patrol_ticks)").fetchall()
+            }
+            for column, ddl in wanted.items():
+                if column not in present:
+                    self._conn.execute(f"ALTER TABLE patrol_ticks ADD COLUMN {column} {ddl}")
+        except sqlite3.Error:
+            # An unreadable table is every reader's problem to tolerate, not this
+            # one's to crash over: they all fall back to zero.
+            pass
+
     def record_tick(self, result: dict[str, Any], *, at: Optional[datetime] = None) -> None:
         """Store one patrol pass.
 
@@ -251,8 +283,8 @@ class ProposalStore:
                 """
                 INSERT INTO patrol_ticks (
                     tick_at, examined, eligible, skipped_warm, skipped_stale,
-                    proposed, dropped, duplicates, expired
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    proposed, dropped, duplicates, expired, executed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     moment,
@@ -264,6 +296,7 @@ class ProposalStore:
                     int(result.get("dropped", 0) or 0),
                     int(result.get("duplicates", 0) or 0),
                     int(result.get("expired", 0) or 0),
+                    int(result.get("executed", 0) or 0),
                 ),
             )
 
@@ -289,7 +322,7 @@ class ProposalStore:
             key: sum(int(row[key] or 0) for row in rows)
             for key in (
                 "examined", "eligible", "skipped_warm", "skipped_stale",
-                "proposed", "dropped", "duplicates", "expired",
+                "proposed", "dropped", "duplicates", "expired", "executed",
             )
         }
         return {

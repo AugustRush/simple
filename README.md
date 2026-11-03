@@ -686,10 +686,26 @@ buses). Those are what a restart is for.
 
 ### Autonomy: what the agent would do
 
-The first version of autonomy here **proposes and records, and executes nothing**. That
-is not a limitation to be fixed later; it is the delivery. An agent whose first act is
-to *do* things has already spent the attention it was supposed to save, and the question
-worth answering first is "what would it have done, and would I have agreed".
+The agent **acts on what is reversible and asks about everything else**. The line is
+drawn by the tool, not by the model: a proposal whose action can only read runs without
+waiting; one that can change something outside the workspace becomes a proposal on the
+`自主` page and waits for a person. There is no configuration that moves an irreversible
+action across that line.
+
+It also has **no daily action cap**. The work is bounded by what the rules can see -- a
+rule fires at most once per session per fact, a live proposal is not written twice, and
+an answered one never returns -- so a cap would only decide which finite set of work to
+skip, and would skip it by arrival order. Instead the pass **orders what it finds by
+priority and works through it**:
+
+| rank | rule | who is blocked |
+|---|---|---|
+| 0 | a queue that has not moved | a person, right now |
+| 1 | a failure nobody read | nobody yet -- but it can repeat unseen |
+| 2 | a task that stopped halfway | nobody; the next turn may pick it up |
+
+An order, deliberately, not a score: weights nobody can justify are how two different
+situations end up looking equally urgent.
 
 ```bash
 uv run simple autonomy review   # the live proposals
@@ -727,9 +743,10 @@ the tool it would call, and the reversibility class; answering it is one click, 
 decline is kept** — the same suggestion does not come back in new words, which is what
 happens when "somebody already said no" lives only in a context window.
 
-What is deliberately absent: **execution**. `acted` is a state the page cannot write and
-this process cannot reach. A form that could claim it would be a page promising something
-the process does not do.
+What the `自主` page shows is therefore the *irreversible* queue: the reversible ones
+already ran and appear under `已答复 · 已执行` with what the run reported. The page can
+still only write `accepted` / `declined` / `acted`; a proposal the executor refused stays
+a proposal.
 
 ### Browser-level tests (optional)
 

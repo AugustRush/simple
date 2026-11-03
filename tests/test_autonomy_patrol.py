@@ -47,24 +47,27 @@ def _session(session_id: str = "s1", **facts) -> dict:
 
 
 def test_a_missing_section_means_enabled_shadow_defaults() -> None:
-    """The first version is harmless, so it may be on by default.
+    """A missing section means the product's intended behaviour, not a cautious one.
 
-    When a later version can *act*, this default has to flip -- and the test that
-    fails then is this one, which is the point of writing it down.
+    On, and acting: the walls are the reversibility check and the
+    ``autonomy_read`` profile, not whether the loop is switched on. A default of
+    "off" would mean the shipped product never does the thing it exists for.
     """
     settings = PatrolSettings.from_config({})
 
     assert settings.enabled is True
-    assert settings.max_auto_actions_per_day == 0, "shadow mode: nothing is executed"
+    assert not hasattr(settings, "max_auto_actions_per_day"), (
+        "there is no action cap: the work is bounded by the facts, not a counter"
+    )
 
 
 def test_a_configured_section_is_read() -> None:
     settings = PatrolSettings.from_config(
-        {"autonomy": {"interval_minutes": 3, "max_auto_actions_per_day": 2}}
+        {"autonomy": {"interval_minutes": 3, "min_confidence": 0.7}}
     )
 
     assert settings.interval_minutes == 3
-    assert settings.max_auto_actions_per_day == 2
+    assert settings.min_confidence == 0.7
 
 
 def test_unreadable_values_keep_their_defaults() -> None:
@@ -85,13 +88,72 @@ def test_the_interval_has_a_floor() -> None:
 # ── the pass ───────────────────────────────────────────────────────────────
 
 
-def test_one_pass_proposes_and_writes(store) -> None:
-    service = PatrolService(store=store, sessions_provider=lambda: [_session(attention=2)])
+def test_a_reversible_proposal_is_acted_on_by_the_pass(store, tmp_path) -> None:
+    """It does not stay a proposal. This test used to assert "proposed", which was
+    true only while the loop refused to act at all.
 
-    result = asyncio.run(service.tick(now=NOW))
+    The scheduler store is injected rather than opened: a test that lets the
+    service resolve the default store is a test that writes into whatever home the
+    process happens to have.
+    """
+    from agent.scheduler import SchedulerStore
 
-    assert result["proposed"] == 1
-    assert store.list_proposals()[0].state == "proposed"
+    scheduler = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    try:
+        service = PatrolService(
+            store=store,
+            sessions_provider=lambda: [_session(attention=2)],
+            scheduler_store_provider=lambda: scheduler,
+        )
+
+        result = asyncio.run(service.tick(now=NOW))
+
+        assert result["proposed"] == 1
+        assert result["executed"] == 1
+        row = store.list_proposals()[0]
+        assert row.reversibility == "reversible"
+        assert row.state == "acted"
+        # ...and it really became work: one task the scheduler will run.
+        tasks = scheduler.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].permission_profile == "autonomy_read", (
+            "an unasked action runs under the profile that denies shell"
+        )
+    finally:
+        scheduler.close()
+
+
+def test_an_irreversible_proposal_is_never_acted_on(store, tmp_path) -> None:
+    """The wall in front of the room, tested from the outside.
+
+    Admission already answers ``prepare`` for anything that can change the world
+    outside the workspace; this checks the second wall -- the executor refuses it
+    even if a row somehow reached the queue.
+    """
+    from agent.scheduler import SchedulerStore
+
+    scheduler = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    try:
+        service = PatrolService(
+            store=store,
+            sessions_provider=lambda: [],
+            scheduler_store_provider=lambda: scheduler,
+        )
+        proposal = Proposal(
+            source="s1",
+            action="发一条飞书消息",
+            tool="send_file",
+            reversibility="irreversible",
+        )
+        store.record(proposal)
+
+        acted = service._act_on_auto(proposal)
+
+        assert acted is False
+        assert store.list_proposals()[0].state == "proposed", "it stays a proposal"
+        assert scheduler.list_tasks() == [], "and nothing was created"
+    finally:
+        scheduler.close()
 
 
 def test_a_pass_expires_what_nobody_answered(store) -> None:

@@ -380,276 +380,113 @@ def _proposal(reversibility: str = "reversible", confidence: float = 0.8) -> Pro
     )
 
 
-def test_shadow_mode_prepares_everything() -> None:
-    """The default budget is zero: this delivery proposes, it does not act."""
-    decision = decide_admission(_proposal(), policy=AdmissionPolicy())
-
-    assert decision.answer == "prepare"
-    assert decision.prepared["tool"] == "schedule_runs"
-    assert "额度" in decision.reason
-
-
-def test_a_reversible_action_within_budget_is_automatic() -> None:
-    decision = decide_admission(
-        _proposal(), policy=AdmissionPolicy(max_auto_actions_per_day=3)
-    )
+def test_a_reversible_action_is_automatic() -> None:
+    """Permission, not budget: reversibility is the whole answer."""
+    decision = decide_admission(_proposal(reversibility="reversible"))
 
     assert decision.answer == "auto"
-    assert decision.prepared is not None, "even an auto answer says what would run"
 
 
 def test_an_irreversible_action_is_never_automatic() -> None:
-    """No budget makes it automatic: there is no configuration for that."""
-    decision = decide_admission(
-        _proposal("irreversible"),
-        policy=AdmissionPolicy(max_auto_actions_per_day=999),
-    )
+    """No configuration makes this automatic -- there is no configuration left."""
+    decision = decide_admission(_proposal(reversibility="irreversible"))
 
     assert decision.answer == "prepare"
-    assert "工作区之外" in decision.reason
+    assert decision.prepared, "a prepare that cannot say what it would do is not one"
 
 
 def test_a_workspace_write_is_prepared_not_automatic() -> None:
-    """Writing files is undoable *by a person who can see them* -- so a person sees them."""
-    decision = decide_admission(
-        _proposal("workspace"),
-        policy=AdmissionPolicy(max_auto_actions_per_day=999),
-    )
+    """Undoable by a person who can see it -- so a person sees it first."""
+    decision = decide_admission(_proposal(reversibility="workspace"))
 
     assert decision.answer == "prepare"
 
 
-def test_a_low_confidence_proposal_is_dropped() -> None:
-    decision = decide_admission(_proposal(confidence=0.2))
-
-    assert decision.answer == "drop"
-    assert "置信度" in decision.reason
-
-
-def test_a_declined_proposal_is_dropped_even_when_it_would_be_automatic() -> None:
-    """The order of the checks: "somebody said no" outranks every budget."""
+def test_a_declined_proposal_is_dropped_even_when_reversible() -> None:
     decision = decide_admission(
-        _proposal(),
-        policy=AdmissionPolicy(max_auto_actions_per_day=99),
-        prior_decision="declined",
+        _proposal(reversibility="reversible"), prior_decision="declined"
     )
 
     assert decision.answer == "drop"
-    assert "拒过" in decision.reason
 
 
-def test_the_daily_proposal_cap_drops_rather_than_shows() -> None:
+def test_a_weak_guess_is_dropped_rather_than_shown() -> None:
+    from agent.autonomy.admission import AdmissionPolicy
+
     decision = decide_admission(
-        _proposal(), policy=AdmissionPolicy(max_proposals_per_day=2), proposals_today=2
+        _proposal(confidence=0.1), policy=AdmissionPolicy(min_confidence=0.5)
     )
 
     assert decision.answer == "drop"
-    assert "上限" in decision.reason
 
 
-def test_the_patrol_records_the_verdict_on_the_row(store) -> None:
-    """A row without its admission answer cannot be audited."""
-    patrol_tick(store=store, sessions=[_session(attention=1)], now=NOW, suggest=rule_candidates)
+def test_there_is_no_daily_action_cap_left_to_hit() -> None:
+    """The counter is gone, so nothing can be "over budget".
 
-    row = store.list_proposals()[0]
-    assert row.context["admission"]["answer"] in {"auto", "prepare"}
-    assert row.context["admission"]["prepared"]["tool"] == row.tool
-
-
-def test_the_patrol_does_not_write_dropped_candidates(store) -> None:
-    """A dropped candidate is not written: the row would be the attention it saves."""
-    result = patrol_tick(
-        store=store,
-        sessions=[_session(attention=1)],
-        now=NOW,
-        options=PatrolOptions(
-            admission=AdmissionPolicy(min_confidence=0.99, max_proposals_per_day=10)
-        ),
-        suggest=rule_candidates,
-    )
-
-    assert result["proposed"] == 0
-    assert result["dropped"] == 1
-    assert store.list_proposals() == []
-
-
-# ── the budget is a day, not a tick ─────────────────────────────────────────
-
-
-def test_the_daily_cap_counts_proposals_from_earlier_ticks(store) -> None:
-    """A loop that restarts hourly and counts its own pass has no daily cap.
-
-    Two ticks of two candidates each, with a cap of three, must write three and
-    drop one -- the second tick has to know what the first one wrote.
+    It used to prepare anything past a daily count. That decided *which* finite
+    set of work to skip, in arrival order -- and the set is already bounded by the
+    facts (a rule fires once per session per fact, dedupe blocks repeats, an
+    answered proposal never returns).
     """
-    policy = AdmissionPolicy(max_proposals_per_day=3)
-    options = PatrolOptions(admission=policy)
+    from agent.autonomy.admission import AdmissionPolicy
 
-    first = patrol_tick(
-        store=store,
-        sessions=[_session("a", attention=1), _session("b", attention=1)],
-        now=NOW,
-        options=options,
-        suggest=rule_candidates,
-    )
-    second = patrol_tick(
-        store=store,
-        sessions=[_session("c", attention=1), _session("d", attention=1)],
-        now=NOW + timedelta(minutes=30),
-        options=options,
-        suggest=rule_candidates,
-    )
+    policy = AdmissionPolicy()
+    assert not hasattr(policy, "max_auto_actions_per_day")
+    assert not hasattr(policy, "max_proposals_per_day")
 
-    assert first["proposed"] == 2
-    assert second["proposed"] == 1, "the second tick must see the first tick's rows"
-    assert second["dropped"] == 1
-    assert len(store.list_proposals()) == 3
+    decision = decide_admission(_proposal(reversibility="reversible"), policy=policy)
+    assert decision.answer == "auto"
 
 
-def test_yesterday_s_proposals_do_not_count_against_today(store) -> None:
-    """The window is a day, not "ever"."""
-    policy = AdmissionPolicy(max_proposals_per_day=1)
-    options = PatrolOptions(admission=policy)
+def test_priority_orders_a_pass_by_who_is_blocked() -> None:
+    """A stalled queue blocks a person; an unread failure does not.
 
-    yesterday = patrol_tick(
-        store=store,
-        sessions=[_session("a", attention=1)],
-        now=NOW,
-        options=options,
-        suggest=rule_candidates,
-    )
-    today = patrol_tick(
-        store=store,
-        sessions=[_session("b", attention=1)],
-        now=NOW + timedelta(days=1),
-        options=options,
-        suggest=rule_candidates,
-    )
-
-    assert yesterday["proposed"] == 1
-    assert today["proposed"] == 1, "a new day starts with a full budget"
-
-
-def test_acted_is_the_number_the_auto_budget_spends(store) -> None:
-    """`acted` is what consumed the auto-action budget; `proposed` is attention."""
-    from agent.autonomy.admission import day_bounds
-
-    store.record(Proposal(source="s1", action="a"))
-    proposal_id = store.list_proposals()[0].id
-    store.decide(proposal_id, "acted", by="test")
-
-    start, _ = day_bounds(NOW)
-    assert store.acted_since(start) == 1
-
-
-def test_attention_from_the_session_s_tasks_is_read(stores=None) -> None:
-    """The fact the rule fires on lives on *tasks*, not on the session.
-
-    An unacknowledged failed run belongs to a task; a session carries it only
-    through the tasks it owns. A rule that only looked at `session["attention"]`
-    could never fire on a real deployment -- which is what happened: the funnel
-    reported "0 proposals" for a day, and that read exactly like "nothing to do".
+    The ranking is an order, not a score: weights nobody can justify would make
+    two different situations look equally urgent.
     """
-    session = _session(
-        tasks=[{"task_id": "t1", "attention": 2}, {"task_id": "t2", "attention": 0}]
+    from agent.autonomy.rules import rule_priority
+
+    assert rule_priority("stale-queue") < rule_priority("failed-run-unreviewed")
+    assert rule_priority("failed-run-unreviewed") < rule_priority(
+        "session-ended-mid-task"
     )
-
-    proposals = rule_candidates(session, now=NOW, capabilities_of=default_capabilities_of)
-
-    assert [p.context["rule"] for p in proposals] == ["failed-run-unreviewed"]
-    assert p_attention(proposals[0]) == 2
+    assert rule_priority("something-new") > rule_priority("session-ended-mid-task")
 
 
-def p_attention(proposal) -> int:
-    return int(proposal.context["attention"])
+def test_a_pass_acts_in_priority_order(store) -> None:
+    """Two candidates, one callback order: the blocked person goes first."""
+    store_seen: list[str] = []
 
-
-def test_a_session_with_tasks_but_no_failures_proposes_nothing() -> None:
-    """Zero attention on every task is a fact; it is not the same as "no tasks"."""
-    session = _session(tasks=[{"task_id": "t1", "attention": 0}])
-
-    assert rule_candidates(session, now=NOW) == []
-
-
-def test_answering_a_proposal_does_not_give_the_budget_back(store) -> None:
-    """A day where every suggestion was declined is still a day that spent attention."""
-    from agent.autonomy.admission import day_bounds
-
-    for index in range(3):
-        store.record(Proposal(source=f"s{index}", action=f"a{index}"))
-    for proposal in store.list_proposals():
-        store.decide(proposal.id, "declined", by="test")
-
-    start, _end = day_bounds(NOW)
-
-    assert store.written_since(start) == 3, "the cap counts what was written"
-    assert store.counts_since(start) == {"declined": 3}, (
-        "the state breakdown is still useful, it is just not the budget"
-    )
-
-
-# ── the queue fact: it only exists while something serves it ───────────────
-
-
-def test_a_live_queue_becomes_a_session_fact() -> None:
-    """A queue is not a database fact: it is memory in the process serving it."""
-    import time
-
-    from agent.autonomy import live_queue_facts
-
-    class _State:
-        pending_interjections = [
-            {"message_id": "m1", "text": "x", "arrived_at": time.time() - 2400}
+    if True:
+        # One session with a stalled queue (rank 0) and one with unread failures
+        # (rank 1). The queue came later but outranks.
+        sessions = [
+            _session(
+                "failing",
+                attention=1,
+                last_activity=(NOW - timedelta(hours=2)).isoformat(),
+            ),
+            _session(
+                "blocked",
+                last_activity=(NOW - timedelta(hours=2)).isoformat(),
+                queue={
+                    "pending": 2,
+                    "queued_since": (NOW - timedelta(hours=1)).isoformat(),
+                },
+            ),
         ]
-        restart_queue: list = []
+        patrol_tick(
+            store=store,
+            sessions=sessions,
+            now=NOW,
+            options=PatrolOptions(),
+            suggest=rule_candidates,
+            on_auto=lambda proposal: store_seen.append(proposal.context["rule"]) or True,
+        )
 
-    facts = live_queue_facts({"s1": _State()})
-
-    assert facts == {
-        "s1": {
-            "pending": 1,
-            "queued_since": facts["s1"]["queued_since"],
-        }
-    }
-    assert facts["s1"]["queued_since"], "the wait needs its own start time"
-
-
-def test_a_session_with_nothing_queued_has_no_fact() -> None:
-    """"No queue" and "an empty queue" are different, and neither is zero."""
-    from agent.autonomy import live_queue_facts
-
-    class _State:
-        pending_interjections: list = []
-        restart_queue: list = []
-
-    assert live_queue_facts({"s1": _State()}) == {}
-
-
-def test_no_live_sessions_means_no_queue_facts() -> None:
-    """A CLI pass is not serving any session; its honest answer is "unknown"."""
-    from agent.autonomy import live_queue_facts
-
-    assert live_queue_facts(None) == {}
-
-
-def test_the_queue_rule_reads_the_queue_s_own_age() -> None:
-    """A conversation somebody is typing in has a recent session and a stuck queue."""
-    from datetime import timedelta
-
-    from agent.autonomy.rules import rule_candidates
-
-    session = _session(
-        last_activity=(NOW - timedelta(minutes=2)).isoformat(),
-        queue={
-            "pending": 2,
-            "queued_since": (NOW - timedelta(hours=2)).isoformat(),
-        },
+    assert store_seen == ["stale-queue", "failed-run-unreviewed"], (
+        "the pass must act on the blocked person before the unread failure"
     )
-
-    proposals = rule_candidates(session, now=NOW)
-
-    assert [p.context["rule"] for p in proposals] == ["stale-queue"]
-    assert "120" in proposals[0].reason, "the wait is what the reason names"
 
 
 def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
@@ -685,10 +522,70 @@ def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
     assert row.expires_at == long_ago + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
 
 
-def test_a_replayed_pass_does_not_spend_a_later_day_s_budget(store) -> None:
-    """The consequence of the stamping, stated as the behaviour it protects."""
-    policy = AdmissionPolicy(max_proposals_per_day=1)
-    options = PatrolOptions(admission=policy)
+def test_priority_orders_a_pass_by_who_is_blocked() -> None:
+    """A stalled queue blocks a person; an unread failure does not.
+
+    The ranking is an order, not a score: weights nobody can justify would make
+    two different situations look equally urgent.
+    """
+    from agent.autonomy.rules import rule_priority
+
+    assert rule_priority("stale-queue") < rule_priority("failed-run-unreviewed")
+    assert rule_priority("failed-run-unreviewed") < rule_priority(
+        "session-ended-mid-task"
+    )
+    assert rule_priority("something-new") > rule_priority("session-ended-mid-task")
+
+
+def test_a_pass_acts_in_priority_order(store) -> None:
+    """Two candidates, one callback order: the blocked person goes first."""
+    store_seen: list[str] = []
+
+    if True:
+        # One session with a stalled queue (rank 0) and one with unread failures
+        # (rank 1). The queue came later but outranks.
+        sessions = [
+            _session(
+                "failing",
+                attention=1,
+                last_activity=(NOW - timedelta(hours=2)).isoformat(),
+            ),
+            _session(
+                "blocked",
+                last_activity=(NOW - timedelta(hours=2)).isoformat(),
+                queue={
+                    "pending": 2,
+                    "queued_since": (NOW - timedelta(hours=1)).isoformat(),
+                },
+            ),
+        ]
+        patrol_tick(
+            store=store,
+            sessions=sessions,
+            now=NOW,
+            options=PatrolOptions(),
+            suggest=rule_candidates,
+            on_auto=lambda proposal: store_seen.append(proposal.context["rule"]) or True,
+        )
+
+    assert store_seen == ["stale-queue", "failed-run-unreviewed"], (
+        "the pass must act on the blocked person before the unread failure"
+    )
+
+
+def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
+    """Not with the wall clock.
+
+    The rules build proposals with `datetime.now()`, which is right when a rule is
+    called directly and wrong when a pass runs at a time somebody chose. The daily
+    budget windows on `created_at`, so a pass replaying "yesterday" would spend
+    today's allowance -- and a backfilled pass would carry timestamps from
+    whenever it happened to execute.
+
+    This is what caught it: `test_yesterday_s_proposals_do_not_count_against_today`
+    passed on the day it was written and failed the next morning, which is the
+    signature of a clock leaking into policy.
+    """
     long_ago = NOW - timedelta(days=30)
     session = _session(
         "a",
@@ -700,15 +597,12 @@ def test_a_replayed_pass_does_not_spend_a_later_day_s_budget(store) -> None:
         store=store,
         sessions=[session],
         now=long_ago,
-        options=options,
-        suggest=rule_candidates,
-    )
-    today = patrol_tick(
-        store=store,
-        sessions=[_session("b", attention=1)],
-        now=NOW,
-        options=options,
+        options=PatrolOptions(),
         suggest=rule_candidates,
     )
 
-    assert today["proposed"] == 1, "a pass thirty days ago must not spend today's"
+    row = store.list_proposals()[0]
+    assert row.created_at == long_ago, "the pass's own time, not the wall clock's"
+    assert row.expires_at == long_ago + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
+
+

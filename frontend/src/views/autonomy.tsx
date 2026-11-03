@@ -138,7 +138,7 @@ export function renderAutonomy(ctx: AppCtx) {
             {expired > 0 && <span className="proposal-muted">已过期 {expired}</span>}
           </div>
           <p>
-            它找到的、<strong>还没有做</strong>的事。答复只是记录你的判断——这一版不会执行任何一条。
+            它找到了、但<strong>没有自己做</strong>的事——因为它们会改动工作区之外的东西。只读的那些它已经自己做了。
           </p>
           {/* How much was looked at to find these. Without it, "nothing proposed"
               invites the reader to guess whether there was nothing to do. */}
@@ -146,7 +146,7 @@ export function renderAutonomy(ctx: AppCtx) {
             <p className="proposal-funnel">
               最近 7 天巡逻 {funnel.passes} 趟，看了 {funnel.examined} 个会话，
               跳过（有人在用 {funnel.skipped_warm} · 太久没动 {funnel.skipped_stale}），
-              产出 {funnel.proposed} 条提议。
+              产出 {funnel.proposed} 条提议，自己做了 {funnel.executed} 件。
             </p>
           )}
         </div>
@@ -164,7 +164,7 @@ export function renderAutonomy(ctx: AppCtx) {
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={
             proposed === 0
-              ? '现在没有提议。它在后台每十分钟看一遍会话，有发现会出现在这里——不会执行，也不会打扰你。'
+              ? '现在没有提议。它在后台每十分钟看一遍，能自己做的已经做了，需要你点头的才会出现在这里。'
               : '没有需要答复的提议。'
           }
           className="page-empty"
@@ -194,8 +194,8 @@ export function renderAutonomy(ctx: AppCtx) {
       )}
       {/* The honest footnote: a page about autonomy has to say what it is not. */}
       <p className="proposal-footnote">
-        这一版是影子模式：巡逻只写记录，<strong>0 次自动执行</strong>。你答复过的建议它不会
-        再提第二次；它判断"不可逆"的动作永远只会准备好，不会自己动手。
+        只读的动作它<strong>自己就做了</strong>，按优先级挨个来，没有次数上限。会改动工作区之外
+        的动作<strong>永远不会自己做</strong>——那不是配置问题。你答复过的建议它不会再提第二次。
       </p>
     </div>
   )

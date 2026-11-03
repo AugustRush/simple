@@ -211,9 +211,10 @@ def test_execution_does_not_bypass_the_admission_answer(stores) -> None:
     """
     proposals, scheduler = stores
     proposal = _approved(proposals)
-    decision = decide_admission(
-        proposal, policy=AdmissionPolicy(max_auto_actions_per_day=3)
-    )
+    # No budget argument: the answer is about permission, and a reversible
+    # proposal is permitted. Passing a cap here would be passing something that no
+    # longer decides anything.
+    decision = decide_admission(proposal, policy=AdmissionPolicy())
     assert decision.answer == "auto"
 
     outcome = execute_proposal(

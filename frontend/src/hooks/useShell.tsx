@@ -451,7 +451,7 @@ export function useShell(deps: Deps) {
       // Says what the page is *for*, in the words the design uses: proposals,
       // not actions. A subtitle promising "what it does on its own" would be
       // wrong twice -- nothing is executed, and the page is where you decide.
-      subtitle: 'agent 觉得可以做的事——它不执行，等你答复',
+      subtitle: '只会做能撤销的；剩下这些等你答复',
     },
     settings: {
       title: '设置',

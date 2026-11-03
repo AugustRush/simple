@@ -275,6 +275,9 @@ export interface AutonomyFunnel {
   dropped: number
   duplicates: number
   expired: number
+  //: How many proposals this window's passes ran without asking. The one number
+  //: that says whether the loop is doing anything at all.
+  executed: number
 }
 
 //: One item of the home page's timeline: a run, or a conversation.

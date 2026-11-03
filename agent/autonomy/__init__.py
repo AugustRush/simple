@@ -208,7 +208,8 @@ class PatrolOptions:
     max_sessions_per_tick: int = 20
     #: How many proposals one tick may write (the store enforces its own cap too).
     max_proposals_per_tick: int = 5
-    #: What may be done without asking. Defaults to "nothing": shadow mode, which
+    #: What may be done without asking. Defaults to "nothing": a caller that has
+    #: not opted in, which
     #: is what this delivery is.
     admission: Any = None
 
@@ -237,6 +238,7 @@ def patrol_tick(
     options: Optional[PatrolOptions] = None,
     suggest: Any = None,
     capabilities_of: Any = None,
+    on_auto: Any = None,
 ) -> dict[str, Any]:
     """One shadow pass: read the room, propose what *would* be done, write nothing else.
 
@@ -257,6 +259,7 @@ def patrol_tick(
         options.admission = AdmissionPolicy()
     warm = timedelta(seconds=options.warm_window_seconds)
     stale = timedelta(seconds=options.stale_window_seconds)
+    auto_queue: list[Proposal] = []
     result: dict[str, Any] = {
         "tick_at": _iso(now),
         "examined": 0,
@@ -273,21 +276,6 @@ def patrol_tick(
 
     if options.max_sessions_per_tick <= 0:
         return result
-
-    # The day's totals, once. `counts_since` is the store's own view of "today",
-    # which is the only one that survives a restart.
-    # Written, not still-open: answering a proposal does not un-spend the
-    # attention it cost, so a day where everything was declined must not read as
-    # a day with no proposals.
-    try:
-        _proposed_today = int(store.written_since(start_of_day(now)) or 0)
-    except Exception:
-        _proposed_today = 0
-    _acted_today = 0
-    try:
-        _acted_today = int(store.acted_since(start_of_day(now)) or 0)
-    except Exception:
-        _acted_today = 0
 
     examined = 0
     for session in sessions[: options.max_sessions_per_tick]:
@@ -351,11 +339,6 @@ def patrol_tick(
                 proposal,
                 now=now,
                 policy=options.admission,
-                # Today's totals, read from the store rather than counted in this
-                # tick: a loop that restarts hourly and counts its own pass has no
-                # daily cap at all.
-                auto_actions_today=_acted_today,
-                proposals_today=_proposed_today + result["proposed"],
                 prior_decision=prior,
             )
             if decision.answer == "drop":
@@ -365,10 +348,38 @@ def patrol_tick(
             if store.record(proposal):
                 result["proposed"] += 1
                 if decision.answer == "auto":
-                    # Even "auto" does not execute here: this delivery has no
-                    # execution path at all. The row records what *would* run.
                     result["auto"] += 1
+                    auto_queue.append(proposal)
                 result["proposals"].append(proposal.to_row())
+    # Act on what admission allowed, **one at a time and in priority order**.
+    #
+    # The pass itself still executes nothing: it hands candidates to whoever owns
+    # an executor -- the patrol service owns one, this function does not -- so the
+    # funnel stays pure and a caller that only wants to look passes nothing.
+    #
+    # Priority, not budget. There is no daily count here on purpose: the number
+    # of candidates is bounded by the facts (a rule fires at most once per
+    # session per fact, and an answered proposal never returns), so a cap would
+    # only decide *which* finite set of work gets skipped -- and it would skip it
+    # by arrival time rather than by importance. Ordering makes the important ones
+    # first instead, which is what "do the work that is there" actually needs.
+    if callable(on_auto):
+        auto_queue.sort(
+            key=lambda item: (
+                int((item.context or {}).get("priority", 99))
+                if isinstance(item.context, dict)
+                else 99,
+                # Oldest first inside a rank: the thing that has been waiting
+                # longest is the one that has cost the most to leave alone.
+                item.created_at,
+            )
+        )
+        for proposal in auto_queue:
+            try:
+                if on_auto(proposal):
+                    result["executed"] = int(result.get("executed", 0)) + 1
+            except Exception as exc:  # noqa: BLE001 - one action must not stop the rest
+                result.setdefault("errors", []).append(str(exc))
     result["examined"] = examined
     return result
 

@@ -39,11 +39,40 @@ from . import (
     MAX_PROPOSAL_REASON_CHARS,
 )
 
-__all__ = ["rule_candidates", "RULE_NAMES"]
+__all__ = ["rule_candidates", "RULE_NAMES", "RULE_PRIORITY", "rule_priority"]
 
 UTC = timezone.utc
 
 #: The rules, by name, so a proposal's ``context`` can say which one fired.
+#: What to do first when several proposals are waiting.
+#:
+#: Ranked by **who is blocked**, not by how alarming the words sound:
+#:
+#: 0. ``stale-queue`` -- a person is waiting on a message that is not moving.
+#:    Somebody is stuck right now, and the queue is the only rule that describes a
+#:    human currently blocked rather than work that already finished failing.
+#: 1. ``failed-run-unreviewed`` -- work was lost and nobody has read why. No one is
+#:    blocked; the cost is that the same failure can repeat unseen.
+#: 2. ``session-ended-mid-task`` -- work stopped halfway. The next turn in that
+#:    session may well pick it up by itself, so acting on it is the most optional
+#:    of the three.
+#:
+#: Deliberately an order, not a score. A weighted sum would need weights nobody
+#: can justify, and the first thing a made-up weight does is make two different
+#: situations look equally urgent. Ties inside a rank are broken by age -- the
+#: thing that has been waiting longest goes first.
+RULE_PRIORITY: dict[str, int] = {
+    "stale-queue": 0,
+    "failed-run-unreviewed": 1,
+    "session-ended-mid-task": 2,
+}
+
+
+#: The order `patrol_tick` acts in when several proposals were admitted at once.
+def rule_priority(rule: str) -> int:
+    return RULE_PRIORITY.get(str(rule or ""), len(RULE_PRIORITY))
+
+
 RULE_NAMES = (
     "failed-run-unreviewed",
     "session-ended-mid-task",
@@ -112,7 +141,11 @@ def rule_candidates(
                 tool="schedule_runs",
                 reversibility=reversibility_for("schedule_runs"),
                 confidence=0.8,
-                context={"rule": "failed-run-unreviewed", "attention": attention},
+                context={
+                    "rule": "failed-run-unreviewed",
+                    "priority": rule_priority("failed-run-unreviewed"),
+                    "attention": attention,
+                },
             )
         )
 
@@ -134,7 +167,11 @@ def rule_candidates(
                     tool="memory_read",
                     reversibility=reversibility_for("memory_read"),
                     confidence=0.6,
-                    context={"rule": "session-ended-mid-task", "status": status},
+                    context={
+                        "rule": "session-ended-mid-task",
+                        "priority": rule_priority("session-ended-mid-task"),
+                        "status": status,
+                    },
                 )
             )
 
@@ -166,7 +203,11 @@ def rule_candidates(
                         tool="list_tools",
                         reversibility=reversibility_for("list_tools"),
                         confidence=0.5,
-                        context={"rule": "stale-queue", "pending": pending},
+                        context={
+                            "rule": "stale-queue",
+                            "priority": rule_priority("stale-queue"),
+                            "pending": pending,
+                        },
                     )
                 )
 

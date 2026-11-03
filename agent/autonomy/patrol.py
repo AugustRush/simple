@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional
 
 from . import PatrolOptions, patrol_tick
 from .admission import AdmissionPolicy
+from .execute import execute_proposal
 from .rules import rule_candidates
 from .store import ProposalStore, open_proposal_store
 
@@ -54,10 +55,9 @@ class PatrolSettings:
     #: failures, stalled queues, unfinished tasks) do not change faster than that,
     #: and a faster pass would only scan the same list more often.
     interval_minutes: int = 10
-    #: What may be done without asking.  Zero auto-actions is the shipped default:
-    #: shadow mode, which is what this delivery is.
-    max_auto_actions_per_day: int = 0
-    max_proposals_per_day: int = 20
+    #: What is too weak to show. There is no cap on how *much* may be done: the
+    #: work is bounded by the facts the rules read, not by a number, and
+    #: ``patrol_tick`` orders what it finds by priority rather than delaying it.
     min_confidence: float = 0.5
     #: A session somebody touched in the last N minutes is skipped.
     warm_window_seconds: int = 15 * 60
@@ -65,11 +65,7 @@ class PatrolSettings:
     stale_window_seconds: int = 7 * 24 * 60 * 60
 
     def admission(self) -> AdmissionPolicy:
-        return AdmissionPolicy(
-            max_auto_actions_per_day=self.max_auto_actions_per_day,
-            max_proposals_per_day=self.max_proposals_per_day,
-            min_confidence=self.min_confidence,
-        )
+        return AdmissionPolicy(min_confidence=self.min_confidence)
 
     def options(self) -> PatrolOptions:
         return PatrolOptions(
@@ -82,10 +78,11 @@ class PatrolSettings:
     def from_config(cls, config: dict[str, Any]) -> "PatrolSettings":
         """Read the ``autonomy`` section, tolerating anything in it being absent.
 
-        A missing section means **enabled with shadow defaults**, because the
-        feature's whole first version is harmless: it writes rows and nothing
-        else.  When a later version can act, the default has to flip to off --
-        and the line to change is here, not in the loop.
+        A missing section means **enabled**, with the shipped defaults: the patrol
+        runs, acts on what is reversible, and leaves everything else as a proposal
+        for a person. That is the intended product, not a cautious first version
+        -- the walls are the reversibility check and the ``autonomy_read`` profile,
+        not whether the loop is switched on.
         """
         section = config.get("autonomy") if isinstance(config, dict) else None
         if not isinstance(section, dict):
@@ -94,8 +91,6 @@ class PatrolSettings:
         for key in (
             "enabled",
             "interval_minutes",
-            "max_auto_actions_per_day",
-            "max_proposals_per_day",
             "min_confidence",
             "warm_window_seconds",
             "stale_window_seconds",
@@ -199,6 +194,61 @@ class PatrolService:
 
     # -- one pass ----------------------------------------------------------
 
+    def _act_on_auto(self, proposal: Any) -> bool:
+        """Execute one proposal the admission stage said may run unasked.
+
+        No budget check: the number of candidates is bounded by the facts, not by
+        a counter. ``patrol_tick`` decides the order (highest priority first, then
+        oldest), so by the time a proposal reaches here it has already won its
+        place.
+
+        What still refuses, and why each one is a *rule* rather than a number:
+
+        * ``execute_proposal`` refuses anything that is not ``reversible``. The
+          admission stage already only answers ``auto`` for those; checking twice
+          is the point, because the second check is the one that runs.
+        * The run goes through the scheduler under ``autonomy_read``, which denies
+          shell. So "what could this do" is answered by a permission profile
+          rather than by a promise -- and an irreversible action is never admitted
+          here at all, so this is the second wall in front of the same room.
+
+        Returns whether a run was actually started.
+        """
+        moment = datetime.now(UTC)
+        scheduler_store = None
+        owns_store = False
+        try:
+            if self.scheduler_store_provider is not None:
+                scheduler_store = self.scheduler_store_provider()
+            else:
+                from agent.scheduler import open_store
+
+                scheduler_store = open_store()
+                owns_store = True
+            outcome = execute_proposal(
+                store=self.store,
+                proposal=proposal,
+                scheduler_store=scheduler_store,
+                now=moment,
+            )
+        except Exception:  # noqa: BLE001 - a failed action is not a failed pass
+            logger.exception("patrol could not act on a proposal")
+            return False
+        finally:
+            if owns_store and scheduler_store is not None:
+                scheduler_store.close()
+        if not outcome.get("ok"):
+            # Refused rather than failed: the row says why, and the next pass will
+            # not try again because the state changed (or did not).
+            logger.info("patrol did not act: %s", outcome.get("reason"))
+            return False
+        logger.info(
+            "patrol acted on %s as task %s",
+            getattr(proposal, "id", "")[:8],
+            str(outcome.get("task_id", ""))[:8],
+        )
+        return True
+
     def read_back_outcomes(self) -> int:
         """Attach each acted-on proposal's run result to the proposal. Returns how many.
 
@@ -273,6 +323,7 @@ class PatrolService:
             now=now,
             options=self.settings.options(),
             suggest=rule_candidates,
+            on_auto=self._act_on_auto,
         )
         # Expiry is part of the pass: a proposal nobody answered is not live
         # forever, and the table is what the next pass reads.

@@ -142,15 +142,13 @@ DEFAULT_CONFIG: dict = {
     # automatic reconnect and then stays failed until something asks for it again.
     "mcp_health_check_seconds": 0.0,
     # ── Autonomy: what the agent would do on its own ──────────────────────
-    # Shadow mode by default: the patrol writes proposals and executes nothing.
-    # `max_auto_actions_per_day: 0` is what makes that true, and it is the first
-    # number to raise once the proposal rows have been read for a while. When this
-    # can *act*, the default has to flip to disabled -- the line to change is here.
+    # On, and acting: reversible proposals run without asking; anything that could
+    # change the world outside the workspace waits as a proposal. There is no
+    # daily action cap on purpose -- the work is bounded by the facts, and order is
+    # decided by priority rather than by a number (see `agent/autonomy/admission.py`).
     "autonomy": {
         "enabled": True,
         "interval_minutes": 10,
-        "max_auto_actions_per_day": 0,
-        "max_proposals_per_day": 20,
         "min_confidence": 0.5,
     },
     # ── Evolution / self-improvement ──────────────────────────────────────

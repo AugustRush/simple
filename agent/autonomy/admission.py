@@ -54,16 +54,21 @@ ADMISSION_ANSWERS = ("auto", "prepare", "drop")
 
 @dataclass
 class AdmissionPolicy:
-    """The caps. Every number here is a guess that the proposal rows will correct."""
+    """What is worth showing, and nothing else.
 
-    #: How many actions may be taken without asking, per rolling day. Zero is a
-    #: legitimate setting: it means "shadow only", which is where this started.
-    max_auto_actions_per_day: int = 0
-    #: How many proposals may be *written* per day, of any kind. This bounds the
-    #: attention a person is asked to spend even when nothing is executed.
-    max_proposals_per_day: int = 20
-    #: Below this confidence, a proposal is dropped rather than shown. A person's
-    #: attention is the scarce resource; a 0.2-confidence guess spends it.
+    The two caps that used to live here -- actions per day, proposals per day --
+    are gone. They were the wrong instrument for the question: a count decides
+    *which* finite set of work to skip, and skips it by arrival order rather than
+    by importance. What actually bounds the work is the facts themselves: a rule
+    fires at most once per session per fact, a live proposal is not written twice,
+    and an answered one never returns. So there is nothing for a cap to protect
+    that dedupe and reversibility are not already protecting.
+
+    What is left is the one judgement a policy should hold: a guess too weak to
+    show is dropped, because a person's attention is the scarce resource.
+    """
+
+    #: Below this confidence, a proposal is dropped rather than shown.
     min_confidence: float = 0.5
 
 
@@ -94,8 +99,6 @@ def decide_admission(
     *,
     now: Optional[datetime] = None,
     policy: Optional[AdmissionPolicy] = None,
-    auto_actions_today: int = 0,
-    proposals_today: int = 0,
     prior_decision: Optional[str] = None,
     arguments: Optional[dict[str, Any]] = None,
 ) -> AdmissionDecision:
@@ -106,14 +109,21 @@ def decide_admission(
 
     1. **Already answered** -- a declined suggestion is dropped, never re-run.
     2. **Confidence floor** -- a weak guess is dropped, not shown.
-    3. **Budget** -- over today's cap, it is prepared rather than done.
-    4. **Reversibility** -- anything that can have changed the world outside the
-       workspace is prepared, always, whatever the budget says.
+    3. **Reversibility** -- anything that can have changed the world outside the
+       workspace is prepared, always.
 
-    Reversibility is checked last and wins: a reversible action that is over
-    budget is still "prepare", and an irreversible one is "prepare" even with an
-    empty day. There is no configuration that makes an irreversible action
-    automatic.
+    There is no longer a budget step. It used to sit between the floor and
+    reversibility ("over today's cap, prepare instead of do"), and it was the
+    wrong shape: a count decides *which* finite set of work to skip and skips it
+    by arrival order, while the set of candidates is already bounded by the facts
+    -- a rule fires at most once per session per fact, and an answered proposal
+    never returns. What was left for the budget to do was delay work that the
+    funnel had already decided was worth doing, in an order nobody chose.
+
+    So the answer is now entirely about *permission*: reversible is done,
+    irreversible is prepared. ``patrol_tick`` decides the order -- highest
+    priority first, then oldest -- which is the part a number was never able to
+    express.
     """
     now = now or datetime.now(UTC)
     policy = policy or AdmissionPolicy()
@@ -138,15 +148,6 @@ def decide_admission(
             ),
         )
 
-    if proposals_today >= policy.max_proposals_per_day:
-        return AdmissionDecision(
-            answer="drop",
-            reason=(
-                f"今天的提议数已达上限（{policy.max_proposals_per_day}），"
-                "这一条不再写入"
-            ),
-        )
-
     if proposal.reversibility == "irreversible":
         return AdmissionDecision(
             answer="prepare",
@@ -163,19 +164,12 @@ def decide_admission(
             prepared=_prepare(proposal, arguments),
         )
 
-    if auto_actions_today >= policy.max_auto_actions_per_day:
-        return AdmissionDecision(
-            answer="prepare",
-            reason=(
-                f"今天自动执行的额度已用完（{policy.max_auto_actions_per_day} 次/天），"
-                "这一条改为准备好等确认"
-            ),
-            prepared=_prepare(proposal, arguments),
-        )
-
     return AdmissionDecision(
         answer="auto",
-        reason="只读动作，且在今天的额度之内",
+        # The reason says what the answer is based on -- a fact about the tool,
+        # not a count of what already ran. "Within today's budget" would be true
+        # and irrelevant now that there is no budget.
+        reason="只读动作：不会改变工作区之外的东西，所以直接做",
         prepared=_prepare(proposal, arguments),
     )
 

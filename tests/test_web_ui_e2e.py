@@ -397,8 +397,10 @@ def test_the_autonomy_page_shows_what_it_would_do(page, live_gateway):
     assert "本来会准备好等你" in text
     assert "schedule_runs" in text
     assert "只读" in text and "不可逆" in text, "the reversibility class must be visible"
-    # The honest footnote, which is the page's promise.
-    assert "0 次自动执行" in text
+    # The honest footnote. It used to promise "0 次自动执行"; the loop acts now, so
+    # what the page has to promise instead is *which* actions it takes on its own.
+    assert "只读的动作它自己就做了" in text
+    assert "永远不会自己做" in text, "the irreversible line is the promise that remains"
 
     # Answering one is the page's whole interaction, and the row goes away.
     page.locator(".proposal-card").first.locator("button", has_text="不要").click()

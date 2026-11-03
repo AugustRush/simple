@@ -1325,12 +1325,12 @@ def gateway(
             catalog.mount(SchedulerPlugin())
             service = require_service(components, "scheduler")
             scheduler_task = asyncio.create_task(service.run_forever())
-            # The shadow patrol runs here because its input is *silence*: it looks
+            # The patrol runs here because its input is *silence*: it looks
             # for sessions nobody is in. A patrol that only runs when a command is
             # typed finds nothing, because typing is the opposite of silence.
             # Its effect on the world is a row in `autonomy/proposals.db` -- this
             # delivery has no execution path at all.
-            patrol_service = _start_shadow_patrol(gateway_cfg, components)
+            patrol_service = _start_patrol(gateway_cfg, components)
             runner = ChannelRunner(channels, components, gateway_cfg)
             await runner.run()
         finally:
@@ -1745,7 +1745,7 @@ def _scheduler_services(components: dict) -> dict:
 def _autonomy_session_rows(
     limit: int = 50, *, live_sessions: Any = None
 ) -> list[dict[str, object]]:
-    """What the shadow patrol may look at, per session -- from the stores that hold it.
+    """What the patrol may look at, per session -- from the stores that hold it.
 
     Three facts, three sources, and the reason each is where it is:
 
@@ -1864,7 +1864,7 @@ def _autonomy_session_rows(
     return rows
 
 
-def _start_shadow_patrol(config: dict, components: dict | None = None) -> Any:
+def _start_patrol(config: dict, components: dict | None = None) -> Any:
     """Start the patrol in this process, or return None when it is off.
 
     Its session list comes from the same index the page reads (see
@@ -1902,8 +1902,8 @@ def _start_shadow_patrol(config: dict, components: dict | None = None) -> Any:
         if not service.start():
             return None
         shared.CONSOLE.print(
-            f"[dim]Autonomy patrol: shadow mode, every {settings.interval_minutes} min "
-            f"({settings.max_auto_actions_per_day} auto-actions/day)[/dim]"
+            f"[dim]Autonomy patrol: every {settings.interval_minutes} min, "
+            "acting on reversible proposals[/dim]"
         )
         return service
     except Exception as exc:  # noqa: BLE001 - never fail a gateway over this
@@ -1916,7 +1916,7 @@ def autonomy(
     action: str = typer.Argument(
         "review",
         help=(
-            "review (list proposals) | tick (run one shadow pass) | decide | "
+            "review (list proposals) | tick (run one pass) | decide | "
             "stats | act (execute one approved reversible proposal)"
         ),
     ),
@@ -1930,7 +1930,7 @@ def autonomy(
         None, "--name", help="Session name (default: ~/.agent)"
     ),
 ):
-    """The shadow patrol: what the agent *would* do, and what you said about it.
+    """The patrol: what the agent would do, what it did, and what you said.
 
     There is no `run` here on purpose.  This delivery proposes and records; it does
     not act.  `tick` walks the sessions once and writes the candidates it found, so
@@ -1970,7 +1970,7 @@ def autonomy(
             except Exception:
                 pass
             shared.CONSOLE.print(
-                f"[dim]shadow tick: examined {result['examined']}, "
+                f"[dim]tick: examined {result['examined']}, "
                 f"eligible {result['eligible']}, warm {result['skipped_warm']}, "
                 f"stale {result['skipped_stale']}, proposed {result['proposed']}, "
                 f"duplicates {result['duplicates']}[/dim]"
@@ -1985,7 +1985,7 @@ def autonomy(
                 )
             return
         if action == "stats":
-            # The funnel's numbers, which are the point of the shadow period: a
+            # The funnel's numbers, which are the calibration: a
             # funnel that proposes nothing because it examines nothing looks
             # exactly like one that proposes nothing because there is nothing to do.
             from datetime import datetime, timedelta, timezone
@@ -2001,7 +2001,8 @@ def autonomy(
             rate = (proposed / examined) if examined else 0.0
             shared.CONSOLE.print(
                 f"[bold]最近 {window} 天[/bold] {stats['passes']} 趟巡逻，"
-                f"看了 {examined} 个会话，产出 {proposed} 条提议"
+                f"看了 {examined} 个会话，产出 {proposed} 条提议，"
+                f"[bold]自己做了 {stats.get('executed', 0)} 件[/bold]"
             )
             shared.CONSOLE.print(
                 f"[dim]跳过：温 {stats['skipped_warm']} · 旧 {stats['skipped_stale']} · "
