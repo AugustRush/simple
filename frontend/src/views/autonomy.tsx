@@ -124,89 +124,84 @@ export function renderAutonomy(ctx: AppCtx) {
     </Card>
   )
 
+  // What this page can say, in the order a reader needs it -- and nothing else:
+  // what is waiting (the only thing anyone can act on), what was answered, how
+  // much was looked at, and the one rule the page exists to state.
+  //
+  // The previous version said all of that as four paragraphs and three
+  // horizontal rules at 11px, with a 200px empty illustration in the middle. On
+  // a page whose usual state is "nothing waiting" that is a wall of prose saying
+  // nothing, and the record it exists for was the smallest thing on it.
   return (
     <div className="page-view autonomy-view">
-      <div className="page-head">
-        <div>
-          <div className="schedule-title-row">
-            <span className="proposal-count">
-              {proposed > 0 ? `${proposed} 条待答复` : '没有待答复的提议'}
-            </span>
-            {/* Counted from the list itself, not from a second tally: the page
-                used to say "已答复 6" above a list of 8 rows, because the
-                counter added up two states and the list rendered three. One
-                number, read off the thing it is counting. */}
-            {answeredProposals.length > 0 && (
-              <span className="proposal-muted">已答复 {answeredProposals.length}</span>
-            )}
-            {expired > 0 && <span className="proposal-muted">已过期 {expired}</span>}
-          </div>
-          <p>
-            这些是它想做、但<strong>必须等你点头</strong>的事——会改动工作区之外的东西。
-            只读的那一类它不问，直接做。
-          </p>
-          {/* How much was looked at to find these. Without it, "nothing proposed"
-              invites the reader to guess whether there was nothing to do -- and a
-              paragraph of prose is the wrong shape for four numbers. */}
-          {funnel && funnel.passes > 0 && (
-            <div className="proposal-funnel">
-              <span>最近 7 天</span>
-              <span><strong>{funnel.passes}</strong> 趟巡逻</span>
-              <span><strong>{funnel.examined}</strong> 次会话</span>
-              <span><strong>{funnel.proposed}</strong> 条提议</span>
-              <span><strong>{funnel.executed}</strong> 件自己做了</span>
-            </div>
-          )}
+      <div className="autonomy-head">
+        <div className="autonomy-head-text">
+          <span className={`autonomy-state${proposed > 0 ? ' is-waiting' : ''}`}>
+            {proposed > 0 ? `${proposed} 条等你答复` : '没有要你答复的事'}
+          </span>
+          <span className="autonomy-note">
+            {proposed > 0
+              ? '这些动作会改动工作区之外的东西，它不会自己做。'
+              : '它在后台每十分钟看一遍，有需要你点头的才出现在这里。'}
+          </span>
         </div>
-        <Space>
-          <Tooltip title="重新读一遍提议">
-            <Button onClick={() => void loadAutonomy()}>刷新</Button>
-          </Tooltip>
-        </Space>
+        {/* The evidence, on the head's line rather than in a footnote: "nothing
+            waiting" is only worth trusting if you can see that it looked. */}
+        {funnel && funnel.passes > 0 && (
+          <div className="autonomy-stat">
+            <span>
+              近 7 天巡逻 <strong>{funnel.passes}</strong> 趟 · 看过{' '}
+              <strong>{funnel.examined}</strong> 次会话
+            </span>
+            <span>
+              提出 <strong>{funnel.proposed}</strong> 条 · 自己做了{' '}
+              <strong>{funnel.executed}</strong> 件
+            </span>
+          </div>
+        )}
+        <Button size="small" onClick={() => void loadAutonomy()}>
+          刷新
+        </Button>
       </div>
 
       {!proposalsLoaded ? (
-        <Skeleton active paragraph={{ rows: 6 }} />
-      ) : proposals.length === 0 ? (
-        /* One line, not a 200px illustration. When the queue is empty the page's
-           content is the record below it, and a full-height empty state pushed
-           that record off the first screen to say nothing. */
-        <p className="proposal-empty-line">
-          现在没有要你答复的事。它在后台每十分钟看一遍，需要你点头的才会出现在这里。
-        </p>
-      ) : (
+        <Skeleton active paragraph={{ rows: 3 }} title={false} />
+      ) : proposals.length > 0 ? (
         <div className="proposal-list">{proposals.map(renderRow)}</div>
-      )}
-      {/* What was answered, with what happened. Collapsed under the queue on
-          purpose: the live list is what needs a person, and this is the record. */}
+      ) : null}
+
       {answeredProposals.length > 0 && (
-        <div className="proposal-answered">
-          <div className="proposal-answered-title">已答复</div>
+        <section className="autonomy-log">
+          <div className="autonomy-log-head">
+            已答复
+            <span className="autonomy-log-count">{answeredProposals.length}</span>
+            {expired > 0 && (
+              <span className="autonomy-log-count">已过期 {expired}</span>
+            )}
+          </div>
           {answeredProposals.map(row => (
-            <div key={row.id} className="proposal-answered-row">
-              <span className={`proposal-state proposal-state-${row.state}`}>
+            <div key={row.id} className="autonomy-log-row">
+              <span className={`autonomy-log-state is-${row.state}`}>
                 {row.state === 'acted' ? '已执行' : row.state === 'accepted' ? '同意' : '不要'}
               </span>
-              <span className="proposal-answered-action">{row.action}</span>
+              <span className="autonomy-log-action" title={row.action}>
+                {row.action}
+              </span>
               {row.outcome?.status && (
-                <span className={`proposal-outcome proposal-outcome-${row.outcome.status}`}>
+                <span className={`autonomy-log-outcome is-${row.outcome.status}`}>
                   {OUTCOME_LABEL[row.outcome.status] || row.outcome.status}
                 </span>
               )}
-              {/* When it was answered. Without a time these rows are a list of
-                  things that happened at no particular moment, which is not a
-                  record -- it is a set. */}
-              <span className="proposal-answered-at">
+              <span className="autonomy-log-at">
                 {formatDateTime(row.decided_at || row.created_at)}
               </span>
             </div>
           ))}
-        </div>
+        </section>
       )}
-      {/* The honest footnote: a page about autonomy has to say what it is not. */}
-      <p className="proposal-footnote">
-        只读的动作它<strong>自己就做了</strong>，按优先级挨个来，没有次数上限。会改动工作区之外
-        的动作<strong>永远不会自己做</strong>——那不是配置问题。你答复过的建议它不会再提第二次。
+
+      <p className="autonomy-rule">
+        只读的动作它自己做，不问你；会改动工作区之外的动作，永远不会自己做。
       </p>
     </div>
   )

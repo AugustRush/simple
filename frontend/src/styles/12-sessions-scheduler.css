@@ -1423,13 +1423,29 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 }
 
 /* ── the autonomy page ─────────────────────────────────────────────────────
-   A review queue, not a dashboard: the rows are the page, and the only numbers
-   are "how many are waiting". The styling follows the automation cards so the
-   two pages read as one product, with the verdict line given its own weight --
-   "why this would not just run" is the part a person is deciding about. */
-.autonomy-view { display:flex; flex-direction:column; gap:14px; }
-.proposal-count { color:var(--text); font-size:13px; font-weight:600; }
-.proposal-muted { color:var(--text-muted); font-size:11px; }
+   One column, four things: the state, the queue (when there is one), the record
+   of what was answered, and the two footnotes that make the page honest. Only
+   the queue is actionable; everything else is context, and is sized like it.
+
+   The page used to state that context four times over -- a paragraph under the
+   heading, a bordered "nothing is waiting" band, a footnote under the record,
+   and the same sentence again in the app header -- all at 11px, on a page whose
+   normal state is "nothing to do" and which is usually two thirds empty. A page
+   with nothing to report should be quiet about it, and the record it exists for
+   should not be the smallest thing on it. */
+.autonomy-view { display:flex; flex-direction:column; gap:24px; }
+
+/* The answer on the left, the evidence behind it on the right, the one control
+   on the far right. Full width, like every other page: a narrow column here read
+   as a cropped page rather than as a quiet one. */
+.autonomy-head { display:flex; align-items:flex-start; gap:24px; }
+.autonomy-head-text { display:flex; flex-direction:column; gap:5px; min-width:0; flex:1 1 auto; }
+.autonomy-state { color:var(--text); font-size:17px; font-weight:650; letter-spacing:-.01em; }
+.autonomy-note { color:var(--text-muted); font-size:12px; line-height:1.65; }
+.autonomy-stat { display:flex; flex-direction:column; gap:3px; flex:0 0 auto; padding-top:3px; color:var(--text-muted); font-size:11px; line-height:1.6; text-align:right; }
+.autonomy-stat strong { color:var(--text-secondary); font-weight:600; font-variant-numeric:tabular-nums; }
+
+/* The queue. Cards, because each one carries the answer a person gives. */
 .proposal-list { display:flex; flex-direction:column; gap:10px; }
 .proposal-card .ant-card-body { padding:14px 16px; }
 .proposal-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
@@ -1440,27 +1456,34 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .proposal-title span { color:var(--text-muted); font-size:11px; line-height:1.5; }
 .proposal-tags { flex:0 0 auto; }
 .proposal-tags .ant-tag { margin:0; font-size:11px; }
-.proposal-verdict { margin:10px 0 0; color:var(--text-secondary); font-size:11px; line-height:1.6; }
+.proposal-verdict { margin:10px 0 0; color:var(--text-secondary); font-size:12px; line-height:1.6; }
 .proposal-prepared { margin:6px 0 0; color:var(--text-muted); font-size:11px; }
 .proposal-prepared code { padding:1px 5px; border-radius:4px; background:var(--surface-hover); }
 .proposal-footer { display:flex; align-items:center; justify-content:space-between; margin-top:12px; padding-top:10px; border-top:1px solid var(--border); color:var(--text-muted); font-size:11px; }
-.proposal-footnote { margin:0; color:var(--text-muted); font-size:11px; line-height:1.7; }
-.proposal-funnel { display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 14px; margin:8px 0 0; color:var(--text-muted); font-size:11px; }
-.proposal-funnel strong { color:var(--text-secondary); font-variant-numeric:tabular-nums; }
-/* Says "nothing is waiting" in the space that fact deserves: one line. */
-.proposal-empty-line { margin:4px 0 0; padding:14px 0; border-top:1px solid var(--border); border-bottom:1px solid var(--border); color:var(--text-muted); font-size:12px; line-height:1.7; }
 .proposal-outcome { margin:8px 0 0; color:var(--text-secondary); font-size:11px; line-height:1.6; }
 .proposal-outcome-failed,
 .proposal-outcome-interrupted { color:var(--red); }
-.proposal-outcome-succeeded { color:#2f7a57; }
+.proposal-outcome-succeeded { color:var(--text-secondary); }
 .proposal-outcome-queued,
 .proposal-outcome-running { color:var(--text-muted); }
-.proposal-answered { margin-top:4px; padding-top:12px; border-top:1px solid var(--border); }
-.proposal-answered-title { margin-bottom:8px; color:var(--text-muted); font-size:11px; font-weight:600; }
-.proposal-answered-row { display:flex; align-items:baseline; gap:10px; padding:5px 0; color:var(--text-secondary); font-size:11px; }
-.proposal-answered-action { flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.proposal-answered-at { flex:0 0 auto; color:var(--text-muted); font-size:10px; font-variant-numeric:tabular-nums; }
-.proposal-state { flex:0 0 auto; padding:1px 6px; border-radius:4px; background:var(--surface-hover); font-size:10px; }
-.proposal-state-declined { color:var(--text-muted); }
-.proposal-state-accepted { color:#2f7a57; }
-.proposal-state-acted { color:#4b76a8; }
+
+/* The record: rows, not prose. Columns line up so the state and the time can be
+   compared down the list instead of read one row at a time. */
+.autonomy-log { display:flex; flex-direction:column; }
+.autonomy-log-head {
+  display:flex; align-items:baseline; gap:8px; padding-bottom:9px;
+  border-bottom:1px solid var(--border);
+  color:var(--text-secondary); font-size:12px; font-weight:600;
+}
+.autonomy-log-count { color:var(--text-muted); font-size:11px; font-weight:500; font-variant-numeric:tabular-nums; }
+.autonomy-log-row { display:flex; align-items:baseline; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); }
+.autonomy-log-state { flex:0 0 44px; color:var(--text-secondary); font-size:11px; font-weight:600; }
+.autonomy-log-state.is-declined { color:var(--text-muted); font-weight:500; }
+.autonomy-log-action { flex:1 1 auto; min-width:0; overflow:hidden; color:var(--text); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+.autonomy-log-outcome { flex:0 0 auto; color:var(--text-muted); font-size:11px; }
+.autonomy-log-outcome.is-failed,
+.autonomy-log-outcome.is-interrupted { color:var(--red); }
+.autonomy-log-at { flex:0 0 auto; color:var(--text-muted); font-size:11px; font-variant-numeric:tabular-nums; }
+
+/* The one rule the page exists to state, and nothing else. */
+.autonomy-rule { margin:0; color:var(--text-muted); font-size:11px; line-height:1.7; }
