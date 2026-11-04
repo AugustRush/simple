@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import traceback
+
 from agent import shared
 from . import fts
 from . import _helpers
 from ._helpers import _now
+
+logger = logging.getLogger(__name__)
+
+#: The three frames that sit between a caller and the deletion itself. Anything
+#: further out is the endpoint or tool that asked for it, which is the thing worth
+#: naming in the log.
+_CLEAR_FRAME_FILES = ("maintenance.py", "store.py", "palace.py")
 
 __all__ = [
     "apply_retention",
@@ -15,12 +26,30 @@ __all__ = [
 ]
 
 
+def _clear_caller() -> str:
+    """The outermost frame that is not the memory package's own plumbing."""
+    for frame in reversed(traceback.extract_stack()):
+        name = Path(str(frame.filename)).name
+        if name in _CLEAR_FRAME_FILES:
+            continue
+        return f"{name}:{frame.lineno} {frame.name}"
+    return "unknown"
+
+
 def clear_persistent_memory(
     conn,
     *,
     invalidate,
 ) -> dict[str, int]:
-    """Atomically delete all model-retrievable memory state."""
+    """Atomically delete all model-retrievable memory state.
+
+    Irreversible and reachable from two places (the ``memory_clear`` tool and
+    ``POST /api/memory/clear``), so it leaves a line in the log. It did not
+    before: a wipe could happen and the only trace was that the store read empty
+    afterwards, which is not enough to answer "what deleted it" after the fact.
+    The line names the caller, because "the web endpoint" and "the model's own
+    tool" call for different investigations.
+    """
     tables = (
         "memory_items_fts",
         "memory_items",
@@ -46,6 +75,12 @@ def clear_persistent_memory(
         deleted[table] = int(row["count"] if row else 0)
         conn.execute(f"DELETE FROM {table}")
     invalidate(set())
+    logger.warning(
+        "memory cleared: %d rows from %d tables, caller=%s",
+        sum(deleted.values()),
+        sum(1 for count in deleted.values() if count),
+        _clear_caller(),
+    )
     return deleted
 
 

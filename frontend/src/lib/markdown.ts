@@ -79,5 +79,14 @@ export function markdownToHtml(
   t = t.replace(/\n{2,}/g, '<br /><br />')
   t = t.replace(/\n/g, '<br />')
 
+  // A line break is a *line* break: `<br />` between two block elements is not a
+  // blank line, it is 17px of nothing. The join above put one after every `\n`,
+  // including the newlines that separate `</h1>` from `<ul>` and `</li>` from
+  // `<li>` -- so an entry whose first line is a heading opened with a gap where a
+  // paragraph should have started.
+  const block = 'ul|ol|li|h[1-4]|blockquote|pre|div'
+  t = t.replace(new RegExp(`<br />\\s*(?=<(?:${block})[\\s>])`, 'g'), '')
+  t = t.replace(new RegExp(`(</(?:${block})>)(?:<br />)+`, 'g'), '$1')
+
   return t
 }

@@ -70,7 +70,18 @@ const FACT_KIND_LABELS: Record<string, string> = {
 function previewSource(content: string): string {
   return String(content || '')
     .split(/(```[\s\S]*?```)/g)
-    .map((chunk, index) => (index % 2 === 1 ? chunk : chunk.replace(/\n{2,}/g, '\n')))
+    .map((chunk, index) =>
+      index % 2 === 1
+        ? chunk
+        : chunk
+            .replace(/\n{2,}/g, '\n')
+            // A blank line directly under the entry's heading renders as an
+            // empty line, and an entry whose first line is a `#` heading paid
+            // for it: ~50px of nothing between the title and its first bullet,
+            // on every row.
+            .replace(/^(#{1,6}[^\n]*)\n+/g, '$1\n')
+            .replace(/^\n+/, ''),
+    )
     .join('')
 }
 

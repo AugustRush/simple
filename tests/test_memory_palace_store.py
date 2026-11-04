@@ -99,6 +99,34 @@ def test_memory_palace_clear_removes_durable_memory_and_pending_staging(tmp_path
     assert palace.read_index() == ""
 
 
+def test_clearing_memory_leaves_a_log_line_naming_the_caller(tmp_path, caplog):
+    """The one irreversible operation must be attributable after the fact.
+
+    It is reachable from two places -- the model's ``memory_clear`` tool and the
+    web page's 清空 button -- and until this line existed neither left a trace: the
+    only evidence was that the store read empty afterwards, which cannot answer
+    "what deleted it". The caller is in the line because the two entry points call
+    for different investigations.
+    """
+    import logging
+
+    from agent import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.add_entry(make_entry())
+
+    with caplog.at_level(logging.WARNING, logger="agent.memory.maintenance"):
+        deleted = store.clear_persistent_memory()
+
+    assert deleted["memory_items"] == 1
+    lines = [record.getMessage() for record in caplog.records]
+    cleared = [line for line in lines if line.startswith("memory cleared:")]
+    assert cleared, lines
+    assert "caller=" in cleared[0], cleared[0]
+    # The caller is this test function, not the memory package's own frames.
+    assert "test_clearing_memory_leaves_a_log_line" in cleared[0], cleared[0]
+
+
 def test_memory_palace_does_not_create_chapter_dirs(tmp_path):
     from agent import MemoryPalace
 
