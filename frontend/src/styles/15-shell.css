@@ -161,3 +161,20 @@
 .self-activity-body { padding: 2px 0 0; }
 .self-activity-empty.ant-empty { margin: 8px 0; }
 .self-activity-empty .ant-empty-description { color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+
+/* ── management pages ───────────────────────────────────────────────────────
+   The sidebar used to give these pages a right edge for free. Without it the
+   content ran the full width of the window, so a row put its label at x=32 and
+   its control at x=1400 with 1300px of nothing between -- the "layout looks
+   wrong" that is really "there is no column". A fixed measure, centred, gives
+   every one of them the same reading shape as the settings page already had. */
+.page-view.schedules-view,
+.page-view.memory-view,
+.page-view.extensions-view,
+.page-view.autonomy-view,
+.page-view.settings-view {
+  width: 100%;
+  max-width: 1080px;
+  margin: 0 auto;
+}
+.settings-view .settings-grid { max-width: none; }

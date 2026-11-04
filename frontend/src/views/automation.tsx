@@ -240,38 +240,47 @@ export function renderSchedules(ctx: AppCtx) {
                   </span>
                   <div>
                     <strong>{row.name}</strong>
-                    <span>
-                      {row.kind === 'chain' ? `流程 · ${row.step_count} 个步骤` : '任务'}
-                      {/* A countdown, not a timestamp: the rest of the page says
-                          "还有 21 小时", and a row that says "2026-11-03 09:00"
-                          makes the reader do the subtraction. `describeNextRun`
-                          takes a ScheduleInfo, and the row already carries the two
-                          fields it reads. */}
-                      {row.next_run_at
-                        ? ` · 下次执行：${describeNextRun(
-                            { next_run_at: row.next_run_at, trigger_type: row.trigger_type } as ScheduleInfo,
-                            clock,
-                          )}`
-                        : row.trigger_type === 'signal'
-                          ? ' · 等待信号触发'
-                          : ''}
+                    {/* Status, attention and the next run, on one line under the
+                        name. They used to sit at the two far ends of a 1200px
+                        row -- the tag beside the switch, the countdown beside
+                        the title -- so reading one row meant crossing an empty
+                        middle twice. The row now reads left to right: what it
+                        is, how it went, when it happens next. */}
+                    <span className="schedule-card-meta">
+                      {row.attention > 0 && (
+                        <Tag color="error" className="schedule-card-attention-tag">
+                          {row.attention} 条待处理
+                        </Tag>
+                      )}
+                      {/* The status is the one word a row exists to report, so it
+                          cannot share a colour with the word that means its
+                          opposite: measured, 执行成功 and 执行失败 rendered as the
+                          same grey pill on the same background. #2f7a57 */}
+                      {row.last_status ? (
+                        <span className={`schedule-status-tag status-${row.last_status}`}>
+                          {scheduleRunStatusLabel(row.last_status)}
+                        </span>
+                      ) : null}
+                      <span className="schedule-card-meta-rest">
+                        {row.kind === 'chain' ? `流程 · ${row.step_count} 个步骤` : '任务'}
+                        {/* A countdown, not a timestamp: the rest of the page says
+                            "还有 21 小时", and a row that says "2026-11-03 09:00"
+                            makes the reader do the subtraction. `describeNextRun`
+                            takes a ScheduleInfo, and the row already carries the
+                            two fields it reads. */}
+                        {row.next_run_at
+                          ? ` · 下次执行：${describeNextRun(
+                              { next_run_at: row.next_run_at, trigger_type: row.trigger_type } as ScheduleInfo,
+                              clock,
+                            )}`
+                          : row.trigger_type === 'signal'
+                            ? ' · 等待信号触发'
+                            : ''}
+                      </span>
                     </span>
                   </div>
                 </div>
                 <Space className="schedule-card-controls">
-                  {row.attention > 0 && (
-                    <Tag color="error">{row.attention} 条待处理</Tag>
-                  )}
-                  {/* The status is the one word a row exists to report, so it
-                      cannot share a colour with the word that means its
-                      opposite: measured, 执行成功 and 执行失败 rendered as the
-                      same grey pill on the same background. The class carries
-                      the status; the palette decides what failure looks like. */}
-                  {row.last_status ? (
-                    <Tag className={`schedule-status-tag status-${row.last_status}`}>
-                      {scheduleRunStatusLabel(row.last_status)}
-                    </Tag>
-                  ) : null}
                   {/* Editing is a conversation too: the row opens one seeded with
                       this automation's name and id, so "改成每周一" is a sentence rather
                       than a form the agent has to be transcribed into. */}

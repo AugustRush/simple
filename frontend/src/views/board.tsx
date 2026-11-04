@@ -2,22 +2,29 @@
  *
  * Why a panel
  * -----------
- * The board used to sit at the top of 主页, above the box: every visit paid for it
- * in vertical space even when nothing needed a person, and a two-line summary of
- * "everything is fine" is the least useful thing a landing page can say. It also
- * fought the one thing the page is for -- talking -- by pushing the box down.
+ * The board used to sit at the top of 主页, above the box: every visit paid for
+ * it in vertical space even when nothing needed a person, and a two-line summary
+ * of "everything is fine" is the least useful thing a landing page can say. A
+ * panel answers the same question on demand without charging the page for it.
  *
- * A panel answers the same question on demand ("what is waiting") without charging
- * the page for it when the answer is "nothing". It stays open while you work,
- * because it is a *state* view rather than a task you finish and close.
+ * Why it opens on one sentence
+ * ----------------------------
+ * The panel's job is to answer "does anything need me" before you have read
+ * anything. It used to answer with three groups, each with a heading and a
+ * divider -- two of them reporting their own emptiness, which is the most
+ * expensive possible way to say "nothing". Now the first line says it once
+ * ("没有要你处理的事 · 3 个已排期"), and the groups below exist only when they
+ * have something in them. An empty group is not evidence of work; the sentence
+ * that says the panel checked is.
  *
- * Why the columns stack here
- * --------------------------
- * Three side-by-side columns need ~700px. A right rail is ~380px, so the same
- * three groups are stacked vertically instead: 等你处理 first (it needs a person),
- * then 正在跑 (alive, needs nothing), then 已排期 (future, needs nothing yet). The
- * order is the same argument as the wide version -- act, watch, ignore -- just
- * turned ninety degrees.
+ * Why two shapes of card
+ * ----------------------
+ * A proposal is a decision and carries its own buttons; a running or scheduled
+ * task is a *pointer* to something the agent owns. Drawing both as identical
+ * boxed cards made the panel a list of boxes to scan rather than a list of
+ * things to act on and things to ignore. So: a card for what needs an answer,
+ * a row for what needs nothing -- the same distinction the three groups make,
+ * expressed in shape rather than in a heading the reader has to hold in mind.
  */
 
 import type { AppCtx } from '../app/AppCtx'
@@ -53,134 +60,111 @@ const REVERSIBILITY_LABEL: Record<string, string> = {
   irreversible: '不可逆',
 }
 
-/** One group of cards, with a heading and a line for when it is empty.
- *
- * The empty line is not decoration: a group that vanishes reads as "this part is
- * broken", while "没有卡住的" beside a full group reads as "checked, nothing wrong"
- * -- which is the whole reason for looking.
- */
-function BoardGroup({
-  cards,
-  empty,
-  more,
+/** A proposal: the one card shape that carries a decision. */
+function ProposalCard({
+  card,
   onDecide,
-  onMore,
-  onOpen,
-  title,
-  tone,
 }: {
-  cards: BoardCard[]
-  empty: string
-  more?: string
+  card: BoardCard
   onDecide?: (id: string, state: 'accepted' | 'declined') => void
-  onMore?: () => void
-  onOpen?: (taskId: string) => void
-  title: string
-  tone: 'running' | 'waiting' | 'scheduled'
 }) {
   return (
-    <section className={`panel-group panel-group-${tone}${cards.length === 0 ? ' is-empty' : ''}`}>
-      <div className="panel-group-head">
-        <span className="panel-group-title">{title}</span>
-        {cards.length > 0 ? (
-          <span className="panel-group-count">{cards.length}</span>
-        ) : (
-          /* The empty sentence belongs on the heading's line, not under it.
-             Stacked, two empty groups spent ~120px of a 380px panel saying
-             nothing, and pushed the one group that had cards to the bottom
-             half of the screen -- so the panel opened on the least useful part
-             of itself. The information (checked, nothing there) is the same. */
-          <span className="panel-group-empty">{empty}</span>
-        )}
-      </div>
-      {cards.length > 0 && (
-        cards.map(card =>
-          card.kind === 'proposal' ? (
-            /* A proposal is a *candidate* task blocked on a person, so its card
-               carries the answer: making somebody close the panel and find 自主 to
-               answer the thing this panel just showed them would be the panel
-               knowing what to do and refusing to do it. */
-            <div key={`proposal:${card.id}`} className="panel-card panel-card-proposal">
-              <strong title={card.name}>{card.name}</strong>
-              {card.detail && <span className="panel-card-detail">{card.detail}</span>}
-              <div className="panel-card-actions">
-                <Tag className="panel-card-tag">
-                  {REVERSIBILITY_LABEL[card.reversibility || ''] || '未知'}
-                </Tag>
-                {/* Agreement first: it is the answer that keeps the agent moving,
-                    and it needs no second step. A decline is the one that is worth
-                    confirming -- it is what the agent is told never to raise again. */}
-                <Button
-                  size="small"
-                  type="primary"
-                  onClick={() => onDecide?.(card.id || '', 'accepted')}
-                >
-                  同意
-                </Button>
-                <Popconfirm
-                  title="不要这件事？"
-                  description="它不会再提第二次。"
-                  okText="不要"
-                  cancelText="取消"
-                  onConfirm={() => onDecide?.(card.id || '', 'declined')}
-                >
-                  <Button size="small">不要</Button>
-                </Popconfirm>
-              </div>
-            </div>
-          ) : (
-            /* A task card is a way into the task, not a picture of it: the group it
-               sits in is made of things that need acting on. */
-            <div
-              key={card.task_id}
-              className="panel-card panel-card-open"
-              role="button"
-              tabIndex={0}
-              aria-label={`打开任务 ${card.name}`}
-              onClick={() => onOpen?.(card.task_id)}
-              onKeyDown={event => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                  event.preventDefault()
-                  onOpen?.(card.task_id)
-                }
-              }}
-            >
-              <strong title={card.name}>{card.name}</strong>
-              {/* For a scheduled card the trigger comes first: "每天" is what the
-                  card is *about* -- it says it will come back -- and the countdown
-                  is the detail. Read the other way round it said "21 小时后 ·
-                  每天", which answers "when" before saying what it is. */}
-              <span className="panel-card-meta">
-                {card.at_kind === 'next' ? (
-                  <>
-                    {TRIGGER_LABEL[card.trigger_type] || '排期中'}
-                    {card.at ? ` · ${relativeTime(card.at)}` : ''}
-                  </>
-                ) : (
-                  <>
-                    {relativeTime(card.at)}
-                    {card.at ? ' · ' : ''}
-                    {card.unread > 1
-                      ? `${RUN_STATUS_LABEL[card.status] || card.status} · ${card.unread} 次未查看`
-                      : RUN_STATUS_LABEL[card.status] || card.status}
-                  </>
-                )}
-              </span>
-              {card.detail && <span className="panel-card-detail">{card.detail}</span>}
-            </div>
-          ),
-        )
-      )}
-      {more ? (
-        <Button type="link" size="small" className="panel-group-more" onClick={onMore}>
-          {more}
+    <div className="panel-card panel-card-proposal">
+      <strong title={card.name}>{card.name}</strong>
+      {card.detail && <span className="panel-card-detail">{card.detail}</span>}
+      <div className="panel-card-actions">
+        <Tag className="panel-card-tag">
+          {REVERSIBILITY_LABEL[card.reversibility || ''] || '未知'}
+        </Tag>
+        {/* Agreement first: it is the answer that keeps the agent moving, and it
+            needs no second step. A decline is the one worth confirming -- it is
+            what the agent is told never to raise again. */}
+        <Button size="small" type="primary" onClick={() => onDecide?.(card.id || '', 'accepted')}>
+          同意
         </Button>
-      ) : null}
-    </section>
+        <Popconfirm
+          title="不要这件事？"
+          description="它不会再提第二次。"
+          okText="不要"
+          cancelText="取消"
+          onConfirm={() => onDecide?.(card.id || '', 'declined')}
+        >
+          <Button size="small">不要</Button>
+        </Popconfirm>
+      </div>
+    </div>
   )
 }
 
-/** The panel's contents: three groups, most urgent first. */
+/** A run that ended badly and is waiting to be read: a card, but not a decision.
+ *
+ * It shares the "等你处理" group with proposals because both need a person, yet
+ * they ask for different things: a proposal asks yes/no, a failed run asks to be
+ * looked at. Drawing the second with the first's buttons would have offered a
+ * "同意" that answers nothing.
+ */
+function AttentionCard({ card, onOpen }: { card: BoardCard; onOpen?: (taskId: string) => void }) {
+  const status = RUN_STATUS_LABEL[card.status || ''] || card.status || ''
+  return (
+    <button
+      type="button"
+      className="panel-card panel-card-attention"
+      aria-label={`打开任务 ${card.name}`}
+      onClick={() => onOpen?.(card.task_id)}
+    >
+      <strong title={card.name}>{card.name}</strong>
+      <span className="panel-card-sub">
+        {status}
+        {card.unread > 1 ? ` · ${card.unread} 次未查看` : ''}
+        {card.at ? ` · ${relativeTime(card.at)}` : ''}
+      </span>
+      {card.detail && <span className="panel-card-detail">{card.detail}</span>}
+    </button>
+  )
+}
+
+/** A running or scheduled task: a row, because there is nothing to decide.
+ *
+ * It still opens the task -- the panel is a way in as well as a status -- but a
+ * row says "this exists" without asking to be read like a card does.
+ */
+function TaskRow({
+  card,
+  tone,
+  onOpen,
+}: {
+  card: BoardCard
+  tone: 'running' | 'scheduled'
+  onOpen?: (taskId: string) => void
+}) {
+  const status = RUN_STATUS_LABEL[card.status || ''] || card.status || ''
+  const meta =
+    tone === 'scheduled'
+      ? TRIGGER_LABEL[card.trigger_type] || '排期中'
+      : card.unread > 1
+        ? `${status} · ${card.unread} 次未查看`
+        : status
+
+  return (
+    <button
+      type="button"
+      className={`panel-row panel-row-${tone}`}
+      aria-label={`打开任务 ${card.name}`}
+      onClick={() => onOpen?.(card.task_id)}
+    >
+      <span className="panel-row-dot" aria-hidden="true" />
+      <span className="panel-row-main">
+        <strong title={card.name}>{card.name}</strong>
+        <span>{meta}</span>
+      </span>
+      <span className="panel-row-when" title={card.at}>
+        {relativeTime(card.at)}
+      </span>
+    </button>
+  )
+}
+
+/** The panel's contents: one summary line, then only the groups that have cards. */
 export function renderBoardPanel(ctx: AppCtx) {
   const { decideProposal, home, navigateTo, openScheduleDetails, schedules, setBoardOpen } = ctx
 
@@ -201,16 +185,14 @@ export function renderBoardPanel(ctx: AppCtx) {
       return
     }
     // Close the panel first: the task's own drawer is about to open on the same
-    // edge, and two of them stacked is a stack of close buttons with no way to tell
-    // which one goes back to what.
+    // edge, and two of them stacked is a stack of close buttons with no way to
+    // tell which one goes back to what.
     setBoardOpen(false)
     openScheduleDetails(task)
     navigateTo('schedules')
   }
 
-  const empty = waiting.length + inFlight.length + scheduledTotal === 0
-
-  if (empty) {
+  if (waiting.length + inFlight.length + scheduledTotal === 0) {
     return (
       <div className="panel-empty">
         <p>现在没有要处理的事。</p>
@@ -221,36 +203,66 @@ export function renderBoardPanel(ctx: AppCtx) {
     )
   }
 
+  // The panel's first line, and the only sentence most visits need.
+  const rest = [
+    inFlight.length ? `${inFlight.length} 个在跑` : '',
+    scheduledTotal ? `${scheduledTotal} 个已排期` : '',
+  ].filter(Boolean)
+
   return (
     <div className="panel-body">
-      <BoardGroup
-        title="等你处理"
-        tone="waiting"
-        cards={waiting}
-        empty="没有卡住的"
-        onDecide={(id, state) => void decideProposal(id, state)}
-        onOpen={openTask}
-      />
-      <BoardGroup
-        title="正在跑"
-        tone="running"
-        cards={inFlight}
-        empty="没有在跑的"
-        onOpen={openTask}
-      />
-      <BoardGroup
-        title="已排期"
-        tone="scheduled"
-        cards={scheduled}
-        empty="没有排期的"
-        more={
-          scheduledTotal > scheduled.length
-            ? `还有 ${scheduledTotal - scheduled.length} 个 · 全部`
-            : ''
-        }
-        onMore={() => navigateTo('schedules')}
-        onOpen={openTask}
-      />
+      <div className="panel-summary">
+        <span className={`panel-summary-state${waiting.length ? ' is-waiting' : ''}`}>
+          {waiting.length ? `${waiting.length} 件等你处理` : '没有要你处理的事'}
+        </span>
+        {rest.length > 0 && <span className="panel-summary-rest">{rest.join(' · ')}</span>}
+      </div>
+
+      {waiting.length > 0 && (
+        <section className="panel-group panel-group-waiting">
+          <div className="panel-group-head">
+            等你处理<span className="panel-group-count">{waiting.length}</span>
+          </div>
+          {waiting.map(card =>
+            card.kind === 'proposal' ? (
+              <ProposalCard
+                key={`proposal:${card.id}`}
+                card={card}
+                onDecide={(id, state) => void decideProposal(id, state)}
+              />
+            ) : (
+              <AttentionCard key={card.task_id} card={card} onOpen={openTask} />
+            ),
+          )}
+        </section>
+      )}
+
+      {inFlight.length > 0 && (
+        <section className="panel-group panel-group-running">
+          <div className="panel-group-head">
+            正在跑<span className="panel-group-count">{inFlight.length}</span>
+          </div>
+          {inFlight.map(card => (
+            <TaskRow key={card.task_id} card={card} tone="running" onOpen={openTask} />
+          ))}
+        </section>
+      )}
+
+      {scheduled.length > 0 && (
+        <section className="panel-group panel-group-scheduled">
+          <div className="panel-group-head">
+            已排期<span className="panel-group-count">{scheduledTotal}</span>
+          </div>
+          {scheduled.map(card => (
+            <TaskRow key={card.task_id} card={card} tone="scheduled" onOpen={openTask} />
+          ))}
+          {scheduledTotal > scheduled.length && (
+            <Button type="link" size="small" className="panel-group-more" onClick={() => navigateTo('schedules')}>
+              还有 {scheduledTotal - scheduled.length} 个 · 全部
+            </Button>
+          )}
+        </section>
+      )}
     </div>
   )
 }

@@ -1,112 +1,121 @@
 /* The board panel: a right rail you pull out, not a block on the page.
  *
- * Width is fixed at 380px because the three groups stack here instead of sitting
- * side by side: three columns need ~700px, and a rail that wide is a second main
- * column rather than a panel. Stacked, the same information reads top to bottom
- * in the same order -- 等你处理 (a person is blocked), 正在跑 (alive), 已排期
- * (future). Same argument as the wide board, turned ninety degrees. */
+ * The panel answers one question -- does anything need me -- so its first line
+ * answers it, and the groups below exist only when they have something in them.
+ * Two shapes of entry, because there are two kinds of thing here: a proposal is
+ * a decision and gets a card, everything else is a pointer and gets a row.
+ *
+ * Width 380: a rail, not a second column. If it were wide enough for three
+ * side-by-side columns it would be a place you work, which this is not. */
 
-.board-drawer .ant-drawer-body { display: flex; flex-direction: column; }
-.panel-body { display: flex; flex-direction: column; gap: 18px; }
+.board-drawer .ant-drawer-body { display: flex; flex-direction: column; padding: 12px 14px 18px; }
+.board-drawer .ant-drawer-header { border-bottom: 1px solid var(--border); padding: 14px 16px; }
+.board-drawer .ant-drawer-title { color: var(--text); font-size: 13px; font-weight: 600; }
 
-.panel-group { display: flex; flex-direction: column; gap: 6px; }
-/* An empty group is one line: heading, and the sentence saying it is empty,
-   on the same baseline. Stacked (heading, then a line underneath) two empty
-   groups took a third of the panel to report two absences. */
-.panel-group.is-empty { gap: 0; }
-.panel-group.is-empty .panel-group-head { border-bottom-color: transparent; padding-bottom: 0; }
+.panel-body { display: flex; flex-direction: column; gap: 22px; }
+
+/* The sentence the panel exists to say. */
+.panel-summary { display: flex; flex-direction: column; gap: 3px; padding: 2px 2px 4px; }
+.panel-summary-state { color: var(--text); font-size: 14px; font-weight: 600; }
+.panel-summary-state.is-waiting { color: var(--text); }
+.panel-summary-rest { color: var(--text-muted); font-size: 11px; }
+
+.panel-group { display: flex; flex-direction: column; gap: 8px; }
 .panel-group-head {
   display: flex;
   align-items: baseline;
-  gap: 6px;
-  padding-bottom: 2px;
-  border-bottom: 1px solid var(--border);
+  gap: 7px;
+  padding: 0 2px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .02em;
 }
-.panel-group-title { color: var(--text-secondary); font-size: 11px; font-weight: 600; }
-/* A count is a badge only when there is something to count: "0" beside a heading
-   is a number that answers nothing. */
-.panel-group-count { color: var(--text-muted); font-size: 10px; }
-.panel-group-empty { margin-left: auto; color: var(--text-muted); font-size: 10px; }
-.panel-group-more { padding: 0; height: auto; align-self: flex-start; font-size: 10px; }
+.panel-group-count { color: var(--text-muted); font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.panel-group-more { padding: 0; height: auto; align-self: flex-start; font-size: 11px; }
 
+/* A proposal: a decision, so it gets a card, a body, and its buttons. */
 .panel-card {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 9px 10px;
+  gap: 6px;
+  padding: 12px 13px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-left: 3px solid var(--red);
+  border-radius: 10px;
   background: var(--surface);
 }
-/* The left edge says which group the card is in before the heading is read. */
-.panel-group-waiting .panel-card { border-left: 2px solid var(--red); }
-.panel-group-running .panel-card { border-left: 2px solid var(--primary); }
-.panel-group-scheduled .panel-card { border-left: 2px solid var(--border-strong, var(--border)); }
 .panel-card strong {
   overflow: hidden;
   color: var(--text);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
+  line-height: 1.45;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.panel-card-meta { color: var(--text-muted); font-size: 10px; }
 /* A failure's own words, clamped: the card is a pointer to the task, not the
    place the failure is diagnosed. */
 .panel-card-detail {
   display: -webkit-box;
   overflow: hidden;
-  color: var(--text-secondary);
-  font-size: 10px;
+  color: var(--text-muted);
+  font-size: 11px;
   line-height: 1.5;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
+.panel-card-actions { display: flex; align-items: center; gap: 6px; padding-top: 2px; }
 
-.panel-card-open { cursor: pointer; transition: background .14s ease; }
-.panel-card-open:hover { background: var(--surface-hover); }
-.panel-card-open:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+/* A failed run waiting to be read: same card, different question -- so no
+   buttons, a red left edge, and the whole card is the way to the run. */
+.panel-card-attention {
+  align-items: flex-start;
+  width: 100%;
+  border-left-color: var(--red);
+  text-align: left;
+  cursor: pointer;
+  transition: background .14s ease;
+}
+.panel-card-attention:hover { background: var(--surface-hover); }
+.panel-card-attention:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.panel-card-sub { color: var(--text-muted); font-size: 11px; }
+.panel-card-tag { margin: 0 auto 0 0; border: 0; background: var(--surface-hover); color: var(--text-muted); font-size: 10px; line-height: 16px; }
 
-/* A proposal carries the answer, so it is the one card that is taller and the one
-   whose buttons must not be mistaken for the card's own click. */
-.panel-card-proposal { background: var(--surface-raised, var(--surface)); }
-.panel-card-actions {
+/* A running or scheduled task: a pointer, so it gets a row. The dot is the only
+   thing that says "alive"; everything else is a label. */
+.panel-row {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  margin-top: 5px;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background .14s ease;
 }
-.panel-card-tag { margin: 0 auto 0 0; font-size: 10px; line-height: 16px; }
+.panel-row:hover { background: var(--surface-hover); }
+.panel-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.panel-row-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--text-muted); }
+.panel-row-running .panel-row-dot { background: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.panel-row-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.panel-row-main strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.panel-row-main span { color: var(--text-muted); font-size: 11px; }
+.panel-row-when { flex: 0 0 auto; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
-.panel-empty { padding: 12px 2px; color: var(--text-secondary); font-size: 12px; }
+.panel-empty { padding: 10px 2px; color: var(--text-secondary); font-size: 13px; }
 .panel-empty p { margin: 0 0 6px; }
 .panel-empty-hint { color: var(--text-muted); font-size: 11px; line-height: 1.7; }
-
-/* ── the header control ───────────────────────────────────────────────────── */
-.header-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-.header-board { color: var(--text-secondary); font-size: 12px; }
-.header-board:hover { color: var(--text); }
-.header-board:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-
-/* The one line on 主页 that says a panel has something in it. A line, not cards:
-   the page's job is to be out of the way of asking something, and the detail is
-   one click away in the panel. */
-.home-needs-line {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid var(--primary-border);
-  border-radius: 999px;
-  background: var(--primary-soft);
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-}
-.home-needs-line:hover { color: var(--text); border-color: var(--focus-ring); }
-.home-needs-line:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-.home-needs-line span { color: var(--text-muted); }
 
 /* The panel starts below the app header, not over it.
  *

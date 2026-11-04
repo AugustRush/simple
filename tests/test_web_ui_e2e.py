@@ -577,12 +577,17 @@ def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
     page.locator(".header-board").click()
     page.wait_for_selector(".panel-card-proposal", timeout=20_000)
 
-    # Three groups, in attention order: the one that needs a person leads.
+    # The panel opens on one sentence, then draws only the groups that have
+    # cards: three headings, two of which report their own emptiness, is the
+    # most expensive possible way to say "nothing needs you".
+    assert "件等你处理" in page.locator(".panel-summary-state").inner_text()
     titles = [
-        page.locator(".panel-group-title").nth(i).inner_text().strip()
-        for i in range(page.locator(".panel-group-title").count())
+        page.locator(".panel-group-head").nth(i).inner_text().strip()
+        for i in range(page.locator(".panel-group-head").count())
     ]
-    assert titles == ["等你处理", "正在跑", "已排期"], titles
+    # "等你处理" and its count are one heading line, and it leads. Not an exact
+    # list: the gateway is shared, so other tests' cards can add groups below.
+    assert titles and titles[0].replace("\n", " ").split()[0] == "等你处理", titles
 
     # By text, not by position: the autonomy page's test seeds its own proposals
     # into the same gateway home, so "the first card" is whichever ran first.
@@ -660,7 +665,7 @@ def test_a_board_card_opens_its_task(page, live_gateway):
     page.goto(page.url.split("#")[0], wait_until="networkidle")
     page.locator(".header-board").click()
     page.wait_for_timeout(600)
-    card = page.locator(".panel-card-open").filter(has_text="看板测试任务")
+    card = page.locator(".panel-card-attention").filter(has_text="看板测试任务")
     card.first.wait_for(timeout=20_000)
     card.first.click()
 

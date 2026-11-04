@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 STYLES = Path(__file__).resolve().parent.parent / "frontend" / "src" / "styles"
+VIEWS = Path(__file__).resolve().parent.parent / "frontend" / "src" / "views"
 
 
 def _rules_mentioning(needle: str) -> list[tuple[str, str]]:
@@ -81,31 +82,26 @@ def test_the_checked_switch_does_not_paint_a_white_knob_on_a_light_track() -> No
     )
 
 
-def test_a_tag_colour_is_not_defeated_by_the_global_important_tag() -> None:
-    """A per-tag colour needs ``!important`` here, and silently losing it is invisible.
+def test_the_automation_status_is_not_an_antd_tag() -> None:
+    """执行成功 and 执行失败 must not be rendered as antd ``Tag``s.
 
     10-secondary-glass.css paints every ``.ant-tag`` with the monochrome palette
-    *and marks the declaration important*. A later rule that sets only ``color``
-    therefore loses, whatever its specificity -- which is how 执行失败 and
-    执行成功 ended up as the same grey word in the same grey pill even after a
-    class per status existed. The rule is not "never use !important"; it is that
-    a status rule has to out-rank the one that is already important.
+    *and marks the declaration important*, which is how 执行失败 and 执行成功
+    ended up as the same grey word in the same grey pill. The first fix was to
+    out-rank it with ``!important``; the row now renders the status as a plain
+    ``span`` whose colour comes from the shared ``.status-*`` rules, so the global
+    override has nothing to win. This guard is about that shape: putting the
+    ``Tag`` back would silently reintroduce the bug, because the override it
+    loses to is two files away.
     """
-    base = (STYLES / "10-secondary-glass.css").read_text()
-    global_rules = [
-        line
-        for line in base.splitlines()
-        if line.strip().startswith("color:") and "!important" in line
-    ]
-    if not global_rules:
-        return  # the global override is gone; per-status rules are plain again
+    automation = (VIEWS / "automation.tsx").read_text()
+    assert "schedule-status-tag" in automation, "the status class should still exist"
+    for line in automation.splitlines():
+        if "schedule-status-tag" not in line:
+            continue
+        assert "<Tag" not in line and "</Tag>" not in line, (
+            "the status must stay a span: as a `.ant-tag` it is flattened to the "
+            f"global grey by an !important rule elsewhere -- {line.strip()}"
+        )
 
-    offenders = [
-        (where, line)
-        for where, line in _rules_mentioning(".schedule-status-tag.status-")
-        if line.strip().startswith("color:") and "!important" not in line
-    ]
-    assert not offenders, (
-        "these status-tag colours lose to the global important `.ant-tag` rule, "
-        f"so every status renders the same colour: {offenders}"
-    )
+

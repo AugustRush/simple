@@ -199,9 +199,13 @@ html[data-theme='dark'] .settings-inline-save:disabled {
 .schedule-card-head { display:flex; justify-content:space-between; align-items:center; gap:16px; }
 .schedule-card-title { display:flex; align-items:center; gap:10px; min-width:0; }
 .schedule-card-icon { display:grid; place-items:center; width:34px; height:34px; flex:0 0 auto; border:1px solid var(--border); border-radius:8px; color:var(--text-secondary); background:var(--surface-hover); }
-.schedule-card-title > div { display:flex; flex-direction:column; min-width:0; gap:2px; }
-.schedule-card-title strong { overflow:hidden; color:var(--text); font-size:14px; text-overflow:ellipsis; white-space:nowrap; }
-.schedule-card-title span { color:var(--text-muted); font-size:10px; }
+.schedule-card-title > div { display:flex; flex-direction:column; min-width:0; gap:4px; }
+.schedule-card-title strong { overflow:hidden; color:var(--text); font-size:14px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+/* One meta line: status, attention, then what happens next -- in that order,
+   because that is the order the questions matter. */
+.schedule-card-meta { display:flex; align-items:center; gap:8px; min-width:0; color:var(--text-muted); font-size:11px; }
+.schedule-card-meta-rest { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.schedule-card-attention-tag { margin:0; font-size:10px; line-height:16px; }
 /* The row's controls (edit, on/off) sit on a card that is itself clickable, so
    they have to read as controls before the cursor arrives. A bare switch in a
    dark row is a grey dot: the pair gets a shared hit area and a hover state. */
@@ -225,155 +229,11 @@ html[data-theme='dark'] .status-running { color:#89add7; }
 html[data-theme='dark'] .status-succeeded { color:#83c8a6; }
 html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-cancelled { color:#d5ae75; }
 
-/* The row's status pill. Without these rules every status rendered as the same
- * neutral tag, so 执行失败 and 执行成功 were the same grey word in the same grey
- * box -- the one distinction a task list exists to show. Colour is the signal
- * here; the shape stays identical so the column does not jump between rows.
- *
- * `!important` because the global `.ant-tag` rule in 10-secondary-glass.css is
- * important too (it paints every tag with the monochrome palette, which is what
- * keeps antd's default blue out of the interface). Specificity decides between
- * two important declarations, so these three-class selectors win. */
-.schedule-status-tag.ant-tag {
-  margin: 0;
-  border-color: transparent !important;
-  font-size: 11px;
-  line-height: 18px;
-}
-.schedule-status-tag.status-succeeded.ant-tag {
-  color: var(--text-secondary) !important;
-  background: var(--surface-hover) !important;
-}
-.schedule-status-tag.status-failed.ant-tag {
-  color: var(--red) !important;
-  background: var(--red-soft) !important;
-}
-.schedule-status-tag.status-interrupted.ant-tag,
-.schedule-status-tag.status-cancelled.ant-tag {
-  color: var(--amber) !important;
-  background: var(--amber-soft) !important;
-}
-.schedule-status-tag.status-running.ant-tag,
-.schedule-status-tag.status-queued.ant-tag {
-  color: var(--text) !important;
-  background: var(--surface-hover) !important;
-}
-/* `color="error"` was painted with the same neutral palette by the same global
- * rule, so "3 条待处理" was a grey number where red is the point. */
-.ant-tag.ant-tag-error {
-  color: var(--red) !important;
-  background: var(--red-soft) !important;
-  border-color: transparent !important;
-}
-.schedule-detail-drawer .ant-drawer-header { padding:16px 20px; border-bottom:1px solid var(--border); }
-.schedule-detail-drawer .ant-drawer-body { padding:0; }
-.schedule-detail { min-height:100%; color:var(--text); }
-.schedule-detail-overview { display:flex; align-items:flex-start; justify-content:space-between; gap:24px; padding:20px; border-bottom:1px solid var(--border); background:var(--surface-hover); }
-.schedule-detail-overview-main { display:flex; align-items:flex-start; gap:12px; min-width:0; }
-.schedule-detail-overview-main > div { min-width:0; }
-.schedule-detail-overview-main p { max-width:580px; margin:9px 0 0; color:var(--text-secondary); font-size:12px; line-height:1.65; white-space:pre-wrap; }
-.schedule-workspace { display:flex; align-items:center; gap:6px; max-width:580px; margin-top:8px; overflow:hidden; color:var(--text-muted); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
-/* A criterion is a sentence, so this one wraps where a folder path is
-   deliberately held to a single ellipsised line. */
-.schedule-acceptance { max-width:620px; align-items:flex-start; white-space:normal; line-height:1.6; }
-.schedule-acceptance > .anticon { flex:0 0 auto; margin-top:2px; }
-/* The sentence the task was asked for with. Also a sentence, so it wraps for
-   the same reason the criterion above does. */
-.schedule-request-quote { max-width:620px; align-items:flex-start; white-space:normal; line-height:1.6; font-style:italic; }
-.schedule-request-quote > .anticon { flex:0 0 auto; margin-top:2px; font-style:normal; }
-.schedule-detail-tags { display:flex; flex-wrap:wrap; gap:6px; }
-.schedule-detail-tags .ant-tag { margin:0; }
-.schedule-detail-next { display:flex; flex:0 0 auto; flex-direction:column; align-items:flex-end; gap:4px; padding-top:2px; }
-.schedule-detail-next small { color:var(--text-muted); font-size:10px; }
-.schedule-detail-next strong { color:var(--text-secondary); font-size:11px; font-weight:600; white-space:nowrap; }
-.schedule-detail-next span { color:var(--text-muted); font-size:10px; white-space:nowrap; }
-.schedule-detail-loading { display:flex; align-items:center; justify-content:center; gap:10px; min-height:260px; color:var(--text-muted); font-size:12px; }
-.schedule-runs-empty { padding:72px 20px; }
-.schedule-detail-grid { display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:calc(100vh - 178px); }
-.schedule-run-list { min-width:0; padding:18px 12px; border-right:1px solid var(--border); }
-.schedule-detail-section-title { display:flex; align-items:center; justify-content:space-between; padding:0 6px 11px; }
-.schedule-detail-section-title strong { font-size:12px; }
-.schedule-detail-section-title span { color:var(--text-muted); font-size:10px; }
-.schedule-run-items { display:flex; flex-direction:column; gap:5px; }
-.schedule-run-item { display:flex; align-items:center; gap:9px; width:100%; min-width:0; padding:9px 8px; border:1px solid transparent; border-radius:8px; color:var(--text-secondary); background:transparent; text-align:left; cursor:pointer; transition:background-color .15s ease, border-color .15s ease; }
-.schedule-run-item:hover { background:var(--surface-hover); }
-.schedule-run-item.active { border-color:var(--primary-border); background:var(--primary-soft); }
-.schedule-run-item-main { display:flex; flex:1 1 auto; min-width:0; flex-direction:column; gap:2px; }
-.schedule-run-item-main strong { color:var(--text); font-size:11px; font-weight:600; }
-.schedule-run-item-main small { overflow:hidden; color:var(--text-muted); font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
-.schedule-run-duration { flex:0 0 auto; color:var(--text-muted); font-size:9px; }
-.schedule-run-unseen { flex:0 0 auto; width:6px; height:6px; border-radius:50%; background:var(--red); }
-.schedule-run-missed { flex:0 0 auto; padding:1px 5px; border:1px solid color-mix(in srgb, var(--amber) 42%, transparent); border-radius:999px; color:var(--amber); font-size:9px; white-space:nowrap; }
-.schedule-run-history-tail { display:flex; align-items:center; gap:2px; }
-.schedule-run-history-tail .ant-btn-link { height:auto; padding:0 2px; font-size:10px; }
-.schedule-run-detail { min-width:0; padding:22px 24px 32px; }
-.schedule-run-detail-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
-.schedule-run-detail-head > div { display:flex; min-width:0; flex-direction:column; gap:8px; }
-.schedule-run-summary { color:var(--text); font-size:15px; font-weight:600; line-height:1.5; }
-.schedule-run-summary br { display:none; }
-.schedule-run-meta { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1px; margin:20px 0; overflow:hidden; border:1px solid var(--border); border-radius:8px; background:var(--border); }
-.schedule-run-meta > div { display:flex; min-width:0; flex-direction:column; gap:4px; padding:10px 12px; background:var(--surface-raised); }
-.schedule-run-meta small { color:var(--text-muted); font-size:9px; }
-.schedule-run-meta span { overflow:hidden; color:var(--text-secondary); font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
-.schedule-run-error { margin:0 0 18px; padding:12px 14px; border:1px solid color-mix(in srgb, var(--red) 28%, transparent); border-radius:8px; color:var(--red); background:var(--red-soft); }
-.schedule-run-error strong { font-size:11px; }
-.schedule-run-error pre { margin:7px 0 0; overflow:auto; color:inherit; font:10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; }
-/* What the run's result was worth, as opposed to whether it ran.  Three
-   treatments for three answers, because the whole point of separating this
-   from the status is that "we could not tell" must not look like either of
-   the other two -- an unknown verdict shown in the failure colour would be
-   the same collapse the field exists to undo. */
-.schedule-run-verdict { margin:0 0 14px; padding:12px 14px; border:1px solid var(--border-strong); border-radius:8px; background:var(--surface-hover); }
-.schedule-run-verdict strong { font-size:11px; }
-.schedule-run-verdict pre { margin:7px 0 0; overflow:auto; color:inherit; font:10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; }
-.schedule-run-verdict small { display:block; margin-top:7px; font-size:10px; line-height:1.6; }
-.schedule-run-verdict.verdict-passed { border-color:color-mix(in srgb, var(--green) 34%, transparent); color:var(--green); background:var(--green-soft); }
-.schedule-run-verdict.verdict-failed { border-color:color-mix(in srgb, var(--red) 32%, transparent); color:var(--red); background:var(--red-soft); }
-.schedule-run-verdict.verdict-unknown { border-color:color-mix(in srgb, var(--amber) 36%, transparent); color:var(--amber); background:color-mix(in srgb, var(--amber) 12%, transparent); }
-.schedule-run-verdict.verdict-passed small, .schedule-run-verdict.verdict-failed small, .schedule-run-verdict.verdict-unknown small { color:inherit; opacity:.72; }
-.schedule-output-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:9px; }
-.schedule-output-head strong { font-size:12px; }
-.schedule-output-head span { color:var(--text-muted); font-size:9px; }
-.schedule-output { max-height:calc(100vh - 410px); min-height:160px; padding:16px 18px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:var(--surface-hover); font-size:12px; line-height:1.7; }
-.schedule-output-state { display:flex; align-items:center; justify-content:center; gap:9px; min-height:180px; border:1px dashed var(--border-strong); border-radius:8px; color:var(--text-secondary); font-size:11px; }
-.schedule-output-state.muted { color:var(--text-muted); }
-.schedule-output-notice { margin-bottom:8px; padding:8px 10px; border-radius:7px; color:#8a632e; background:rgba(183,138,63,.1); font-size:10px; }
-.schedule-artifacts { margin-top:20px; }
-.schedule-artifact-list { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
-.schedule-artifact-item { display:flex; align-items:center; gap:9px; min-width:0; padding:8px; border:1px solid var(--border); border-radius:8px; color:var(--text); background:var(--surface-raised); text-decoration:none; transition:border-color .15s ease, background-color .15s ease; }
-.schedule-artifact-item:hover { border-color:var(--border-strong); background:var(--surface-hover); }
-.schedule-artifact-item > img, .schedule-artifact-item > span { display:grid; place-items:center; width:38px; height:38px; flex:0 0 38px; border-radius:6px; background:var(--surface-hover); object-fit:cover; }
-.schedule-artifact-item > div { display:flex; min-width:0; flex-direction:column; gap:3px; }
-.schedule-artifact-item strong { overflow:hidden; font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
-.schedule-artifact-item small { color:var(--text-muted); font-size:9px; }
-.resource-delete-confirm .ant-modal-confirm-content { color:var(--text-secondary); }
-@media (max-width: 640px) {
-  .schedule-detail-drawer .ant-drawer-content-wrapper { width:100vw !important; max-width:100vw; }
-  /* A full-width chip on a phone: the composer is narrower than two tracks, so
-   * the grid in `04-composer.css` would already collapse to one, but asking for
-   * it explicitly keeps the intent legible and survives a track-width change. */
-  .composer-attachments { grid-template-columns:1fr; }
-  .bubble-with-attachments { width:min(100%, calc(100vw - 72px)); }
-  .message-attachments { grid-template-columns:1fr; }
-  .schedule-field-grid, .schedule-action-picker, .schedule-preview ol { grid-template-columns:1fr; }
-  .schedule-card-head { align-items:flex-start; }
-  .schedule-card-detail-button { width:100%; margin-left:0; justify-content:flex-start; }
-  .schedule-detail-overview { flex-direction:column; gap:14px; padding:16px; }
-  .schedule-detail-next { align-items:flex-start; }
-  .schedule-detail-grid { grid-template-columns:1fr; min-height:0; }
-  .schedule-run-list { padding:14px 12px; overflow:hidden; border-right:0; border-bottom:1px solid var(--border); }
-  .schedule-run-items { flex-direction:row; overflow-x:auto; padding-bottom:3px; }
-  .schedule-run-item { min-width:220px; }
-  .schedule-run-detail { padding:18px 16px 26px; }
-  .schedule-run-detail-head { flex-direction:column; }
-  .schedule-run-meta { grid-template-columns:1fr; }
-  .schedule-output { max-height:440px; }
-  .schedule-artifact-list { grid-template-columns:1fr; }
-  .schedule-toolbar > .ant-input-affix-wrapper { width:100%; }
-  .schedule-filter { max-width:100%; overflow-x:auto; }
-  .schedule-bulk-actions { width:100%; margin-left:0; overflow-x:auto; }
-}
-@media (max-width: 900px) { .conversation-indicator { display:none; } }
+/* The row's status, as a word in the meta line rather than a pill at the far
+ * edge. Colour is the signal -- 执行成功 and 执行失败 used to be the same grey --
+ * and the palette decides it: the `.status-*` rules below carry the colour, so
+ * this only has to stop inheriting the meta line's muted tone. */
+.schedule-status-tag { font-size: 11px; font-weight: 600; white-space: nowrap; }
 
 /* Composer footer controls: keep the action hierarchy clear while allowing the
  * model name and workspace metadata to shrink without moving the send target.

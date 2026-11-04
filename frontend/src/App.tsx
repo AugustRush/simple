@@ -707,7 +707,7 @@ function App() {
           opened it. */}
       <Drawer
         placement="right"
-        width={380}
+        width={400}
         open={boardOpen}
         onClose={() => setBoardOpen(false)}
         mask={false}

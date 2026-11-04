@@ -344,11 +344,11 @@ function ProvidersCard({
   return (
     <Card
       className="settings-card settings-card-wide"
-      title="Providers"
-      extra={<span className="card-kicker">ENDPOINTS</span>}
+      title="模型服务商"
+      extra={<span className="card-kicker">接入点</span>}
     >
       <p className="settings-hint">
-        每个 Provider 是一个接口地址、一个密钥和一组模型。改动只作用于这一个 Provider，
+        每个服务商是一个接口地址、一个密钥和一组模型。改动只作用于这一个，
         不会影响其它；「高级 JSON」里手写的同一段配置也会即时反映到这里。
       </p>
       <Space direction="vertical" style={{ width: '100%' }} size="small">
@@ -471,7 +471,7 @@ function ProvidersCard({
         </Card>
       ) : (
         <Button style={{ marginTop: 12 }} onClick={openNew}>
-          添加 Provider
+          添加服务商
         </Button>
       )}
     </Card>
