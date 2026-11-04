@@ -161,6 +161,30 @@ def _chain_row(
     }
 
 
+def own_errand_task_ids(store: Any) -> set[str]:
+    """Ids of tasks the patrol created to carry out one of its own proposals.
+
+    They are machinery, not automations: the thing a person reads is the
+    proposal's outcome (on 自主), and the errand exists only long enough to run
+    once. Listing them here put the agent's errands and the tasks a person set up
+    in one list -- measured, five of eight rows on a fresh install were `[自主]`
+    one-offs that had already finished.
+
+    ``agent.autonomy.is_own_errand`` is the one definition, read rather than
+    copied: a second spelling of "this is the agent's own" is how the list and
+    the patrol would drift apart.
+    """
+    from agent.autonomy import is_own_errand
+
+    return {
+        task.id
+        for task in store.list_tasks()
+        if is_own_errand(
+            getattr(task, "payload", None), getattr(task, "name", "")
+        )
+    }
+
+
 def automation_rows(store: Any, snapshot: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     """Every automation a person manages: standalone tasks, then chains.
 
@@ -171,12 +195,17 @@ def automation_rows(store: Any, snapshot: Optional[dict[str, Any]] = None) -> li
     Ordered as a person reads a list: chains first by creation, then standalone tasks by
     creation -- chains are the bigger thing and their rows explain more. Sorted here
     rather than in SQL because both halves come from different tables.
+
+    The patrol's own errands are left out (see :func:`own_errand_task_ids`): they are
+    one-off runs the agent started for itself, whose result is on the proposal that
+    started them.
     """
     # The caller may already hold a snapshot for the same response (the badge number is
     # read from one too); reusing it is what keeps "add up the rows, get the number" true.
     if snapshot is None:
         snapshot = store.attention_snapshot()
     unseen: dict[str, int] = snapshot.get("counts") or {}
+    hidden = own_errand_task_ids(store)
 
     rows: list[dict[str, Any]] = []
     chained: set[str] = set()
@@ -200,6 +229,9 @@ def automation_rows(store: Any, snapshot: Optional[dict[str, Any]] = None) -> li
         if task.id in chained:
             # A step of a chain. It belongs to its chain's row; a second row here is the
             # same thing counted twice, which is what this endpoint must never do.
+            continue
+        if task.id in hidden:
+            # The patrol's own one-off errand. Its result is on the proposal.
             continue
         rows.append(
             _task_row(

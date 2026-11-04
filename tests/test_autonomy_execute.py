@@ -282,6 +282,14 @@ def test_the_patrol_reads_the_run_result_back(stores) -> None:
     assert row.context["outcome"]["status"] == "succeeded"
     assert row.context["outcome"]["summary"] == "读完了"
 
+    # Reading the outcome is the acknowledgement. The result is on the proposal
+    # now, and the errand itself is no longer listed in 自动化 -- so a run left
+    # in the "N 条待查看" count would be a number with nothing behind it and no
+    # row left to click.
+    assert scheduler.attention_snapshot()["total"] == 0, (
+        "an outcome that has been read is not still waiting to be read"
+    )
+
 
 def test_reading_back_happens_once(stores) -> None:
     """The second pass must not rewrite an outcome that has already been read."""

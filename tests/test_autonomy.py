@@ -684,8 +684,14 @@ def test_the_agent_s_own_errands_are_recognisable() -> None:
     """
     from agent.autonomy import is_own_errand
 
+    from agent.autonomy import OWN_ERRAND_PREFIX
+
     assert is_own_errand({"prompt": "go", "origin": "autonomy"})
     assert not is_own_errand({"prompt": "go"})
     assert not is_own_errand({"origin": "person"})
     assert not is_own_errand(None)
     assert not is_own_errand("origin=autonomy")
+    # The name is the same fact, spelled by the same constant -- for rows created
+    # before the payload carried the marker.
+    assert is_own_errand({}, f"{OWN_ERRAND_PREFIX}读一遍")
+    assert not is_own_errand({}, "每天早上看日志")

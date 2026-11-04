@@ -219,7 +219,9 @@ def _task_name(proposal: Any) -> str:
     """
     action = str(getattr(proposal, "action", "") or "").strip()
     name = action[:60] if action else "自主提议"
-    return f"[自主] {name}"
+    from . import OWN_ERRAND_PREFIX
+
+    return f"{OWN_ERRAND_PREFIX}{name}"
 
 
 def _task_body(proposal: Any, *, now: datetime) -> str:

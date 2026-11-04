@@ -121,7 +121,15 @@ export function renderHome(ctx: AppCtx) {
       <div key={`run:${item.run_id}`} className={`home-timeline-row ${failed ? 'is-failed' : ''}`}>
         <span className="home-timeline-icon">{icon}</span>
         <div className="home-timeline-body">
-          <strong>{item.title}</strong>
+          <strong>
+            {/* An errand the agent started for itself says so. The title is the
+                sentence it wrote ("读一遍「t」那几次失败的运行…"); without the
+                marker a reader would take it for a task they had created. */}
+            {item.origin === 'autonomy' && (
+              <span className="home-timeline-own">自主</span>
+            )}
+            {item.title}
+          </strong>
           {/* No second line for a success: the icon already says it, and a row
               whose second line repeats "成功" is a row taking two lines to say one
               thing. Only a failure earns the extra line, because the reason is the

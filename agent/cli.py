@@ -1813,7 +1813,9 @@ def _autonomy_session_rows(
                 # and the person's automation list grows a `[自主]` row each time.
                 # The failure is not hidden by this: it lands on the proposal's
                 # `outcome`, which is what 自主 renders next to the proposal.
-                if is_own_errand(getattr(task, "payload", None)):
+                if is_own_errand(
+                    getattr(task, "payload", None), getattr(task, "name", "")
+                ):
                     continue
                 # The *session*, not the words. `request_quote` holds what the user
                 # typed ("每天早上九点提醒我写日报"); grepping it for a session id

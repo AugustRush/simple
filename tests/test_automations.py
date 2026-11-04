@@ -233,3 +233,62 @@ def test_the_route_serves_the_list_and_the_badge_from_one_snapshot(tmp_path, mon
     assert {row["kind"] for row in body["automations"]} == {"task", "chain"}
     assert body["unseen_attention"] == 0
     assert "permission_profiles" in body, "the editor's vocabulary travels with the list"
+
+
+def test_the_patrol_s_own_errands_are_not_automations(tmp_path) -> None:
+    """A task the agent created to do its own reading is machinery, not something you set up.
+
+    Measured on a fresh install: five of the eight rows in 自动化 were `[自主]`
+    one-offs that had already finished. The result of each is on the proposal that
+    started it, so the row said nothing the 自主 page did not already say better.
+    """
+    store = make_store(tmp_path)
+    try:
+        make_task(store, "每天早上看日志")
+        store.create_task(
+            NewScheduledTask(
+                name="[自主] 读一遍那 2 次失败的运行",
+                kind="agent_prompt",
+                trigger=TriggerSpec.once("2026-05-01T11:58:00+00:00", "UTC"),
+                payload={
+                    "prompt": "read the failures",
+                    "origin": "autonomy",
+                    "proposal_id": "p1",
+                },
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+
+        rows = automation_rows(store)
+
+        assert [row["name"] for row in rows] == ["每天早上看日志"]
+        assert len(store.list_tasks()) == 2, "it is still a task in the store"
+    finally:
+        store.close()
+
+
+def test_own_errand_ids_reads_one_definition_of_own_errand(tmp_path) -> None:
+    """The list and the patrol must not disagree about which tasks are the agent's."""
+    from agent.scheduler.automations import own_errand_task_ids
+
+    store = make_store(tmp_path)
+    try:
+        mine = make_task(store, "每天看日志")
+        theirs = store.create_task(
+            NewScheduledTask(
+                name="[自主] 干一件事",
+                kind="agent_prompt",
+                trigger=TriggerSpec.once("2026-05-01T11:58:00+00:00", "UTC"),
+                payload={"prompt": "x", "origin": "autonomy"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+
+        hidden = own_errand_task_ids(store)
+
+        assert hidden == {theirs.id}
+        assert mine.id not in hidden
+    finally:
+        store.close()

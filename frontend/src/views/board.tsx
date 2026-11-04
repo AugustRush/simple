@@ -146,14 +146,25 @@ function BoardGroup({
               }}
             >
               <strong title={card.name}>{card.name}</strong>
+              {/* For a scheduled card the trigger comes first: "每天" is what the
+                  card is *about* -- it says it will come back -- and the countdown
+                  is the detail. Read the other way round it said "21 小时后 ·
+                  每天", which answers "when" before saying what it is. */}
               <span className="panel-card-meta">
-                {relativeTime(card.at)}
-                {card.at ? ' · ' : ''}
-                {card.at_kind === 'next'
-                  ? TRIGGER_LABEL[card.trigger_type] || '排期中'
-                  : card.unread > 1
-                    ? `${RUN_STATUS_LABEL[card.status] || card.status} · ${card.unread} 次未查看`
-                    : RUN_STATUS_LABEL[card.status] || card.status}
+                {card.at_kind === 'next' ? (
+                  <>
+                    {TRIGGER_LABEL[card.trigger_type] || '排期中'}
+                    {card.at ? ` · ${relativeTime(card.at)}` : ''}
+                  </>
+                ) : (
+                  <>
+                    {relativeTime(card.at)}
+                    {card.at ? ' · ' : ''}
+                    {card.unread > 1
+                      ? `${RUN_STATUS_LABEL[card.status] || card.status} · ${card.unread} 次未查看`
+                      : RUN_STATUS_LABEL[card.status] || card.status}
+                  </>
+                )}
               </span>
               {card.detail && <span className="panel-card-detail">{card.detail}</span>}
             </div>

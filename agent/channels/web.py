@@ -961,8 +961,17 @@ class WebChannel(Channel):
             # number the navigation is showing.
             snapshot = store.attention_snapshot()
             unseen = snapshot["counts"]
+            # The patrol's own one-off errands are not this list's business: they
+            # exist to run once, and their result lives on the proposal that
+            # started them (see 自主). Read through `automation_rows`' one
+            # definition so the two endpoints cannot disagree about what counts.
+            from agent.scheduler.automations import own_errand_task_ids
+
+            hidden = own_errand_task_ids(store)
             tasks = []
             for task in store.list_tasks():
+                if task.id in hidden:
+                    continue
                 latest_run = store.latest_run(task.id)
                 tasks.append(
                     scheduler_task_payload(

@@ -62,7 +62,14 @@ __all__ = [
     "MAX_PROPOSALS_PER_TICK",
     "unowned_task_rows",
     "is_own_errand",
+    "OWN_ERRAND_PREFIX",
+    "strip_own_prefix",
 ]
+
+#: How a task the patrol created for itself is named. One spelling: the
+#: executor writes it, and the ledger strips it so its activity reads as what the
+#: agent did rather than as a task name a machine produced.
+OWN_ERRAND_PREFIX = "[自主] "
 
 #: The dispositions a candidate can end in.  ``proposed`` is the only non-final
 #: one; the rest are kept so a suggestion that was declined is recognisably the
@@ -476,7 +483,13 @@ def live_queue_facts(live_sessions: Any, now: Optional[datetime] = None) -> dict
     return facts
 
 
-def is_own_errand(payload: Any) -> bool:
+def strip_own_prefix(name: str) -> str:
+    """The name without the provenance prefix, for places that say it another way."""
+    text = str(name or "").strip()
+    return text[len(OWN_ERRAND_PREFIX):] if text.startswith(OWN_ERRAND_PREFIX) else text
+
+
+def is_own_errand(payload: Any, name: str = "") -> bool:
     """Whether a scheduled task is the agent's own work rather than a person's.
 
     The patrol executes a reversible candidate by creating a one-off task, and
@@ -488,11 +501,20 @@ def is_own_errand(payload: Any) -> bool:
     proposal is another autonomous read -- and every cycle has a new task id, so
     dedupe cannot break it.
 
+    The *name* is the second reading of the same fact, for the rows created before
+    the payload carried a marker: ``_task_name`` has always spelled them with
+    ``OWN_ERRAND_PREFIX``. Both sides come from that one constant, so an errand
+    the agent started is recognisable whenever it was created -- leaving the five
+    finished `[自主]` rows of an existing install in the automation list would be
+    exactly the clutter this exists to remove.
+
     A payload is free-form, so this answers ``False`` for anything it cannot read:
     treating a person's task as the agent's own would hide a real failure, while
     the opposite mistake only costs one redundant proposal.
     """
-    return isinstance(payload, dict) and payload.get("origin") == "autonomy"
+    if isinstance(payload, dict) and payload.get("origin") == "autonomy":
+        return True
+    return str(name or "").strip().startswith(OWN_ERRAND_PREFIX)
 
 
 def unowned_task_rows(

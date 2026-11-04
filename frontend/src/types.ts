@@ -289,6 +289,10 @@ export interface HomeActivity {
   kind: 'run' | 'thread'
   at: string
   title: string
+  //: `autonomy` when the run was the patrol carrying out one of its own
+  //: proposals. The ledger marks those as the agent acting, rather than as a
+  //: task the person set up.
+  origin?: string
   status?: string
   summary?: string
   error?: string

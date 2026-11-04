@@ -228,6 +228,19 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* "This one it did by itself." A word rather than an icon: the ledger's icons
+   already mean how a run ended, and a second icon in the same slot would have to
+   be learned. */
+.home-timeline-own {
+  margin-right: 6px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
 /* One line. The detail is now failure-only and short; a second line on a feed row
    makes rows uneven and pushes the next one down for no reason a glance needs. */
 .home-timeline-body span {

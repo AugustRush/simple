@@ -446,11 +446,20 @@ def _activity(
                 if str(getattr(run, "status", "") or "") in _still_running:
                     continue
                 stamp = getattr(run, "finished_at", None) or getattr(run, "started_at", None)
+                # An errand the patrol started for itself is *the agent acting*,
+                # so the ledger says so instead of printing the task name the
+                # machine gave it: "[自主] 读一遍「t」那几次失败的运行" is a label
+                # for the automation list, not a sentence about what happened.
+                from agent.autonomy import is_own_errand, strip_own_prefix
+
+                raw_title = str(getattr(task, "name", "") or "")
+                own = is_own_errand(getattr(task, "payload", None), raw_title)
                 items.append(
                     {
                         "kind": "run",
                         "at": stamp.isoformat() if stamp else "",
-                        "title": str(getattr(task, "name", "") or ""),
+                        "title": strip_own_prefix(raw_title) if own else raw_title,
+                        "origin": "autonomy" if own else "",
                         "status": str(getattr(run, "status", "") or ""),
                         "summary": str(getattr(run, "summary", "") or "")[:160],
                         "error": str(getattr(run, "error", "") or "")[:160],

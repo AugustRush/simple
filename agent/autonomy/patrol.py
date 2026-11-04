@@ -304,6 +304,19 @@ class PatrolService:
                         "output_path": str(getattr(latest, "output_path", "") or ""),
                     },
                 )
+                # Reading the outcome *is* the acknowledgement.
+                #
+                # The result now sits on the proposal, which is where a person
+                # reads it; the run itself is the agent's own errand and no
+                # longer appears in 自动化 at all, so leaving it in the "N 条待
+                # 查看" count would be a number with nothing behind it -- and one
+                # nobody can clear, since the row they would click is not listed.
+                run_id = str(getattr(latest, "id", "") or "")
+                if run_id:
+                    try:
+                        scheduler_store.acknowledge_run(task_id, run_id)
+                    except Exception:  # noqa: BLE001 - the outcome is already stored
+                        pass
                 written += 1
         finally:
             # Only a store this method opened is a store it may close. Closing the
