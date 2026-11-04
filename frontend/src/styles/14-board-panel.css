@@ -114,9 +114,10 @@
  * header's 看板 button ends up under the panel's own title bar, so the same button
  * cannot close what it opened -- and the aria-label says it can. Offsetting the
  * wrapper keeps the toggle reachable and the two ways out (this button, the
- * panel's own ×) both honest.
+ * panel's own ×) both honest. The number is the top bar's height, and it lives
+ * in one token (--topbar-height) so the bar and the drawer cannot drift apart.
  */
 .board-drawer .ant-drawer-content-wrapper {
-  top: 68px !important;
-  height: calc(100% - 68px) !important;
+  top: var(--topbar-height, 56px) !important;
+  height: calc(100% - var(--topbar-height, 56px)) !important;
 }

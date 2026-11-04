@@ -1202,7 +1202,7 @@ export function useConversations(deps: Deps) {
       setSessionState(null)
       activeSessionRef.current = sid
       setActiveSession(sid)
-      setView('chat')
+      setView('home')
       streamIdRef.current = null
       streamTurnRef.current = null
       setIsStreaming(false)
@@ -1244,8 +1244,13 @@ export function useConversations(deps: Deps) {
         messagesRef.current = []
         setMessages([])
       }
-      loadMessages(sid)
-      loadSessionPermissions(sid)
+      // Empty means "no thread open" -- the landing page. There is nothing to
+      // fetch: `/api/sessions//state` is a 404, and it used to be a 404 the
+      // browser console reported every time somebody went back to the landing.
+      if (sid) {
+        loadMessages(sid)
+        loadSessionPermissions(sid)
+      }
     },
     [loadMessages, loadSessionPermissions, token],
   )
@@ -1418,7 +1423,7 @@ export function useConversations(deps: Deps) {
         const sid = data.session_id as string
         activeSessionRef.current = sid
         await loadSessions()
-        setView('chat')
+        setView('home')
         setActiveSession(sid)
         loadSessionState(sid)
       } catch {
@@ -2001,7 +2006,7 @@ export function useConversations(deps: Deps) {
 
   const applyCommand = (command: CommandInfo) => {
     setInput(`/${command.name} `)
-    setView('chat')
+    setView('home')
     setCommandPaletteOpen(false)
     setPaletteQuery('')
     // The command is half-written -- it is waiting for its arguments -- so the

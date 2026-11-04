@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, HomeOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, HomeOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor } from '../lib/route'
@@ -114,6 +114,16 @@ export function useShell(deps: Deps) {
   }, [loadSchedulerHealth, view])
 
   useEffect(() => {
+    // The home record is re-read on entering the page *and* when the open thread
+    // changes. Both edits happen inside the same view now -- starting a
+    // conversation and going back to the landing are the same screen -- so a
+    // view-change-only effect left the landing showing the record from before
+    // the conversation the reader just had.
+    if (view === 'home') {
+      void loadHome()
+      void loadSessions()
+      loadSchedules()
+    }
     // Both lists load on entering the merged page: the counts on the tabs and
     // the page subtitle are about both, and switching tabs is not a data
     // event -- it is the same visit continuing.
@@ -132,22 +142,9 @@ export function useShell(deps: Deps) {
       loadSkills(true)
       loadSchedulerHealth()
     }
-    if (view === 'home') {
-      // Both are re-read on every arrival, not cached across it: the page's whole
-      // job is "what is true right now", and a home page showing a timeline from
-      // before the last conversation would be the one screen that lies about the
-      // agent's state. (`loadSessions` too: the sidebar is on every view, and it
-      // used to arrive as a side effect of the chat view's mount.)
-      void loadHome()
-      void loadSessions()
-      // The board's cards are task ids; opening one needs the task record, and
-      // that list is this side's. Loading it here keeps the page from rendering
-      // cards it cannot act on -- a board that is all doors and no handles.
-      loadSchedules()
-    }
     if (view === 'autonomy') loadAutonomy()
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions, loadAutonomy])
+  }, [view, activeSession, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions, loadAutonomy])
 
   /** Move to another view, asking first if the settings page has unsaved edits.
    *
@@ -215,19 +212,13 @@ export function useShell(deps: Deps) {
     }
     const from = parseRoute(current)
     const to = parseRoute(route)
-    // The landing page *becomes* the conversation: an empty chat is not a place
-    // to go back to, it is the page a session is started from, so the session
-    // takes its entry over instead of stacking on top of it. Without this the
-    // first session of a visit left "back" pointing at a welcome screen the
-    // reader had already passed through, and pressing it looked like a no-op.
-    const landingBecameConversation =
-      from.view === 'chat' && !from.sessionId && to.view === 'chat' && !!to.sessionId
-    // The other end of the same rule: a conversation whose link went stale
-    // collapses into the landing entry rather than stacking a corrected address
-    // on top of the stale one, which would make "back" revisit the dead link.
-    const conversationBecameLanding =
-      from.view === 'chat' && !!from.sessionId && to.view === 'chat' && !to.sessionId
-    if (firstRouteRef.current || landingBecameConversation || conversationBecameLanding) {
+    // A thread is a *state of the same screen*, not a page: opening one from the
+    // landing page replaces the address instead of stacking `#/t/x` on top of
+    // `#/`. Otherwise "back" walks through a landing page the reader never left,
+    // and pressing it looks like a no-op. A change of *page* still pushes,
+    // because that is a place they can return to.
+    const sameScreen = from.view === to.view
+    if (firstRouteRef.current || sameScreen) {
       firstRouteRef.current = false
       window.history.replaceState(null, '', route)
       return
@@ -282,13 +273,11 @@ export function useShell(deps: Deps) {
     )
   }, [commands, paletteQuery])
 
+  // The management pages, as one menu. There is no navigation column any more:
+  // the app's day-to-day surface is one screen (the agent), and these are the
+  // places you go deliberately and briefly. A sidebar charged every screen for
+  // six entries, five of which are visited once a week.
   const navItems = [
-    // The landing view: one agent, one box, and what needs a person. 对话 is still
-    // a view (a thread you are reading), but it is no longer the *entrance* --
-    // opening on "whichever session was last active" answered a question nobody
-    // asked.
-    { key: 'home', icon: <HomeOutlined />, label: '主页' },
-    { key: 'chat', icon: <MessageOutlined />, label: '对话' },
     // One entry for both lists: plugins and skills answer the same question
     // ("what can the agent do beyond its own tools?") and each list on its
     // own is too short to justify a navigation slot of its own.
@@ -356,8 +345,7 @@ export function useShell(deps: Deps) {
   const paletteEntries = useMemo<PaletteEntry[]>(() => {
     const query = paletteQuery.trim().toLowerCase()
     const destinations = [
-      { view: 'home', label: '主页', icon: <HomeOutlined />, terms: 'home 主页 首页' },
-      { view: 'chat', label: '对话', icon: <MessageOutlined />, terms: 'chat' },
+      { view: 'home', label: '主页', icon: <HomeOutlined />, terms: 'home 主页 首页 对话 chat' },
       { view: 'extensions', label: '扩展', icon: <AppstoreOutlined />, terms: '插件 技能 extensions plugins skills' },
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
       { view: 'autonomy', label: '自主', icon: <CompassOutlined />, terms: '自主 提议 proposals autonomy patrol' },
@@ -403,29 +391,20 @@ export function useShell(deps: Deps) {
 
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
     home: {
-      title: '主页',
-      // Not "welcome", and not a description of the widgets: the subtitle answers
-      // the question a person opens the app with -- what can I do here, and what
-      // has it been doing. "有需要你的事，也有一个输入框" described the layout
-      // instead, which the layout already says.
-      subtitle: '说一句话交给它，或者看它做了什么',
-    },
-    chat: {
-      title: activeSession ? '当前对话' : '开始新的对话',
-      // The connection state is a status, not a session name, and it is the
-      // part that changes -- so it stands alone rather than being welded to a
-      // session id the reader cannot act on.
-      subtitle: !activeSession
-        ? '与你的 AI Agent 开始一段对话'
-        // Three states, not two. A socket that has not opened yet is not a
-        // dropped one, and saying "连接已断开" before it has ever connected
-        // tells the reader something has gone wrong when nothing has.
-        : connected
+      title: activeSession ? '当前对话' : '主页',
+      // The subtitle is the connection state once a thread is open: it is the
+      // part that changes while you read, and the thread's own name is in the
+      // title. Three states, not two -- a socket that has not opened yet is not
+      // a dropped one.
+      subtitle: activeSession
+        ? connected
           ? '实时连接中'
           : connecting
             ? '正在连接…'
-            : '连接已断开',
+            : '连接已断开'
+        : '说一句话交给它，或者看它做了什么',
     },
+
     sessions: {
       title: '会话管理',
       subtitle: `${sessions.length} 个会话，${sessions.filter(item => item.live).length} 个动态会话`,

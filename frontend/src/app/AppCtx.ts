@@ -264,7 +264,7 @@ export interface AppCtx {
   setSettingsDirty: Dispatch<SetStateAction<boolean>>
   // Movement between pages, so a view can hand the reader somewhere else
   // without reaching into the shell.  `navigateTo` keeps the unsaved-settings
-  // guard; `selectSession` plus `navigateTo('chat')` is what a link to a source
+  // guard; `selectSession` alone is what a link to a source
   // conversation is made of.
   navigateTo: (next: string) => void
   selectSession: (sid: string) => void

@@ -20,6 +20,25 @@ export function useUi() {
   //: quarter of the window from the thing they came for; the header button carries
   //: a count when there is something to see, so "nothing is hidden" does not depend
   //: on the panel being open. Once opened, the choice is remembered.
+  //: The threads drawer. It replaces the sidebar: threads are a *list you open*
+  //: when you want to change thread, not a permanent second column that charges
+  //: every screen for a navigation decision made once a day.
+  const [threadsOpen, setThreadsOpenState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('simple.threads.open') === '1'
+    } catch {
+      return false
+    }
+  })
+  const setThreadsOpen = useCallback((next: boolean) => {
+    setThreadsOpenState(next)
+    try {
+      localStorage.setItem('simple.threads.open', next ? '1' : '0')
+    } catch {
+      /* a browser with no storage keeps the in-memory answer */
+    }
+  }, [])
+
   const [boardOpen, setBoardOpenState] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem('simple.board.panelOpen') === '1'
@@ -100,5 +119,5 @@ export function useUi() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, setThemeMode, setView, themeMode, view } as const
+  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, setThemeMode, setThreadsOpen, setView, themeMode, threadsOpen, view } as const
 }

@@ -140,7 +140,7 @@ export function renderMemory(ctx: AppCtx) {
     if (!clean || clean === 'manual') return
     if (!sessions.some(item => item.session_id === clean)) return
     selectSession(clean)
-    navigateTo('chat')
+    navigateTo('home')
   }
 
   const unavailable = memoryUnavailable ? (

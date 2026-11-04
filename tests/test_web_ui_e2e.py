@@ -170,6 +170,19 @@ def page(browser, live_gateway):
         context.close()
 
 
+
+def open_page(page, label: str) -> None:
+    """Go to a management page the way a person does -- through the ⋯ menu.
+
+    The sidebar is gone: the app's day-to-day surface is one screen, and those
+    pages are opened deliberately from a menu instead of occupying a column on
+    every visit.
+    """
+    page.locator(".topbar-more").click()
+    page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
+    page.locator(".ant-dropdown-menu-item", has_text=label).first.click()
+
+
 def test_the_shell_renders_without_javascript_errors(page):
     """A bundle that throws while mounting still answers every request correctly.
 
@@ -179,8 +192,15 @@ def test_the_shell_renders_without_javascript_errors(page):
     logged an error while it did.
     """
     page.wait_for_selector("textarea", timeout=20_000)
-    assert page.locator("text=记忆").first.is_visible()
-    assert page.locator("text=扩展").first.is_visible()
+    # The shell: a bar with the agent's name on it, and the pages behind ⋯.
+    assert page.locator(".topbar-brand").is_visible()
+    assert page.locator(".topbar-title").inner_text().strip()
+    assert page.locator(".topbar-more").is_visible()
+    page.locator(".topbar-more").click()
+    page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
+    assert page.locator(".ant-dropdown-menu-item", has_text="记忆").count() == 1
+    assert page.locator(".ant-dropdown-menu-item", has_text="扩展").count() == 1
+    page.keyboard.press("Escape")
     assert page.errors == [], page.errors
 
 
@@ -214,7 +234,7 @@ def test_the_automation_page_is_one_list(page, live_gateway):
     import json
     import urllib.request
 
-    page.locator(".nav-label", has_text="自动化").first.click()
+    open_page(page, "自动化")
     page.wait_for_selector(".schedule-tabs", timeout=20_000)
 
     # Two tabs, not three: what needs a person, and everything that exists.
@@ -306,7 +326,7 @@ def test_editing_an_automation_is_a_conversation_too(page, live_gateway):
         created = json.loads(response.read().decode("utf-8"))
     task_id = created["task"]["id"]
 
-    page.locator(".nav-label", has_text="自动化").first.click()
+    open_page(page, "自动化")
     page.wait_for_selector("text=每晚复盘一下", timeout=20_000)
 
     page.get_by_role("button", name="在对话里修改 每晚复盘一下").first.click()
@@ -326,7 +346,7 @@ def test_creating_an_automation_is_a_conversation(page):
     that and can ask one question at a time, so the entry opens a conversation and seeds
     the composer with the three things it would ask anyway.
     """
-    page.locator(".nav-label", has_text="自动化").first.click()
+    open_page(page, "自动化")
     page.wait_for_selector(".schedule-tabs", timeout=20_000)
 
     # One entry, and it says what it does.
@@ -415,9 +435,9 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
 
     Opening on whichever conversation was last active was the right shape when the
     product *was* a session manager. It is not any more: the agent has one
-    identity, and a thread is where some of its work happened. So the first screen
-    is a box, what needs a person, and five recent threads -- and typing in the
-    box starts a thread without a "new conversation" click first.
+    identity and one screen, so the landing page is a box and the record of what
+    the agent has been doing. Typing in the box starts a thread without a "new
+    conversation" click first.
     """
     page.goto(page.url.split("#")[0], wait_until="networkidle")
 
@@ -433,11 +453,10 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
     placeholder = composer.get_attribute("placeholder")
     assert "说一句话就开始" in placeholder
     assert "每天早上提醒我" in placeholder
-    # The timeline: runs and conversations together, and a fresh gateway has
-    # neither. So the *empty state* is what has to be right here -- and it names
-    # the way in, which is the box above it. Threads are not listed on this page
-    # any more: they are in the sidebar, and listing them twice said nothing new.
-    assert page.locator(".home-thread").count() == 0, "the sidebar owns the thread list"
+    # The record: runs and conversations together, behind one line. Threads are
+    # rows in it and in a drawer, not a second navigation column.
+    assert page.locator(".app-sider").count() == 0, "the sidebar is gone"
+    assert page.locator(".home-thread").count() == 0, "thread rows are record rows"
     # The board is a panel now, so the page itself carries no board groups.
     assert page.locator(".panel-group").count() == 0, "the board belongs to the panel"
     if page.locator(".home-timeline-row").count():
@@ -446,18 +465,20 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
         text = page.inner_text(".home-view")
         assert "还没有记录" in text
         assert "框" in text, "the empty state names the way in"
-    # The nav is about the agent, not about session records: 主页 leads, and
-    # 会话管理 is no longer a place you work in.
-    # The navigation entries are menu items, not a single class: only 自动化 carries
-    # a `nav-label` span (it holds the failure badge), so reading them by that class
-    # finds one entry and calls the rest missing.
+    # Navigation is one menu, not a column: the pages a person manages are behind
+    # ⋯, and threads behind their own drawer. A sidebar charged every screen for
+    # six entries, five of which are opened once a week.
+    page.locator(".topbar-more").click()
+    page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
     labels = [
-        page.locator(".sider-nav .ant-menu-item").nth(i).inner_text().strip()
-        for i in range(page.locator(".sider-nav .ant-menu-item").count())
+        page.locator(".ant-dropdown-menu-item").nth(i).inner_text().strip()
+        for i in range(page.locator(".ant-dropdown-menu-item").count())
     ]
-    assert labels, "the navigation rendered nothing"
-    assert labels[0] == "主页", labels
+    assert "线程" in labels and "设置" in labels, labels
     assert "会话管理" not in labels, labels
+    # 对话 is not a page any more: the conversation is this screen.
+    assert "对话" not in labels, labels
+    page.keyboard.press("Escape")
     assert page.errors == [], page.errors
 
 
@@ -468,43 +489,47 @@ def test_typing_on_home_starts_a_thread(page):
 
     box = page.wait_for_selector(".home-composer-input", timeout=20_000)
     box.fill("帮我看看昨天的构建")
-    page.locator(".home-composer").locator("button[aria-label='发送']").click()
+    page.locator(".home-box").locator("button[aria-label='发送']").click()
 
-    # It navigates into the conversation it just created.
-    page.wait_for_selector("textarea", timeout=20_000)
+    # The same screen becomes the conversation, and the address names the thread.
+    page.wait_for_selector(".home-room", timeout=20_000)
     page.wait_for_timeout(1200)
-    assert "#/chat/" in page.url, page.url
+    assert "#/t/" in page.url, page.url
     assert len(page.url) > before
 
 
-def test_a_new_conversation_shows_up_in_the_timeline(page):
-    """The home page's timeline is the record of what the agent did, so the thing
-    it just did has to appear in it.
+def test_a_new_conversation_shows_up_in_the_record(page):
+    """The record is where "what has it done" is answered, so a thread you just
+    had has to appear in it.
 
-    This is the end-to-end version of the two bugs found while building the page:
-    the effect that loads `/api/home` had neither `loadHome` nor `loadSessions` in
+    The end-to-end version of the two bugs found while building the page: the
+    effect that loads `/api/home` had neither `loadHome` nor `loadSessions` in
     its dependency list, so arriving at the view a second time kept the first
-    visit's answer -- and the sidebar showed "暂无会话" over sessions that existed.
+    visit's answer -- and the thread list showed "暂无会话" over sessions that
+    existed.
     """
     page.goto(page.url.split("#")[0], wait_until="networkidle")
     page.wait_for_timeout(2500)
-    before = page.locator(".home-timeline-row").count()
+    before = page.locator(".home-timeline-thread").count()
 
     box = page.wait_for_selector(".home-composer-input", timeout=20_000)
     box.fill("帮我总结当前项目")
-    page.locator(".home-composer").locator("button[aria-label='发送']").click()
-    page.wait_for_selector("textarea", timeout=20_000)
+    page.locator(".home-box").locator("button[aria-label='发送']").click()
+    page.wait_for_selector(".home-room", timeout=20_000)
     page.wait_for_timeout(3500)
-    assert "#/chat/" in page.url
 
-    # Navigate the way a person does -- the sidebar entry, not a fresh page load.
-    page.locator(".sider-nav .ant-menu-item").first.click()
+    # Back to the landing the way a person does: 新对话 in the threads drawer.
+    page.locator(".topbar-more").click()
+    page.locator(".ant-dropdown-menu-item", has_text="线程").first.click()
+    page.wait_for_selector(".threads-new", timeout=10_000)
+    page.locator(".threads-new").click()
     page.wait_for_timeout(2500)
 
-    after = page.locator(".home-timeline-row").count()
-    assert after > before, f"the timeline did not grow ({before} -> {after})"
-    top = page.locator(".home-timeline-row").first.inner_text()
-    assert "帮我总结当前项目" in top, top
+    after = page.locator(".home-timeline-thread").count()
+    assert after > before, f"the record did not grow a thread ({before} -> {after})"
+    # The row exists; its title may still be 未命名线程 for a turn that has not
+    # finished, which is the backend's business, not this screen's.
+    assert page.locator(".home-timeline-thread").first.inner_text().strip()
     assert page.errors == [], page.errors
 
 

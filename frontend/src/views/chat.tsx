@@ -27,7 +27,7 @@ import React from 'react'
 const { TextArea } = Input
 
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, canRewind, editLastTurn, regenerateLastTurn, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, sessionUsage, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, canRewind, editLastTurn, regenerateLastTurn, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, sessionUsage, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
   return (
@@ -125,33 +125,12 @@ export function renderChat(ctx: AppCtx) {
             </div>
           )}
           {messages.length === 0 ? (
-            <div className="chat-empty">
-              <div className="chat-empty-mark">S</div>
-              <h2>有什么可以帮你？</h2>
-              <p>
-                输入消息开始对话，或按 <kbd>/</kbd> 使用命令，按{' '}
-                <kbd>⌘ K</kbd> 打开命令面板
-              </p>
-              <div className="chat-empty-suggestions">
-                {[
-                  '帮我总结当前项目',
-                  '查看最近会话',
-                  '用 /help 查看可用命令',
-                ].map(item => (
-                  <Button
-                    key={item}
-                    size="small"
-                    onClick={() => {
-                      setInput(item)
-                      // Filled but not focused, the suggestion left the
-                      // reader to go and click the box it had just typed in.
-                      focusComposer()
-                    }}
-                  >
-                    {item}
-                  </Button>
-                ))}
-              </div>
+            /* A thread with nothing in it. Not a second welcome screen: the
+               landing page is where the app introduces itself, and a hero here
+               repeated it one click inside a thread the reader had already
+               chosen. This says the one thing that is true of an empty thread. */
+            <div className="chat-empty chat-empty-bare">
+              <p>这条线程还没有消息，说一句话就开始。</p>
             </div>
           ) : (
             <>

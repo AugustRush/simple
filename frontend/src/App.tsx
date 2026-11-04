@@ -1,12 +1,12 @@
-import { CloseOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MenuOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
-import { Badge, Button, ConfigProvider, Drawer, Dropdown, Empty, Input, Layout, Menu, Modal, Skeleton, theme, Tooltip } from 'antd'
+import { ArrowLeftOutlined, BranchesOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import type { MenuProps } from 'antd'
+import { Badge, Button, ConfigProvider, Drawer, Dropdown, Empty, Input, Layout, Modal, Skeleton, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
 import React from 'react'
 import 'dayjs/locale/zh-cn'
 import './index.css'
 import type { AppCtx } from './app/AppCtx'
-import { renderChat } from './views/chat'
 import { renderHome } from './views/home'
 import { renderBoardPanel } from './views/board'
 import { renderExtensions } from './views/extensions'
@@ -29,7 +29,7 @@ import { useSettings } from './hooks/useSettings'
 import { useAutomation } from './hooks/useAutomation'
 import { useShell } from './hooks/useShell'
 
-const { Content, Header, Sider } = Layout
+const { Content, Header } = Layout
 dayjs.locale('zh-cn')
 
 //: How many hits the search modal shows before the "还有 N 条" line. The
@@ -84,7 +84,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, collapsed, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setSearchOpen, setThemeMode, themeMode, view } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setSearchOpen, setThemeMode, setThreadsOpen, themeMode, threadsOpen, view } = ui
 
   const { contextHolder, messageApi, token } = apiClient
 
@@ -395,7 +395,6 @@ function App() {
 
   const renderCurrentView = () => {
     if (view === 'home') return renderHome(ctx)
-    if (view === 'chat') return renderChat(ctx)
     if (view === 'extensions') return renderExtensions(ctx)
     if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)
@@ -404,19 +403,44 @@ function App() {
     return renderHome(ctx)
   }
 
-  // The chat header is the only place a person can see *which* conversation is
-  // open, and it used to say "当前对话" for all of them -- the title lived in the
-  // sidebar only, so the main area never answered the question. `sessionState`
-  // first: it is what the server just sent, while the list may be a poll behind.
-  const activeSessionTitle = String(
-    (sessionState as { title?: string } | null)?.title ||
-      sessions.find(item => item.session_id === activeSession)?.title ||
-      '',
-  ).trim()
-  const currentMeta =
-    view === 'chat' && activeSessionTitle
-      ? { title: activeSessionTitle, subtitle: pageMeta.chat.subtitle }
-      : pageMeta[view] || pageMeta.chat
+  // The thread name is the screen's title when one is open -- it is the only
+  // place that answers "which conversation is this", now that no column does.
+  const currentMeta = pageMeta[view] || pageMeta.home
+
+  const topbarMenu: MenuProps['items'] = [
+    { key: 'threads', icon: <BranchesOutlined />, label: '线程' },
+    { key: 'search', icon: <SearchOutlined />, label: '搜索线程' },
+    { type: 'divider' },
+    ...navItems.filter(item => item.key !== 'home'),
+    { type: 'divider' },
+    { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+    {
+      key: 'theme',
+      icon: themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />,
+      label: themeMode === 'dark' ? '切到浅色模式' : '切到深色模式',
+    },
+  ]
+
+  const handleTopbarMenu: MenuProps['onClick'] = ({ key }) => {
+    if (key === 'threads') {
+      setThreadsOpen(true)
+      return
+    }
+    if (key === 'search') {
+      setSearchOpen(true)
+      return
+    }
+    if (key === 'theme') {
+      const next = themeMode === 'dark' ? 'light' : 'dark'
+      setThemeMode(next)
+      localStorage.setItem('agent_theme', next)
+      return
+    }
+    // `navigateTo` keeps the unsaved-edits guard, so a menu entry refuses to lose
+    // work exactly as the navigation item it replaces did. 设置 included: it is a
+    // destination like any other now that there is no footer to hide it in.
+    navigateTo(key)
+  }
 
   return (
     <ConfigProvider
@@ -452,279 +476,231 @@ function App() {
       }}
     >
       {contextHolder}
-      <Layout className="app-shell">
-        <Sider
-          className="app-sider"
-          width={260}
-          collapsedWidth={0}
-          collapsed={collapsed}
-          trigger={null}
-        >
-          <div className="brand">
-            <div className="brand-logo">
-              <RobotOutlined />
-            </div>
-            <div className="brand-copy">
-              <strong>Simple Agent</strong>
-              <span>Personal AI</span>
-            </div>
-            <Tooltip title="搜索会话">
+      <Layout className="app-shell app-shell-flat">
+        {/* One bar, not a column. The app's day-to-day surface is one screen --
+            the agent -- so navigation is the exception: four management pages in
+            a menu, and threads in a drawer that opens when you want another one.
+            A 260px sidebar charged every screen for six entries, five of which
+            are opened once a week. */}
+        <Header className="app-topbar">
+          <div className="topbar-left">
+            {view !== 'home' && (
               <Button
                 type="text"
-                size="small"
-                className="brand-action"
-                icon={<SearchOutlined />}
-                onClick={() => setSearchOpen(true)}
+                className="topbar-back"
+                icon={<ArrowLeftOutlined />}
+                aria-label="返回"
+                onClick={() => navigateTo('home')}
               />
-            </Tooltip>
-            <Button
-              type="text"
-              size="small"
-              icon={<CloseOutlined />}
-              onClick={() => setCollapsed(true)}
-            />
-          </div>
-
-          <div className="sider-nav">
-            <Menu
-              mode="inline"
-              selectedKeys={[view]}
-              items={navItems}
-              onClick={event => {
-                navigateTo(event.key)
-                if (window.innerWidth <= 768) setCollapsed(true)
-              }}
-            />
-          </div>
-
-          {/* Not a "新建会话" button. The way in is the box on 主页: a thread is
-              something a conversation creates, not a thing you create before
-              having one. What is left here is the list. */}
-
-          <div className="session-panel">
-            <div className="session-panel-label">
-              线程
-              {/* No "全部 N" link. It opened a page whose only unique job was
-                  bulk delete, and the row menu already renames and deletes; a
-                  screen that lists the same threads as this list, one click
-                  deeper, was the page saying nothing twice. */}
+            )}
+            <button
+              type="button"
+              className="topbar-brand"
+              aria-label="回到主页"
+              onClick={() => navigateTo('home')}
+            >
+              <RobotOutlined />
+            </button>
+            <div className="topbar-title">
+              <div className="page-title">{currentMeta.title}</div>
+              <div className="page-subtitle">{currentMeta.subtitle}</div>
             </div>
-            {loadingSessions ? (
-              <Skeleton active paragraph={{ rows: 5 }} title={false} />
-            ) : filteredSessions.length === 0 ? (
-              <Empty
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description="暂无会话"
-              />
-            ) : (
-              filteredSessions.map((item, index) => {
-                // Live sessions lead the list now, so the divider that
-                // matters is where they end: history gets its own label
-                // once something live sits above it.
-                const showHistoryHeader =
-                  !item.live && index > 0 && Boolean(filteredSessions[index - 1].live)
-                return (
-                  <React.Fragment key={item.session_id}>
-                    {showHistoryHeader && (
-                      <div className="session-panel-label sub">历史会话</div>
-                    )}
+          </div>
+          <div className="header-right">
+            {/* The board lives behind this button on every screen: it is a *state*
+                panel rather than one page's content, and somebody watching a task
+                run should not have to lose where they were to look at it. The
+                badge is the only thing here that speaks up -- a count over zero. */}
+            <Badge count={boardWaiting} size="small" offset={[-2, 4]}>
+              <Button
+                type="text"
+                className="header-board"
+                aria-label={boardOpen ? '收起看板' : '打开看板'}
+                aria-expanded={boardOpen}
+                onClick={() => setBoardOpen(!boardOpen)}
+              >
+                看板
+              </Button>
+            </Badge>
+            <Dropdown menu={{ items: topbarMenu, onClick: handleTopbarMenu }} placement="bottomRight" trigger={['click']}>
+              <Button type="text" className="topbar-more" icon={<MoreOutlined />} aria-label="更多" />
+            </Dropdown>
+          </div>
+        </Header>
+        <Content className="app-content">{renderCurrentView()}</Content>
+      </Layout>
+
+      {/* Threads: a drawer, not a column. A thread is a row you click when you
+          want to go back to one -- the same shape as the board on the other
+          edge, and for the same reason. */}
+      <Drawer
+        placement="left"
+        width={300}
+        open={threadsOpen}
+        onClose={() => setThreadsOpen(false)}
+        rootClassName="threads-drawer"
+        title="线程"
+        styles={{ body: { padding: '10px 12px 16px' } }}
+      >
+        {/* Not "新建会话" in the old sense: a thread is something a conversation
+            creates. This just clears the open thread so the next message starts
+            a new one -- which is what "new" means in a product whose unit of
+            conversation is the message, not the document. */}
+        <Button
+          block
+          icon={<PlusOutlined />}
+          className="threads-new"
+          onClick={() => {
+            selectSession('')
+            setThreadsOpen(false)
+          }}
+        >
+          新对话
+        </Button>
+      <div className="session-panel">
+        <div className="session-panel-label">
+          线程
+          {/* No "全部 N" link. It opened a page whose only unique job was
+              bulk delete, and the row menu already renames and deletes; a
+              screen that lists the same threads as this list, one click
+              deeper, was the page saying nothing twice. */}
+        </div>
+        {loadingSessions ? (
+          <Skeleton active paragraph={{ rows: 5 }} title={false} />
+        ) : filteredSessions.length === 0 ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="暂无会话"
+          />
+        ) : (
+          filteredSessions.map((item, index) => {
+            // Live sessions lead the list now, so the divider that
+            // matters is where they end: history gets its own label
+            // once something live sits above it.
+            const showHistoryHeader =
+              !item.live && index > 0 && Boolean(filteredSessions[index - 1].live)
+            return (
+              <React.Fragment key={item.session_id}>
+                {showHistoryHeader && (
+                  <div className="session-panel-label sub">历史会话</div>
+                )}
+                <div
+                  className={`session-item ${
+                    item.session_id === activeSession ? 'active' : ''
+                  }`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`打开会话 ${item.title || '未命名会话'}${sessionStatusOf(item) ? `（${sessionStatusOf(item)}）` : ''}`}
+                  aria-current={item.session_id === activeSession ? 'true' : undefined}
+                  onClick={event => handleSessionContainerClick(event, item.session_id)}
+                  onKeyDown={event => {
+                    if (event.target !== event.currentTarget) return
+                    // F2 renames, as it does for a file in Finder/Explorer.
+                    if (event.key === 'F2') {
+                      event.preventDefault()
+                      setRenamingSession(`sider:${item.session_id}`)
+                      return
+                    }
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      handleSessionContainerClick(event, item.session_id)
+                    }
+                  }}
+                >
+                  <div className="session-item-status">
+                    <span className={`${item.live ? 'live' : 'durable'}${isSessionBusy(item) ? ' busy' : ''}`} />
+                  </div>
+                  <div className="session-item-main">
+                    <div className="session-item-title">
+                      <SessionTitle
+                        item={item}
+                        editing={renamingSession === `sider:${item.session_id}`}
+                        onStartEdit={() => setRenamingSession(`sider:${item.session_id}`)}
+                        onCommit={title => void commitSessionTitle(item, title)}
+                        onCancel={() => setRenamingSession(null)}
+                      />
+                    </div>
+                    <div className="session-item-meta">
+                      {/* When it was last touched, and whether it is busy.
+                          The turn count is gone: "2 轮 · 6 小时前" on every row
+                          was the busiest text in the sidebar and answered a
+                          question nobody asks while choosing what to read. */}
+                      {sessionStatusOf(item) && (
+                        <span
+                          className={`session-status-badge ${
+                            item.status === 'queued' ? 'is-queued' : 'is-running'
+                          }`}
+                        >
+                          {sessionStatusOf(item)}
+                        </span>
+                      )}
+                      {relativeTime(item.last_activity)}
+                    </div>
+                  </div>
+                  {pendingDeleteSessionId === item.session_id ? (
                     <div
-                      className={`session-item ${
-                        item.session_id === activeSession ? 'active' : ''
-                      }`}
-                      role="button"
-                      tabIndex={0}
-                      aria-label={`打开会话 ${item.title || '未命名会话'}${sessionStatusOf(item) ? `（${sessionStatusOf(item)}）` : ''}`}
-                      aria-current={item.session_id === activeSession ? 'true' : undefined}
-                      onClick={event => handleSessionContainerClick(event, item.session_id)}
-                      onKeyDown={event => {
-                        if (event.target !== event.currentTarget) return
-                        // F2 renames, as it does for a file in Finder/Explorer.
-                        if (event.key === 'F2') {
-                          event.preventDefault()
-                          setRenamingSession(`sider:${item.session_id}`)
-                          return
-                        }
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault()
-                          handleSessionContainerClick(event, item.session_id)
-                        }
+                      className="session-item-delete-actions"
+                      onClick={event => event.stopPropagation()}
+                    >
+                      <Button
+                        type="text"
+                        danger
+                        size="small"
+                        onClick={() => deleteSession(item)}
+                      >
+                        删除
+                      </Button>
+                      <Button
+                        type="text"
+                        size="small"
+                        onClick={() => setPendingDeleteSessionId(null)}
+                      >
+                        取消
+                      </Button>
+                    </div>
+                  ) : (
+                    <Dropdown
+                      trigger={['click']}
+                      menu={{
+                        onClick: ({ domEvent }) => domEvent.stopPropagation(),
+                        items: [
+                          {
+                            key: 'reveal',
+                            label: '在 Finder 中显示',
+                            icon: <FolderOpenOutlined />,
+                            onClick: () => revealSession(item),
+                          },
+                          {
+                            key: 'rename',
+                            label: '重命名',
+                            icon: <EditOutlined />,
+                            onClick: () => setRenamingSession(`sider:${item.session_id}`),
+                          },
+                          {
+                            key: 'delete',
+                            label: '删除',
+                            icon: <DeleteOutlined />,
+                            danger: true,
+                            onClick: () => setPendingDeleteSessionId(item.session_id),
+                          },
+                        ],
                       }}
                     >
-                      <div className="session-item-status">
-                        <span className={`${item.live ? 'live' : 'durable'}${isSessionBusy(item) ? ' busy' : ''}`} />
-                      </div>
-                      <div className="session-item-main">
-                        <div className="session-item-title">
-                          <SessionTitle
-                            item={item}
-                            editing={renamingSession === `sider:${item.session_id}`}
-                            onStartEdit={() => setRenamingSession(`sider:${item.session_id}`)}
-                            onCommit={title => void commitSessionTitle(item, title)}
-                            onCancel={() => setRenamingSession(null)}
-                          />
-                        </div>
-                        <div className="session-item-meta">
-                          {/* When it was last touched, and whether it is busy.
-                              The turn count is gone: "2 轮 · 6 小时前" on every row
-                              was the busiest text in the sidebar and answered a
-                              question nobody asks while choosing what to read. */}
-                          {sessionStatusOf(item) && (
-                            <span
-                              className={`session-status-badge ${
-                                item.status === 'queued' ? 'is-queued' : 'is-running'
-                              }`}
-                            >
-                              {sessionStatusOf(item)}
-                            </span>
-                          )}
-                          {relativeTime(item.last_activity)}
-                        </div>
-                      </div>
-                      {pendingDeleteSessionId === item.session_id ? (
-                        <div
-                          className="session-item-delete-actions"
-                          onClick={event => event.stopPropagation()}
-                        >
-                          <Button
-                            type="text"
-                            danger
-                            size="small"
-                            onClick={() => deleteSession(item)}
-                          >
-                            删除
-                          </Button>
-                          <Button
-                            type="text"
-                            size="small"
-                            onClick={() => setPendingDeleteSessionId(null)}
-                          >
-                            取消
-                          </Button>
-                        </div>
-                      ) : (
-                        <Dropdown
-                          trigger={['click']}
-                          menu={{
-                            onClick: ({ domEvent }) => domEvent.stopPropagation(),
-                            items: [
-                              {
-                                key: 'reveal',
-                                label: '在 Finder 中显示',
-                                icon: <FolderOpenOutlined />,
-                                onClick: () => revealSession(item),
-                              },
-                              {
-                                key: 'rename',
-                                label: '重命名',
-                                icon: <EditOutlined />,
-                                onClick: () => setRenamingSession(`sider:${item.session_id}`),
-                              },
-                              {
-                                key: 'delete',
-                                label: '删除',
-                                icon: <DeleteOutlined />,
-                                danger: true,
-                                onClick: () => setPendingDeleteSessionId(item.session_id),
-                              },
-                            ],
-                          }}
-                        >
-                          <Button
-                            type="text"
-                            size="small"
-                            icon={<MoreOutlined />}
-                            onClick={event => event.stopPropagation()}
-                          />
-                        </Dropdown>
-                      )}
-                    </div>
-                  </React.Fragment>
-                )
-              })
-            )}
-          </div>
-
-          <div className="sider-footer">
-            <div className="sider-footer-row">
-              {/* Icon-only, at their natural size.  These two are a footer of
-                  utilities rather than a page, and a word beside each icon
-                  made two half-width buttons out of two 38px targets -- a
-                  label a person reads once, and the footer spends the width
-                  of the whole column on it.  The label is not dropped: it
-                  moves into the tooltip and into the accessible name, since
-                  an icon on its own is a picture, not a label. */}
-              <Tooltip title={themeMode === 'dark' ? '切到浅色模式' : '切到深色模式'}>
-                <Button
-                  icon={themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
-                  aria-label={themeMode === 'dark' ? '切到浅色模式' : '切到深色模式'}
-                  onClick={() => {
-                    const next = themeMode === 'dark' ? 'light' : 'dark'
-                    setThemeMode(next)
-                    localStorage.setItem('agent_theme', next)
-                  }}
-                />
-              </Tooltip>
-              {/* The settings entry, out of the main navigation by design: it
-                  sits beside the theme switch -- the two things a person
-                  touches once and then rarely -- rather than beside the pages
-                  they visit every day.  navigateTo keeps the unsaved-edits
-                  guard, so this small entry refuses to lose work exactly as
-                  the menu item it replaces did. */}
-              <Tooltip title="设置">
-                <Button
-                  icon={<SettingOutlined />}
-                  aria-label="设置"
-                  aria-current={view === 'settings' ? 'page' : undefined}
-                  onClick={() => navigateTo('settings')}
-                />
-              </Tooltip>
-            </div>
-          </div>
-        </Sider>
-
-        <div
-          className={`mobile-sider-backdrop ${collapsed ? '' : 'visible'}`}
-          onClick={() => setCollapsed(true)}
-          aria-hidden="true"
-        />
-
-        <Layout className="app-main">
-          <Header className="app-header">
-            <div className="header-left">
-              <Button
-                type="text"
-                className="header-menu"
-                icon={<MenuOutlined />}
-                aria-label={collapsed ? '展开侧栏' : '收起侧栏'}
-                onClick={() => setCollapsed(value => !value)}
-              />
-              <div>
-                <div className="page-title">{currentMeta.title}</div>
-                <div className="page-subtitle">{currentMeta.subtitle}</div>
-              </div>
-            </div>
-            {/* The board lives behind this button, on every page: it is a *state*
-                panel rather than one page's content, and a person watching a task
-                run should be able to open it without losing where they were. The
-                badge is the only thing here that speaks up -- a count over zero. */}
-            <div className="header-right">
-              <Badge count={boardWaiting} size="small" offset={[-2, 4]}>
-                <Button
-                  type="text"
-                  className="header-board"
-                  aria-label={boardOpen ? '收起看板' : '打开看板'}
-                  aria-expanded={boardOpen}
-                  onClick={() => setBoardOpen(!boardOpen)}
-                >
-                  看板
-                </Button>
-              </Badge>
-            </div>
-          </Header>
-          <Content className="app-content">{renderCurrentView()}</Content>
-        </Layout>
-      </Layout>
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<MoreOutlined />}
+                        onClick={event => event.stopPropagation()}
+                      />
+                    </Dropdown>
+                  )}
+                </div>
+              </React.Fragment>
+            )
+          })
+        )}
+      </div>
+      </Drawer>
 
       {/* No mask: the panel is a control you keep open while working, not a modal
           that stops the page until answered. Closing is the same button that
@@ -748,14 +724,14 @@ function App() {
           notice says which conversation is waiting and offers the way back --
           the deadline keeps running, so saying nothing would be the silent
           auto-deny this replaced. */}
-      {view !== 'chat' && activeConfirm && confirmRemaining > 0 && (
+      {view !== 'home' && activeConfirm && confirmRemaining > 0 && (
         <div className="approval-notice" role="status" aria-live="polite">
           <SafetyCertificateOutlined className="approval-notice-icon" />
           <span>
             会话「{approvalSessionTitle}」有一个操作等待你确认
           </span>
           <span className="approval-notice-timer">{confirmRemaining}s</span>
-          <Button size="small" type="primary" onClick={() => navigateTo('chat')}>
+          <Button size="small" type="primary" onClick={() => navigateTo('home')}>
             回到对话
           </Button>
         </div>
