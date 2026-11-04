@@ -169,8 +169,8 @@ def execute_proposal(
             # fails becomes attention, attention becomes "read the failed run",
             # and that becomes another autonomous read -- each with a new task id
             # and a new action sentence, so dedupe cannot break the chain and
-            # every round leaves another `[自主]` task in the person's automation
-            # list. A failure that matters is recorded on the proposal's outcome
+            # every round leaves another task behind. A failure that matters is
+            # recorded on the proposal's outcome
             # instead (``read_back_outcomes``), which is where somebody reading
             # 自主 already looks.
             payload={"prompt": body, "origin": "autonomy", "proposal_id": proposal.id},
@@ -212,16 +212,16 @@ def execute_proposal(
 
 
 def _task_name(proposal: Any) -> str:
-    """A task name a person can recognise in the 自动化 list.
+    """The scheduler row's name, which is also what the ledger prints.
 
-    Prefixed so an executed proposal is distinguishable from a task the person
-    made: the two have different provenance and the list is where that shows.
+    It is the action sentence and nothing else. Provenance used to be a `[自主]`
+    prefix here, which meant two readers had to parse a name to answer "did the
+    agent do this": the automation list now answers it from the payload marker
+    (and does not list these tasks at all), and the ledger marks the row itself.
+    A name nobody has to decode.
     """
     action = str(getattr(proposal, "action", "") or "").strip()
-    name = action[:60] if action else "自主提议"
-    from . import OWN_ERRAND_PREFIX
-
-    return f"{OWN_ERRAND_PREFIX}{name}"
+    return action[:60] if action else "自主提议"
 
 
 def _task_body(proposal: Any, *, now: datetime) -> str:

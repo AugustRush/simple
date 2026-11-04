@@ -576,22 +576,18 @@ def test_the_feed_stops_at_the_end(stores) -> None:
 
 
 def test_the_ledger_says_when_the_agent_did_it_itself(stores) -> None:
-    """An autonomous errand reads as the agent acting, not as a task name.
+    """An autonomous errand reads as the agent acting, not as one of your tasks.
 
-    The executor names its task "[自主] <the action sentence>" so the automation
-    list could tell provenance apart; on the ledger that prefix is machine noise
-    around a sentence that is already the whole story. The marker says the part a
-    reader needs, which is *who* did this.
+    The provenance travels as a field, not as a prefix on the name, so the ledger
+    can mark the row without asking a reader to decode its title.
     """
     scheduler, proposals = stores
     mine = _task(scheduler, "每天早上看日志")
     _run(scheduler, mine, status="succeeded")
 
-    from agent.autonomy import OWN_ERRAND_PREFIX
-
     theirs = scheduler.create_task(
         NewScheduledTask(
-            name=f"{OWN_ERRAND_PREFIX}读一遍那 2 次失败的运行",
+            name="读一遍那 2 次失败的运行",
             kind="agent_prompt",
             trigger=TriggerSpec.once(NOW.isoformat(), "UTC"),
             payload={"prompt": "p", "origin": "autonomy"},
@@ -606,6 +602,5 @@ def test_the_ledger_says_when_the_agent_did_it_itself(stores) -> None:
     )
 
     by_title = {entry["title"]: entry for entry in payload["activity"]}
-    assert "读一遍那 2 次失败的运行" in by_title, "the prefix is stripped"
     assert by_title["读一遍那 2 次失败的运行"]["origin"] == "autonomy"
     assert by_title["每天早上看日志"]["origin"] == "", "a person's task carries no marker"

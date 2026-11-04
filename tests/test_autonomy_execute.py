@@ -79,7 +79,9 @@ def test_an_approved_reversible_proposal_becomes_a_one_off_task(stores) -> None:
 
     task = scheduler.list_tasks()[0]
     assert task.id == outcome["task_id"]
-    assert task.name.startswith("[自主] "), "provenance shows in the automation list"
+    # The name is the action sentence; provenance is the payload marker, not a
+    # prefix somebody has to parse.
+    assert task.name == "读一遍那 2 次失败的运行，写一句它们为什么失败"
     assert task.trigger.trigger_type == "once"
     # The prompt carries the reason, so the run does not rediscover what the
     # patrol already knew.

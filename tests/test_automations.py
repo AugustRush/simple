@@ -238,16 +238,17 @@ def test_the_route_serves_the_list_and_the_badge_from_one_snapshot(tmp_path, mon
 def test_the_patrol_s_own_errands_are_not_automations(tmp_path) -> None:
     """A task the agent created to do its own reading is machinery, not something you set up.
 
-    Measured on a fresh install: five of the eight rows in 自动化 were `[自主]`
-    one-offs that had already finished. The result of each is on the proposal that
-    started it, so the row said nothing the 自主 page did not already say better.
+    Measured on a fresh install: five of the eight rows in 自动化 were one-off
+    errands the patrol had created for itself, and had already finished. The
+    result of each is on the proposal that started it, so the row said nothing
+    the 自主 page did not already say better.
     """
     store = make_store(tmp_path)
     try:
         make_task(store, "每天早上看日志")
         store.create_task(
             NewScheduledTask(
-                name="[自主] 读一遍那 2 次失败的运行",
+                name="读一遍那 2 次失败的运行",
                 kind="agent_prompt",
                 trigger=TriggerSpec.once("2026-05-01T11:58:00+00:00", "UTC"),
                 payload={
@@ -277,7 +278,7 @@ def test_own_errand_ids_reads_one_definition_of_own_errand(tmp_path) -> None:
         mine = make_task(store, "每天看日志")
         theirs = store.create_task(
             NewScheduledTask(
-                name="[自主] 干一件事",
+                name="干一件事",
                 kind="agent_prompt",
                 trigger=TriggerSpec.once("2026-05-01T11:58:00+00:00", "UTC"),
                 payload={"prompt": "x", "origin": "autonomy"},

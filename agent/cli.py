@@ -1810,12 +1810,10 @@ def _autonomy_session_rows(
                 # failure -> attention -> "read the failed run" -> another
                 # autonomous task -> another failure. Every round has a fresh task
                 # id and a fresh action sentence, so the dedupe key never matches
-                # and the person's automation list grows a `[自主]` row each time.
+                # and each round leaves another task behind.
                 # The failure is not hidden by this: it lands on the proposal's
                 # `outcome`, which is what 自主 renders next to the proposal.
-                if is_own_errand(
-                    getattr(task, "payload", None), getattr(task, "name", "")
-                ):
+                if is_own_errand(getattr(task, "payload", None)):
                     continue
                 # The *session*, not the words. `request_quote` holds what the user
                 # typed ("每天早上九点提醒我写日报"); grepping it for a session id

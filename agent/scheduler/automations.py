@@ -167,8 +167,8 @@ def own_errand_task_ids(store: Any) -> set[str]:
     They are machinery, not automations: the thing a person reads is the
     proposal's outcome (on 自主), and the errand exists only long enough to run
     once. Listing them here put the agent's errands and the tasks a person set up
-    in one list -- measured, five of eight rows on a fresh install were `[自主]`
-    one-offs that had already finished.
+    in one list -- measured, five of eight rows on a fresh install were one-off
+    errands the patrol had already finished.
 
     ``agent.autonomy.is_own_errand`` is the one definition, read rather than
     copied: a second spelling of "this is the agent's own" is how the list and
@@ -179,9 +179,7 @@ def own_errand_task_ids(store: Any) -> set[str]:
     return {
         task.id
         for task in store.list_tasks()
-        if is_own_errand(
-            getattr(task, "payload", None), getattr(task, "name", "")
-        )
+        if is_own_errand(getattr(task, "payload", None))
     }
 
 
