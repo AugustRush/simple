@@ -703,8 +703,10 @@ function App() {
       </Drawer>
 
       {/* No mask: the panel is a control you keep open while working, not a modal
-          that stops the page until answered. Closing is the same button that
-          opened it. */}
+          that stops the page until answered. It runs the full height, so its own
+          header sits on the same line as the app bar and its × is the way out --
+          a panel that starts below the bar leaves a band of page above it that
+          reads as a mistake. */}
       <Drawer
         placement="right"
         width={400}

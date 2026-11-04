@@ -117,16 +117,34 @@
 .panel-empty p { margin: 0 0 6px; }
 .panel-empty-hint { color: var(--text-muted); font-size: 11px; line-height: 1.7; }
 
-/* The panel starts below the app header, not over it.
+/* The panel is full height, and its header is the app bar's height.
  *
- * A drawer that covers the whole height hides the control that opens it: the
- * header's 看板 button ends up under the panel's own title bar, so the same button
- * cannot close what it opened -- and the aria-label says it can. Offsetting the
- * wrapper keeps the toggle reachable and the two ways out (this button, the
- * panel's own ×) both honest. The number is the top bar's height, and it lives
- * in one token (--topbar-height) so the bar and the drawer cannot drift apart.
+ * It used to start below the bar (top: 56px) so the 看板 button that opened it
+ * stayed visible. Measured on screen, that offset is what everybody sees first:
+ * a white panel beginning one bar-height down leaves a band of page between it
+ * and the bar, and no amount of explaining ("the button is still reachable")
+ * makes the band look deliberate. The panel has its own × -- the toggle was never
+ * the only way out.
+ *
+ * So: full height, and a header of exactly --topbar-height. The bar and the
+ * panel's title then sit on one line, across two surfaces, which is what a side
+ * panel is supposed to look like.
  */
-.board-drawer .ant-drawer-content-wrapper {
-  top: var(--topbar-height, 56px) !important;
-  height: calc(100% - var(--topbar-height, 56px)) !important;
+/* `!important` because antd injects its own drawer styles into <head> after
+   this sheet: a later rule with equal specificity wins, and the header's 16px
+   padding and 16px title are exactly the two properties being replaced. */
+.board-drawer .ant-drawer-header,
+.threads-drawer .ant-drawer-header {
+  /* antd gives the header `flex: 0 1 0%`: in a column flex container that is the
+     height, so an `!important` height alone still comes out 25px tall. */
+  flex: 0 0 auto !important;
+  height: var(--topbar-height, 56px) !important;
+  padding: 0 14px 0 16px !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+.board-drawer .ant-drawer-header .ant-drawer-title,
+.threads-drawer .ant-drawer-header .ant-drawer-title {
+  color: var(--text) !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
 }
