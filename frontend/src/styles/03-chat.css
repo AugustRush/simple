@@ -12,6 +12,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* antd's Header is dark by default and carries `color: rgba(255,255,255,.85)`.
+     The background is overridden here but the colour was not, so in the light
+     theme the page title was white on near-white -- measured 1.05:1, invisible.
+     A component library's default colour is as much a hard-coded value as one
+     written here, and it has to be answered with a token. */
+  color: var(--text) !important;
   background: var(--surface) !important;
   backdrop-filter: blur(24px) saturate(120%);
   -webkit-backdrop-filter: blur(24px) saturate(120%);

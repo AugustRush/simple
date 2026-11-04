@@ -106,17 +106,27 @@ export function renderHome(ctx: AppCtx) {
     const icon = live ? <LoadingOutlined /> : failed ? <CloseCircleOutlined /> : <CheckCircleOutlined />
     // A run's second line says how it ended, in its own words: the summary when
     // there is one, the error when it failed, nothing when neither exists.
-    const detail = item.summary || item.error || ''
+    // A success does not need explaining on a feed -- "✓ 每天早上看日志 · 成功" is
+    // the whole story. Only a failure earns a second line, because that line is the
+    // reason it is worth surfacing at all. Showing every run's full output summary
+    // here turned the feed into a wall of log-file lists.
+    const detail = failed ? (item.error || item.summary || '') : ''
 
     return (
       <div key={`run:${item.run_id}`} className={`home-timeline-row ${failed ? 'is-failed' : ''}`}>
         <span className="home-timeline-icon">{icon}</span>
         <div className="home-timeline-body">
           <strong>{item.title}</strong>
-          <span>
-            {RUN_STATUS_LABEL[item.status || ''] || item.status}
-            {detail ? ` · ${detail}` : ''}
-          </span>
+          {/* No second line for a success: the icon already says it, and a row
+              whose second line repeats "成功" is a row taking two lines to say one
+              thing. Only a failure earns the extra line, because the reason is the
+              whole point of surfacing it. */}
+          {failed && (
+            <span>
+              {RUN_STATUS_LABEL[item.status || ''] || item.status}
+              {detail ? ` · ${detail}` : ''}
+            </span>
+          )}
         </div>
         <span className="home-timeline-at" title={formatDateTime(item.at, true)}>
           {relativeTime(item.at)}
@@ -161,6 +171,7 @@ export function renderHome(ctx: AppCtx) {
               第一条消息就是一条线程；任务也一样，说出来就行，不用填表
             </span>
             <Button
+              className="home-send"
               type="primary"
               shape="circle"
               icon={<SendOutlined />}

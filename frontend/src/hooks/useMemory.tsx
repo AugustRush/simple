@@ -199,6 +199,27 @@ export function useMemory(deps: Deps) {
     }
   }, [api, loadMemory, memoryDraft, memoryEditing, messageApi])
 
+  /** Entries whose full text is showing.
+   *
+   * Memory entries are journal dumps -- one of them is forty lines of markdown. All
+   * of them expanded turns the page into a wall you cannot scan or tick your way
+   * through, which is the opposite of what a list is for. So the list shows a
+   * four-line excerpt and expanding one is an explicit act.
+   *
+   * Kept here rather than in the view because views here are plain render
+   * functions: a `useState` inside one runs only while that view is current, and
+   * React counts hooks per component -- a varying count is error #300, a blank page.
+   */
+  const [expandedMemoryIds, setExpandedMemoryIds] = useState<string[]>([])
+
+  const toggleMemoryExpanded = useCallback((entryId: string) => {
+    setExpandedMemoryIds(current =>
+      current.includes(entryId)
+        ? current.filter(id => id !== entryId)
+        : [...current, entryId],
+    )
+  }, [])
+
   /** The ids the page has ticked. Kept here so the bar and the rows agree. */
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<string[]>([])
 
@@ -362,6 +383,8 @@ export function useMemory(deps: Deps) {
     closeMemoryEditor,
     clearAllMemory,
     clearMemorySelection,
+    expandedMemoryIds,
+    toggleMemoryExpanded,
     deleteMemoryEntry,
     deleteSelectedMemoryEntries,
     selectedMemoryIds,

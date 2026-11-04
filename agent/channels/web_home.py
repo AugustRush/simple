@@ -302,13 +302,13 @@ def _detail(latest: Any, *, failure: Any, status: str, unread: int) -> str:
     if failure is not None:
         return str(
             getattr(failure, "error", "") or getattr(failure, "summary", "") or ""
-        )[:160]
+        )[:90]
     if latest is None:
         return ""
     if status in {"failed", "interrupted"}:
         return str(
             getattr(latest, "error", "") or getattr(latest, "summary", "") or ""
-        )[:160]
+        )[:90]
     if unread > 0:
         return f"{unread} 次运行结束得不好，还没有人看过"
     return ""

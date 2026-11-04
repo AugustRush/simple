@@ -298,6 +298,8 @@ export interface AppCtx {
   updateMemoryDraft: (patch: Partial<MemoryDraft>) => void
   saveMemoryEntry: () => Promise<void>
   clearAllMemory: () => Promise<void>
+  expandedMemoryIds: string[]
+  toggleMemoryExpanded: (entryId: string) => void
   clearMemorySelection: () => void
   deleteSelectedMemoryEntries: () => Promise<void>
   selectedMemoryIds: string[]

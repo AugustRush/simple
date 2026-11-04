@@ -473,12 +473,14 @@ html[data-theme='light'] .schedule-card-attention { color: #7d4646; }
 }
 
 .page-title {
+  color: var(--text);
   font-size: 14px;
   font-weight: 600;
 }
 
 .page-subtitle {
   margin-top: 2px;
+  color: var(--text-muted);
   font-size: 11px;
 }
 

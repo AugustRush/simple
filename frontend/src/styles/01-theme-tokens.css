@@ -33,6 +33,7 @@
   --red-soft: rgba(240, 163, 163, 0.12);
   --amber: #d6c7a3;
   --shadow: 0 14px 34px rgba(0, 0, 0, 0.2);
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
 
 html[data-theme='light'] {
@@ -60,6 +61,7 @@ html[data-theme='light'] {
   --red-soft: rgba(161, 98, 98, 0.1);
   --amber: #806f4b;
   --shadow: 0 14px 34px rgba(39, 39, 42, 0.1);
+  --shadow-soft: 0 1px 2px rgba(39, 39, 42, 0.06);
 }
 
 html[data-theme='dark'] .ant-btn-primary {

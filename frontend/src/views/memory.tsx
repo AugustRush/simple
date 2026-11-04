@@ -107,7 +107,7 @@ export function renderMemory(ctx: AppCtx) {
     sessions,
     setMemoryTab,
     toggleMemoryPin,
-    updateMemoryDraft, clearAllMemory, clearMemorySelection, deleteSelectedMemoryEntries, selectedMemoryIds, toggleMemorySelected } = ctx
+    updateMemoryDraft, clearAllMemory, clearMemorySelection, deleteSelectedMemoryEntries, selectedMemoryIds, toggleMemorySelected, expandedMemoryIds, toggleMemoryExpanded } = ctx
 
   const categoryOptions = [
     { value: '', label: '全部分类' },
@@ -179,7 +179,12 @@ export function renderMemory(ctx: AppCtx) {
           entry.source_session !== 'manual' &&
           sessions.some(item => item.session_id === entry.source_session)
         return (
-          <div className={`memory-row${pinned ? ' is-pinned' : ''}`} key={entry.id}>
+          <div
+            className={`memory-row${pinned ? ' is-pinned' : ''}${
+              selectedMemoryIds.includes(entry.id) ? ' is-selected' : ''
+            }`}
+            key={entry.id}
+          >
             <Checkbox
               className="memory-row-check"
               checked={selectedMemoryIds.includes(entry.id)}
@@ -187,7 +192,20 @@ export function renderMemory(ctx: AppCtx) {
               aria-label={`选择记忆 ${entry.content.slice(0, 16)}`}
             />
             <div className="memory-row-main">
-              <div className="memory-row-text">{entry.content}</div>
+              <div
+                className={`memory-row-text${expandedMemoryIds.includes(entry.id) ? ' is-expanded' : ''}`}
+              >
+                {entry.content}
+              </div>
+              {entry.content.length > 160 && (
+                <button
+                  type="button"
+                  className="memory-row-expand"
+                  onClick={() => toggleMemoryExpanded(entry.id)}
+                >
+                  {expandedMemoryIds.includes(entry.id) ? '收起' : '展开'}
+                </button>
+              )}
               <div className="memory-row-meta">
                 <Tag className="memory-tag">{entry.category}</Tag>
                 {entry.entity && <Tag className="memory-tag is-quiet">{entry.entity}</Tag>}

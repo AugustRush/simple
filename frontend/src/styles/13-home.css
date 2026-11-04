@@ -66,18 +66,56 @@
   font-weight: 700;
 }
 .home-agent-title { margin: 0; color: var(--text); font-size: 18px; font-weight: 700; }
+/* The composer has to read as "type here" in both themes. Two things made it fail
+   in light mode: the placeholder fell back to a near-white grey (invisible on the
+   white card), and a disabled send button rendered as an empty ring. The card also
+   barely separated from the near-white page, so it looked like dead space rather
+   than an input. */
 .home-composer {
   width: 100%;
-  padding: 10px 10px 8px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface);
+  padding: 12px 12px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--surface-raised, var(--surface));
+  box-shadow: var(--shadow-soft, 0 1px 2px rgba(0, 0, 0, 0.04));
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
-.home-composer:focus-within { border-color: var(--primary-border); }
-.home-composer-input.ant-input { border: 0; box-shadow: none; background: transparent; }
+.home-composer:focus-within {
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.home-composer-input.ant-input {
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 2px 0;
+  resize: none;
+}
+.home-composer-input.ant-input::placeholder { color: var(--text-muted); opacity: 1; }
 .home-composer-input.ant-input:focus { box-shadow: none; }
-.home-composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 8px; }
+.home-composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 10px; }
 .home-composer-hint { color: var(--text-muted); font-size: 11px; }
+/* The send control is always a real button -- an empty ring reads as "broken", not
+   as "nothing to send yet". When there is no text it is quiet rather than absent. */
+.home-send.ant-btn {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+/* Empty input: the control still reads as a button, just a quiet one. A ring with
+   a barely visible arrow reads as "broken", which is how it looked in light mode. */
+.home-send.ant-btn[disabled],
+.home-send.ant-btn[disabled]:hover {
+  background: var(--surface-hover);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  opacity: 1;
+}
 
 /* ── threads ─────────────────────────────────────────────────────────────── */
 .home-thread-list { display: flex; flex-direction: column; gap: 2px; }
@@ -158,16 +196,15 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* The detail line is where a run explains itself. Two lines maximum: a summary
-   that runs long belongs on the task's page, not on the way to the input box. */
+/* One line. The detail is now failure-only and short; a second line on a feed row
+   makes rows uneven and pushes the next one down for no reason a glance needs. */
 .home-timeline-body span {
-  display: -webkit-box;
   overflow: hidden;
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.5;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .home-timeline-at {
   flex: 0 0 auto;
@@ -193,3 +230,40 @@
   font-size: 11px;
 }
 .memory-selection-actions { display: flex; gap: 6px; }
+
+/* ── memory rows: a list, not a wall ──────────────────────────────────────
+   An entry is a journal dump -- forty lines of markdown is normal. Expanded, every
+   row is a screen tall, and a list you cannot see the shape of is one you cannot
+   tick your way through. Four lines plus an explicit 展开. */
+.memory-row-text {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  white-space: pre-wrap;
+}
+.memory-row-text.is-expanded {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+.memory-row-expand {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+.memory-row-expand:hover { color: var(--text-secondary); }
+.memory-row-expand:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+/* Ticked rows say so. Multi-select without a selected state is a set of ticks you
+   have to re-read after every scroll to know what you are about to delete. */
+.memory-row.is-selected {
+  background: var(--primary-soft);
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px var(--primary-border);
+}
