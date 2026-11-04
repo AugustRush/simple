@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined, BranchesOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
 import { Badge, Button, ConfigProvider, Drawer, Dropdown, Empty, Input, Layout, Modal, Skeleton, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
@@ -408,10 +408,9 @@ function App() {
   const currentMeta = pageMeta[view] || pageMeta.home
 
   const topbarMenu: MenuProps['items'] = [
-    { key: 'threads', icon: <BranchesOutlined />, label: '线程' },
     { key: 'search', icon: <SearchOutlined />, label: '搜索线程' },
     { type: 'divider' },
-    ...navItems.filter(item => item.key !== 'home'),
+    ...navItems.filter(item => item.key !== 'home' && item.key !== 'schedules'),
     { type: 'divider' },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
     {
@@ -422,10 +421,6 @@ function App() {
   ]
 
   const handleTopbarMenu: MenuProps['onClick'] = ({ key }) => {
-    if (key === 'threads') {
-      setThreadsOpen(true)
-      return
-    }
     if (key === 'search') {
       setSearchOpen(true)
       return
@@ -472,6 +467,15 @@ function App() {
           Card: {
             colorBorderSecondary: 'rgba(128, 128, 150, 0.14)',
           },
+          Button: {
+            // antd's default is `0 2px 0 <colour>`, a hard 2px bar under every
+            // primary button. In light mode the primary is near-black and that
+            // bar is near-white: a button with a second edge under it. Nothing
+            // here wants a fake bevel, and in a toolbar it read as a rendering
+            // fault rather than a style.
+            primaryShadow: 'none',
+            dangerShadow: 'none',
+          },
         },
       }}
     >
@@ -507,10 +511,34 @@ function App() {
             </div>
           </div>
           <div className="header-right">
-            {/* The board lives behind this button on every screen: it is a *state*
-                panel rather than one page's content, and somebody watching a task
-                run should not have to lose where they were to look at it. The
-                badge is the only thing here that speaks up -- a count over zero. */}
+            {/* Three entries, not eight. A menu is for the pages opened once a
+                week; the ones a person moves between while working stay on the
+                bar, where they cost a click less and, more to the point, are
+                visible -- a menu hides its contents, and a destination nobody
+                can see is a destination nobody uses. The ⋯ now holds 记忆 / 自主
+                / 扩展 / 设置 and the theme switch. */}
+            {/* Threads: the most frequent move there is -- the other half of
+                "which conversation am I in". */}
+            <Button
+              type="text"
+              className="header-threads"
+              aria-expanded={threadsOpen}
+              onClick={() => setThreadsOpen(true)}
+            >
+              线程
+            </Button>
+            <Button
+              type="text"
+              className="header-schedules"
+              aria-current={view === 'schedules' ? 'page' : undefined}
+              onClick={() => navigateTo('schedules')}
+            >
+              自动化
+            </Button>
+            {/* The board is a *state* panel rather than one page's content: it is
+                a control you open on whatever screen you are on, so it sits here
+                as one. The badge is the only thing that speaks up -- a count
+                over zero. */}
             <Badge count={boardWaiting} size="small" offset={[-2, 4]}>
               <Button
                 type="text"

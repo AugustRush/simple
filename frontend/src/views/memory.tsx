@@ -396,7 +396,7 @@ export function renderMemory(ctx: AppCtx) {
         onChange={applyMemoryCategory}
       />
       <div className="list-toolbar-side">
-        <Button icon={<ReloadOutlined />} onClick={() => void loadMemory()} size="small">
+        <Button icon={<ReloadOutlined />} onClick={() => void loadMemory()}>
           刷新
         </Button>
         <Button type="primary" icon={<PlusOutlined />} onClick={openMemoryCreate}>
@@ -419,7 +419,7 @@ export function renderMemory(ctx: AppCtx) {
           okButtonProps={{ danger: true }}
           onConfirm={() => void clearAllMemory()}
         >
-          <Button size="small" danger icon={<DeleteOutlined />} disabled={memoryBusy}>
+          <Button danger icon={<DeleteOutlined />} disabled={memoryBusy}>
             清空
           </Button>
         </Popconfirm>
@@ -430,7 +430,7 @@ export function renderMemory(ctx: AppCtx) {
   const factsToolbar = (
     <div className="list-toolbar">
       <div className="list-toolbar-side">
-        <Button icon={<ReloadOutlined />} onClick={() => void loadMemory()} size="small">
+        <Button icon={<ReloadOutlined />} onClick={() => void loadMemory()}>
           刷新
         </Button>
       </div>

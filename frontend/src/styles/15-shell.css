@@ -70,6 +70,13 @@
 .topbar-title .page-title { color: var(--text); font-size: 13px; font-weight: 600; line-height: 1.3; }
 .topbar-title .page-subtitle { color: var(--text-muted); font-size: 11px; line-height: 1.3; }
 
+/* The bar's own buttons: same type size, same colour, one hover. `aria-current`
+   marks the page you are on without a second colour. */
+.header-right { display: flex; align-items: center; gap: 2px; }
+.header-right .ant-btn { color: var(--text-secondary); font-size: 12px; padding: 0 8px; }
+.header-right .ant-btn:hover { color: var(--text); background: var(--surface-hover); }
+.header-right .ant-btn[aria-current='page'] { color: var(--text); background: var(--surface-hover); }
+.header-threads.ant-btn { padding: 0 6px; }
 .topbar-back.ant-btn { color: var(--text-secondary); }
 .topbar-more.ant-btn { color: var(--text-secondary); }
 .header-right { display: flex; align-items: center; gap: 4px; }

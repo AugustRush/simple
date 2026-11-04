@@ -172,12 +172,17 @@ def page(browser, live_gateway):
 
 
 def open_page(page, label: str) -> None:
-    """Go to a management page the way a person does -- through the ⋯ menu.
+    """Go to a page the way a person does: the bar if it is on the bar, else ⋯.
 
-    The sidebar is gone: the app's day-to-day surface is one screen, and those
-    pages are opened deliberately from a menu instead of occupying a column on
-    every visit.
+    The sidebar is gone. 线程 / 自动化 / 看板 are on the bar because they are the
+    pages somebody moves between while working; everything else is opened from
+    the menu. A test that only knew one of the two would pass while the entry it
+    was supposed to be testing had moved.
     """
+    on_bar = page.locator(".header-right .ant-btn", has_text=label)
+    if on_bar.count():
+        on_bar.first.click()
+        return
     page.locator(".topbar-more").click()
     page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
     page.locator(".ant-dropdown-menu-item", has_text=label).first.click()
@@ -468,16 +473,24 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
     # Navigation is one menu, not a column: the pages a person manages are behind
     # ⋯, and threads behind their own drawer. A sidebar charged every screen for
     # six entries, five of which are opened once a week.
+    # The bar carries what is used while working; the menu carries the rest.
+    bar = [
+        page.locator(".header-right .ant-btn").nth(i).inner_text().strip()
+        for i in range(page.locator(".header-right .ant-btn").count())
+    ]
+    assert {"线程", "自动化", "看板"} <= set(bar), bar
     page.locator(".topbar-more").click()
     page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
     labels = [
         page.locator(".ant-dropdown-menu-item").nth(i).inner_text().strip()
         for i in range(page.locator(".ant-dropdown-menu-item").count())
     ]
-    assert "线程" in labels and "设置" in labels, labels
+    assert "记忆" in labels and "设置" in labels, labels
     assert "会话管理" not in labels, labels
     # 对话 is not a page any more: the conversation is this screen.
     assert "对话" not in labels, labels
+    # …and what is on the bar is not duplicated in the menu.
+    assert "自动化" not in labels and "线程" not in labels, labels
     page.keyboard.press("Escape")
     assert page.errors == [], page.errors
 
@@ -518,9 +531,9 @@ def test_a_new_conversation_shows_up_in_the_record(page):
     page.wait_for_selector(".home-room", timeout=20_000)
     page.wait_for_timeout(3500)
 
-    # Back to the landing the way a person does: 新对话 in the threads drawer.
-    page.locator(".topbar-more").click()
-    page.locator(".ant-dropdown-menu-item", has_text="线程").first.click()
+    # Back to the landing the way a person does: 新对话 in the threads drawer, which
+    # is now the bar's 线程 button rather than an item in ⋯.
+    page.locator(".header-right .ant-btn", has_text="线程").first.click()
     page.wait_for_selector(".threads-new", timeout=10_000)
     page.locator(".threads-new").click()
     page.wait_for_timeout(2500)
