@@ -3,16 +3,18 @@
 Why this is separate from the patrol
 ------------------------------------
 The patrol finds candidates. This decides what may *happen* to them, and the two
-questions are asked at different times by different code: a later execution
-layer will ask this function "may I?" and a person reading the page will ask it
-"why not?". Keeping the answer in one function is what makes those two agree.
+questions are asked at different times by different code: the patrol service asks
+this function "may I?" before handing a candidate to the executor, and a person
+reading the page asks it "why not?". Keeping the answer in one function is what
+makes those two agree.
 
 The three answers, and why there are three
 ------------------------------------------
-* ``auto`` -- reversible, within today's budget. Do it, log it, tell nobody.
-* ``prepare`` -- irreversible, or over the budget. Do *not* do it: write the
-  exact call that would have been made, and wait. This is the answer for
-  anything that sends, deletes, or runs a command.
+* ``auto`` -- reversible. Do it, log it, tell nobody.
+* ``prepare`` -- irreversible or workspace. Do *not* do it: write the exact call
+  that would have been made, and wait. This is the answer for anything that
+  sends, deletes, or runs a command, and for file writes a person should see
+  before they happen.
 * ``drop`` -- the same suggestion was already declined, or its confidence is
   below the floor. Do not write anything; the row already says why.
 
@@ -20,21 +22,12 @@ The middle answer is the one that matters. A system with only "do" and "don't"
 either takes risks it cannot take back or is so cautious it is useless; "prepare"
 is the shape that lets an agent be useful *and* safe -- it does the thinking
 (which call, which arguments) and leaves the commitment to a person.
-
-Why the budget is a count and not a score
------------------------------------------
-"Expected value > cost" is the right idea and an untestable one: tokens are
-measurable, "value" is not, and a formula with an unmeasurable term is a
-formality that will be tuned until it says yes. So the budget here is
-deliberately crude -- **N actions per day, M proposals per day** -- and the
-*calibration* is what later replaces it. A cap that is wrong in a visible way
-beats a formula that is wrong in an invisible one.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:  # the model lives in the package's __init__; import it for types only
@@ -88,10 +81,6 @@ class AdmissionDecision:
             "reason": self.reason,
             "prepared": self.prepared,
         }
-
-
-def _start_of_day(now: datetime) -> datetime:
-    return now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def decide_admission(
@@ -166,9 +155,8 @@ def decide_admission(
 
     return AdmissionDecision(
         answer="auto",
-        # The reason says what the answer is based on -- a fact about the tool,
-        # not a count of what already ran. "Within today's budget" would be true
-        # and irrelevant now that there is no budget.
+        # The reason names the fact the answer is based on: the tool's own
+        # declaration that it only reads.
         reason="只读动作：不会改变工作区之外的东西，所以直接做",
         prepared=_prepare(proposal, arguments),
     )
@@ -189,10 +177,3 @@ def _prepare(
         "action": proposal.action,
         "reversibility": proposal.reversibility,
     }
-
-
-def day_bounds(now: Optional[datetime] = None) -> tuple[datetime, datetime]:
-    """The rolling-day window the counters are about, for a caller that stores them."""
-    moment = now or datetime.now(UTC)
-    start = _start_of_day(moment)
-    return start, start + timedelta(days=1)

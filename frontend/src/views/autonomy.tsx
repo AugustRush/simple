@@ -13,7 +13,6 @@ import { formatDateTime } from '../lib/format'
 import {
   Button,
   Card,
-  Empty,
   Skeleton,
   Space,
   Tag,
@@ -61,7 +60,6 @@ export function renderAutonomy(ctx: AppCtx) {
 
   const proposed = Number(proposalCounts.proposed || 0)
   const funnel = ctx.funnel
-  const decided = Number(proposalCounts.accepted || 0) + Number(proposalCounts.declined || 0)
   const expired = Number(proposalCounts.expired || 0)
 
   const renderRow = (row: ProposalRow) => (
@@ -134,20 +132,30 @@ export function renderAutonomy(ctx: AppCtx) {
             <span className="proposal-count">
               {proposed > 0 ? `${proposed} 条待答复` : '没有待答复的提议'}
             </span>
-            {decided > 0 && <span className="proposal-muted">已答复 {decided}</span>}
+            {/* Counted from the list itself, not from a second tally: the page
+                used to say "已答复 6" above a list of 8 rows, because the
+                counter added up two states and the list rendered three. One
+                number, read off the thing it is counting. */}
+            {answeredProposals.length > 0 && (
+              <span className="proposal-muted">已答复 {answeredProposals.length}</span>
+            )}
             {expired > 0 && <span className="proposal-muted">已过期 {expired}</span>}
           </div>
           <p>
-            它找到了、但<strong>没有自己做</strong>的事——因为它们会改动工作区之外的东西。只读的那些它已经自己做了。
+            这些是它想做、但<strong>必须等你点头</strong>的事——会改动工作区之外的东西。
+            只读的那一类它不问，直接做。
           </p>
           {/* How much was looked at to find these. Without it, "nothing proposed"
-              invites the reader to guess whether there was nothing to do. */}
+              invites the reader to guess whether there was nothing to do -- and a
+              paragraph of prose is the wrong shape for four numbers. */}
           {funnel && funnel.passes > 0 && (
-            <p className="proposal-funnel">
-              最近 7 天巡逻 {funnel.passes} 趟，看了 {funnel.examined} 个会话，
-              跳过（有人在用 {funnel.skipped_warm} · 太久没动 {funnel.skipped_stale}），
-              产出 {funnel.proposed} 条提议，自己做了 {funnel.executed} 件。
-            </p>
+            <div className="proposal-funnel">
+              <span>最近 7 天</span>
+              <span><strong>{funnel.passes}</strong> 趟巡逻</span>
+              <span><strong>{funnel.examined}</strong> 次会话</span>
+              <span><strong>{funnel.proposed}</strong> 条提议</span>
+              <span><strong>{funnel.executed}</strong> 件自己做了</span>
+            </div>
           )}
         </div>
         <Space>
@@ -160,15 +168,12 @@ export function renderAutonomy(ctx: AppCtx) {
       {!proposalsLoaded ? (
         <Skeleton active paragraph={{ rows: 6 }} />
       ) : proposals.length === 0 ? (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description={
-            proposed === 0
-              ? '现在没有提议。它在后台每十分钟看一遍，能自己做的已经做了，需要你点头的才会出现在这里。'
-              : '没有需要答复的提议。'
-          }
-          className="page-empty"
-        />
+        /* One line, not a 200px illustration. When the queue is empty the page's
+           content is the record below it, and a full-height empty state pushed
+           that record off the first screen to say nothing. */
+        <p className="proposal-empty-line">
+          现在没有要你答复的事。它在后台每十分钟看一遍，需要你点头的才会出现在这里。
+        </p>
       ) : (
         <div className="proposal-list">{proposals.map(renderRow)}</div>
       )}
@@ -188,6 +193,12 @@ export function renderAutonomy(ctx: AppCtx) {
                   {OUTCOME_LABEL[row.outcome.status] || row.outcome.status}
                 </span>
               )}
+              {/* When it was answered. Without a time these rows are a list of
+                  things that happened at no particular moment, which is not a
+                  record -- it is a set. */}
+              <span className="proposal-answered-at">
+                {formatDateTime(row.decided_at || row.created_at)}
+              </span>
             </div>
           ))}
         </div>

@@ -32,6 +32,7 @@
   --red: #f0a3a3;
   --red-soft: rgba(240, 163, 163, 0.12);
   --amber: #d6c7a3;
+  --amber-soft: rgba(214, 199, 163, 0.12);
   --shadow: 0 14px 34px rgba(0, 0, 0, 0.2);
   --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
@@ -57,9 +58,12 @@ html[data-theme='light'] {
   --focus-ring: #3f3f46;
   --green: #52525b;
   --green-soft: rgba(82, 82, 91, 0.1);
-  --red: #a16262;
-  --red-soft: rgba(161, 98, 98, 0.1);
+  /* #a16262 measured 4.17:1 as 11px text on its own 10% tint -- under the 4.5
+   * that size needs. Darkened until it clears it: 5.35:1 on the same tint. */
+  --red: #8f4f4f;
+  --red-soft: rgba(143, 79, 79, 0.1);
   --amber: #806f4b;
+  --amber-soft: rgba(128, 111, 75, 0.1);
   --shadow: 0 14px 34px rgba(39, 39, 42, 0.1);
   --shadow-soft: 0 1px 2px rgba(39, 39, 42, 0.06);
 }
@@ -70,6 +74,17 @@ html[data-theme='dark'] .ant-btn-primary {
 
 html[data-theme='light'] .ant-btn-primary {
   color: #fafafa !important;
+}
+
+/* A checked switch is the light fill (`--primary`) plus a knob. antd draws the
+ * knob white in both themes, which is right when the fill is dark (light) and
+ * invisible when the fill is light (dark): measured 1.72:1 between knob and
+ * track, so an enabled automation looked like an empty pale pill.
+ * The knob takes the page colour instead -- 14.5:1 on the same track, and the
+ * "on" state now reads as a dark dot inside a light pill rather than as a
+ * washed-out control. */
+html[data-theme='dark'] .ant-switch.ant-switch-checked .ant-switch-handle::before {
+  background: var(--bg);
 }
 
 * {

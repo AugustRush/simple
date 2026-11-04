@@ -79,14 +79,21 @@ function BoardGroup({
   tone: 'running' | 'waiting' | 'scheduled'
 }) {
   return (
-    <section className={`panel-group panel-group-${tone}`}>
+    <section className={`panel-group panel-group-${tone}${cards.length === 0 ? ' is-empty' : ''}`}>
       <div className="panel-group-head">
         <span className="panel-group-title">{title}</span>
-        {cards.length > 0 && <span className="panel-group-count">{cards.length}</span>}
+        {cards.length > 0 ? (
+          <span className="panel-group-count">{cards.length}</span>
+        ) : (
+          /* The empty sentence belongs on the heading's line, not under it.
+             Stacked, two empty groups spent ~120px of a 380px panel saying
+             nothing, and pushed the one group that had cards to the bottom
+             half of the screen -- so the panel opened on the least useful part
+             of itself. The information (checked, nothing there) is the same. */
+          <span className="panel-group-empty">{empty}</span>
+        )}
       </div>
-      {cards.length === 0 ? (
-        <span className="panel-group-empty">{empty}</span>
-      ) : (
+      {cards.length > 0 && (
         cards.map(card =>
           card.kind === 'proposal' ? (
             /* A proposal is a *candidate* task blocked on a person, so its card

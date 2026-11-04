@@ -1,15 +1,20 @@
-"""The shadow patrol: proposals, not actions.
+"""The autonomy funnel: what it finds, what it may do, and what it records.
 
 What this pins
 --------------
-The first delivery of autonomy is deliberately unable to *do* anything. It reads
-the session directory, applies two silence gates, asks the rules for candidates,
-and writes rows. The value of that is measurable only if the rules are
-trustworthy, so the tests below are about the *rules* and the *bookkeeping*:
+The patrol reads the row sources (the session index, tasks with unreviewed
+failures, live queues), applies two silence gates, asks the rules for candidates,
+and has admission decide what may happen to each: a reversible one may run, and
+everything else is written down and waits for a person. The value of that is
+measurable only if the rules and the bookkeeping are trustworthy, so the tests
+below are about those:
 
 * every rule fires on a fact that is on disk and does not fire when it is absent;
 * a proposal's reversibility comes from the tool's declared capabilities, not
-  from anything the model said about itself;
+  from anything the model said about itself -- and no declaration is not a clean
+  bill of health;
+* a task with a failure nobody read gets a row even when it belongs to no
+  session, because the rule fires per row;
 * a suggestion somebody declined does not come back in new words -- the failure
   this table exists to prevent;
 * one tick cannot flood the table.
@@ -36,6 +41,7 @@ from agent.autonomy import (
     classify_reversibility,
     default_capabilities_of,
     patrol_tick,
+    unowned_task_rows,
 )
 from agent.autonomy.admission import AdmissionPolicy, decide_admission
 from agent.autonomy.rules import RULE_NAMES, rule_candidates
@@ -67,7 +73,9 @@ def _session(session_id: str = "s1", **facts) -> dict:
 
 def test_a_read_tool_is_reversible() -> None:
     assert classify_reversibility({"read"}) == "reversible"
-    assert classify_reversibility(frozenset()) == "reversible"
+    # "No capabilities declared" is not "declared safe": an unknown tool is
+    # treated as if it could do anything, which is the safe direction.
+    assert classify_reversibility(frozenset()) == "irreversible"
 
 
 def test_a_file_write_is_reversible_but_leaves_a_trace() -> None:
@@ -91,8 +99,26 @@ def test_the_builtin_vocabulary_agrees_with_the_classifier() -> None:
     assert default_capabilities_of("schedule_runs") == frozenset({"read"})
     assert classify_reversibility(default_capabilities_of("schedule_runs")) == "reversible"
     # An unknown tool answers "no capabilities", which the classifier reads as
-    # reversible -- and the *patrol* is what turns that into "cannot be trusted".
+    # irreversible: the declaration it needs to say "reversible" is missing, and
+    # missing is not the same as safe.
     assert default_capabilities_of("no_such_tool") == frozenset()
+
+
+def test_an_unknown_tool_is_never_admitted_automatically() -> None:
+    """The fail-open this closes: no declaration used to mean reversible, and the
+    auto path is exactly "run it without asking"."""
+    proposal = Proposal(
+        source="s1",
+        action="用一个没人分类的插件工具做点什么",
+        tool="no_such_tool",
+        reversibility=classify_reversibility(default_capabilities_of("no_such_tool")),
+        confidence=0.9,
+    )
+
+    assert proposal.reversibility == "irreversible"
+    assert decide_admission(proposal).answer == "prepare", (
+        "an undeclared tool must reach a person, never the auto path"
+    )
 
 
 # ── the rules fire on facts, and only on facts ──────────────────────────────
@@ -275,6 +301,94 @@ def test_one_tick_cannot_flood_the_table(store) -> None:
         suggest=rule_candidates,
     )
     assert result["examined"] == 3
+
+
+# ── a task with no session: its own row ─────────────────────────────────────
+
+
+def test_a_task_without_a_session_gets_its_own_row() -> None:
+    """The join needs a row to attach attention to; this task has no session.
+
+    A task created without a session id -- which is every task the patrol
+    executes -- has nothing for ``failed-run-unreviewed`` to fire on, so its
+    failures were permanently invisible.  The row it gets must carry real
+    activity (the newest run's time), because the warm/stale gates drop rows by
+    it.
+    """
+    created = (NOW - timedelta(days=3)).isoformat()
+    latest_run = (NOW - timedelta(minutes=40)).isoformat()
+
+    rows = unowned_task_rows(
+        [
+            {
+                "task_id": "t1",
+                "name": "日报",
+                "last_run_at": created,
+                "created_at": created,
+            },
+            {
+                "task_id": "t2",
+                "name": "周报",
+                "last_run_at": "",
+                "created_at": created,
+            },
+            {
+                "task_id": "t3",
+                "name": "已经挂在会话下",
+                "last_run_at": "",
+                "created_at": created,
+            },
+            {
+                "task_id": "t4",
+                "name": "没有失败",
+                "last_run_at": "",
+                "created_at": created,
+            },
+        ],
+        attention_counts={"t1": 2, "t2": 1, "t3": 5},
+        placed_task_ids={"t3"},
+        latest_run_at={"t1": latest_run},
+    )
+
+    # t3 is already shown under its session (never twice), t4 has no failures.
+    assert [row["session_id"] for row in rows] == ["task:t1", "task:t2"]
+    assert rows[0]["title"] == "日报", "the row is named by the task, not a session"
+    assert rows[0]["status"] == "task"
+    assert rows[0]["last_activity"] == latest_run, (
+        "the newest run's time is real activity; the task's creation time is not"
+    )
+    assert rows[1]["last_activity"] == created, "no run time: fall back to the task's own"
+    assert rows[0]["tasks"] == [{"task_id": "t1", "attention": 2}]
+
+
+# ── the exact call reaches the proposal and the run ────────────────────────
+
+
+def test_the_admitted_call_reaches_the_proposal_and_the_run_prompt(store) -> None:
+    """A run told only "read the failed runs" had to guess which ones -- and a
+    real one guessed that they were no longer in the store.
+
+    So the rule names the task, admission writes the arguments down, and the
+    prompt the executor gets carries them.
+    """
+    from agent.autonomy.execute import _task_body
+
+    patrol_tick(
+        store=store,
+        sessions=[_session("s1", tasks=[{"task_id": "t-failed", "attention": 2}])],
+        now=NOW,
+        suggest=rule_candidates,
+        capabilities_of=default_capabilities_of,
+    )
+
+    proposal = store.list_proposals()[0]
+    prepared = proposal.context["admission"]["prepared"]
+    assert prepared["tool"] == "schedule_runs"
+    assert prepared["arguments"] == {"task_id": "t-failed"}
+
+    body = _task_body(proposal, now=NOW)
+    assert "t-failed" in body, "the prompt names the task the run has to read"
+    assert "schedule_runs" in body, "and the tool to read it with"
 
 
 # ── the store: expiry, decisions, counts ─────────────────────────────────────
@@ -493,14 +607,13 @@ def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
     """Not with the wall clock.
 
     The rules build proposals with `datetime.now()`, which is right when a rule is
-    called directly and wrong when a pass runs at a time somebody chose. The daily
-    budget windows on `created_at`, so a pass replaying "yesterday" would spend
-    today's allowance -- and a backfilled pass would carry timestamps from
-    whenever it happened to execute.
+    called directly and wrong when a pass runs at a time somebody chose: a pass
+    replaying "yesterday" would carry timestamps from whenever it happened to
+    execute, and a proposal is an assertion about *when* the fact was seen.
 
-    This is what caught it: `test_yesterday_s_proposals_do_not_count_against_today`
-    passed on the day it was written and failed the next morning, which is the
-    signature of a clock leaking into policy.
+    This is what caught it: a daily-window test around these timestamps passed on
+    the day it was written and failed the next morning, which is the signature of
+    a clock leaking into policy.
     """
     long_ago = NOW - timedelta(days=30)
     session = _session(
@@ -522,87 +635,57 @@ def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
     assert row.expires_at == long_ago + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
 
 
-def test_priority_orders_a_pass_by_who_is_blocked() -> None:
-    """A stalled queue blocks a person; an unread failure does not.
+# ── what the pass spends its budget on ──────────────────────────────────────
 
-    The ranking is an order, not a score: weights nobody can justify would make
-    two different situations look equally urgent.
+
+def _task_row(task_id: str = "t1", attention: int = 2) -> dict:
+    """The row `unowned_task_rows` builds for a failure with no conversation."""
+    return {
+        "session_id": f"task:{task_id}",
+        "title": "构建检查",
+        "last_activity": (NOW - timedelta(hours=2)).isoformat(),
+        "status": "task",
+        "tasks": [{"task_id": task_id, "attention": attention}],
+    }
+
+
+def test_the_pass_reads_its_own_errands_before_conversations(store) -> None:
+    """A capped pass must not spend the cap on rows that carry no fact.
+
+    `max_sessions_per_tick` bounds the work, and a plain slice ranks by list
+    order -- in which the task rows come last. On an install with more
+    conversations than the cap, every row that exists *because something failed*
+    would be dropped before it was read, while quiet conversations took its place.
     """
-    from agent.autonomy.rules import rule_priority
-
-    assert rule_priority("stale-queue") < rule_priority("failed-run-unreviewed")
-    assert rule_priority("failed-run-unreviewed") < rule_priority(
-        "session-ended-mid-task"
-    )
-    assert rule_priority("something-new") > rule_priority("session-ended-mid-task")
-
-
-def test_a_pass_acts_in_priority_order(store) -> None:
-    """Two candidates, one callback order: the blocked person goes first."""
-    store_seen: list[str] = []
-
-    if True:
-        # One session with a stalled queue (rank 0) and one with unread failures
-        # (rank 1). The queue came later but outranks.
-        sessions = [
-            _session(
-                "failing",
-                attention=1,
-                last_activity=(NOW - timedelta(hours=2)).isoformat(),
-            ),
-            _session(
-                "blocked",
-                last_activity=(NOW - timedelta(hours=2)).isoformat(),
-                queue={
-                    "pending": 2,
-                    "queued_since": (NOW - timedelta(hours=1)).isoformat(),
-                },
-            ),
-        ]
-        patrol_tick(
-            store=store,
-            sessions=sessions,
-            now=NOW,
-            options=PatrolOptions(),
-            suggest=rule_candidates,
-            on_auto=lambda proposal: store_seen.append(proposal.context["rule"]) or True,
-        )
-
-    assert store_seen == ["stale-queue", "failed-run-unreviewed"], (
-        "the pass must act on the blocked person before the unread failure"
-    )
-
-
-def test_a_pass_stamps_its_findings_with_its_own_time(store) -> None:
-    """Not with the wall clock.
-
-    The rules build proposals with `datetime.now()`, which is right when a rule is
-    called directly and wrong when a pass runs at a time somebody chose. The daily
-    budget windows on `created_at`, so a pass replaying "yesterday" would spend
-    today's allowance -- and a backfilled pass would carry timestamps from
-    whenever it happened to execute.
-
-    This is what caught it: `test_yesterday_s_proposals_do_not_count_against_today`
-    passed on the day it was written and failed the next morning, which is the
-    signature of a clock leaking into policy.
-    """
-    long_ago = NOW - timedelta(days=30)
-    session = _session(
-        "a",
-        attention=1,
-        last_activity=(long_ago - timedelta(hours=2)).isoformat(),
-    )
+    quiet = [
+        _session(f"chat{index}", last_activity=(NOW - timedelta(hours=2)).isoformat())
+        for index in range(5)
+    ]
 
     patrol_tick(
         store=store,
-        sessions=[session],
-        now=long_ago,
-        options=PatrolOptions(),
+        sessions=[*quiet, _task_row()],
+        now=NOW,
+        options=PatrolOptions(max_sessions_per_tick=2),
         suggest=rule_candidates,
     )
 
-    row = store.list_proposals()[0]
-    assert row.created_at == long_ago, "the pass's own time, not the wall clock's"
-    assert row.expires_at == long_ago + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
+    rows = store.list_proposals()
+    assert [row.source for row in rows] == ["task:t1"], (
+        "the row that named a failure is the one the pass looked at"
+    )
 
 
+def test_the_agent_s_own_errands_are_recognisable() -> None:
+    """Provenance the funnel can read, and a permissive default for anything else.
+
+    Reading a person's task as the agent's own would hide a real failure; the
+    opposite mistake only costs one redundant proposal.
+    """
+    from agent.autonomy import is_own_errand
+
+    assert is_own_errand({"prompt": "go", "origin": "autonomy"})
+    assert not is_own_errand({"prompt": "go"})
+    assert not is_own_errand({"origin": "person"})
+    assert not is_own_errand(None)
+    assert not is_own_errand("origin=autonomy")

@@ -391,51 +391,6 @@ class ProposalStore:
             )
         ]
 
-    def counts_since(self, since: datetime) -> dict[str, int]:
-        """How many proposals of each state were created at or after *since*.
-
-        Counting in the store rather than in the loop is what makes the cap
-        survive a restart: a patrol that restarts every hour and counts its own
-        tick has no daily cap at all.
-
-        **Grouping by state is not what the budget wants**, though: answering a
-        proposal moves it out of ``proposed``, so a day where every suggestion was
-        declined would read as "nothing was proposed today" and the cap would
-        reset every time somebody answered. ``written_since`` is the number the
-        budget actually spends.
-        """
-        with self._transaction() as conn:
-            rows = conn.execute(
-                "SELECT state, COUNT(*) AS n FROM proposals "
-                "WHERE created_at >= ? GROUP BY state",
-                (_iso(since),),
-            ).fetchall()
-        return {str(row["state"]): int(row["n"]) for row in rows}
-
-    def written_since(self, since: datetime) -> int:
-        """How many proposals were *written* since *since*, whatever became of them.
-
-        This is the attention the cap is about. A suggestion that was answered
-        cost the same attention as one still waiting, and a day where every
-        suggestion was declined must not read as a day with no suggestions.
-        """
-        with self._transaction() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM proposals WHERE created_at >= ?",
-                (_iso(since),),
-            ).fetchone()
-        return int(row["n"] or 0)
-
-    def acted_since(self, since: datetime) -> int:
-        """How many proposals were *acted on* since *since* -- the auto-action count."""
-        with self._transaction() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM proposals "
-                "WHERE state = 'acted' AND decided_at >= ?",
-                (_iso(since),),
-            ).fetchone()
-        return int(row["n"] or 0)
-
     def already_decided(self, source: str, action: str) -> Optional[str]:
         """The state a matching proposal was last decided in, if any.
 

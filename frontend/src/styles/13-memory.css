@@ -54,7 +54,9 @@
   font-size: 14px;
   line-height: 1.62;
   color: var(--text);
-  white-space: pre-wrap;
+  /* No `white-space: pre-wrap` any more: the body is rendered Markdown, whose
+     blocks own their own spacing. Keeping it would turn every source newline
+     into a second blank line between paragraphs. */
   overflow-wrap: anywhere;
 }
 
@@ -113,23 +115,6 @@
   align-items: center;
   gap: 0;
   flex: 0 0 auto;
-}
-
-/* 44×4 的一条：够读，不够抢。 */
-.memory-strength {
-  display: inline-block;
-  width: 44px;
-  height: 4px;
-  margin-right: 6px;
-  border-radius: 999px;
-  background: var(--border);
-  overflow: hidden;
-}
-.memory-strength > span {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: var(--text-muted);
 }
 
 .memory-more {

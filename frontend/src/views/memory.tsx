@@ -15,6 +15,7 @@
 import type { AppCtx } from '../app/AppCtx'
 import type { MemoryEntry, MemoryFact } from '../types'
 import { relativeTime } from '../lib/format'
+import { markdownToHtml } from '../lib/markdown'
 import {
   DeleteOutlined,
   EditOutlined,
@@ -57,6 +58,20 @@ const FACT_KIND_LABELS: Record<string, string> = {
   consolidation: '对话里总结的',
   inference: '推断的',
   bootstrap: '启动时写下的',
+}
+
+//: The preview's source: Markdown with blank lines collapsed outside fenced code.
+//:
+//: The transcript renderer turns a newline into `<br>` rather than closing a
+//: paragraph, so the blank line after a `#` heading arrives as `<br><br>` -- two
+//: empty lines that ate the whole four-line clamp and left every entry looking
+//: blank under its title. Inside a fence those newlines are content, so they are
+//: left alone.
+function previewSource(content: string): string {
+  return String(content || '')
+    .split(/(```[\s\S]*?```)/g)
+    .map((chunk, index) => (index % 2 === 1 ? chunk : chunk.replace(/\n{2,}/g, '\n')))
+    .join('')
 }
 
 function sourceLabel(sourceSession: string, sessions: AppCtx['sessions']): string {
@@ -192,18 +207,21 @@ export function renderMemory(ctx: AppCtx) {
               aria-label={`选择记忆 ${entry.content.slice(0, 16)}`}
             />
             <div className="memory-row-main">
+              {/* Rendered, not printed. These entries are Markdown journals, and
+                  showing the source made every row begin with a literal "#" and
+                  wear its backticks as text -- a page about what the agent
+                  remembers read like a log file of what it wrote. */}
               <div
-                className={`memory-row-text${expandedMemoryIds.includes(entry.id) ? ' is-expanded' : ''}`}
-              >
-                {entry.content}
-              </div>
+                className={`memory-row-text markdown${expandedMemoryIds.includes(entry.id) ? ' is-expanded' : ''}`}
+                dangerouslySetInnerHTML={{ __html: markdownToHtml(previewSource(entry.content)) }}
+              />
               {entry.content.length > 160 && (
                 <button
                   type="button"
                   className="memory-row-expand"
                   onClick={() => toggleMemoryExpanded(entry.id)}
                 >
-                  {expandedMemoryIds.includes(entry.id) ? '收起' : '展开'}
+                  {expandedMemoryIds.includes(entry.id) ? '收起' : '展开全文'}
                 </button>
               )}
               <div className="memory-row-meta">
@@ -222,14 +240,16 @@ export function renderMemory(ctx: AppCtx) {
                 )}
                 <span className="memory-meta-plain">{relativeTime(entry.updated_at)}</span>
                 {pinned && <span className="memory-pin-flag">已钉住</span>}
+                {/* The importance number, spelled out. It used to be a 44x4px
+                    bar with no label, sitting beside the row's buttons: at that
+                    size it read as a stray divider rather than as a meter, and
+                    a value nobody can name is a value nobody uses. */}
+                <span className="memory-meta-plain">
+                  重要度 {Math.round(entry.importance * 100)}%
+                </span>
               </div>
             </div>
             <div className="memory-row-side">
-              <Tooltip title={`重要度 ${Math.round(entry.importance * 100)}%`}>
-                <span className="memory-strength" aria-label={`重要度 ${Math.round(entry.importance * 100)}%`}>
-                  <span style={{ width: `${Math.max(4, Math.round(entry.importance * 100))}%` }} />
-                </span>
-              </Tooltip>
               <Tooltip title={pinned ? '取消钉住' : '钉住：不再随时间淡出'}>
                 <Button
                   type="text"

@@ -20,9 +20,13 @@ often than anything it looks for changes.
 
 What it does with its findings
 ------------------------------
-Writes them.  This delivery has no execution path at all: every candidate
-becomes a row in ``proposals.db``, with the admission verdict beside it.  The
-loop's only effect on the world is a row and a log line.
+Writes them, and acts on the ones admission allows.  Every candidate becomes a
+row in ``proposals.db`` with the admission verdict beside it.  A candidate
+admission answers ``auto`` for -- a tool that declared ``read`` and nothing else
+-- is handed to the executor and becomes a one-off scheduler task under the
+``autonomy_read`` profile; everything irreversible or workspace stays a
+``prepare`` row waiting for a person.  So a pass's effect on the world is a row,
+a task, and a log line.
 """
 
 from __future__ import annotations
@@ -309,7 +313,7 @@ class PatrolService:
         return written
 
     async def tick(self, now: Optional[datetime] = None) -> dict[str, Any]:
-        """One pass: read the sessions, propose, write.  Nothing else."""
+        """One pass: read the sessions, propose, act on what admission allowed, record."""
         sessions: list[dict[str, Any]] = []
         if self.sessions_provider is not None:
             try:

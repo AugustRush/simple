@@ -11,11 +11,12 @@ proposal and answering it are the same visit, and a CLI makes them two.
 What this page may change
 -------------------------
 Only the *proposals*: accept, decline, and nothing else.  There is no "run it"
-here, and that is not an omission -- this delivery has no execution path at all.
-Accepting a proposal records that a person would have agreed, which is exactly
-what the calibration needs; acting on it is a later version's problem, and
-pretending otherwise would make this page promise something the process cannot
-do.
+here, and that is not an omission -- this handler has no execution path.  The
+patrol executes reversible candidates itself (under the executor's permission
+profile), and an irreversible one is prepared for a person; a form that could
+write ``acted`` would be a second way to start work, beside the admission check
+and the executor's walls.  Accepting a proposal records that a person would have
+agreed, which is exactly what the calibration needs.
 
 Why every handler takes ``store``
 ---------------------------------

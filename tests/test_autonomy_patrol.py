@@ -5,7 +5,7 @@ for. These tests pin the properties that make it safe to leave running in a
 gateway:
 
 * it never raises into the loop (a patrol failure is not a gateway failure);
-* one pass is bounded (the caps live in the store and the policy, not here);
+* one pass is bounded (the row and proposal caps are in ``PatrolOptions``, not here);
 * stopping actually stops it;
 * a pass with no sessions is a pass, not an error.
 """
@@ -46,7 +46,7 @@ def _session(session_id: str = "s1", **facts) -> dict:
 # ── settings ───────────────────────────────────────────────────────────────
 
 
-def test_a_missing_section_means_enabled_shadow_defaults() -> None:
+def test_a_missing_section_means_enabled_and_acting() -> None:
     """A missing section means the product's intended behaviour, not a cautious one.
 
     On, and acting: the walls are the reversibility check and the

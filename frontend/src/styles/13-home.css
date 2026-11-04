@@ -47,25 +47,33 @@
 .home-card-arrow { margin-left: auto; color: var(--text-muted); }
 
 /* ── the agent ───────────────────────────────────────────────────────────── */
-/* The composer is compact on purpose. It was a hero -- a 46px mark over a 24px
-   title over a tall box, a third of the page -- when the landing view had nothing
-   else on it. It now sits under a board, and a hero in the middle of a status
-   page reads as the page's main point, which it is not: the board is what you
-   came to look at, and the box is how you change it. */
-.home-agent { display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 2px 0; }
-.home-agent-mark {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--text-secondary);
-  background: var(--surface-hover);
-  font-size: 14px;
-  font-weight: 700;
+/* The box, with at most one line above it.
+ *
+ * The hero is gone. It was an "S" mark over "有什么可以帮你？" -- the same two
+ * elements, in the same order, as the chat page's empty state, so the landing
+ * view and the conversation view opened on the same picture. A page whose
+ * first screen is a copy of another page has no identity of its own: what this
+ * one is for is the ledger below, and the box is the way to add to it.
+ *
+ * The only thing allowed above the box is the one sentence that changes what
+ * the person should do next: how many things are waiting for them. */
+.home-agent {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
 }
-.home-agent-title { margin: 0; color: var(--text); font-size: 18px; font-weight: 700; }
+.home-needs-line { align-self: flex-start; }
+/* A filled dot, not a border: the pill already has an edge, and the thing that
+   needs saying is "something is waiting", which a colour says faster. */
+.home-needs-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+}
+.home-needs-open { color: var(--text-muted); }
+.home-needs-line:hover .home-needs-open { color: var(--text); }
 /* The composer has to read as "type here" in both themes. Two things made it fail
    in light mode: the placeholder fell back to a near-white grey (invisible on the
    white card), and a disabled send button rendered as an empty ring. The card also
@@ -140,7 +148,6 @@
 
 @media (max-width: 768px) {
   .home-view { gap: 22px; }
-  .home-agent-title { font-size: 20px; }
   .home-composer-hint { display: none; }
 }
 
@@ -166,6 +173,31 @@
 
 /* ── the timeline ────────────────────────────────────────────────────────── */
 .home-timeline { display: flex; flex-direction: column; gap: 1px; }
+/* A day boundary, not a divider: the label sits on its own line so scanning
+   down the list answers "what did it do today" without reading eight relative
+   timestamps and doing the arithmetic. */
+.home-day { display: flex; flex-direction: column; gap: 1px; }
+.home-day + .home-day { margin-top: 14px; }
+.home-day-label {
+  padding: 0 10px 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+/* The ledger takes the rest of the page. Without this the landing view ended two
+   thirds of the way down and the remaining third was empty surface, which reads
+   as a page that failed to finish loading rather than as a list that is short. */
+.home-activity { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+/* Under the last day heading, at the left edge of the list it extends. Centred
+   under a left-aligned ledger it looked like a page footer rather than a control. */
+.home-timeline-more.ant-btn {
+  align-self: flex-start;
+  margin-top: 10px;
+  padding-left: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
 .home-timeline-row {
   display: flex;
   align-items: flex-start;
@@ -234,30 +266,54 @@
 /* ── memory rows: a list, not a wall ──────────────────────────────────────
    An entry is a journal dump -- forty lines of markdown is normal. Expanded, every
    row is a screen tall, and a list you cannot see the shape of is one you cannot
-   tick your way through. Four lines plus an explicit 展开. */
+   tick your way through. Four lines plus an explicit 展开.
+
+   The clamp is a height, not `-webkit-line-clamp`: the body is rendered Markdown
+   now, so its children are blocks and the line counter would clamp by block and
+   cut mid-sentence. A max-height with a fade at the bottom tells the truth about
+   where it ends without pretending the row has fewer lines than it does. */
 .memory-row-text {
-  display: -webkit-box;
+  position: relative;
+  max-height: 6.8em;
   overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 4;
-  white-space: pre-wrap;
+  /* Fade the text itself out rather than painting a gradient over it. A gradient
+     needs a colour, and the row's background is translucent -- so an opaque fade
+     ended in `--surface` drew a band across a surface tinted with
+     `rgba(255,255,255,.055)`. A mask has no colour and cannot mismatch. */
+  mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
 }
 .memory-row-text.is-expanded {
-  display: block;
+  max-height: none;
   overflow: visible;
-  -webkit-line-clamp: unset;
+  mask-image: none;
 }
+/* The journal's own headings are structure, not titles: a `#` line must not
+   become a 22px banner in the middle of a list. Same for its code blocks. */
+.memory-row-text.markdown h1,
+.memory-row-text.markdown h2,
+.memory-row-text.markdown h3,
+.memory-row-text.markdown h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+.memory-row-text.markdown p { margin: 0 0 8px; }
+.memory-row-text.markdown pre {
+  margin: 0 0 8px;
+  font-size: 11px;
+}
+.memory-row-text.markdown ul,
+.memory-row-text.markdown ol { margin: 0 0 8px; padding-left: 18px; }
 .memory-row-expand {
   align-self: flex-start;
-  margin-top: 4px;
+  margin-top: 2px;
   padding: 0;
   border: 0;
   background: transparent;
-  color: var(--text-muted);
-  font-size: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
   cursor: pointer;
 }
-.memory-row-expand:hover { color: var(--text-secondary); }
+.memory-row-expand:hover { color: var(--text); text-decoration: underline; }
 .memory-row-expand:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 /* Ticked rows say so. Multi-select without a selected state is a set of ticks you

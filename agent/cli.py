@@ -1328,8 +1328,8 @@ def gateway(
             # The patrol runs here because its input is *silence*: it looks
             # for sessions nobody is in. A patrol that only runs when a command is
             # typed finds nothing, because typing is the opposite of silence.
-            # Its effect on the world is a row in `autonomy/proposals.db` -- this
-            # delivery has no execution path at all.
+            # Its effect on the world is rows in `autonomy/proposals.db`, plus the
+            # one-off scheduler tasks it creates for reversible candidates.
             patrol_service = _start_patrol(gateway_cfg, components)
             runner = ChannelRunner(channels, components, gateway_cfg)
             await runner.run()
@@ -1745,9 +1745,9 @@ def _scheduler_services(components: dict) -> dict:
 def _autonomy_session_rows(
     limit: int = 50, *, live_sessions: Any = None
 ) -> list[dict[str, object]]:
-    """What the patrol may look at, per session -- from the stores that hold it.
+    """What the patrol may look at, per source -- from the stores that hold it.
 
-    Three facts, three sources, and the reason each is where it is:
+    Four facts, and the reason each is where it is:
 
     * **which sessions exist, and when they were last active** -- the web session
       index (the same file the page reads);
@@ -1756,7 +1756,12 @@ def _autonomy_session_rows(
       schedule;
     * **a queue that has not moved** -- the live runtime state, which only exists
       while the process serving it is running. A session nobody is serving has no
-      queue to be stuck in, so its absence is the honest answer rather than zero.
+      queue to be stuck in, so its absence is the honest answer rather than zero;
+    * **a failed run nobody has read** -- the scheduler's attention snapshot. It
+      is a fact about a *task*, and a task belongs to a session only when its row
+      names one. A task without a session id (every task the patrol itself
+      executes is created that way) gets a row of its own keyed ``task:<id>``;
+      without that row rule 1 can never fire for it, and its loss is invisible.
 
     A missing fact means the matching rule cannot fire. What must not happen is
     what happened before this was written: the rules were given *no* facts at all,
@@ -1764,8 +1769,11 @@ def _autonomy_session_rows(
     is nothing to do".
     """
     from agent import shared
-    from agent.autonomy import live_queue_facts
+    from agent.autonomy import is_own_errand, live_queue_facts, unowned_task_rows
     from agent.session_service import _WebSessionRegistry
+
+    def _stamp(value: Any) -> str:
+        return value.astimezone(timezone.utc).isoformat() if value is not None else ""
 
     queue_by_session = live_queue_facts(live_sessions)
     rows: list[dict[str, object]] = []
@@ -1773,14 +1781,16 @@ def _autonomy_session_rows(
         registry = _WebSessionRegistry(shared.AGENT_HOME / "web" / "sessions" / "index.db")
         entries = list(registry.list(limit=limit))
     except Exception:
-        return rows
+        # No session index is not "no failures": the scheduler may still hold
+        # runs nobody has read, and those get their own rows below.
+        entries = []
 
-    # The memory store is where the working state lives; opening it once for the
-    # whole pass rather than per session, because it is one database.
     # The scheduler's attention snapshot, read once: which tasks have failures
-    # nobody has acknowledged.
+    # nobody has acknowledged, and when each task last did anything.
     attention_counts: dict[str, int] = {}
     session_task_ids: dict[str, set[str]] = {}
+    task_facts: list[dict[str, object]] = []
+    latest_run_at: dict[str, str] = {}
     try:
         from agent.scheduler import open_store as open_scheduler_store
 
@@ -1788,9 +1798,23 @@ def _autonomy_session_rows(
         try:
             snapshot = scheduler_store.attention_snapshot()
             attention_counts = {
-                str(key): int(value) for key, value in (snapshot.get("counts") or {}).items()
+                str(key): int(value)
+                for key, value in (snapshot.get("counts") or {}).items()
             }
             for task in scheduler_store.list_tasks():
+                # The agent's own errands are skipped on purpose.
+                #
+                # An autonomous proposal executes by creating a one-off task (see
+                # `execute.py`), and that task carries `origin: autonomy`. Reading
+                # its failure back as a new candidate closes a loop with no exit:
+                # failure -> attention -> "read the failed run" -> another
+                # autonomous task -> another failure. Every round has a fresh task
+                # id and a fresh action sentence, so the dedupe key never matches
+                # and the person's automation list grows a `[自主]` row each time.
+                # The failure is not hidden by this: it lands on the proposal's
+                # `outcome`, which is what 自主 renders next to the proposal.
+                if is_own_errand(getattr(task, "payload", None)):
+                    continue
                 # The *session*, not the words. `request_quote` holds what the user
                 # typed ("每天早上九点提醒我写日报"); grepping it for a session id
                 # never matched anything, which is why the funnel was blind even
@@ -1798,12 +1822,39 @@ def _autonomy_session_rows(
                 owner = str(getattr(task, "session_id", "") or "").strip()
                 if owner:
                     session_task_ids.setdefault(owner, set()).add(task.id)
+                task_facts.append(
+                    {
+                        "task_id": task.id,
+                        "name": str(getattr(task, "name", "") or ""),
+                        "last_run_at": _stamp(getattr(task, "last_run_at", None)),
+                        "created_at": _stamp(getattr(task, "created_at", None)),
+                    }
+                )
+            # The row's ``last_activity`` has to be real: the warm/stale gates
+            # drop rows by it. A failure is activity at the run's time, not at
+            # the task's creation.
+            for task_id in attention_counts:
+                try:
+                    latest = scheduler_store.latest_run(task_id)
+                except Exception:
+                    continue
+                if latest is None:
+                    continue
+                moment = getattr(latest, "finished_at", None) or getattr(
+                    latest, "scheduled_for", None
+                )
+                if moment is not None:
+                    latest_run_at[task_id] = _stamp(moment)
         finally:
             scheduler_store.close()
     except Exception:
         attention_counts = {}
         session_task_ids = {}
+        task_facts = []
+        latest_run_at = {}
 
+    # The memory store is where the working state lives; opened once for the
+    # whole pass rather than per session, because it is one database.
     memory_store = None
     try:
         from agent.memory.store import LTMStore
@@ -1812,6 +1863,7 @@ def _autonomy_session_rows(
     except Exception:
         memory_store = None
 
+    placed_task_ids: set[str] = set()
     try:
         for item in entries:
             session_id = str(item.get("session_id") or "")
@@ -1835,6 +1887,9 @@ def _autonomy_session_rows(
                         for task_id, count in attention_counts.items()
                         if task_id in session_task_ids.get(session_id, ())
                     ]
+                    placed_task_ids.update(
+                        str(task["task_id"]) for task in row["tasks"]
+                    )
             except Exception:
                 pass
             # A queue only exists while something is serving it. The gateway
@@ -1861,6 +1916,18 @@ def _autonomy_session_rows(
                 memory_store.close()
             except Exception:
                 pass
+    # A task with an unread failure but no session row would otherwise never be
+    # seen by rule 1, which fires per row.  Only tasks that are *not* already
+    # shown under a session are added, so one failure cannot become two proposals
+    # under two sources (which would also walk around the dedupe).
+    rows.extend(
+        unowned_task_rows(
+            task_facts,
+            attention_counts=attention_counts,
+            placed_task_ids=placed_task_ids,
+            latest_run_at=latest_run_at,
+        )
+    )
     return rows
 
 
@@ -1930,13 +1997,14 @@ def autonomy(
         None, "--name", help="Session name (default: ~/.agent)"
     ),
 ):
-    """The patrol: what the agent would do, what it did, and what you said.
+    """The patrol: what the agent noticed, what it did about it, and what you said.
 
-    There is no `run` here on purpose.  This delivery proposes and records; it does
-    not act.  `tick` walks the sessions once and writes the candidates it found, so
-    the numbers a later decision layer would be calibrated from exist before that
-    layer exists.  `review` is what a person reads, and `decide` is how a proposal
-    stops being live -- including "no", which is the answer worth keeping.
+    `tick` runs one pass through the same funnel the gateway's scheduled pass uses
+    -- including acting on what admission allowed -- so the numbers and the
+    behaviour are the same ones a person would see in production.  `review` is
+    what a person reads, `decide` is how a proposal stops being live (including
+    "no", which is the answer worth keeping), and `act` is the road left for a
+    person who wants to run a reversible proposal by hand.
     """
     if isinstance(name, str):
         agent_module._set_agent_home(shared.session_home(name))

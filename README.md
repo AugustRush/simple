@@ -305,10 +305,13 @@ uv run simple gateway
 # open http://127.0.0.1:8787/
 ```
 
-The React UI has six views — 对话 (chat), 会话管理 (sessions), 插件 (plugins),
-技能 (skills), 自动化 (scheduled tasks and workflows) and 设置 (settings) —
-plus a command palette and streamed responses, all through the same `/api/...`
-endpoints.  Or use the API directly:
+The React UI has seven views — 主页 (the agent: a box and a ledger of what it did),
+对话 (chat), 扩展 (plugins and skills), 记忆 (memory), 自动化 (scheduled tasks and
+workflows), 自主 (proposals it wants to act on) and 设置 (settings) — plus a task
+board panel, a command palette and streamed responses, all through the same
+`/api/...` endpoints.  There is no separate 会话管理 page: threads live in the
+sidebar, because a conversation is where work happened rather than a record to
+manage.  Or use the API directly:
 
 | Area | Method Path | Description |
 |---|---|---|
@@ -718,20 +721,21 @@ It also runs on its own, every ten minutes, inside the gateway — because its i
 *silence*: it looks for sessions nobody is in and failures nobody has read. A patrol that
 only runs when a command is typed finds nothing, since typing is the opposite of silence.
 
-**How a candidate is decided, and why in that order.** `auto` (reversible, within
-today's budget) / `prepare` (irreversible or over budget — write the exact call that
-*would* have been made and wait) / `drop` (already declined, or below the confidence
-floor). The checks can only make the answer more cautious, and **reversibility is read
-from the tool's declared capabilities** — `read` / `output_write` / `state_write` /
-`side_effect` / `shell` — never from prose a model wrote about itself. The party being
-supervised does not grade its own homework. There is no configuration that makes an
-irreversible action automatic.
+**How a candidate is decided, and why in that order.** `auto` (reversible — the tool
+declared `read` and nothing else) / `prepare` (irreversible, or a file write a person
+should see — write the exact call that *would* have been made and wait) / `drop` (already
+declined, or below the confidence floor). The checks can only make the answer more
+cautious, and **reversibility is read from the tool's declared capabilities** — `read` /
+`output_write` / `state_write` / `side_effect` / `shell` — never from prose a model wrote
+about itself. The party being supervised does not grade its own homework. An undeclared
+tool (an unknown name, a plugin nobody classified) is treated as irreversible: "no
+capabilities" is not "declared safe". There is no configuration that makes an irreversible
+action automatic.
 
-**The budget is a count, not a score.** "Expected value > cost" is the right idea and an
-untestable one: tokens are measurable, value is not, and a formula with an unmeasurable
-term gets tuned until it says yes. So: N auto-actions per day, M proposals per day, both
-counted in the store (a loop that restarts hourly and counts its own pass has no daily
-cap at all). The **calibration** is what replaces them, and it comes from the numbers the
+**Permission, not a count.** A daily cap was tried and removed: it decided *which* finite
+set of work to skip and skipped it by arrival order, while the set is already bounded by
+the facts. So the admission answer is entirely about what the tool can change — reversible
+runs, everything else is prepared — and the **calibration** comes from the numbers the
 patrol keeps about itself:
 
 ```

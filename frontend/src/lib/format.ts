@@ -121,6 +121,27 @@ export function formatDateTime(value?: string | null, withSeconds = false): stri
 }
 
 
+/**
+ * Which day a timestamp belongs to, as a heading a reader can scan.
+ *
+ * The timeline is a log, and a log without day boundaries makes "刚刚" and "两天前"
+ * sit next to each other with nothing between them -- the reader has to do the
+ * arithmetic the headings were supposed to do. Local days, not UTC: "yesterday"
+ * is the day the person had, and a UTC boundary would move mid-afternoon here.
+ */
+export function dayBucket(value?: string): string {
+  if (!value) return ''
+  const at = dayjs(value)
+  if (!at.isValid()) return ''
+  const today = dayjs().startOf('day')
+  const day = at.startOf('day')
+  const diff = today.diff(day, 'day')
+  if (diff <= 0) return '今天'
+  if (diff === 1) return '昨天'
+  return at.format('M月D日')
+}
+
+
 export function formatScheduleDuration(durationMs?: number | null): string {
   if (durationMs === null || durationMs === undefined) return '—'
   if (durationMs < 1000) return `${durationMs} 毫秒`

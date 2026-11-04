@@ -8,39 +8,33 @@
  * and the question a person has on opening the app is not "which conversation was
  * I in" but **"is anything waiting for me, and what has it been doing"**.
  *
- * Three blocks, in that order:
+ * Two blocks, in that order:
  *
- * 1. **需要你** -- proposals nobody has answered (they will not be executed without
- *    one) and runs that ended badly. Absent when empty: a healthy agent must not
- *    take up screen with a report that it is healthy.
- * 2. **正在做** -- what is running, and what is next. Also absent when empty.
- * 3. **A box** -- the agent. Typing here starts a thread; the first message *is*
+ * 1. **A box** -- the agent. Typing here starts a thread; the first message *is*
  *    the thread. Tasks are created the same way, by asking: `schedule_create` is
- *    a tool, and a form on this page would be a second path to the same act.
+ *    a tool, and a form on this page would be a second path to the same act. The
+ *    one line allowed above it is how much is waiting, because that is the only
+ *    fact that changes what the person should do next.
+ * 2. **最近做了什么** -- one ledger of runs and conversations, newest first, with
+ *    day headings, because "what has it done lately" is a question about the
+ *    agent rather than about a table.
  *
- * Then the **board**: three columns -- 等你处理 / 正在跑 / 已排期 -- ordered by how
- * close each is to needing a person, so reading left to right is reading from
- * "act" to "ignore". The urgent column is leftmost on purpose: a column that
- * needs a person must not sit behind two that do not. There is no "done" column:
- * finished work that needs nobody is the timeline's job, and a board with a done
- * column is a log with worse scanning.
- *
- * Then **最近做了什么**: one timeline of runs and conversations, newest first,
- * because "what has it done lately" is a question about the agent, not about a
- * table. Splitting them would answer a question about the schema.
+ * The board is a panel (see `board.tsx`), not a block on this page: it answers
+ * the same question on demand without charging every visit for it.
  *
  * What it deliberately is not
  * ---------------------------
- * Not a dashboard, and not a duplicate of the sidebar. The old version listed five
- * threads -- the same `filteredSessions` the sidebar already shows, taking a
- * quarter of the page to say nothing new. Threads live in the sidebar; this page
- * is about what the agent did *with* them.
+ * Not a dashboard, not a duplicate of the chat page, and not a duplicate of the
+ * sidebar. It used to open on an "S" mark over "有什么可以帮你？" -- byte for byte
+ * the chat page's empty state -- so the two pages were indistinguishable on the
+ * screen a person sees first. Threads live in the sidebar; the conversation
+ * lives on 对话; this page is the box plus the record.
  */
 
 import type { AppCtx } from '../app/AppCtx'
 import type { HomeActivity } from '../types'
 import { RUN_STATUS_LABEL } from './board'
-import { formatDateTime, relativeTime } from '../lib/format'
+import { dayBucket, formatDateTime, relativeTime } from '../lib/format'
 import { Button, Empty, Input, Skeleton } from 'antd'
 import {
   CheckCircleOutlined,
@@ -63,6 +57,17 @@ export function renderHome(ctx: AppCtx) {
 
   const waitingCount = Number(home?.board?.waiting?.length || 0)
   const needsPerson = waitingCount > 0
+
+  // Day headings, derived here rather than rendered as a column: the same
+  // heading repeated on eight rows is noise, and a date column would push the
+  // titles (the thing being scanned) away from the edge.
+  const groups: { label: string; items: HomeActivity[] }[] = []
+  for (const item of activity) {
+    const label = dayBucket(item.at) || '更早'
+    const last = groups[groups.length - 1]
+    if (last && last.label === label) last.items.push(item)
+    else groups.push({ label, items: [item] })
+  }
 
   const submit = () => {
     if (!input.trim() || creatingSession) return
@@ -137,19 +142,22 @@ export function renderHome(ctx: AppCtx) {
 
   return (
     <div className="page-view home-view">
-      {/* ── the agent ───────────────────────────────────────────────────── */}
+      {/* ── the box ─────────────────────────────────────────────────────────
+          No greeting above it. "S / 有什么可以帮你？" is the *conversation's*
+          empty state, and this page had it too -- two pages whose first
+          impression was the same avatar asking the same question, which is the
+          duplication that made the old 会话 page removable. A landing page for
+          the agent is the box and the ledger; the box needs no introduction. */}
       <section className="home-agent">
-        <div className="home-agent-mark">S</div>
-        <h1 className="home-agent-title">
-          {needsPerson ? '还有几件事等你' : '有什么可以帮你？'}
-        </h1>
         {needsPerson && (
           <button
             type="button"
             className="home-needs-line"
             onClick={() => setBoardOpen(true)}
           >
-            {waitingCount} 件等你处理 <span>打开看板 →</span>
+            <span className="home-needs-dot" aria-hidden="true" />
+            {waitingCount} 件等你处理
+            <span className="home-needs-open">打开看板 →</span>
           </button>
         )}
         <div className="home-composer">
@@ -163,7 +171,7 @@ export function renderHome(ctx: AppCtx) {
               submit()
             }}
             placeholder="说一句话就开始——也可以让它「每天早上提醒我看日志」"
-            autoSize={{ minRows: 2, maxRows: 6 }}
+            autoSize={{ minRows: 1, maxRows: 6 }}
             className="home-composer-input"
           />
           <div className="home-composer-foot">
@@ -203,7 +211,14 @@ export function renderHome(ctx: AppCtx) {
           />
         ) : (
           <>
-            <div className="home-timeline">{activity.map(renderActivity)}</div>
+            <div className="home-timeline">
+              {groups.map(group => (
+                <div className="home-day" key={group.label}>
+                  <div className="home-day-label">{group.label}</div>
+                  {group.items.map(renderActivity)}
+                </div>
+              ))}
+            </div>
             {!activityExhausted && (activityCursor || home?.activity_next) && (
               <Button
                 type="link"

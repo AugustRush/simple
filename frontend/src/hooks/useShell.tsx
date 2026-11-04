@@ -404,9 +404,11 @@ export function useShell(deps: Deps) {
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
     home: {
       title: '主页',
-      // Not "welcome": the subtitle says what the page is for, which is the
-      // question a person opens the app with.
-      subtitle: '有需要你的事，也有一个输入框',
+      // Not "welcome", and not a description of the widgets: the subtitle answers
+      // the question a person opens the app with -- what can I do here, and what
+      // has it been doing. "有需要你的事，也有一个输入框" described the layout
+      // instead, which the layout already says.
+      subtitle: '说一句话交给它，或者看它做了什么',
     },
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',

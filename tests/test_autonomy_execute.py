@@ -1,4 +1,4 @@
-"""From "a person said yes" to "it ran": the bridge, and the four things it refuses.
+"""From "admission says it may run" to "it ran": the bridge, and what it refuses.
 
 The execution path is the scheduler's, not a second one built here. What these
 tests pin is the *bridge*: the state transition that makes it single-shot, the
@@ -55,7 +55,7 @@ def _approved(proposals, *, reversibility="reversible", answer="prepare"):
     )
     proposal.context["admission"] = {
         "answer": answer,
-        "reason": "今天自动执行的额度已用完",
+        "reason": "这个动作只能准备好等确认",
         "prepared": {"tool": "schedule_runs", "arguments": {}},
     }
     proposals.record(proposal)
@@ -85,6 +85,11 @@ def test_an_approved_reversible_proposal_becomes_a_one_off_task(stores) -> None:
     # patrol already knew.
     assert "读一遍" in task.payload["prompt"]
     assert "还没有人看过" in task.payload["prompt"]
+    # Marked as the agent's own errand. Without this the funnel reads the task's
+    # own failure as a new thing to investigate, and the two facts feed each
+    # other: failure -> attention -> "read the failure" -> a new task -> ...
+    assert task.payload["origin"] == "autonomy"
+    assert task.payload["proposal_id"] == proposal.id
 
 
 def test_the_run_is_pinned_to_a_profile_that_cannot_run_commands(stores) -> None:
@@ -200,7 +205,7 @@ def test_a_second_approval_cannot_create_a_second_task(stores) -> None:
     assert len(scheduler.list_tasks()) == 1, "the second approval must not add a task"
 
 
-# ── the budget the admission stage promised ────────────────────────────────
+# ── admission's verdict is not a second gate ───────────────────────────────
 
 
 def test_execution_does_not_bypass_the_admission_answer(stores) -> None:
@@ -211,9 +216,8 @@ def test_execution_does_not_bypass_the_admission_answer(stores) -> None:
     """
     proposals, scheduler = stores
     proposal = _approved(proposals)
-    # No budget argument: the answer is about permission, and a reversible
-    # proposal is permitted. Passing a cap here would be passing something that no
-    # longer decides anything.
+    # The answer is about permission, not a count: a reversible proposal is
+    # permitted, and there is no cap left for this call to pass in.
     decision = decide_admission(proposal, policy=AdmissionPolicy())
     assert decision.answer == "auto"
 

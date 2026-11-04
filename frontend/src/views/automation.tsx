@@ -262,8 +262,15 @@ export function renderSchedules(ctx: AppCtx) {
                   {row.attention > 0 && (
                     <Tag color="error">{row.attention} 条待处理</Tag>
                   )}
+                  {/* The status is the one word a row exists to report, so it
+                      cannot share a colour with the word that means its
+                      opposite: measured, 执行成功 and 执行失败 rendered as the
+                      same grey pill on the same background. The class carries
+                      the status; the palette decides what failure looks like. */}
                   {row.last_status ? (
-                    <Tag>{scheduleRunStatusLabel(row.last_status)}</Tag>
+                    <Tag className={`schedule-status-tag status-${row.last_status}`}>
+                      {scheduleRunStatusLabel(row.last_status)}
+                    </Tag>
                   ) : null}
                   {/* Editing is a conversation too: the row opens one seeded with
                       this automation's name and id, so "改成每周一" is a sentence rather

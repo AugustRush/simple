@@ -4,8 +4,8 @@ The page exists so reading a proposal and answering it are one visit. These test
 pin the two halves that make that safe:
 
 * **it cannot act.** ``decide`` accepts only ``accepted`` / ``declined``; a form
-  that could write ``acted`` would be a page promising an execution path this
-  process does not have.
+  that could write ``acted`` would be a second way to start work, beside the
+  patrol's admission check and the executor's walls.
 * **a decline is kept.** The answer is the fact the table exists to remember.
 """
 
@@ -66,7 +66,7 @@ def _seed(store, action: str = "读一遍失败的运行", **facts) -> str:
     )
     proposal.context["admission"] = {
         "answer": "prepare",
-        "reason": "今天自动执行的额度已用完",
+        "reason": "这个动作只能准备好等确认",
         "prepared": {"tool": "schedule_runs", "arguments": {}},
     }
     store.record(proposal)

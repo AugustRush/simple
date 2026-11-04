@@ -224,6 +224,47 @@ html[data-theme='dark'] .settings-inline-save:disabled {
 html[data-theme='dark'] .status-running { color:#89add7; }
 html[data-theme='dark'] .status-succeeded { color:#83c8a6; }
 html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-cancelled { color:#d5ae75; }
+
+/* The row's status pill. Without these rules every status rendered as the same
+ * neutral tag, so 执行失败 and 执行成功 were the same grey word in the same grey
+ * box -- the one distinction a task list exists to show. Colour is the signal
+ * here; the shape stays identical so the column does not jump between rows.
+ *
+ * `!important` because the global `.ant-tag` rule in 10-secondary-glass.css is
+ * important too (it paints every tag with the monochrome palette, which is what
+ * keeps antd's default blue out of the interface). Specificity decides between
+ * two important declarations, so these three-class selectors win. */
+.schedule-status-tag.ant-tag {
+  margin: 0;
+  border-color: transparent !important;
+  font-size: 11px;
+  line-height: 18px;
+}
+.schedule-status-tag.status-succeeded.ant-tag {
+  color: var(--text-secondary) !important;
+  background: var(--surface-hover) !important;
+}
+.schedule-status-tag.status-failed.ant-tag {
+  color: var(--red) !important;
+  background: var(--red-soft) !important;
+}
+.schedule-status-tag.status-interrupted.ant-tag,
+.schedule-status-tag.status-cancelled.ant-tag {
+  color: var(--amber) !important;
+  background: var(--amber-soft) !important;
+}
+.schedule-status-tag.status-running.ant-tag,
+.schedule-status-tag.status-queued.ant-tag {
+  color: var(--text) !important;
+  background: var(--surface-hover) !important;
+}
+/* `color="error"` was painted with the same neutral palette by the same global
+ * rule, so "3 条待处理" was a grey number where red is the point. */
+.ant-tag.ant-tag-error {
+  color: var(--red) !important;
+  background: var(--red-soft) !important;
+  border-color: transparent !important;
+}
 .schedule-detail-drawer .ant-drawer-header { padding:16px 20px; border-bottom:1px solid var(--border); }
 .schedule-detail-drawer .ant-drawer-body { padding:0; }
 .schedule-detail { min-height:100%; color:var(--text); }
@@ -1404,7 +1445,10 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .proposal-prepared code { padding:1px 5px; border-radius:4px; background:var(--surface-hover); }
 .proposal-footer { display:flex; align-items:center; justify-content:space-between; margin-top:12px; padding-top:10px; border-top:1px solid var(--border); color:var(--text-muted); font-size:11px; }
 .proposal-footnote { margin:0; color:var(--text-muted); font-size:11px; line-height:1.7; }
-.proposal-funnel { margin:6px 0 0; color:var(--text-muted); font-size:11px; }
+.proposal-funnel { display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 14px; margin:8px 0 0; color:var(--text-muted); font-size:11px; }
+.proposal-funnel strong { color:var(--text-secondary); font-variant-numeric:tabular-nums; }
+/* Says "nothing is waiting" in the space that fact deserves: one line. */
+.proposal-empty-line { margin:4px 0 0; padding:14px 0; border-top:1px solid var(--border); border-bottom:1px solid var(--border); color:var(--text-muted); font-size:12px; line-height:1.7; }
 .proposal-outcome { margin:8px 0 0; color:var(--text-secondary); font-size:11px; line-height:1.6; }
 .proposal-outcome-failed,
 .proposal-outcome-interrupted { color:var(--red); }
@@ -1413,8 +1457,9 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .proposal-outcome-running { color:var(--text-muted); }
 .proposal-answered { margin-top:4px; padding-top:12px; border-top:1px solid var(--border); }
 .proposal-answered-title { margin-bottom:8px; color:var(--text-muted); font-size:11px; font-weight:600; }
-.proposal-answered-row { display:flex; align-items:baseline; gap:10px; padding:4px 0; color:var(--text-secondary); font-size:11px; }
+.proposal-answered-row { display:flex; align-items:baseline; gap:10px; padding:5px 0; color:var(--text-secondary); font-size:11px; }
 .proposal-answered-action { flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.proposal-answered-at { flex:0 0 auto; color:var(--text-muted); font-size:10px; font-variant-numeric:tabular-nums; }
 .proposal-state { flex:0 0 auto; padding:1px 6px; border-radius:4px; background:var(--surface-hover); font-size:10px; }
 .proposal-state-declined { color:var(--text-muted); }
 .proposal-state-accepted { color:#2f7a57; }

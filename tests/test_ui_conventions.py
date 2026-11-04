@@ -59,3 +59,53 @@ def test_the_focus_token_exists_in_both_themes() -> None:
     assert tokens.count("--focus-ring:") == 2, (
         "every theme block must define --focus-ring"
     )
+
+
+def test_the_checked_switch_does_not_paint_a_white_knob_on_a_light_track() -> None:
+    """The knob has to differ from the track it sits on.
+
+    ``--primary`` is near-white in the dark theme, so antd's checked switch is a
+    light track -- and antd draws the knob white in both themes. Measured on the
+    rendered page: 1.72:1 between knob and track. An enabled automation then read
+    as an empty pale pill, which is the one thing a switch exists to answer.
+
+    The dark theme therefore repaints the knob with the page colour (10.97:1 on
+    the same track). This guard is *about that override existing*, because the
+    visible symptom is a colour, not a missing element.
+    """
+    tokens = (STYLES / "01-theme-tokens.css").read_text()
+
+    assert "ant-switch-checked .ant-switch-handle::before" in tokens, (
+        "the dark theme must repaint the checked switch's knob; antd's white knob "
+        "on the near-white track measures 1.72:1"
+    )
+
+
+def test_a_tag_colour_is_not_defeated_by_the_global_important_tag() -> None:
+    """A per-tag colour needs ``!important`` here, and silently losing it is invisible.
+
+    10-secondary-glass.css paints every ``.ant-tag`` with the monochrome palette
+    *and marks the declaration important*. A later rule that sets only ``color``
+    therefore loses, whatever its specificity -- which is how 执行失败 and
+    执行成功 ended up as the same grey word in the same grey pill even after a
+    class per status existed. The rule is not "never use !important"; it is that
+    a status rule has to out-rank the one that is already important.
+    """
+    base = (STYLES / "10-secondary-glass.css").read_text()
+    global_rules = [
+        line
+        for line in base.splitlines()
+        if line.strip().startswith("color:") and "!important" in line
+    ]
+    if not global_rules:
+        return  # the global override is gone; per-status rules are plain again
+
+    offenders = [
+        (where, line)
+        for where, line in _rules_mentioning(".schedule-status-tag.status-")
+        if line.strip().startswith("color:") and "!important" not in line
+    ]
+    assert not offenders, (
+        "these status-tag colours lose to the global important `.ant-tag` rule, "
+        f"so every status renders the same colour: {offenders}"
+    )

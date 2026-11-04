@@ -1,4 +1,4 @@
-"""From "a person said yes" to "it ran": the bridge, and nothing else.
+"""From "a proposal may run" to "it ran": the bridge, and nothing else.
 
 Why this is a bridge and not an executor
 ----------------------------------------
@@ -8,27 +8,32 @@ two runs cannot overlap; it records what happened so a crash is recoverable; and
 it runs under a permission profile because nobody is there to answer a question.
 Building a second executor here would duplicate all of that and drift from it.
 
-So this module does one thing: turn an approved proposal into **a one-off task
+So this module does one thing: turn an admitted proposal into **a one-off task
 due now**, and let the existing path run it. The proposal keeps the task id, and
 the next patrol pass reads the run's outcome back.
 
-Why the permission profile is pinned to `read_only`
----------------------------------------------------
+Why the permission profile is ``autonomy_read``
+-----------------------------------------------
 The patrol classified the proposal as reversible because the *tool it named* is
 read-only. But when the task actually runs, an agent reads the prompt and chooses
 its own tools -- so "reversible" describes an intention, not a guarantee. What
 actually constrains the run is the permission profile, and the only profile that
-matches "nothing outside the workspace may change" is ``read_only``.
+matches "nothing outside the workspace may change" is ``autonomy_read``.
 
 That is the honest chain: **the classification decides whether a person is asked;
-the profile decides what can happen when they say yes.** A reversible proposal
-that ran with `workspace_write` would be a promise the classification never made.
+the profile decides what can happen when the answer is yes.** A reversible
+proposal that ran with `workspace_write` would be a promise the classification
+never made.
 
-Why it is a person's command, not the agent's decision
-------------------------------------------------------
-``act`` is run by a person (the CLI today). The agent never decides to execute a
-proposal: that is the line this whole delivery is drawn on, and moving it would
-need the calibration numbers the shadow period exists to produce.
+Where a proposal comes from
+---------------------------
+Two callers reach this bridge, and the line between them is the reversibility
+class, not who clicked. A ``prepare`` proposal (irreversible or workspace) is
+never executed here: it waits for a person, who does the action themselves or
+answers the proposal; the bridge refuses it even if a row somehow arrives. A
+reversible proposal may be executed by the patrol itself without asking --
+admission already decided it may -- or by a person's ``act`` command, which is
+the same bridge and the same walls.
 
 Why the transition is the lock
 ------------------------------
@@ -40,7 +45,8 @@ and does nothing. The state machine is the mutex -- no separate lock, no
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 __all__ = ["execute_proposal", "ExecutionOutcome"]
@@ -157,7 +163,17 @@ def execute_proposal(
             name=_task_name(proposal),
             kind="agent_prompt",
             trigger=TriggerSpec.once(moment.isoformat(), "UTC"),
-            payload={"prompt": body},
+            # `origin` is provenance, not prompt text: it marks this task as the
+            # agent's own errand so the patrol does not read its failure back as
+            # a fresh thing to investigate. Without it, an autonomous read that
+            # fails becomes attention, attention becomes "read the failed run",
+            # and that becomes another autonomous read -- each with a new task id
+            # and a new action sentence, so dedupe cannot break the chain and
+            # every round leaves another `[自主]` task in the person's automation
+            # list. A failure that matters is recorded on the proposal's outcome
+            # instead (``read_back_outcomes``), which is where somebody reading
+            # 自主 already looks.
+            payload={"prompt": body, "origin": "autonomy", "proposal_id": proposal.id},
             delivery_mode="standalone",
             delivery_target=DeliveryTarget.standalone(),
             context_policy="stateless",
@@ -213,19 +229,39 @@ def _task_body(proposal: Any, *, now: datetime) -> str:
     runs" has to rediscover which ones and why, and the proposal already knows.
     The reason is what the patrol saw, so handing it over is what makes the run
     cheaper than the patrol was.
+
+    It also carries the admitted call when admission wrote one down -- the tool
+    and its arguments. Without that the run was told *what* to do but not *how*
+    to find it, and the real failure that prompted this was a run that said the
+    failed runs "are no longer in the store, there is no error record to read":
+    it had been handed a goal and had to guess the target.
     """
     action = str(getattr(proposal, "action", "") or "").strip()
     reason = str(getattr(proposal, "reason", "") or "").strip()
     source = str(getattr(proposal, "source", "") or "").strip()
     lines = [
-        "这是一条自主提议，已经由人批准执行。",
+        # Not "a person approved it": a reversible proposal is executed by the
+        # patrol without one.  What is true for both roads is that admission let
+        # it through, and that is what the run can be told.
+        "这是一条自主提议，准入判定它可以执行。",
         "",
         f"要做的事：{action}",
     ]
+    admission = (getattr(proposal, "context", {}) or {}).get("admission") or {}
+    prepared = admission.get("prepared") if isinstance(admission, dict) else None
+    if isinstance(prepared, dict):
+        tool = str(prepared.get("tool") or "").strip()
+        arguments = prepared.get("arguments")
+        if tool:
+            lines.append(f"用工具：{tool}")
+        if arguments:
+            lines.append(
+                f"参数：{json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
+            )
     if reason:
         lines.append(f"为什么：{reason}")
     if source:
-        lines.append(f"来自会话：{source}")
+        lines.append(f"来源：{source}")
     lines += [
         "",
         "只做这件事。如果它需要改变工作区之外的东西（发消息、删数据、跑命令），",
@@ -237,15 +273,8 @@ def _task_body(proposal: Any, *, now: datetime) -> str:
 def _runner(proposal: Any) -> str:
     """Which clock will run this, said at creation time.
 
-    Same contract ``schedule_create`` owes: a stored task is not a running clock,
-    and the person who just approved it is still here to be told.
+    One answer today: the gateway's scheduler loop, which this process does not
+    own.  A stored task is not a running clock, and saying so at creation keeps
+    "queued" from being read as "running".
     """
-    try:
-        from agent import shared
-
-        scheduler_dir = getattr(shared, "SCHEDULER_DIR", None)
-        if scheduler_dir is not None and (scheduler_dir / "scheduler.db").exists():
-            return "external"
-    except Exception:
-        pass
     return "external"

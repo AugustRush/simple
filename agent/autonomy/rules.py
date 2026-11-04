@@ -10,14 +10,14 @@ the same facts appear -- which is what makes a proposal's *reason* checkable.
 Every rule below fires on a fact that is already on disk.  None of them calls a
 model, and none of them guesses: if a rule cannot see the fact, it does not
 fire.  That is the opposite of "the model thinks something might be wrong", and
-it is what lets the shadow numbers be trusted.
+it is what lets the funnel's numbers be trusted.
 
 What the rules are not
 ----------------------
 They are not the decision.  A rule firing produces a **proposal** -- "here is
-something I would do, and here is why" -- and nothing else happens.  The
-decision layer (a later step) reads these rows; a person reads them too, and
-that is the calibration.
+something I would do, and here is why" -- and admission, in the same pass,
+decides whether that may run or has to wait for a person.  A person reads the
+rows too, and that is the calibration.
 
 Why each rule names a tool
 --------------------------
@@ -122,11 +122,29 @@ def rule_candidates(
     # the tasks it knows about, and the count is theirs. A session with no tasks
     # has no failures to read -- which is different from zero failures.
     attention = int(session.get("attention") or 0)
-    for task in (session.get("tasks") or []):
-        if not isinstance(task, dict):
-            continue
+    task_rows = [
+        task for task in (session.get("tasks") or []) if isinstance(task, dict)
+    ]
+    for task in task_rows:
         attention += int(task.get("attention") or 0)
     if attention > 0:
+        # The call has to name *which* task failed. Without an argument the
+        # executor is told "read the failed runs" and has to guess -- a real run
+        # answered that those runs "are no longer in the store, there is no error
+        # record to read". The largest count wins; ties keep the first, because
+        # the row order is the only ordering the caller gave us.
+        failed_tasks = [
+            task for task in task_rows if int(task.get("attention") or 0) > 0
+        ]
+        target = max(
+            failed_tasks,
+            key=lambda task: int(task.get("attention") or 0),
+            default=None,
+        )
+        arguments: dict[str, Any] = {}
+        target_id = str((target or {}).get("task_id") or "").strip()
+        if target_id:
+            arguments["task_id"] = target_id
         found.append(
             Proposal(
                 source=session_id,
@@ -145,6 +163,9 @@ def rule_candidates(
                     "rule": "failed-run-unreviewed",
                     "priority": rule_priority("failed-run-unreviewed"),
                     "attention": attention,
+                    # The exact call admission writes down for a "prepare" row,
+                    # and the prompt the executor gets when it runs.
+                    "arguments": arguments,
                 },
             )
         )

@@ -1,18 +1,24 @@
-"""What the agent *would* have done, written down instead of done.
+"""What the agent noticed, what it may do about it, and what it actually did.
 
 Why this module exists
 ----------------------
 An autonomous agent's first honest question is not "what can it do" but "what
-would it have done, and would I have agreed".  Neither question can be answered
-by running the loop -- a loop that acts has already spent the attention it was
-supposed to save.  So the first version of autonomy here **proposes and records,
-and does not execute**: every candidate the patrol finds becomes a row, and the
-row says what it wanted to do and why.
+would it have done, and would I have agreed".  The patrol here answers the
+first half from facts already on disk, admission answers the second, and every
+candidate that survives either way becomes a row that says what it wanted to do
+and why.
 
-That is the whole design decision.  Everything else (the funnel, the cost
-budget, the push policy) is calibrated *from* these rows.  Without them, "96.4%
-of ticks are filtered" is somebody else's deployment, and "confidence 0.8" is a
-number with no evidence behind it.
+Which is where it ends for anything that could change the world outside the
+workspace: that becomes a ``prepare`` row and waits for a person.  A
+**reversible** candidate (a tool that declared ``read`` and nothing else) is the
+one class admission answers ``auto`` for, and the patrol may hand it to an
+executor without asking -- under a permission profile that denies the things
+the classification said it could not do.
+
+Everything else (the funnel, the admission policy, the push policy) is
+calibrated *from* these rows.  Without them, "96.4% of ticks are filtered" is
+somebody else's deployment, and "confidence 0.8" is a number with no evidence
+behind it.
 
 What a candidate is, and is not
 -------------------------------
@@ -44,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from .admission import AdmissionPolicy, decide_admission, day_bounds
+from .admission import AdmissionPolicy, decide_admission
 
 __all__ = [
     "AUTONOMY_STATES",
@@ -54,6 +60,8 @@ __all__ = [
     "MAX_PROPOSAL_ACTION_CHARS",
     "MAX_PROPOSAL_REASON_CHARS",
     "MAX_PROPOSALS_PER_TICK",
+    "unowned_task_rows",
+    "is_own_errand",
 ]
 
 #: The dispositions a candidate can end in.  ``proposed`` is the only non-final
@@ -103,18 +111,36 @@ def classify_reversibility(capabilities: Any) -> str:
 
     The three answers exist because "can this be undone" is not a yes/no:
 
-    * **reversible** -- reads only.  Nothing outside the agent changed.
-    * **workspace** -- writes files inside the workspace.  Undoable by a person
-      who can see the file, and it leaves a trace to review.
+    * **reversible** -- the tool declares ``read`` and no capability that writes
+      or acts.  Nothing outside the agent changed.
+    * **workspace** -- the tool writes files (``output_write``).  Undoable by a
+      person who can see the file, and it leaves a trace to review.
     * **irreversible** -- state writes, side effects, shell.  A message sent, a
       record deleted, a command run.  These wait for a person, always.
+
+    **No declaration is not a clean bill of health.**  A tool that answers "no
+    capabilities" -- an unknown name, a misspelled one, a plugin nobody
+    classified -- did not say it was read-only, so it must not share an answer
+    with a tool that did: ``reversible`` is exactly what admission turns into
+    "do it without asking".  The empty set is therefore **irreversible**, and so
+    is any declaration this function does not recognise as safe.  Only an
+    explicit ``read`` earns the automatic path; the builtin table classifies
+    every registered tool, so a real tool never lands on that branch.
     """
     declared = {str(item).strip().lower() for item in (capabilities or ())}
+    if not declared:
+        # Unknown tool, misspelled name, plugin with no declaration: it did not
+        # say "read only", so it is treated as if it could do anything.
+        return "irreversible"
     if declared & _IRREVERSIBLE_CAPABILITIES:
         return "irreversible"
     if declared & _WORKSPACE_ONLY_CAPABILITIES:
         return "workspace"
-    return "reversible"
+    if "read" in declared:
+        return "reversible"
+    # It declared something, but not a read.  A vocabulary this function does not
+    # know is not evidence of safety, so the answer stays conservative.
+    return "irreversible"
 
 
 @dataclass
@@ -136,13 +162,13 @@ class Proposal:
     #: ``reversible`` / ``workspace`` / ``irreversible`` -- from the tool's
     #: declaration, never from the model's opinion of itself.
     reversibility: str = "irreversible"
-    #: The model's own confidence, kept as *evidence* rather than as a gate.  The
-    #: gate is the cost budget and the reversibility class; this number is what
-    #: the calibration is done from later.
+    #: The model's own confidence, kept as *evidence* rather than as the gate.  The
+    #: gates are the confidence floor and the reversibility class; this number is
+    #: what the calibration is done from later.
     confidence: float = 0.0
     state: str = "proposed"
-    #: Free-form facts the proposal carried: how it was found, which rule passed
-    #: it, what it estimated the cost at.  A row without this cannot be audited.
+    #: Free-form facts the proposal carried: how it was found, which rule raised
+    #: it, what it would call.  A row without this cannot be audited.
     context: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=_now)
     expires_at: datetime = field(
@@ -191,9 +217,9 @@ class Proposal:
 
 @dataclass
 class PatrolOptions:
-    """What the shadow patrol is allowed to do this tick.
+    """What the patrol is allowed to do this tick.
 
-    All costs are hard caps, not expectations: the design principle this is the
+    All bounds are hard caps, not expectations: the design principle this is the
     first test of is "autonomy spends bounded attention, or it spends none".
     """
 
@@ -208,9 +234,10 @@ class PatrolOptions:
     max_sessions_per_tick: int = 20
     #: How many proposals one tick may write (the store enforces its own cap too).
     max_proposals_per_tick: int = 5
-    #: What may be done without asking. Defaults to "nothing": a caller that has
-    #: not opted in, which
-    #: is what this delivery is.
+    #: What may be done without asking.  ``None`` means the shipped
+    #: :class:`AdmissionPolicy`: a reversible candidate may run, and anything
+    #: that could change the world outside the workspace is prepared for a
+    #: person instead.
     admission: Any = None
 
 
@@ -220,7 +247,9 @@ def default_capabilities_of(tool: str) -> frozenset[str]:
     A lookup rather than an import-time table: the registry owns the vocabulary
     (``ToolRegistry._DEFAULT_TOOL_CAPABILITIES``), and copying it here would be a
     second place for "what this tool may do" to drift.  An unknown tool answers
-    the empty set, which classifies as irreversible -- the safe direction.
+    the empty set, which :func:`classify_reversibility` reads as ``irreversible``
+    -- the safe direction: "no capabilities declared" is not "declared safe",
+    and only the latter may run without asking a person.
     """
     try:
         from agent.tools.runtime import ToolRegistry
@@ -240,17 +269,20 @@ def patrol_tick(
     capabilities_of: Any = None,
     on_auto: Any = None,
 ) -> dict[str, Any]:
-    """One shadow pass: read the room, propose what *would* be done, write nothing else.
+    """One pass: read the room, decide what may happen, write and act on the verdict.
 
-    This is the whole first delivery.  It does not call a model, does not run a
-    tool, does not touch a session's context.  It reads the session directory
-    (sizes and activity), applies the two silence gates, and asks ``suggest`` --
+    It does not call a model itself and does not run a tool: it reads the session
+    rows it is handed, applies the two silence gates, and asks ``suggest`` --
     which in v1 is a rules function and in v2 may be a model -- for each
-    remaining session.  Whatever it says becomes a row in the proposals table,
-    and the loop's only effect on the world is that row.
+    remaining row.  Admission then decides each candidate's fate: a candidate it
+    answers ``auto`` for is handed to ``on_auto`` (when the caller owns an
+    executor) in priority order, and everything else becomes a row in the
+    proposals table.  The function's own effect on the world is those rows plus
+    whatever ``on_auto`` does; a caller that only wants to look passes no
+    ``on_auto``.
 
     ``suggest`` is a callable ``(session) -> list[Proposal] | Proposal | None``.
-    The patrol does the bookkeeping: which sessions are eligible, the caps, the
+    The patrol does the bookkeeping: which rows are eligible, the caps, the
     dedupe, the audit dict returned to the caller.
     """
     now = now or _now()
@@ -271,14 +303,29 @@ def patrol_tick(
         "dropped": 0,
         "auto": 0,
         "over_cap": 0,
+        "failed": 0,
         "proposals": [],
     }
 
     if options.max_sessions_per_tick <= 0:
         return result
 
+    # Task rows before session rows, inside the same budget.
+    #
+    # The cap exists to bound the work one pass may do, not to rank what it looks
+    # at. But a plain `sessions[:N]` ranks by list order, and the task rows come
+    # last -- so on an install with twenty-odd sessions every row that carries a
+    # *failure* would be dropped before it was ever read, while twenty quiet
+    # conversations took its place. A task row exists only because something
+    # already went wrong, so it is the cheapest possible thing to spend the
+    # budget on first.
+    task_rows = [row for row in sessions if str(row.get("status") or "") == "task"]
+    others = [row for row in sessions if str(row.get("status") or "") != "task"]
+    budget = options.max_sessions_per_tick
+    selected = task_rows[:budget] + others[: max(0, budget - min(len(task_rows), budget))]
+
     examined = 0
-    for session in sessions[: options.max_sessions_per_tick]:
+    for session in selected:
         examined += 1
         last_active = _parse_dt(session.get("last_activity") or session.get("created_at"))
         if last_active is None:
@@ -302,13 +349,18 @@ def patrol_tick(
                 capabilities_of=capabilities_of or default_capabilities_of,
             )
         except Exception as exc:  # noqa: BLE001 - the patrol must not die on one session
-            result["over_cap"] += 1  # reuse: a failure is also not a proposal
+            # Not a cap hit: one row's suggestion function raised.  Recorded under
+            # its own key so "over_cap" keeps meaning exactly one thing.
+            result["failed"] += 1
             result.setdefault("errors", []).append(str(exc))
             continue
 
         candidates = _as_list(raw)
+        # Count the candidates this row's cap drops *once*, not once per kept
+        # candidate -- the per-row cap is the literal thing being counted.
+        if len(candidates) > options.max_proposals_per_tick:
+            result["over_cap"] += len(candidates) - options.max_proposals_per_tick
         for proposal in candidates[: options.max_proposals_per_tick]:
-            result["over_cap"] += max(0, len(candidates) - options.max_proposals_per_tick)
             if not isinstance(proposal, Proposal):
                 continue
             if not proposal.action.strip():
@@ -318,11 +370,10 @@ def patrol_tick(
             # `rule_candidates` builds each proposal with `datetime.now()`, which
             # is right when a rule is called directly and wrong when a pass runs
             # at a time somebody chose: a replayed or backfilled pass would write
-            # timestamps from whenever it happened to execute. That is not
-            # cosmetic -- the daily budget windows on `created_at`, so a pass
-            # running "yesterday" would spend today's allowance. Found by a test
-            # that passed on the day it was written and failed the next morning,
-            # which is the signature of a clock leaking into policy.
+            # timestamps from whenever it happened to execute, and a proposal is
+            # an assertion about *when* the fact was seen. Found by a test that
+            # passed on the day it was written and failed the next morning, which
+            # is the signature of a clock leaking into policy.
             proposal.created_at = now
             proposal.expires_at = now + timedelta(seconds=DEFAULT_EXPIRY_SECONDS)
             # Declined is a fact, not a gap: a suggestion somebody already
@@ -340,6 +391,10 @@ def patrol_tick(
                 now=now,
                 policy=options.admission,
                 prior_decision=prior,
+                # The exact call, when the rule knows it.  A "prepare" row
+                # without arguments is a question the reader has to reconstruct,
+                # which is the thing the middle answer exists to avoid.
+                arguments=(proposal.context or {}).get("arguments"),
             )
             if decision.answer == "drop":
                 result["dropped"] += 1
@@ -421,17 +476,84 @@ def live_queue_facts(live_sessions: Any, now: Optional[datetime] = None) -> dict
     return facts
 
 
+def is_own_errand(payload: Any) -> bool:
+    """Whether a scheduled task is the agent's own work rather than a person's.
+
+    The patrol executes a reversible candidate by creating a one-off task, and
+    that task carries ``origin: "autonomy"`` in its payload (see
+    ``execute.ExecutionOutcome``). Those tasks are invisible to the funnel: their
+    failure belongs on the proposal that started them, not in a new round of
+    "something failed, go and read it". Without this the two facts feed each
+    other -- a failed autonomous read is attention, attention is a proposal, the
+    proposal is another autonomous read -- and every cycle has a new task id, so
+    dedupe cannot break it.
+
+    A payload is free-form, so this answers ``False`` for anything it cannot read:
+    treating a person's task as the agent's own would hide a real failure, while
+    the opposite mistake only costs one redundant proposal.
+    """
+    return isinstance(payload, dict) and payload.get("origin") == "autonomy"
+
+
+def unowned_task_rows(
+    tasks: list[dict[str, Any]],
+    *,
+    attention_counts: dict[str, int],
+    placed_task_ids: set[str],
+    latest_run_at: Optional[dict[str, str]] = None,
+) -> list[dict[str, Any]]:
+    """Rows for tasks whose unreviewed failures belong to no session row.
+
+    A failed run is a fact about a *task*, but the patrol's rules fire per
+    session.  A task created without a session id -- every task the patrol
+    itself executes is created that way -- has no conversation to hang its
+    attention on, so ``failed-run-unreviewed`` cannot see the loss, and "no
+    proposals" reads exactly like "nothing failed".  These rows give such a task
+    its own source (``task:<id>``) so the rule can fire for it.
+
+    ``tasks`` carries the plain facts, one dict per task: ``task_id``, ``name``,
+    ``last_run_at`` and ``created_at`` (ISO strings).  ``latest_run_at`` maps a
+    task id to its newest run's time, and that is the row's ``last_activity``;
+    the fallbacks are the task's own timestamps.  It has to be a real time:
+    the patrol's warm/stale gates compare activity, and a fabricated "now" would
+    make the row permanently warm and therefore never examined.
+
+    ``placed_task_ids`` is the set of tasks already shown under a session row.
+    A task in it is skipped here, so one failure cannot become two proposals
+    with different sources -- which would also walk around the dedupe.
+    """
+    rows: list[dict[str, Any]] = []
+    latest = latest_run_at or {}
+    for task in tasks:
+        task_id = str(task.get("task_id") or "").strip()
+        if not task_id or task_id in placed_task_ids:
+            continue
+        attention = int(attention_counts.get(task_id) or 0)
+        if attention <= 0:
+            continue
+        rows.append(
+            {
+                "session_id": f"task:{task_id}",
+                "title": str(task.get("name") or "").strip() or task_id[:8],
+                "last_activity": str(
+                    latest.get(task_id)
+                    or task.get("last_run_at")
+                    or task.get("created_at")
+                    or ""
+                ),
+                "status": "task",
+                "tasks": [{"task_id": task_id, "attention": attention}],
+            }
+        )
+    return rows
+
+
 def _as_list(raw: Any) -> list[Any]:
     if raw is None:
         return []
     if isinstance(raw, list):
         return raw
     return [raw]
-
-
-def start_of_day(now: datetime) -> datetime:
-    """Midnight UTC of *now*'s day -- the window the budget is about."""
-    return day_bounds(now)[0]
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
