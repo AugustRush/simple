@@ -4,6 +4,7 @@ import { useState } from 'react'
 import type { AppCtx } from '../app/AppCtx'
 import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
+import { renderCapabilities } from './extensions'
 import { ApiOutlined, CheckCircleFilled, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
   Button,
@@ -696,6 +697,11 @@ export function createSettingsView(ctx: AppCtx) {
               </section>
             </Form>
           </Card>
+
+          {/* Capability belongs with configuration: 扩展 was a page of its own,
+              and a page whose entire content is switches and deletes is a
+              settings section wearing a page's clothes. */}
+          {renderCapabilities(ctx)}
 
           <Card
             className="settings-card settings-card-wide settings-json-card"

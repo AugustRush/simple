@@ -8,7 +8,7 @@
  * ``index.html`` for every path it does not own).
  *
  * Shapes: ``#/`` (home, optionally with a thread: ``#/t/<session>``),
- * ``#/extensions``, ``#/memory``, ``#/schedules``, ``#/autonomy``, ``#/settings``.
+ * ``#/memory``, ``#/schedules``, ``#/settings``.
  * An unknown or empty hash means home: the app opens on the agent, not on
  * whichever thread was last touched -- a URL someone typed by hand should not be
  * an error page either.
@@ -18,7 +18,7 @@
  * so "which page am I on" and "which thread am I in" stopped being two questions.
  */
 
-export const VIEW_NAMES = ['home', 'extensions', 'memory', 'schedules', 'autonomy', 'settings'] as const
+export const VIEW_NAMES = ['home', 'memory', 'schedules', 'settings'] as const
 
 export type ViewName = (typeof VIEW_NAMES)[number]
 

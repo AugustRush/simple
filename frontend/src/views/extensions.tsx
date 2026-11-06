@@ -1,4 +1,15 @@
-/** The extensions view. Rendered by the App container from its context object. */
+/** The capability lists: plugins and skills, as a card on 设置.
+ *
+ * Why not a page
+ * --------------
+ * 扩展 was a destination of its own, and it was the wrong shape for what it
+ * holds. A page answers "where am I"; these two lists answer "what can it do",
+ * which is a question you have while changing a setting, not one you go
+ * somewhere to ask. Everything on this screen is a switch or a delete -- the
+ * same verbs as the settings page it now lives on. The old page also had to
+ * carry its own title bar, its own lead sentence and a tab strip, three
+ * affordances around two lists that each fit on a card.
+ */
 
 import type { AppCtx } from '../app/AppCtx'
 import {
@@ -10,7 +21,7 @@ import {
 } from '@ant-design/icons'
 import { Button, Card, Col, Empty, Input, Row, Skeleton, Switch, Tag } from 'antd'
 
-export function renderExtensions(ctx: AppCtx) {
+export function renderCapabilities(ctx: AppCtx) {
   const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
 
 
@@ -167,15 +178,18 @@ export function renderExtensions(ctx: AppCtx) {
   )
 
   return (
-    <div className="page-view extensions-view">
-      {/* No title here: the bar above already says 扩展 and counts both lists.
-          A body heading that repeats it word for word made the page open with
-          the same sentence twice, forty pixels apart. */}
-      <p className="page-lead">插件给 Agent 增加新的能力入口，技能决定这些能力怎么被调用。</p>
-      {/* The same tab idiom as the 自动化 page, so the two multi-list pages
-          read as one family.  Counts sit on the tabs because that is where
-          the visitor decides which list they are about to see. */}
-      <div className="schedule-tabs extensions-tabs" role="tablist" aria-label="扩展视图">
+    <Card
+      className="settings-card settings-card-wide capabilities-card"
+      title="能力"
+      extra={<span className="card-kicker">即时生效</span>}
+    >
+      <p className="settings-hint capabilities-hint">
+        插件给 Agent 增加新的能力入口，技能决定这些能力怎么被调用。这一页的开关不用保存，拨完就是结果。
+      </p>
+      {/* The same tab idiom as the 自动化 page, so the two multi-list screens
+          read as one family. Counts on the tabs because that is where the
+          reader decides which list to look at. */}
+      <div className="schedule-tabs extensions-tabs" role="tablist" aria-label="能力">
         <button
           type="button"
           role="tab"
@@ -183,7 +197,7 @@ export function renderExtensions(ctx: AppCtx) {
           className={extensionsTab === 'plugins' ? 'active' : ''}
           onClick={() => setExtensionsTab('plugins')}
         >
-          插件
+          插件<span className="tab-count">{filteredPlugins.length}</span>
         </button>
         <button
           type="button"
@@ -192,10 +206,10 @@ export function renderExtensions(ctx: AppCtx) {
           className={extensionsTab === 'skills' ? 'active' : ''}
           onClick={() => setExtensionsTab('skills')}
         >
-          技能
+          技能<span className="tab-count">{skills.length}</span>
         </button>
       </div>
       {extensionsTab === 'plugins' ? renderPluginsBody() : renderSkillsBody()}
-    </div>
+    </Card>
   )
 }

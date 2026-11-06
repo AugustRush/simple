@@ -204,7 +204,12 @@ def test_the_shell_renders_without_javascript_errors(page):
     page.locator(".topbar-more").click()
     page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
     assert page.locator(".ant-dropdown-menu-item", has_text="记忆").count() == 1
-    assert page.locator(".ant-dropdown-menu-item", has_text="扩展").count() == 1
+    assert page.locator(".ant-dropdown-menu-item", has_text="设置").count() == 1
+    # 扩展 and 自主 were pages here; both were content another screen already
+    # owns (设置 and 看板). A destination that is not a place you go is what made
+    # this app feel bigger than it is.
+    assert page.locator(".ant-dropdown-menu-item", has_text="扩展").count() == 0
+    assert page.locator(".ant-dropdown-menu-item", has_text="自主").count() == 0
     page.keyboard.press("Escape")
     assert page.errors == [], page.errors
 
@@ -217,6 +222,33 @@ def test_a_message_is_answered_on_the_page(page):
 
     page.wait_for_selector("text=pong from the browser", timeout=30_000)
     assert "this is a browser message" in page.inner_text("body")
+    assert page.errors == [], page.errors
+
+
+def test_the_capability_lists_live_on_the_settings_page(page):
+    """扩展 was a page; its two lists are a card on 设置 now.
+
+    That is the fold this change makes: a page whose whole content is switches
+    and deletes is configuration, and configuration already had a page. The
+    assertion is not "it moved" -- it is that both lists are still reachable and
+    still switchable, because a fold that loses the controls is a deletion with
+    better manners.
+    """
+    page.goto(page.url.split("#")[0] + "#/settings", wait_until="networkidle")
+    page.wait_for_selector(".capabilities-card", timeout=20_000)
+
+    tabs = page.locator(".capabilities-card .extensions-tabs button")
+    assert tabs.count() == 2
+    assert "插件" in tabs.nth(0).inner_text() and "技能" in tabs.nth(1).inner_text()
+
+    # Both tabs render something: the count on the tab is the list's whole size,
+    # so a tab with a number and an empty body would be the panel lying.
+    assert page.locator(".capabilities-card .entity-card, .capabilities-card .page-empty").count() >= 1
+    tabs.nth(1).click()
+    page.wait_for_timeout(400)
+    assert tabs.nth(1).get_attribute("aria-selected") == "true"
+    assert page.locator(".capabilities-card .skill-row, .capabilities-card .page-empty").count() >= 1
+
     assert page.errors == [], page.errors
 
 
@@ -368,23 +400,27 @@ def test_creating_an_automation_is_a_conversation(page):
     assert page.errors == [], page.errors
 
 
-def test_the_autonomy_page_shows_what_it_would_do(page, live_gateway):
-    """The page a person checks: proposals, not actions.
+def test_the_board_shows_what_it_would_do(page, live_gateway):
+    """The panel that answers "does anything need me", proposals included.
 
     Seeded through the store the patrol writes, because the patrol itself runs on
-    a ten-minute clock -- waiting for it would make this test a slow test of the
-    scheduler rather than a test of the page.
+    a ten-minute clock -- waiting for it would make this a slow test of the
+    scheduler rather than a test of the screen.
+
+    The proposals used to have a page of their own (自主) that drew the same rows
+    this panel draws, one door deeper. What the decision needs is on the card: the
+    action, what was observed, and how bad it would be. What the *page* carried --
+    which actions it takes on its own -- is the one sentence under the queue.
     """
     import os
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-    from datetime import datetime, timezone
 
     from agent.autonomy import Proposal
     from agent.autonomy.store import open_proposal_store
 
-    # The gateway's home, so the page reads the store the test wrote.
+    # The gateway's home, so the panel reads the store the test wrote.
     os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
     from agent import shared
 
@@ -412,26 +448,30 @@ def test_the_autonomy_page_shows_what_it_would_do(page, live_gateway):
     finally:
         store.close()
 
-    page.goto(page.url.split("#")[0] + "#/autonomy", wait_until="networkidle")
-    page.wait_for_selector(".proposal-card", timeout=20_000)
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    # The 看板 button, and not a route: there is no URL for this panel, because it
+    # is a control you open on whatever screen you are on.
+    page.locator(".header-board").click()
+    page.wait_for_selector(".panel-card-proposal", timeout=20_000)
 
-    assert page.locator(".proposal-card").count() == 2
-    text = page.inner_text(".autonomy-view")
-    # What it would do, why it would not just run, and the tool it would call.
-    assert "读一遍失败的运行" in text
-    assert "本来会准备好等你" in text
-    assert "schedule_runs" in text
-    assert "只读" in text and "不可逆" in text, "the reversibility class must be visible"
-    # The one rule the page exists to state. It used to promise "0 次自动执行";
+    # By text, not by position: another test in this module seeds its own
+    # proposal into the same gateway home.
+    readable = page.locator(".panel-card-proposal").filter(has_text="读一遍失败的运行")
+    assert readable.count() == 1, "the proposal this test seeded is not on the panel"
+    assert page.locator(".panel-card-proposal").filter(has_text="检查卡住的队列").count() == 1
+    assert "有一个事实值得看一眼" in readable.first.inner_text(), (
+        "what was observed is what a decision is made on"
+    )
+    panel = page.inner_text(".panel-body")
+    # The reversibility class, because it is the reason the row is here at all.
+    assert "只读" in panel and "不可逆" in panel, "the reversibility class must be visible"
+    # The one rule the panel exists to state. It used to promise "0 次自动执行";
     # the loop acts now, so what it has to state instead is *which* actions it
     # takes on its own -- and that the rest is never taken.
-    assert "只读的动作它自己做" in text
-    assert "永远不会自己做" in text, "the irreversible line is the promise that remains"
-
-    # Answering one is the page's whole interaction, and the row goes away.
-    page.locator(".proposal-card").first.locator("button", has_text="不要").click()
-    page.wait_for_timeout(1200)
-    assert page.locator(".proposal-card").count() == 1
+    assert "只读的动作它自己做" in panel
+    assert "永远不会自己做" in panel, "the irreversible line is the promise that remains"
+    # Answering on the card is the next test's subject; this one is about the
+    # panel saying what is waiting without a second screen.
     assert page.errors == [], page.errors
 
 
@@ -549,13 +589,14 @@ def test_a_new_conversation_shows_up_in_the_record(page):
 def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
     """The card that asks you to decide is the card you decide on.
 
-    A board that shows a blocking proposal and then makes you navigate to 自主 to
-    answer it is a page that knows what to do and refuses to do it. The answer is
-    the same endpoint either way; only the distance differs.
+    A board that shows a blocking proposal and then makes you navigate somewhere
+    else to answer it is a page that knows what to do and refuses to do it. (That
+    elsewhere was 自主, a page that drew the same rows; it is gone, and this is
+    why it could go.)
 
     Also pins the refresh: answering changes the column, and the page has to be
-    told. The first version refreshed only 自主, so the card the server had already
-    dropped sat on the board until a reload.
+    told. The first version refreshed only the page the button was on, so the card
+    the server had already dropped sat on the board until a reload.
     """
     import os
     import sys
@@ -602,8 +643,9 @@ def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
     # list: the gateway is shared, so other tests' cards can add groups below.
     assert titles and titles[0].replace("\n", " ").split()[0] == "等你处理", titles
 
-    # By text, not by position: the autonomy page's test seeds its own proposals
-    # into the same gateway home, so "the first card" is whichever ran first.
+    # By text, not by position: another test in this module seeds its own
+    # proposals into the same gateway home, so "the first card" is whichever ran
+    # first.
     card = page.locator(".panel-card-proposal").filter(has_text="读一遍那 2 次失败的运行")
     assert card.count() == 1, "the proposal this test seeded is not on the board"
     assert "有 2 次运行结束得不好" in card.first.inner_text(), (

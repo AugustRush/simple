@@ -298,31 +298,25 @@ export function useAutomation(deps: Deps) {
     }
   }, [activityCursor, activityLoading, api, home])
 
-  // ── the autonomy page ──────────────────────────────────────────────────
+  // ── the autonomy record ────────────────────────────────────────────────
   //
-  // Separate state from the automation page's: proposals are a review queue, not
-  // a list of things that run, and the two pages never show the same row. The
-  // loader lives here because both pages are part of the same view family and the
-  // shell already threads this hook's functions.
-  const [proposals, setProposals] = useState<ProposalRow[]>([])
-  const [proposalCounts, setProposalCounts] = useState<Record<string, number>>({})
-  const [proposalsLoaded, setProposalsLoaded] = useState(false)
+  // Only the *record* is read here. The unanswered proposals come from
+  // `/api/home`, because the board already lists them and a second fetch of the
+  // same rows is a second chance for two numbers on one screen to disagree.
+  // What is left is what the board cannot derive: what has already been answered
+  // (the history of the queue above it) and the patrol's own counts (the evidence
+  // that anything was looked at).
   const [funnel, setFunnel] = useState<AutonomyFunnel | null>(null)
   const [answeredProposals, setAnsweredProposals] = useState<ProposalRow[]>([])
 
   const loadAutonomy = useCallback(async () => {
     try {
       const data = await (await api('/api/autonomy')).json()
-      setProposals(Array.isArray(data.live) ? data.live : [])
-      setProposalCounts(
-        data && typeof data.counts === 'object' && data.counts ? data.counts : {},
-      )
       setFunnel(data && typeof data.funnel === 'object' && data.funnel ? data.funnel : null)
       setAnsweredProposals(Array.isArray(data.answered) ? data.answered : [])
-      setProposalsLoaded(true)
     } catch {
-      // An unreachable list must not read as "the agent proposed nothing": the
-      // last known one stands, and the page says it is stale.
+      // An unreachable list must not read as "it proposed nothing": the last
+      // known record stands rather than being emptied by a failed request.
     }
   }, [api])
 
@@ -339,10 +333,10 @@ export function useAutomation(deps: Deps) {
       } else {
         messageApi.success(state === 'accepted' ? '已记下：你会同意这件事' : '已记下：不做这件事')
       }
-      // Both surfaces show this row: 自主 lists proposals, and the home board's
-      // "等你处理" column holds the same ones. Refreshing only the page the
-      // request came from is how the other one keeps a card the server has
-      // already removed.
+      // The board's "等你处理" column holds this row, and the record under it
+      // shows the answer. They are two readers of one endpoint, so both are
+      // refreshed -- a card the server has already dropped otherwise sits in the
+      // queue with a record below it saying it was answered.
       await Promise.all([loadAutonomy(), loadHome()])
     } catch {
       // surfaced by the api helper
@@ -876,5 +870,5 @@ export function useAutomation(deps: Deps) {
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-  return { acknowledgeScheduleRun, activityCursor, activityExhausted, activityLoading, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadMoreActivity, olderActivity, loadAutonomy, proposalCounts, proposals, proposalsLoaded, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
+  return { acknowledgeScheduleRun, activityCursor, activityExhausted, activityLoading, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadMoreActivity, olderActivity, loadAutonomy, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }

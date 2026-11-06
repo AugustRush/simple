@@ -187,9 +187,6 @@ export interface AppCtx {
   homeLoaded: boolean
   loadHome: () => Promise<void>
   funnel: AutonomyFunnel | null
-  proposals: ProposalRow[]
-  proposalsLoaded: boolean
-  proposalCounts: Record<string, number>
   loadAutonomy: () => Promise<void>
   decideProposal: (id: string, state: "accepted" | "declined") => Promise<void>
   loadAutomations: (silent?: boolean) => Promise<void>

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, BulbOutlined, ClockCircleOutlined, CompassOutlined, HomeOutlined, SettingOutlined } from '@ant-design/icons'
+import { BulbOutlined, ClockCircleOutlined, HomeOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor } from '../lib/route'
@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, tokenDirty, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -127,7 +127,10 @@ export function useShell(deps: Deps) {
     // Both lists load on entering the merged page: the counts on the tabs and
     // the page subtitle are about both, and switching tabs is not a data
     // event -- it is the same visit continuing.
-    if (view === 'extensions') {
+    // 设置 holds the capability lists now (they were a page of their own), so
+    // entering it loads plugins and skills alongside the config.
+    if (view === 'settings') {
+      loadSettings()
       loadPlugins()
       loadSkills()
     }
@@ -142,9 +145,16 @@ export function useShell(deps: Deps) {
       loadSkills(true)
       loadSchedulerHealth()
     }
-    if (view === 'autonomy') loadAutonomy()
-    if (view === 'settings') loadSettings()
-  }, [view, activeSession, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions, loadAutonomy])
+  }, [view, activeSession, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions])
+
+  // The board panel is where a proposal is answered now -- 自主 was a second
+  // screen showing the same rows. So the panel fetches them when it opens, and
+  // only then: a request on behalf of a panel nobody opened is a poll of a
+  // screen that is not on screen.
+  useEffect(() => {
+    if (!boardOpen) return
+    void loadAutonomy()
+  }, [boardOpen, loadAutonomy])
 
   /** Move to another view, asking first if the settings page has unsaved edits.
    *
@@ -176,19 +186,6 @@ export function useShell(deps: Deps) {
         setView(next)
       },
     })
-  }
-
-  /**
-   * Go straight to the runs that are waiting to be looked at.
-   *
-   * `navigateTo` alone is not enough: it returns early when the view is
-   * already the schedules page, which is exactly when the badge is most
-   * likely to be pressed -- someone is on the page and still cannot find what
-   * the number is talking about.
-   */
-  const openAttention = () => {
-    navigateTo('schedules')
-    setAutomationTab('attention')
   }
 
   // ── The address bar ───────────────────────────────────────────────────────
@@ -273,60 +270,18 @@ export function useShell(deps: Deps) {
     )
   }, [commands, paletteQuery])
 
-  // The management pages, as one menu. There is no navigation column any more:
-  // the app's day-to-day surface is one screen (the agent), and these are the
-  // places you go deliberately and briefly. A sidebar charged every screen for
-  // six entries, five of which are visited once a week.
+  // The two places the ⋯ menu holds. Not a navigation column: the app's
+  // day-to-day surface is one screen (the agent), so what is left over is the
+  // things you visit deliberately and briefly. 扩展 and 自主 used to sit here
+  // too, and both were the same mistake in different clothes -- a destination
+  // that is not a place you *go*: the capability lists are configuration (they
+  // live on 设置 now), and a proposal is answered where it is shown (the board).
+  // A menu entry's whole job is to be a place; an entry that opens a page whose
+  // content another screen already shows is a second door into one room.
   const navItems = [
-    // One entry for both lists: plugins and skills answer the same question
-    // ("what can the agent do beyond its own tools?") and each list on its
-    // own is too short to justify a navigation slot of its own.
-    { key: 'extensions', icon: <AppstoreOutlined />, label: '扩展' },
-    // 记忆 sits next to 扩展 because both answer "what is this agent made of":
-    // 扩展 is what it *can* do, 记忆 is what it *knows*. Before this page there
-    // was no way to see the second half, and a wrong memory could only be
-    // argued with inside a conversation.
+    // What the agent *knows*. (What it *can* do is on 设置 with the rest of the
+    // configuration, which is also where you would look to change it.)
     { key: 'memory', icon: <BulbOutlined />, label: '记忆' },
-    {
-      key: 'schedules',
-      icon: <ClockCircleOutlined />,
-      // The badge lives on the navigation entry, not on the schedules page,
-      // because the entire problem is a failure that finished while the page
-      // was closed -- and it is a button rather than a chip, because a number
-      // that says "two things need you" and then drops you on an unfiltered
-      // list of forty tasks has told you nothing you can act on. Pressing it
-      // opens the runs themselves.
-      label: (
-        <span className="nav-label">
-          自动化
-          {unseenFailures > 0 && (
-            <button
-              type="button"
-              className="nav-badge"
-              aria-label={`${unseenFailures} 次运行需要查看，打开待处理列表`}
-              title={`${unseenFailures} 次运行需要查看`}
-              onClick={event => {
-                // The menu entry behind it would otherwise also fire and
-                // settle the tab back to whatever it was.
-                event.stopPropagation()
-                openAttention()
-              }}
-            >
-              {unseenFailures > 99 ? '99+' : unseenFailures}
-            </button>
-          )}
-        </span>
-      ),
-    },
-    // What the agent would do on its own. Last, because it is the page you
-    // check rather than the one you work in -- and first among the "about the
-    // agent itself" group, because it is the only one that can ask you a
-    // question (the proposals).
-    { key: 'autonomy', icon: <CompassOutlined />, label: '自主' },
-    // Settings is deliberately absent from the main navigation: it is visited
-    // rarely and briefly, so it lives as a small entry in the sidebar footer
-    // next to the theme switch rather than taking a slot beside the pages
-    // someone visits every day.
   ]
 
   // The palette's own list: one index over commands and destinations, so the
@@ -346,10 +301,9 @@ export function useShell(deps: Deps) {
     const query = paletteQuery.trim().toLowerCase()
     const destinations = [
       { view: 'home', label: '主页', icon: <HomeOutlined />, terms: 'home 主页 首页 对话 chat' },
-      { view: 'extensions', label: '扩展', icon: <AppstoreOutlined />, terms: '插件 技能 extensions plugins skills' },
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
-      { view: 'autonomy', label: '自主', icon: <CompassOutlined />, terms: '自主 提议 proposals autonomy patrol' },
-      { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings' },
+      { view: 'memory', label: '记忆', icon: <BulbOutlined />, terms: '记忆 memory 事实' },
+      { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings 插件 技能 plugins skills' },
     ].filter(item => !query || `${item.label} ${item.terms}`.toLowerCase().includes(query))
     return [
       ...paletteCommands.slice(0, 8).map(command => ({ kind: 'command' as const, key: `command:${command.name}`, command })),
@@ -409,33 +363,19 @@ export function useShell(deps: Deps) {
       title: '会话管理',
       subtitle: `${sessions.length} 个会话，${sessions.filter(item => item.live).length} 个动态会话`,
     },
-    // One meta for the merged page: the head the visitor sees is the page's,
-    // while each tab keeps its own counts where they already were -- the
-    // skills summary strip and the plugins search both belong to their lists.
     memory: {
       title: '记忆',
       subtitle: '它记得的关于你的事 —— 看得见，也改得动',
-    },
-    extensions: {
-      title: '扩展',
-      subtitle: `${plugins.length} 个插件 · ${skills.length} 个技能`,
     },
     // Not "定时任务": the page now holds tasks that wait for a signal, and a
     // name that promises a time would be wrong for them. "自动化" is what the
     // page actually is -- work that runs without being asked each time.
     schedules: { title: '自动化', subtitle: '管理定时执行与等待信号的任务。' },
-    autonomy: {
-      title: '自主',
-      // Says what the page is *for*, in the words the design uses: proposals,
-      // not actions. A subtitle promising "what it does on its own" would be
-      // wrong twice -- nothing is executed, and the page is where you decide.
-      subtitle: '只会做能撤销的；剩下这些等你答复',
-    },
     settings: {
       title: '设置',
-      subtitle: '管理访问令牌、模型与频道',
+      subtitle: '令牌、模型、频道，以及它能用的插件和技能',
     },
   }
 
-  return { navItems, navigateTo, openAttention, pageMeta, paletteCommands, paletteEntries, paletteIndex, setPaletteIndex, handlePaletteKeyDown, runPaletteEntry } as const
+  return { navItems, navigateTo, pageMeta, paletteCommands, paletteEntries, paletteIndex, setPaletteIndex, handlePaletteKeyDown, runPaletteEntry } as const
 }

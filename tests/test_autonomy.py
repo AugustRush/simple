@@ -405,7 +405,13 @@ def test_expiry_is_the_default_lifetime(store) -> None:
 
 def test_expired_proposals_stop_being_live(store) -> None:
     store.record(Proposal(source="s1", action="a"))
-    later = NOW + timedelta(days=3)
+    # Later than this row's own expiry, not later than a constant. The store
+    # stamps `expires_at` from the wall clock, so `NOW + 3 days` only counts as
+    # "later" during the few days after NOW was written -- on any other day the
+    # test asserted that nothing had expired yet, and failed. The row's own
+    # expiry is the fact under test.
+    row = store.list_proposals()[0]
+    later = row.expires_at + timedelta(seconds=1)
 
     expired = store.expire_stale(now=later)
 

@@ -17,6 +17,15 @@
  * have something in them. An empty group is not evidence of work; the sentence
  * that says the panel checked is.
  *
+ * Why the record is under the queue
+ * ---------------------------------
+ * The answered proposals and the patrol's own numbers used to be a page of their
+ * own (自主), which drew the same proposal rows this panel draws plus a log of
+ * what had been decided. A second door into one room is how an app starts
+ * feeling bigger than it is: the queue is answered here, so the history of that
+ * queue belongs here too -- below it, quieter, and always visible, because "what
+ * did I agree to" is asked when nothing is pending.
+ *
  * Why two shapes of card
  * ----------------------
  * A proposal is a decision and carries its own buttons; a running or scheduled
@@ -52,6 +61,12 @@ export const RUN_STATUS_LABEL: Record<string, string> = {
   unverified: '未判定',
   running: '正在跑',
   queued: '排队中',
+}
+
+const ANSWER_LABEL: Record<string, string> = {
+  acted: '已执行',
+  accepted: '同意',
+  declined: '不要',
 }
 
 const REVERSIBILITY_LABEL: Record<string, string> = {
@@ -165,6 +180,66 @@ function TaskRow({
 }
 
 /** The panel's contents: one summary line, then only the groups that have cards. */
+/** The record under the queue: what was answered, and how much it looked at.
+ *
+ * Deliberately not cards. Nothing here can be acted on -- one is a history, the
+ * other is a number -- and giving history a card's shape is how a panel grows a
+ * second list of things that look like they want something.
+ */
+function PanelRecord({ ctx }: { ctx: AppCtx }) {
+  const { answeredProposals, funnel } = ctx
+  // Every answered row, not a sample: the count beside the heading says how many
+  // there are, and a heading that says 6 above four rows is the two-numbers-
+  // disagree bug -- the one this panel already paid for once. History sits below
+  // the queue, so length here costs the reader nothing they came for.
+  const answered = answeredProposals
+  const passes = Number(funnel?.passes || 0)
+  const examined = Number(funnel?.examined || 0)
+  const executed = Number(funnel?.executed || 0)
+
+  return (
+    <section className="panel-group panel-group-record">
+      {answered.length > 0 && (
+        <>
+          <div className="panel-group-head">
+            已答复<span className="panel-group-count">{answered.length}</span>
+          </div>
+          {answered.map(row => {
+            // An answer is only as good as what came of it. The row says 已执行
+            // when the run started; the one case worth a second word is the run
+            // that started and ended badly -- otherwise "approve and never hear
+            // about it again" is the same leap of faith the page was built to end.
+            const outcome = row.outcome?.status || ''
+            const outcomeBad = outcome === 'failed' || outcome === 'interrupted'
+            return (
+              <div className="panel-log-row" key={row.id}>
+                <span className={`panel-log-state is-${row.state}`}>
+                  {ANSWER_LABEL[row.state] || row.state}
+                </span>
+                <span className="panel-log-action" title={row.action}>{row.action}</span>
+                {outcomeBad && <span className="panel-log-outcome">失败</span>}
+                <span className="panel-log-at">{relativeTime(row.decided_at || row.created_at)}</span>
+              </div>
+            )
+          })}
+        </>
+      )}
+      {/* The evidence, not a boast: "nothing waiting" is only worth trusting if
+          the panel can show that the thing which produces proposals has been
+          running. It says 趟 because that is what a patrol is -- the count is of
+          passes over the conversations, not of things it thought of. */}
+      {passes > 0 && (
+        <p className="panel-foot">
+          近 7 天巡逻 <strong>{passes}</strong> 趟 · 看过 <strong>{examined}</strong> 次会话 · 自己做了{' '}
+          <strong>{executed}</strong> 件
+        </p>
+      )}
+      <p className="panel-rule">只读的动作它自己做；会改动工作区之外的动作，永远不会自己做。</p>
+    </section>
+  )
+}
+
+/** The panel's contents: one summary line, then only the groups that have cards. */
 export function renderBoardPanel(ctx: AppCtx) {
   const { decideProposal, home, navigateTo, openScheduleDetails, schedules, setBoardOpen } = ctx
 
@@ -192,16 +267,7 @@ export function renderBoardPanel(ctx: AppCtx) {
     navigateTo('schedules')
   }
 
-  if (waiting.length + inFlight.length + scheduledTotal === 0) {
-    return (
-      <div className="panel-empty">
-        <p>现在没有要处理的事。</p>
-        <p className="panel-empty-hint">
-          它在后台每十分钟看一遍；能自己做的会直接做，需要你点头的会出现在这里。
-        </p>
-      </div>
-    )
-  }
+  const nothingToDo = waiting.length + inFlight.length + scheduledTotal === 0
 
   // The panel's first line, and the only sentence most visits need.
   const rest = [
@@ -211,58 +277,71 @@ export function renderBoardPanel(ctx: AppCtx) {
 
   return (
     <div className="panel-body">
-      <div className="panel-summary">
-        <span className={`panel-summary-state${waiting.length ? ' is-waiting' : ''}`}>
-          {waiting.length ? `${waiting.length} 件等你处理` : '没有要你处理的事'}
-        </span>
-        {rest.length > 0 && <span className="panel-summary-rest">{rest.join(' · ')}</span>}
-      </div>
-
-      {waiting.length > 0 && (
-        <section className="panel-group panel-group-waiting">
-          <div className="panel-group-head">
-            等你处理<span className="panel-group-count">{waiting.length}</span>
+      {nothingToDo ? (
+        <div className="panel-empty">
+          <p>现在没有要处理的事。</p>
+          <p className="panel-empty-hint">
+            它在后台每十分钟看一遍；能自己做的会直接做，需要你点头的会出现在这里。
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="panel-summary">
+            <span className={`panel-summary-state${waiting.length ? ' is-waiting' : ''}`}>
+              {waiting.length ? `${waiting.length} 件等你处理` : '没有要你处理的事'}
+            </span>
+            {rest.length > 0 && <span className="panel-summary-rest">{rest.join(' · ')}</span>}
           </div>
-          {waiting.map(card =>
-            card.kind === 'proposal' ? (
-              <ProposalCard
-                key={`proposal:${card.id}`}
-                card={card}
-                onDecide={(id, state) => void decideProposal(id, state)}
-              />
-            ) : (
-              <AttentionCard key={card.task_id} card={card} onOpen={openTask} />
-            ),
+
+          {waiting.length > 0 && (
+            <section className="panel-group panel-group-waiting">
+              <div className="panel-group-head">
+                等你处理<span className="panel-group-count">{waiting.length}</span>
+              </div>
+              {waiting.map(card =>
+                card.kind === 'proposal' ? (
+                  <ProposalCard
+                    key={`proposal:${card.id}`}
+                    card={card}
+                    onDecide={(id, state) => void decideProposal(id, state)}
+                  />
+                ) : (
+                  <AttentionCard key={card.task_id} card={card} onOpen={openTask} />
+                ),
+              )}
+            </section>
           )}
-        </section>
-      )}
 
-      {inFlight.length > 0 && (
-        <section className="panel-group panel-group-running">
-          <div className="panel-group-head">
-            正在跑<span className="panel-group-count">{inFlight.length}</span>
-          </div>
-          {inFlight.map(card => (
-            <TaskRow key={card.task_id} card={card} tone="running" onOpen={openTask} />
-          ))}
-        </section>
-      )}
-
-      {scheduled.length > 0 && (
-        <section className="panel-group panel-group-scheduled">
-          <div className="panel-group-head">
-            已排期<span className="panel-group-count">{scheduledTotal}</span>
-          </div>
-          {scheduled.map(card => (
-            <TaskRow key={card.task_id} card={card} tone="scheduled" onOpen={openTask} />
-          ))}
-          {scheduledTotal > scheduled.length && (
-            <Button type="link" size="small" className="panel-group-more" onClick={() => navigateTo('schedules')}>
-              还有 {scheduledTotal - scheduled.length} 个 · 全部
-            </Button>
+          {inFlight.length > 0 && (
+            <section className="panel-group panel-group-running">
+              <div className="panel-group-head">
+                正在跑<span className="panel-group-count">{inFlight.length}</span>
+              </div>
+              {inFlight.map(card => (
+                <TaskRow key={card.task_id} card={card} tone="running" onOpen={openTask} />
+              ))}
+            </section>
           )}
-        </section>
+
+          {scheduled.length > 0 && (
+            <section className="panel-group panel-group-scheduled">
+              <div className="panel-group-head">
+                已排期<span className="panel-group-count">{scheduledTotal}</span>
+              </div>
+              {scheduled.map(card => (
+                <TaskRow key={card.task_id} card={card} tone="scheduled" onOpen={openTask} />
+              ))}
+              {scheduledTotal > scheduled.length && (
+                <Button type="link" size="small" className="panel-group-more" onClick={() => navigateTo('schedules')}>
+                  还有 {scheduledTotal - scheduled.length} 个 · 全部
+                </Button>
+              )}
+            </section>
+          )}
+        </>
       )}
+
+      <PanelRecord ctx={ctx} />
     </div>
   )
 }

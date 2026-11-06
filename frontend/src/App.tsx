@@ -9,9 +9,7 @@ import './index.css'
 import type { AppCtx } from './app/AppCtx'
 import { renderHome } from './views/home'
 import { renderBoardPanel } from './views/board'
-import { renderExtensions } from './views/extensions'
 import { renderMemory } from './views/memory'
-import { renderAutonomy } from './views/autonomy'
 import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
 import { relativeTime } from './lib/format'
@@ -96,7 +94,7 @@ function App() {
 
   const { activateProvider, applyToken, config, configText, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, testProvider, setConfigText, setSettingsDirty, setTokenDraft, settingsDirty, settingsModelOptions, thinkingEffortOptions, tokenDirty, tokenDraft } = settings
 
-  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, proposals, proposalsLoaded, proposalCounts, loadAutonomy, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, activityCursor, activityExhausted, activityLoading, loadMoreActivity, olderActivity, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } = automation
+  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, loadAutonomy, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, activityCursor, activityExhausted, activityLoading, loadMoreActivity, olderActivity, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } = automation
 
   const { handlePaletteKeyDown, navItems, navigateTo, pageMeta, paletteCommands, paletteEntries, paletteIndex, runPaletteEntry, setPaletteIndex } = shell
 
@@ -315,9 +313,6 @@ function App() {
     home,
     homeLoaded,
     loadHome,
-    proposals,
-    proposalsLoaded,
-    proposalCounts,
     loadAutonomy,
     decideProposal,
     loadAutomations,
@@ -395,10 +390,8 @@ function App() {
 
   const renderCurrentView = () => {
     if (view === 'home') return renderHome(ctx)
-    if (view === 'extensions') return renderExtensions(ctx)
     if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)
-    if (view === 'autonomy') return renderAutonomy(ctx)
     if (view === 'settings') return renderSettings()
     return renderHome(ctx)
   }
@@ -482,10 +475,10 @@ function App() {
       {contextHolder}
       <Layout className="app-shell app-shell-flat">
         {/* One bar, not a column. The app's day-to-day surface is one screen --
-            the agent -- so navigation is the exception: four management pages in
-            a menu, and threads in a drawer that opens when you want another one.
-            A 260px sidebar charged every screen for six entries, five of which
-            are opened once a week. */}
+            the agent -- so navigation is the exception: two pages in a menu, and
+            threads / the board in drawers that open when you want them. A 260px
+            sidebar charged every screen for six entries, five of which are
+            opened once a week. */}
         <Header className="app-topbar">
           <div className="topbar-left">
             {view !== 'home' && (
@@ -515,8 +508,10 @@ function App() {
                 week; the ones a person moves between while working stay on the
                 bar, where they cost a click less and, more to the point, are
                 visible -- a menu hides its contents, and a destination nobody
-                can see is a destination nobody uses. The ⋯ now holds 记忆 / 自主
-                / 扩展 / 设置 and the theme switch. */}
+                can see is a destination nobody uses. The ⋯ now holds 记忆 / 设置
+                / 搜索 / 主题 -- four things, none of which is a place you work
+                from. 扩展 and 自主 were pages here; both were content that
+                belongs to a page that already existed (设置 and 看板). */}
             {/* Threads: the most frequent move there is -- the other half of
                 "which conversation am I in". */}
             <Button

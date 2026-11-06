@@ -113,6 +113,47 @@
 .panel-row-main span { color: var(--text-muted); font-size: 11px; }
 .panel-row-when { flex: 0 0 auto; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
+/* The record under the queue: a history, not a list of things to act on. Rows,
+   not cards -- and no buttons anywhere, so nothing here can be mistaken for
+   work. It is separated from the queue above by a rule rather than a heading
+   gap, because it is a different tense. */
+.panel-group-record {
+  gap: 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.panel-group-record .panel-group-head { padding-bottom: 2px; }
+.panel-log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-log-row:last-of-type { border-bottom: 0; }
+.panel-log-state { flex: 0 0 34px; color: var(--text-secondary); font-size: 10px; font-weight: 600; }
+.panel-log-state.is-declined { color: var(--text-muted); font-weight: 500; }
+.panel-log-action {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.panel-log-outcome { flex: 0 0 auto; color: var(--red); font-size: 10px; }
+.panel-log-at { flex: 0 0 auto; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.panel-foot {
+  margin: 10px 2px 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.7;
+}
+.panel-foot strong { color: var(--text-secondary); font-weight: 600; font-variant-numeric: tabular-nums; }
+/* The promise, once, at the bottom of the place where it is decided. */
+.panel-rule { margin: 6px 2px 0; color: var(--text-muted); font-size: 10px; line-height: 1.7; }
+
 .panel-empty { padding: 10px 2px; color: var(--text-secondary); font-size: 13px; }
 .panel-empty p { margin: 0 0 6px; }
 .panel-empty-hint { color: var(--text-muted); font-size: 11px; line-height: 1.7; }

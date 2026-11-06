@@ -177,8 +177,6 @@
    every one of them the same reading shape as the settings page already had. */
 .page-view.schedules-view,
 .page-view.memory-view,
-.page-view.extensions-view,
-.page-view.autonomy-view,
 .page-view.settings-view {
   width: 100%;
   max-width: 1080px;

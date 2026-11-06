@@ -1,15 +1,21 @@
-/* The merged extensions page and the skills/settings workspace rows. */
+/* The capability card on 设置, and the skills/settings workspace rows. */
 
-/* The merged 扩展 page: both list bodies keep the classes they had as pages,
-   so only the tab strip and the per-tab toolbars are new.  The tab margin
-   mirrors the 自动化 page's spacing so the two multi-list pages share one
-   rhythm. */
+/* 扩展 used to be a page; it is now a card on 设置. Both list bodies kept the
+   classes they had, so only the tab strip and the per-tab toolbars are new. The
+   tab margin mirrors the 自动化 page's spacing so the two multi-list screens
+   share one rhythm. */
 .extensions-tabs {
-  margin-bottom: 16px;
+  margin: 14px 0;
 }
-.extensions-view .page-head {
-  margin-bottom: 0;
+.extensions-tabs .tab-count {
+  margin-left: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
 }
+.capabilities-hint { margin: 0; }
+.capabilities-card .ant-card-body { padding-top: 4px; }
 /* One toolbar shape for every list page (会话管理 / 扩展 / 自动化): search
    first, at one width, then whatever narrows or acts on the list.  Before
    this, the same control sat on the right of one page, the left of another
@@ -33,7 +39,7 @@
 .list-toolbar-side {
   margin-left: auto;
 }
-.extensions-view .skills-summary {
+.capabilities-card .skills-summary {
   justify-content: flex-end;
   margin-bottom: 16px;
 }
