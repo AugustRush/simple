@@ -415,6 +415,13 @@ def _proposal_cards(proposal_store: Any) -> list[dict[str, Any]]:
                 "detail": str(getattr(proposal, "reason", "") or "")[:160],
                 "session_id": str(getattr(proposal, "source", "") or ""),
                 "reversibility": str(getattr(proposal, "reversibility", "") or ""),
+                # Which task this is about, when it is about one. A proposal
+                # whose action is "decide what to do with 汇报" is useless
+                # without a way to the task it names -- the person would have to
+                # retype the name into 自动化.
+                "target_task_id": str(
+                    (getattr(proposal, "context", {}) or {}).get("task_id") or ""
+                ),
                 "unread": 0,
             }
         )

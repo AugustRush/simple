@@ -542,7 +542,14 @@ def unowned_task_rows(
                     or ""
                 ),
                 "status": "task",
-                "tasks": [{"task_id": task_id, "attention": attention}],
+                "tasks": [
+                    {
+                        "task_id": task_id,
+                        "name": str(task.get("name") or ""),
+                        "attention": attention,
+                        "failures": list(task.get("failures") or []),
+                    }
+                ],
             }
         )
     return rows

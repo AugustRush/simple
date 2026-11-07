@@ -650,3 +650,33 @@ def test_a_board_with_no_work_store_still_answers():
     from agent.channels import web_home
 
     assert web_home.build_home_overview()["board"]["working"] == []
+
+
+def test_a_proposal_about_a_task_says_which_task(monkeypatch, tmp_path):
+    """The card names the task and opens it: a recommendation you cannot reach
+    is a sentence, not a working queue item."""
+    from agent import shared
+    from agent.autonomy import Proposal
+    from agent.autonomy.store import open_proposal_store
+    from agent.channels import web_home
+
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path)
+    store = open_proposal_store()
+    try:
+        store.record(
+            Proposal(
+                source="task:t1",
+                reason="「汇报」最近 2 次都是同一个原因失败（连接中断）。",
+                action="决定「汇报」怎么办：调大超时或重试次数，还是先停掉",
+                tool="schedule_create",
+                reversibility="workspace",
+                confidence=0.75,
+                context={"rule": "repeated-task-failure", "task_id": "t1"},
+            )
+        )
+        (card,) = web_home._proposal_cards(store)
+    finally:
+        store.close()
+
+    assert card["target_task_id"] == "t1"
+    assert card["kind"] == "proposal"

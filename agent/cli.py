@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import logging
@@ -1742,6 +1742,45 @@ def _scheduler_services(components: dict) -> dict:
     }
 
 
+#: How far back a repeated failure counts. A week is long enough for a weekly
+#: task to fail twice and short enough that last month's outage is not evidence.
+_REPEAT_FAILURE_WINDOW = timedelta(days=7)
+
+
+def _task_failure_history(store: Any, task_id: str) -> list[dict[str, str]]:
+    """This task's failures inside the window, classified.
+
+    Read from the runs rather than the attention count: attention says *how
+    many* failures nobody has read, and the repeated-failure rule needs the
+    reasons and their times. Returns newest-last, with the label from
+    `agent.scheduler.diagnostics` -- the same classification the board shows, so
+    two surfaces cannot describe one failure differently.
+    """
+    from agent.scheduler.diagnostics import describe_failure
+
+    try:
+        runs = store.list_runs(task_id)
+    except Exception:
+        return []
+    horizon = datetime.now(timezone.utc) - _REPEAT_FAILURE_WINDOW
+    history: list[dict[str, str]] = []
+    for run in runs:
+        if str(getattr(run, "status", "") or "") not in {"failed", "interrupted"}:
+            continue
+        moment = getattr(run, "finished_at", None) or getattr(run, "started_at", None)
+        if moment is None or moment < horizon:
+            continue
+        reason = describe_failure(getattr(run, "error", ""))
+        history.append(
+            {
+                "at": moment.astimezone(timezone.utc).isoformat(),
+                "label": reason.label if reason is not None else "",
+                "task_id": str(task_id),
+            }
+        )
+    return history
+
+
 def _autonomy_session_rows(
     limit: int = 50, *, live_sessions: Any = None
 ) -> list[dict[str, object]]:
@@ -1828,6 +1867,12 @@ def _autonomy_session_rows(
                         "name": str(getattr(task, "name", "") or ""),
                         "last_run_at": _stamp(getattr(task, "last_run_at", None)),
                         "created_at": _stamp(getattr(task, "created_at", None)),
+                        # The reasons, not just the count. "This task keeps
+                        # failing" is only actionable with *why* -- two failures
+                        # from a dropped connection and two from a broken
+                        # credential need different answers, and the classified
+                        # label is what tells them apart.
+                        "failures": _task_failure_history(scheduler_store, task.id),
                     }
                 )
             # The row's ``last_activity`` has to be real: the warm/stale gates
@@ -1882,8 +1927,21 @@ def _autonomy_session_rows(
             # task rows carry (`request_quote` / the session that created them).
             try:
                 if attention_counts:
+                    history = {
+                        str(fact["task_id"]): fact.get("failures") or []
+                        for fact in task_facts
+                    }
+                    names = {
+                        str(fact["task_id"]): str(fact.get("name") or "")
+                        for fact in task_facts
+                    }
                     row["tasks"] = [
-                        {"task_id": task_id, "attention": count}
+                        {
+                            "task_id": task_id,
+                            "name": names.get(task_id, ""),
+                            "attention": count,
+                            "failures": history.get(task_id, []),
+                        }
                         for task_id, count in attention_counts.items()
                         if task_id in session_task_ids.get(session_id, ())
                     ]

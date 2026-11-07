@@ -355,6 +355,8 @@ export interface BoardCard {
   detail: string
   session_id: string
   reversibility?: string
+  //: For a proposal about a task: which task, so the card can open it.
+  target_task_id?: string
   //: How many unread failures this card stands for. The sidebar badge counts
   //: *runs*; a card per task would disagree with it unless the card says how
   //: many it holds.

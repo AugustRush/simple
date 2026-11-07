@@ -79,9 +79,11 @@ export const REVERSIBILITY_LABEL: Record<string, string> = {
 function ProposalCard({
   card,
   onDecide,
+  onOpenTask,
 }: {
   card: BoardCard
   onDecide?: (id: string, state: 'accepted' | 'declined') => void
+  onOpenTask?: (taskId: string) => void
 }) {
   return (
     <div className="panel-card panel-card-proposal">
@@ -97,6 +99,15 @@ function ProposalCard({
         <Button size="small" type="primary" onClick={() => onDecide?.(card.id || '', 'accepted')}>
           同意
         </Button>
+        {/* The way to the thing being asked about. Some proposals are a
+            question whose answer is an edit on another screen ("decide what to
+            do with 汇报"); a card that names the task and cannot open it makes
+            the reader hunt for it by name. */}
+        {card.target_task_id && (
+          <Button size="small" type="link" onClick={() => onOpenTask?.(card.target_task_id || '')}>
+            打开任务
+          </Button>
+        )}
         <Popconfirm
           title="不要这件事？"
           description="它不会再提第二次。"
@@ -328,6 +339,7 @@ export function renderBoardPanel(ctx: AppCtx) {
                     key={`proposal:${card.id}`}
                     card={card}
                     onDecide={(id, state) => void decideProposal(id, state)}
+                    onOpenTask={openTask}
                   />
                 ) : (
                   <AttentionCard key={card.task_id} card={card} onOpen={openTask} />

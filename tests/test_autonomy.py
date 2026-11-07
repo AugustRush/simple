@@ -358,7 +358,9 @@ def test_a_task_without_a_session_gets_its_own_row() -> None:
         "the newest run's time is real activity; the task's creation time is not"
     )
     assert rows[1]["last_activity"] == created, "no run time: fall back to the task's own"
-    assert rows[0]["tasks"] == [{"task_id": "t1", "attention": 2}]
+    assert rows[0]["tasks"] == [
+        {"task_id": "t1", "name": "日报", "attention": 2, "failures": []}
+    ]
 
 
 # ── the exact call reaches the proposal and the run ────────────────────────
@@ -695,3 +697,101 @@ def test_the_agent_s_own_errands_are_recognisable() -> None:
     assert not is_own_errand({"origin": "person"})
     assert not is_own_errand(None)
     assert not is_own_errand("origin=autonomy")
+
+
+# ── repeated failures: an explanation nobody acts on is a diary ─────────────
+
+
+def _session_with_failures(failures, *, task_name="汇报") -> dict:
+    return {
+        "session_id": "task:t1",
+        "title": task_name,
+        "last_activity": (NOW - timedelta(hours=3)).isoformat(),
+        "status": "task",
+        "tasks": [
+            {
+                "task_id": "t1",
+                "name": task_name,
+                "attention": len(failures),
+                "failures": failures,
+            }
+        ],
+    }
+
+
+def test_the_same_task_failing_the_same_way_twice_is_proposed_as_a_decision():
+    """The gap this closes: failure -> explanation -> nothing.
+
+    `汇报` failed with a dropped connection, the rule-1 task explained it, and
+    then two days passed with the task unchanged. Noticing that it keeps
+    happening is a different question from "has anybody read it", and it asks
+    for a different action.
+    """
+    from agent.autonomy.rules import rule_candidates
+
+    session = _session_with_failures(
+        [
+            {"at": "2026-11-05T01:00:00+00:00", "label": "连接中断"},
+            {"at": "2026-11-06T01:00:00+00:00", "label": "连接中断"},
+        ]
+    )
+
+    proposals = rule_candidates(session, now=NOW)
+    repeated = [item for item in proposals if item.context.get("rule") == "repeated-task-failure"]
+
+    assert len(repeated) == 1
+    proposal = repeated[0]
+    assert "汇报" in proposal.action
+    assert "连接中断" in proposal.reason
+    assert proposal.context["occurrences"] == 2
+    assert proposal.context["task_id"] == "t1"
+    # A task definition is the person's own sentence: this waits for them.
+    assert proposal.reversibility == "workspace"
+
+
+def test_one_failure_is_not_a_pattern():
+    from agent.autonomy.rules import rule_candidates
+
+    session = _session_with_failures(
+        [{"at": "2026-11-06T01:00:00+00:00", "label": "连接中断"}]
+    )
+
+    proposals = rule_candidates(session, now=NOW)
+    assert not [
+        item for item in proposals if item.context.get("rule") == "repeated-task-failure"
+    ]
+
+
+def test_two_failures_with_different_causes_are_not_a_pattern():
+    """Two unrelated failures are two accidents, not a recurring cause."""
+    from agent.autonomy.rules import rule_candidates
+
+    session = _session_with_failures(
+        [
+            {"at": "2026-11-05T01:00:00+00:00", "label": "连接中断"},
+            {"at": "2026-11-06T01:00:00+00:00", "label": "鉴权失败"},
+        ]
+    )
+
+    proposals = rule_candidates(session, now=NOW)
+    assert not [
+        item for item in proposals if item.context.get("rule") == "repeated-task-failure"
+    ]
+
+
+def test_the_most_repeated_cause_is_the_one_reported():
+    from agent.autonomy.rules import rule_candidates
+
+    session = _session_with_failures(
+        [
+            {"at": "2026-11-03T01:00:00+00:00", "label": "超时"},
+            {"at": "2026-11-05T01:00:00+00:00", "label": "连接中断"},
+            {"at": "2026-11-06T01:00:00+00:00", "label": "连接中断"},
+        ]
+    )
+
+    proposals = rule_candidates(session, now=NOW)
+    repeated = [item for item in proposals if item.context.get("rule") == "repeated-task-failure"]
+
+    assert repeated[0].context["cause"] == "连接中断"
+    assert repeated[0].context["occurrences"] == 2

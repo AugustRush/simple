@@ -63,8 +63,9 @@ UTC = timezone.utc
 #: thing that has been waiting longest goes first.
 RULE_PRIORITY: dict[str, int] = {
     "stale-queue": 0,
-    "failed-run-unreviewed": 1,
-    "session-ended-mid-task": 2,
+    "repeated-task-failure": 1,
+    "failed-run-unreviewed": 2,
+    "session-ended-mid-task": 3,
 }
 
 
@@ -74,6 +75,7 @@ def rule_priority(rule: str) -> int:
 
 
 RULE_NAMES = (
+    "repeated-task-failure",
     "failed-run-unreviewed",
     "session-ended-mid-task",
     "stale-queue",
@@ -166,6 +168,69 @@ def rule_candidates(
                     # The exact call admission writes down for a "prepare" row,
                     # and the prompt the executor gets when it runs.
                     "arguments": arguments,
+                },
+            )
+        )
+
+    # ── 2. the same task failing the same way, twice ───────────────────────
+    #
+    # Rule 1 says "somebody read the failure". This one says "reading it was not
+    # enough": the same task has now failed twice for the same classified
+    # reason inside a week, so the explanation exists and the situation anyway
+    # repeats. The two are different questions and they get different actions --
+    # 1 asks for an explanation, this asks for a decision.
+    #
+    # Measured on this machine: `汇报` and `每周五写周报` both failed with
+    # "connection lost mid-reply", were diagnosed by the rule-1 tasks, and then
+    # nothing happened for two days. A diagnosis nobody acts on is a diary.
+    for task in task_rows:
+        if not isinstance(task, dict):
+            continue
+        task_name = str(task.get("name") or task.get("title") or "").strip()
+        task_id = str(task.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        by_label: dict[str, list[dict[str, Any]]] = {}
+        for failure in task.get("failures") or ():
+            if not isinstance(failure, dict):
+                continue
+            cause = str(failure.get("label") or "").strip()
+            if not cause:
+                continue
+            by_label.setdefault(cause, []).append(failure)
+        # The most repeated cause wins; ties by the most recent failure, because
+        # that is the one still happening.
+        cause, occurrences = max(
+            by_label.items(),
+            key=lambda item: (len(item[1]), str(item[1][-1].get("at") or "")),
+            default=("", []),
+        )
+        if len(occurrences) < 2:
+            continue
+        found.append(
+            Proposal(
+                source=session_id,
+                reason=(
+                    f"「{task_name}」最近 {len(occurrences)} 次都是同一个原因失败"
+                    f"（{cause}）。上一次是 {str(occurrences[-1].get('at') or '')[:10]}。"
+                )[:MAX_PROPOSAL_REASON_CHARS],
+                action=(
+                    f"决定「{task_name}」怎么办：调大超时或重试次数，还是先停掉"
+                )[:MAX_PROPOSAL_ACTION_CHARS],
+                # A task definition is the person's own sentence, so changing it
+                # is a "prepare": the agent names the change and waits. It is
+                # not read-only either -- that would be a proposal that does
+                # nothing and calls it a decision.
+                tool="schedule_create",
+                reversibility="workspace",
+                confidence=0.75,
+                context={
+                    "rule": "repeated-task-failure",
+                    "priority": rule_priority("repeated-task-failure"),
+                    "task_id": task_id,
+                    "task_name": task_name,
+                    "cause": cause,
+                    "occurrences": len(occurrences),
                 },
             )
         )
