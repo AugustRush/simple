@@ -116,22 +116,10 @@ export interface AppCtx {
   sendMessage: (overrideText?: string | undefined) => Promise<void>
   resolvedComposerText: string
   pageMeta: Record<string, { title: string; subtitle: string; }>
-  // Every session, unfiltered -- so an empty page can tell "none yet" from
-  // "none match the search".
+  // The conversation's own title, for the bar. There is exactly one session, so
+  // there is no list here any more: 线程 was a list of things to switch between,
+  // and switching is what this product stopped having.
   sessions: SessionInfo[]
-  filteredSessions: SessionInfo[]
-  sessionSearch: string
-  setSessionSearch: Dispatch<SetStateAction<string>>
-  loadingSessions: boolean
-  handleSessionContainerClick: (event: ReactMouseEvent<HTMLElement, MouseEvent> | ReactKeyboardEvent<HTMLElement>, sid: string) => void
-  pendingDeleteSessionId: string | null
-  deleteSession: (item: SessionInfo) => Promise<void>
-  setPendingDeleteSessionId: Dispatch<SetStateAction<string | null>>
-  revealSession: (item: SessionInfo) => Promise<void>
-  // `${place}:${session_id}` of the title being edited in place, if any.
-  renamingSession: string | null
-  setRenamingSession: Dispatch<SetStateAction<string | null>>
-  commitSessionTitle: (item: SessionInfo, title: string) => Promise<void>
   pluginSearch: string
   setPluginSearch: Dispatch<SetStateAction<string>>
   loadingView: boolean

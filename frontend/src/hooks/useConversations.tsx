@@ -4,7 +4,7 @@ import { truncate } from '../lib/format'
 import { parseRoute } from '../lib/route'
 import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
-import { compareSessions, isInTurnUserMessage, isSessionBusy, sessionStateBusy } from '../lib/tools'
+import { isInTurnUserMessage, isSessionBusy, sessionStateBusy } from '../lib/tools'
 import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState } from '../types'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import { useUi } from './useUi'
@@ -34,7 +34,6 @@ export function useConversations(deps: Deps) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
 
 
-  const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null)
 
   //: A session named in the address bar is the one the page was asked for, so
   //: it is the state from the first render rather than something an effect
@@ -43,9 +42,11 @@ export function useConversations(deps: Deps) {
   //: the link with a bare ``#/chat`` before the restore had a chance to open it.
   //: The restore effect below still validates it against the server's list; a
   //: stale id is cleared there and the bar follows.
-  const [activeSession, setActiveSession] = useState<string | null>(
-    () => parseRoute(window.location.hash).sessionId,
-  )
+  // Always null on the first paint: the conversation is the install's, and it
+  // arrives from `POST /api/session/main` (see the boot effect). There used to
+  // be a session id in the address here, which meant the first render could
+  // open a thread the server no longer had.
+  const [activeSession, setActiveSession] = useState<string | null>(null)
 
   const [messages, setMessages] = useState<Message[]>([])
 
@@ -152,7 +153,6 @@ export function useConversations(deps: Deps) {
     return () => clearTimeout(t)
   }, [messages, activeSession])
 
-  const [sessionSearch, setSessionSearch] = useState('')
 
   // '' means "provider default": the backend resolves no override to the
   // active provider's default model. Never a display string — the backend
@@ -1267,7 +1267,6 @@ export function useConversations(deps: Deps) {
       //: navigation somebody asked for.
       options: { stayOnView?: boolean } = {},
     ) => {
-      setPendingDeleteSessionId(null)
       followChatRef.current = true
       queuedMessagesRef.current = []
       setQueuedMessages([])
@@ -1337,12 +1336,7 @@ export function useConversations(deps: Deps) {
     // server knew nothing about. It is now the install's, asked for once at
     // boot: the answer cannot disagree with the sessions on disk because there
     // is nothing on this side to disagree with.
-    //
-    // A session named in the address bar still outranks it: a link says *which*
-    // thread it meant, and that is the one thing a main conversation cannot
-    // guess.
     const route = parseRoute(window.location.hash)
-    const linked = route.sessionId
     const restore = async () => {
       let main = ''
       try {
@@ -1354,11 +1348,10 @@ export function useConversations(deps: Deps) {
         // landing shows and the first message mints one, as before.
       }
       if (cancelled) return
-      const target = linked || main
-      if (target) {
+      if (main) {
         // Stay on the page the address names: a reload of `#/schedules` is a
         // reload of 自动化, not a jump into the conversation behind it.
-        selectSession(target, { stayOnView: route.view !== 'home' })
+        selectSession(main, { stayOnView: route.view !== 'home' })
         return
       }
       activeSessionRef.current = null
@@ -1876,114 +1869,6 @@ export function useConversations(deps: Deps) {
     }
   }
 
-  // Which title is open for editing, as `${place}:${session_id}`: the sidebar
-  // and the sessions page show the same session at once, and only the one the
-  // person acted on should turn into an input.
-  const [renamingSession, setRenamingSession] = useState<string | null>(null)
-
-  const commitSessionTitle = async (item: SessionInfo, next: string) => {
-    setRenamingSession(null)
-    const title = next.trim().slice(0, 120)
-    // Clearing the box reads as "never mind", not "remove the title": an
-    // emptied input is far more often a slip than a wish for 未命名会话.
-    if (!title || title === (item.title || '')) return
-    const sid = item.session_id
-    const previous = item.title
-    const retitle = (value: string | undefined) =>
-      setSessions(current => current.map(s => (s.session_id === sid ? { ...s, title: value } : s)))
-    pendingTitlesRef.current.set(sid, title)
-    retitle(title)
-    try {
-      await api(`/api/sessions/${encodeURIComponent(sid)}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
-      })
-    } catch {
-      // api() has said why; the row goes back to what the server still has.
-      retitle(previous)
-    } finally {
-      pendingTitlesRef.current.delete(sid)
-    }
-  }
-
-  const revealSession = async (item: SessionInfo) => {
-    try {
-      const resp = await api(`/api/sessions/${encodeURIComponent(item.session_id)}/reveal`, {
-        method: 'POST',
-      })
-      const data = await resp.json()
-      messageApi.success(data.path ? '已在 Finder 中显示会话数据' : '已打开会话数据')
-    } catch {
-      // api() already surfaces the server error through the global message API.
-    }
-  }
-
-  const deleteSession = async (item: SessionInfo) => {
-    try {
-      await api(`/api/sessions/${encodeURIComponent(item.session_id)}`, {
-        method: 'DELETE',
-      })
-      messageApi.success('会话已删除')
-      try {
-        localStorage.removeItem(`chat_messages:${item.session_id}`)
-        const raw = localStorage.getItem('chat_messages:index')
-        const index = raw
-          ? (JSON.parse(raw) as string[]).filter(id => id !== item.session_id)
-          : []
-        localStorage.setItem('chat_messages:index', JSON.stringify(index))
-      } catch {
-        // ignore storage errors
-      }
-      if (activeSession === item.session_id) {
-        // Deleting the conversation does not leave the app without one: the
-        // next line asks for it again, which mints a fresh one (the server
-        // clears its pointer on delete). A null session here would show the
-        // landing page to somebody who just pressed 删除 on their history.
-        activeSessionRef.current = null
-        setActiveSession(null)
-        setMessages([])
-        messagesRef.current = []
-        streamIdRef.current = null
-        queuedMessagesRef.current = []
-        setQueuedMessages([])
-        setSessionState(null)
-      }
-      setPendingDeleteSessionId(current => current === item.session_id ? null : current)
-      await loadSessions()
-    } catch {
-      // Errors are surfaced by the shared request helper.
-    }
-  }
-
-  // Dropdown menus are rendered through a React portal. Guard the session
-  // container click as well as the menu itself so selecting an action cannot
-  // bubble into selectSession() and immediately reset the pending state.
-  // Takes a keyboard event as well as a mouse one: a row is activated with
-  // Enter or Space as well as a click, and the guard below (do not act when the
-  // event landed on the row's own dropdown or delete buttons) is the same
-  // question either way, so it stays in one place rather than being restated
-  // per call site.
-  const handleSessionContainerClick = (
-    event: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>,
-    sid: string,
-  ) => {
-    const target = event.target as HTMLElement | null
-    // The second click of a double-click: the first one already opened the
-    // session, and the double-click itself means "rename" -- running the whole
-    // switch (state reset, history reload) again would be pure waste.
-    if (event.detail > 1) return
-    if (
-      target?.closest('.ant-dropdown') ||
-      target?.closest('.ant-dropdown-trigger') ||
-      target?.closest('.session-item-delete-actions') ||
-      target?.closest('.ant-typography-copy')
-    ) {
-      return
-    }
-    selectSession(sid)
-  }
-
   const updateSessionPermissions = async (patch: { level?: string; sandbox?: string }) => {
     if (!activeSession) {
       messageApi.info('请先打开对话')
@@ -2011,21 +1896,6 @@ export function useConversations(deps: Deps) {
       : permissionLevel === 'medium'
         ? '中权限'
         : '需确认'
-
-  const filteredSessions = useMemo(() => {
-    const query = sessionSearch.trim().toLowerCase()
-    const filtered = sessions.filter(
-      item =>
-        !query ||
-        (item.title || '').toLowerCase().includes(query) ||
-        item.session_id.toLowerCase().includes(query),
-    )
-    // Active sessions lead: this list used to push every live session to the
-    // bottom, so the conversation the agent was working in sat under all of
-    // history. ``sort`` is stable, so ties keep the server's order.
-    return [...filtered].sort(compareSessions)
-  }, [sessions, sessionSearch])
-
 
   const filteredCommands = useMemo(() => {
     const query = input.startsWith('/')
@@ -2346,5 +2216,5 @@ export function useConversations(deps: Deps) {
     !isStreaming &&
     String(sessionState?.operation_state || 'idle') === 'idle'
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPermissionLevel, setQueuedMessages, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

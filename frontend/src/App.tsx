@@ -1,6 +1,6 @@
-import { ArrowLeftOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, CodeOutlined, SearchOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
-import { Badge, Button, ConfigProvider, Drawer, Dropdown, Empty, Input, Layout, Modal, Skeleton, theme } from 'antd'
+import { Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Modal, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
 import React from 'react'
@@ -12,9 +12,6 @@ import { renderBoardPanel } from './views/board'
 import { renderMemory } from './views/memory'
 import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
-import { relativeTime } from './lib/format'
-import { isSessionBusy, sessionStatusOf } from './lib/tools'
-import { SessionTitle } from './components/SessionTitle'
 
 import { useUi } from './hooks/useUi'
 import { useApiClient } from './hooks/useApiClient'
@@ -29,33 +26,6 @@ import { useShell } from './hooks/useShell'
 
 const { Content, Header } = Layout
 dayjs.locale('zh-cn')
-
-//: How many hits the search modal shows before the "还有 N 条" line. The
-//: list scrolls, so this is a "don't render a wall" cap rather than a
-//: screen-space one -- but the line has to say it, or a session past the cut
-//: looks like it does not exist.
-const SEARCH_RESULT_LIMIT = 12
-
-/** The query's first hit inside `text`, wrapped in a `<mark>`.
- *
- * Search matches on substring (title or session id), so a hit is a run of
- * characters the user just typed -- marking it is what lets them scan a list
- * of similar titles for the one they meant. Only the first hit is marked:
- * the rest are found by eye from there.
- */
-function highlightQuery(text: string, query: string): React.ReactNode {
-  const needle = query.trim().toLowerCase()
-  if (!needle) return text
-  const at = text.toLowerCase().indexOf(needle)
-  if (at < 0) return text
-  return (
-    <>
-      {text.slice(0, at)}
-      <mark>{text.slice(at, at + needle.length)}</mark>
-      {text.slice(at + needle.length)}
-    </>
-  )
-}
 
 function App() {
   const ui = useUi()
@@ -82,13 +52,13 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setSearchOpen, setThemeMode, setThreadsOpen, themeMode, threadsOpen, view } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setThemeMode, themeMode, view } = ui
 
   const { contextHolder, messageApi, token } = apiClient
 
   const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
-  const { activateTurnIndex, activeSession, openConversation, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSendShortcut, setSessionSearch, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
+  const { activateTurnIndex, activeSession, openConversation, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setInput, setPendingAttachments, setSendShortcut, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
@@ -99,41 +69,6 @@ function App() {
   const { handlePaletteKeyDown, navItems, navigateTo, pageMeta, paletteCommands, paletteEntries, paletteIndex, runPaletteEntry, setPaletteIndex } = shell
 
   const paletteInputRef = React.useRef<HTMLInputElement | null>(null)
-
-  //: The search modal's keyboard cursor, on the same plan as the command
-  //: palette's: the input keeps focus, arrows move a highlight, Enter opens
-  //: the highlighted row. Reset whenever the query (or the modal itself)
-  //: changes what the list is, so the highlight never points past the end.
-  const [searchIndex, setSearchIndex] = React.useState(0)
-  const searchResults = filteredSessions.slice(0, SEARCH_RESULT_LIMIT)
-  const activeSearchIndex = Math.min(searchIndex, Math.max(searchResults.length - 1, 0))
-  React.useEffect(() => {
-    setSearchIndex(0)
-  }, [sessionSearch, searchOpen])
-
-  const openSearchResult = (sid: string) => {
-    selectSession(sid)
-    setSearchOpen(false)
-    setSessionSearch('')
-  }
-
-  //: Same contract as the command palette's key handler: arrows cycle with
-  //: wrap-around (a short list should not dead-end at either end), Enter runs
-  //: the highlighted row. Escape needs no case here -- rc-dialog hears it on
-  //: the document and closes the modal itself.
-  const handleSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (!searchResults.length) return
-    if (event.key === 'ArrowDown') {
-      event.preventDefault()
-      setSearchIndex(index => (index + 1) % searchResults.length)
-    } else if (event.key === 'ArrowUp') {
-      event.preventDefault()
-      setSearchIndex(index => (index - 1 + searchResults.length) % searchResults.length)
-    } else if (event.key === 'Enter') {
-      event.preventDefault()
-      openSearchResult(searchResults[activeSearchIndex].session_id)
-    }
-  }
 
   // A prompt belongs to the conversation that raised it: the decision goes out
   // on that session's socket, so showing it over another chat (or over 设置)
@@ -241,18 +176,6 @@ function App() {
     resolvedComposerText,
     pageMeta,
     sessions,
-    filteredSessions,
-    sessionSearch,
-    setSessionSearch,
-    loadingSessions,
-    handleSessionContainerClick,
-    pendingDeleteSessionId,
-    deleteSession,
-    setPendingDeleteSessionId,
-    revealSession,
-    renamingSession,
-    setRenamingSession,
-    commitSessionTitle,
     pluginSearch,
     setPluginSearch,
     loadingView,
@@ -395,8 +318,6 @@ function App() {
   const currentMeta = pageMeta[view] || pageMeta.home
 
   const topbarMenu: MenuProps['items'] = [
-    { key: 'search', icon: <SearchOutlined />, label: '搜索线程' },
-    { type: 'divider' },
     ...navItems.filter(item => item.key !== 'home' && item.key !== 'schedules'),
     { type: 'divider' },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
@@ -408,10 +329,6 @@ function App() {
   ]
 
   const handleTopbarMenu: MenuProps['onClick'] = ({ key }) => {
-    if (key === 'search') {
-      setSearchOpen(true)
-      return
-    }
     if (key === 'theme') {
       const next = themeMode === 'dark' ? 'light' : 'dark'
       setThemeMode(next)
@@ -506,16 +423,6 @@ function App() {
                 / 搜索 / 主题 -- four things, none of which is a place you work
                 from. 扩展 and 自主 were pages here; both were content that
                 belongs to a page that already existed (设置 and 看板). */}
-            {/* Threads: the most frequent move there is -- the other half of
-                "which conversation am I in". */}
-            <Button
-              type="text"
-              className="header-threads"
-              aria-expanded={threadsOpen}
-              onClick={() => setThreadsOpen(true)}
-            >
-              线程
-            </Button>
             <Button
               type="text"
               className="header-schedules"
@@ -546,163 +453,6 @@ function App() {
         </Header>
         <Content className="app-content">{renderCurrentView()}</Content>
       </Layout>
-
-      {/* Threads: a drawer, not a column. A thread is a row you click when you
-          want to go back to one -- the same shape as the board on the other
-          edge, and for the same reason. */}
-      <Drawer
-        placement="left"
-        width={300}
-        open={threadsOpen}
-        onClose={() => setThreadsOpen(false)}
-        rootClassName="threads-drawer"
-        title="线程"
-        styles={{ body: { padding: '10px 12px 16px' } }}
-      >
-        {/* No "新对话" button. Starting a conversation was never the work: the
-            app has one, it is always open, and the first sentence in the box is
-            what makes it say something. This list is the *threads* -- the
-            sessions work happened in, including the ones a scheduled task ran
-            in -- and a row here is a place to look, not a thing to create. */}
-      <div className="session-panel">
-        {/* No section label: the drawer's own title says 线程, and a second one
-            40px below it was the page saying the same word twice. */}
-        {loadingSessions ? (
-          <Skeleton active paragraph={{ rows: 5 }} title={false} />
-        ) : filteredSessions.length === 0 ? (
-          <Empty
-            image={Empty.PRESENTED_IMAGE_SIMPLE}
-            description="暂无会话"
-          />
-        ) : (
-          filteredSessions.map((item, index) => {
-            // Live sessions lead the list now, so the divider that
-            // matters is where they end: history gets its own label
-            // once something live sits above it.
-            const showHistoryHeader =
-              !item.live && index > 0 && Boolean(filteredSessions[index - 1].live)
-            return (
-              <React.Fragment key={item.session_id}>
-                {showHistoryHeader && (
-                  <div className="session-panel-label sub">历史会话</div>
-                )}
-                <div
-                  className={`session-item ${
-                    item.session_id === activeSession ? 'active' : ''
-                  }`}
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`打开会话 ${item.title || '未命名会话'}${sessionStatusOf(item) ? `（${sessionStatusOf(item)}）` : ''}`}
-                  aria-current={item.session_id === activeSession ? 'true' : undefined}
-                  onClick={event => handleSessionContainerClick(event, item.session_id)}
-                  onKeyDown={event => {
-                    if (event.target !== event.currentTarget) return
-                    // F2 renames, as it does for a file in Finder/Explorer.
-                    if (event.key === 'F2') {
-                      event.preventDefault()
-                      setRenamingSession(`sider:${item.session_id}`)
-                      return
-                    }
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault()
-                      handleSessionContainerClick(event, item.session_id)
-                    }
-                  }}
-                >
-                  <div className="session-item-status">
-                    <span className={`${item.live ? 'live' : 'durable'}${isSessionBusy(item) ? ' busy' : ''}`} />
-                  </div>
-                  <div className="session-item-main">
-                    <div className="session-item-title">
-                      <SessionTitle
-                        item={item}
-                        editing={renamingSession === `sider:${item.session_id}`}
-                        onStartEdit={() => setRenamingSession(`sider:${item.session_id}`)}
-                        onCommit={title => void commitSessionTitle(item, title)}
-                        onCancel={() => setRenamingSession(null)}
-                      />
-                    </div>
-                    <div className="session-item-meta">
-                      {/* When it was last touched, and whether it is busy.
-                          The turn count is gone: "2 轮 · 6 小时前" on every row
-                          was the busiest text in the sidebar and answered a
-                          question nobody asks while choosing what to read. */}
-                      {sessionStatusOf(item) && (
-                        <span
-                          className={`session-status-badge ${
-                            item.status === 'queued' ? 'is-queued' : 'is-running'
-                          }`}
-                        >
-                          {sessionStatusOf(item)}
-                        </span>
-                      )}
-                      {relativeTime(item.last_activity)}
-                    </div>
-                  </div>
-                  {pendingDeleteSessionId === item.session_id ? (
-                    <div
-                      className="session-item-delete-actions"
-                      onClick={event => event.stopPropagation()}
-                    >
-                      <Button
-                        type="text"
-                        danger
-                        size="small"
-                        onClick={() => deleteSession(item)}
-                      >
-                        删除
-                      </Button>
-                      <Button
-                        type="text"
-                        size="small"
-                        onClick={() => setPendingDeleteSessionId(null)}
-                      >
-                        取消
-                      </Button>
-                    </div>
-                  ) : (
-                    <Dropdown
-                      trigger={['click']}
-                      menu={{
-                        onClick: ({ domEvent }) => domEvent.stopPropagation(),
-                        items: [
-                          {
-                            key: 'reveal',
-                            label: '在 Finder 中显示',
-                            icon: <FolderOpenOutlined />,
-                            onClick: () => revealSession(item),
-                          },
-                          {
-                            key: 'rename',
-                            label: '重命名',
-                            icon: <EditOutlined />,
-                            onClick: () => setRenamingSession(`sider:${item.session_id}`),
-                          },
-                          {
-                            key: 'delete',
-                            label: '删除',
-                            icon: <DeleteOutlined />,
-                            danger: true,
-                            onClick: () => setPendingDeleteSessionId(item.session_id),
-                          },
-                        ],
-                      }}
-                    >
-                      <Button
-                        type="text"
-                        size="small"
-                        icon={<MoreOutlined />}
-                        onClick={event => event.stopPropagation()}
-                      />
-                    </Dropdown>
-                  )}
-                </div>
-              </React.Fragment>
-            )
-          })
-        )}
-      </div>
-      </Drawer>
 
       {/* No mask: the panel is a control you keep open while working, not a modal
           that stops the page until answered. It runs the full height, so its own
@@ -740,89 +490,6 @@ function App() {
           </Button>
         </div>
       )}
-
-      {/* The search modal. Structure mirrors the command palette: the input
-          is the modal's fixed head, only the result list scrolls. It used to
-          sit inside the scrolling body, so a long list scrolled the query box
-          out of sight -- the one control the user still needed. */}
-      <Modal
-        open={searchOpen}
-        className="global-search-modal"
-        width={680}
-        title={
-          <div className="global-search-title">
-            <SearchOutlined />
-            <span>搜索会话</span>
-            <kbd>ESC</kbd>
-          </div>
-        }
-        footer={null}
-        onCancel={() => {
-          setSearchOpen(false)
-          setSessionSearch('')
-        }}
-      >
-        <div className="global-search-body">
-          <Input
-            autoFocus
-            size="large"
-            prefix={<SearchOutlined />}
-            placeholder="搜索标题或会话 ID"
-            value={sessionSearch}
-            onChange={event => setSessionSearch(event.target.value)}
-            onKeyDown={handleSearchKeyDown}
-            allowClear
-            aria-controls="global-search-results"
-          />
-
-          <div className="global-search-section-title">会话</div>
-          <div
-            className="global-search-results"
-            id="global-search-results"
-            role="listbox"
-            aria-label="会话列表"
-          >
-            {searchResults.length === 0 ? (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的会话" />
-            ) : (
-              searchResults.map((item, index) => (
-                <button
-                  type="button"
-                  className={`global-search-item ${item.session_id === activeSession ? 'active' : ''} ${
-                    index === activeSearchIndex ? 'cursor' : ''
-                  }`}
-                  key={item.session_id}
-                  role="option"
-                  aria-selected={index === activeSearchIndex}
-                  ref={element => {
-                    if (element && index === activeSearchIndex) {
-                      element.scrollIntoView({ block: 'nearest' })
-                    }
-                  }}
-                  onMouseMove={() => { if (index !== activeSearchIndex) setSearchIndex(index) }}
-                  onClick={() => openSearchResult(item.session_id)}
-                >
-                  <span className={`session-status-dot ${item.live ? 'live' : ''}`} />
-                  <span className="global-search-item-main">
-                    <strong>{highlightQuery(item.title || '未命名会话', sessionSearch)}</strong>
-                    <small>
-                      {item.turn_count || 0} 轮 · {relativeTime(item.last_activity)} ·{' '}
-                      {highlightQuery(item.session_id.slice(0, 12), sessionSearch)}
-                    </small>
-                  </span>
-                  {item.session_id === activeSession && <span className="current-mark">当前</span>}
-                  <kbd className="global-search-enter" aria-hidden="true">↵</kbd>
-                </button>
-              ))
-            )}
-          </div>
-          {filteredSessions.length > searchResults.length && (
-            <div className="global-search-more">
-              仅显示前 {SEARCH_RESULT_LIMIT} 条，还有 {filteredSessions.length - searchResults.length} 个匹配，换个更具体的关键词
-            </div>
-          )}
-        </div>
-      </Modal>
 
       <Modal
         open={commandPaletteOpen}

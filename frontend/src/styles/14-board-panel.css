@@ -174,8 +174,7 @@
 /* `!important` because antd injects its own drawer styles into <head> after
    this sheet: a later rule with equal specificity wins, and the header's 16px
    padding and 16px title are exactly the two properties being replaced. */
-.board-drawer .ant-drawer-header,
-.threads-drawer .ant-drawer-header {
+.board-drawer .ant-drawer-header {
   /* antd gives the header `flex: 0 1 0%`: in a column flex container that is the
      height, so an `!important` height alone still comes out 25px tall. */
   flex: 0 0 auto !important;
@@ -183,8 +182,7 @@
   padding: 0 14px 0 16px !important;
   border-bottom: 1px solid var(--border) !important;
 }
-.board-drawer .ant-drawer-header .ant-drawer-title,
-.threads-drawer .ant-drawer-header .ant-drawer-title {
+.board-drawer .ant-drawer-header .ant-drawer-title {
   color: var(--text) !important;
   font-size: 13px !important;
   font-weight: 600 !important;

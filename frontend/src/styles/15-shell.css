@@ -83,10 +83,6 @@
 
 /* Threads, on the same edge as the board and for the same reason: a list you
    pull out, not a column that charges every screen for a decision made once. */
-.threads-drawer .ant-drawer-body { padding-top: 10px; }
-.threads-new.ant-btn { margin-bottom: 10px; }
-.threads-drawer .session-panel { padding: 0; }
-.threads-drawer .session-panel-label { padding: 0 4px 6px; }
 
 /* ── the agent's screen ─────────────────────────────────────────────────────
    Two states, one page: the conversation (with a strip of background above it),

@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, selectSession, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, tokenDirty, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, tokenDirty, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -173,7 +173,7 @@ export function useShell(deps: Deps) {
     // settings, so the address has to say so again -- otherwise a cancelled
     // confirm leaves the bar describing a page that is not on screen.
     if (options.fromHistory) {
-      window.history.replaceState(null, '', routeFor(view, activeSession))
+      window.history.replaceState(null, '', routeFor(view))
     }
     Modal.confirm({
       title: '放弃未保存的设置？',
@@ -195,7 +195,7 @@ export function useShell(deps: Deps) {
   // (nav, palette, a session row, a creating/deleting session) gets an address
   // without being taught about it. The reader is the browser's popstate, which
   // is the only source of change the app does not own.
-  const route = routeFor(view, activeSession)
+  const route = routeFor(view)
 
   // The entry the app was opened on is replaced, not pushed: a click on 设置
   // straight after load should leave one "back" press between the two pages,
@@ -207,13 +207,11 @@ export function useShell(deps: Deps) {
       firstRouteRef.current = false
       return
     }
+    // The entry the app opened on is replaced, and so is any write that only
+    // re-words the same page: a page change is a place to return to, a rewrite
+    // of the page you are on is not.
     const from = parseRoute(current)
     const to = parseRoute(route)
-    // A thread is a *state of the same screen*, not a page: opening one from the
-    // landing page replaces the address instead of stacking `#/t/x` on top of
-    // `#/`. Otherwise "back" walks through a landing page the reader never left,
-    // and pressing it looks like a no-op. A change of *page* still pushes,
-    // because that is a place they can return to.
     const sameScreen = from.view === to.view
     if (firstRouteRef.current || sameScreen) {
       firstRouteRef.current = false
@@ -235,10 +233,6 @@ export function useShell(deps: Deps) {
     // fires neither, so this cannot feed back into itself.
     const applyAddress = () => {
       const target = parseRoute(window.location.hash)
-      if (target.sessionId && target.sessionId !== activeSession) {
-        selectSession(target.sessionId)
-        return
-      }
       if (target.view !== view) {
         navigateTo(target.view, { fromHistory: true })
         return
@@ -246,7 +240,7 @@ export function useShell(deps: Deps) {
       // The bare chat entry while a conversation is open. Closing that
       // conversation here would detach a live socket to show a welcome screen;
       // the bar goes back to naming what is actually open instead.
-      const current = routeFor(view, activeSession)
+      const current = routeFor(view)
       if (window.location.hash !== current) {
         window.history.replaceState(null, '', current)
       }
@@ -257,7 +251,7 @@ export function useShell(deps: Deps) {
       window.removeEventListener('popstate', applyAddress)
       window.removeEventListener('hashchange', applyAddress)
     }
-  }, [activeSession, navigateTo, selectSession, view])
+  }, [navigateTo, view])
 
   const paletteCommands = useMemo(() => {
     const query = paletteQuery.trim().toLowerCase()

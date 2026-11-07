@@ -7,8 +7,12 @@
  * -- no router dependency, no server route (the gateway serves the same
  * ``index.html`` for every path it does not own).
  *
- * Shapes: ``#/`` (home, optionally with a thread: ``#/t/<session>``),
- * ``#/memory``, ``#/schedules``, ``#/settings``.
+ * Shapes: ``#/`` (the conversation) and ``#/<view>`` for the four pages.
+ *
+ * There is no thread address any more. With one conversation, ``#/t/<id>``
+ * named a thing that cannot change -- the id was the same on every load -- so
+ * the only content it carried was the possibility of being wrong after a
+ * delete. The address names the screen, which is what a person can navigate.
  * An unknown or empty hash means home: the app opens on the agent, not on
  * whichever thread was last touched -- a URL someone typed by hand should not be
  * an error page either.
@@ -28,21 +32,16 @@ export function isViewName(value: string): value is ViewName {
 }
 
 
-export function parseRoute(hash: string): { view: ViewName; sessionId: string | null } {
+export function parseRoute(hash: string): { view: ViewName } {
   const raw = String(hash || '').replace(/^#\/?/, '')
-  const [head, ...rest] = raw.split('/')
-  // `#/t/<id>` is the one thread-address there is: the id belongs to the same
-  // screen, so it rides on home rather than naming a page of its own.
-  if (head === 't') {
-    const session = rest.join('/')
-    return { view: 'home', sessionId: session ? decodeURIComponent(session) : null }
-  }
+  const [head] = raw.split('/')
+  // An old `#/t/<id>` link lands on the conversation: that is the only screen it
+  // could have meant, and `t` is not a view name.
   const view = isViewName(head) ? head : 'home'
-  return { view, sessionId: null }
+  return { view }
 }
 
 
-export function routeFor(view: string, sessionId: string | null): string {
-  if (view !== 'home') return `#/${view}`
-  return sessionId ? `#/t/${encodeURIComponent(sessionId)}` : '#/'
+export function routeFor(view: string): string {
+  return view === 'home' ? '#/' : `#/${view}`
 }

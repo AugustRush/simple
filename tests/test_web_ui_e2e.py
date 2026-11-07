@@ -579,7 +579,9 @@ def test_the_app_opens_the_one_conversation(page):
     assert page.locator(".home-view").count() == 0, (
         "the landing page -- a box with a new-conversation click behind it -- is gone"
     )
-    assert "#/t/" in page.url, f"the address names the open thread: {page.url}"
+    assert page.url.rstrip("/").endswith("8787") or page.url.endswith("#/"), (
+        f"the address names the screen, not a session: {page.url}"
+    )
     assert page.locator(".composer-wrap textarea").count() == 1
     # One feed, not two. The strip that used to sit above the chat ("它自己做的事")
     # listed runs and threads the conversation now carries itself: a report row for
@@ -595,7 +597,10 @@ def test_the_app_opens_the_one_conversation(page):
         page.locator(".header-right .ant-btn").nth(i).inner_text().strip()
         for i in range(page.locator(".header-right .ant-btn").count())
     ]
-    assert {"线程", "自动化", "看板"} <= set(bar), bar
+    assert {"自动化", "看板"} <= set(bar), bar
+    # 线程 is gone with the concept it named: there is one conversation, so a list
+    # of conversations to switch between had nothing to list.
+    assert "线程" not in bar, bar
     page.locator(".topbar-more").click()
     page.wait_for_selector(".ant-dropdown-menu-item", timeout=10_000)
     labels = [
@@ -606,6 +611,7 @@ def test_the_app_opens_the_one_conversation(page):
     assert "会话管理" not in labels, labels
     assert "对话" not in labels, labels
     assert "自动化" not in labels and "线程" not in labels, labels
+    assert "搜索线程" not in labels, "a search over thread titles has nothing left to search"
     page.keyboard.press("Escape")
     assert page.errors == [], page.errors
 
@@ -631,34 +637,29 @@ def test_typing_sends_into_the_same_conversation(page):
     assert page.errors == [], page.errors
 
 
-def test_the_drawer_lists_threads_and_offers_no_way_to_make_one(page):
-    """线程 is a list of work, not a set of documents to create.
+def test_there_is_no_thread_surface_to_manage(page):
+    """线程 was a list of conversations to switch between. There is one.
 
-    It used to open with 新对话, which is the same question the landing page
-    asked, one door deeper: which container does this sentence belong to. The
-    button is gone -- the conversation already exists -- and what is left is the
-    record: the sessions work happened in, with the open one marked.
+    The drawer, its create button, its rename/delete menu and the address that
+    named an open thread all went together: a list of one thing is a control
+    that asks a question with one answer. What a run's record needs instead is on
+    自动化 (the run list and its output), which is where work is managed.
     """
     page.goto(page.url.split("#")[0], wait_until="networkidle")
     page.wait_for_selector(".home-room", timeout=20_000)
 
+    assert page.locator(".threads-drawer").count() == 0
+    assert page.locator(".session-panel").count() == 0
+    assert page.locator(".threads-new").count() == 0
+    assert page.locator(".header-threads").count() == 0
+
+    # Sending a message still works and does not mint anything to manage.
     box = page.wait_for_selector(".composer-wrap textarea", timeout=20_000)
-    box.fill("帮我总结当前项目")
+    box.fill("帮我看看昨天的构建")
     box.press("Enter")
-    page.wait_for_selector("text=帮我总结当前项目", timeout=30_000)
-    page.wait_for_timeout(2000)
-
-    page.locator(".header-right .ant-btn", has_text="线程").first.click()
-    page.wait_for_selector(".session-panel", timeout=10_000)
-
-    assert page.locator(".threads-new").count() == 0, (
-        "a conversation is not something the person creates"
-    )
-    rows = page.locator(".session-item")
-    assert rows.count() >= 1, "the thread the turn happened in must be listed"
-    assert rows.first.inner_text().strip()
-    assert page.locator(".session-item.active").count() == 1, "the open thread is marked"
-
+    page.wait_for_selector("text=帮我看看昨天的构建", timeout=30_000)
+    page.wait_for_timeout(800)
+    assert page.locator(".session-panel").count() == 0
     assert page.errors == [], page.errors
 
 
