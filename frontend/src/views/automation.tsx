@@ -934,8 +934,32 @@ export function renderSchedules(ctx: AppCtx) {
 
                       {selectedScheduleRun.error && (
                         <div className="schedule-run-error">
-                          <strong>执行错误</strong>
-                          <pre>{selectedScheduleRun.error}</pre>
+                          {selectedScheduleRun.error_reason ? (
+                            <>
+                              {/* The classification first, the provider's own
+                                  words second: `connection lost mid-reply
+                                  (unexpected EOF)` is not a sentence a person
+                                  can act on, but it is what a support thread
+                                  needs, so both are here. */}
+                              <strong>
+                                {selectedScheduleRun.error_reason.label}
+                                {selectedScheduleRun.error_reason.transient && (
+                                  <span className="schedule-run-error-retry">会自动重试一次</span>
+                                )}
+                              </strong>
+                              {selectedScheduleRun.error_reason.hint && (
+                                <p className="schedule-run-error-hint">
+                                  {selectedScheduleRun.error_reason.hint}
+                                </p>
+                              )}
+                              <pre>{selectedScheduleRun.error}</pre>
+                            </>
+                          ) : (
+                            <>
+                              <strong>执行错误</strong>
+                              <pre>{selectedScheduleRun.error}</pre>
+                            </>
+                          )}
                         </div>
                       )}
 

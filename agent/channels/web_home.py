@@ -314,15 +314,11 @@ def _board(
 
 def _detail(latest: Any, *, failure: Any, status: str, unread: int) -> str:
     if failure is not None:
-        return str(
-            getattr(failure, "error", "") or getattr(failure, "summary", "") or ""
-        )[:90]
+        return _human_failure(failure)
     if latest is None:
         return ""
     if status in {"failed", "interrupted"}:
-        return str(
-            getattr(latest, "error", "") or getattr(latest, "summary", "") or ""
-        )[:90]
+        return _human_failure(latest)
     if unread > 0:
         return f"{unread} 次运行结束得不好，还没有人看过"
     return ""
@@ -366,6 +362,22 @@ def _working(work_store: Any) -> list[dict[str, Any]]:
         )
     rows.sort(key=lambda item: item.get("at") or "")
     return rows[:BOARD_WORKING_PREVIEW]
+
+
+def _human_failure(row: Any, limit: int = 90) -> str:
+    """A card's one line: what it means, not what the provider said.
+
+    Measured on the board: `OpenDesign: connection lost mid-reply (unexpected
+    EOF)` was the second line of an attention card for two days. The
+    classification says "连接中断" and what to do about it; the original is one
+    click away in the run detail.
+    """
+    from agent.scheduler.diagnostics import describe_failure
+
+    reason = describe_failure(getattr(row, "error", ""))
+    if reason is not None:
+        return reason.summary[:limit]
+    return str(getattr(row, "summary", "") or "")[:limit]
 
 
 def _proposal_cards(proposal_store: Any) -> list[dict[str, Any]]:

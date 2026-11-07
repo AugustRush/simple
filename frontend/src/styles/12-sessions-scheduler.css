@@ -1298,3 +1298,22 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* A failure, said twice: once in a person's terms, once in the provider's.
+   The label is the line that has to be readable at a glance; the hint says what
+   could be done; the quote below is evidence. */
+.schedule-run-error-retry {
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+.schedule-run-error-hint {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}

@@ -41,6 +41,60 @@ UTC = timezone.utc
 logger = logging.getLogger(__name__)
 
 
+def automatic_retry_at(
+    task, run, finished_at: datetime, error: str
+) -> Optional[datetime]:
+    snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+    retry_policy = snapshot.get("retry_policy")
+    if not isinstance(retry_policy, dict):
+        retry_policy = getattr(task, "retry_policy", {}) or {}
+    max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
+    attempt = max(1, int(getattr(run, "attempt", 1) or 1))
+    if attempt >= max_attempts:
+        # One grace retry, for a reason a second try can plausibly change.
+        #
+        # `max_attempts: 1` is a statement about the *work* ("don't spend
+        # more than one attempt on this"), not about a dropped connection:
+        # an attempt that never reached the work did not spend one. Every
+        # task on this machine had `max_attempts: 1` and two of them died
+        # on "connection lost mid-reply" -- work that a single retry would
+        # almost certainly have completed.
+        #
+        # Exactly once, from the first attempt: the retry is attempt 2,
+        # which reaches `attempt >= max_attempts` again with `attempt != 1`
+        # and therefore does not get a third. A provider that is genuinely
+        # down stays down, and the second failure is the one recorded.
+        from .diagnostics import describe_failure
+
+        reason = describe_failure(error)
+        if attempt != 1 or reason is None or not reason.transient:
+            return None
+        if shared.is_account_exhausted_text(error):
+            return None
+        grace_delay = max(15, int(retry_policy.get("backoff_seconds", 30) or 0))
+        logger.warning(
+            "Retrying run %s once: transient failure (%s)",
+            getattr(run, "id", "?"),
+            reason.label,
+        )
+        return finished_at + timedelta(seconds=grace_delay)
+    # A retry policy says "this step may fail for reasons a second try
+    # fixes".  An account that has run out of quota is not one of them: the
+    # second try lands in the same closed window, hours before it reopens,
+    # and costs a whole step to find that out.  The vocabulary is shared with
+    # the LLM retry loop rather than written twice.
+    if shared.is_account_exhausted_text(error):
+        logger.warning(
+            "Not scheduling an automatic retry for run %s: the provider "
+            "account cannot serve requests (%s)",
+            getattr(run, "id", "?"),
+            error[:200],
+        )
+        return None
+    base_delay = max(0, int(retry_policy.get("backoff_seconds", 30) or 0))
+    return finished_at + timedelta(seconds=base_delay * (2 ** max(0, attempt - 1)))
+
+
 class SchedulerService:
     def __init__(
         self,
@@ -597,29 +651,7 @@ class SchedulerService:
     def _automatic_retry_at(
         self, task, run, finished_at: datetime, error: str
     ) -> Optional[datetime]:
-        snapshot = dict(getattr(run, "config_snapshot", {}) or {})
-        retry_policy = snapshot.get("retry_policy")
-        if not isinstance(retry_policy, dict):
-            retry_policy = getattr(task, "retry_policy", {}) or {}
-        max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
-        attempt = max(1, int(getattr(run, "attempt", 1) or 1))
-        if attempt >= max_attempts:
-            return None
-        # A retry policy says "this step may fail for reasons a second try
-        # fixes".  An account that has run out of quota is not one of them: the
-        # second try lands in the same closed window, hours before it reopens,
-        # and costs a whole step to find that out.  The vocabulary is shared with
-        # the LLM retry loop rather than written twice.
-        if shared.is_account_exhausted_text(error):
-            logger.warning(
-                "Not scheduling an automatic retry for run %s: the provider "
-                "account cannot serve requests (%s)",
-                getattr(run, "id", "?"),
-                error[:200],
-            )
-            return None
-        base_delay = max(0, int(retry_policy.get("backoff_seconds", 30) or 0))
-        return finished_at + timedelta(seconds=base_delay * (2 ** max(0, attempt - 1)))
+        return automatic_retry_at(task, run, finished_at, error)
 
     async def _owns_unexpired_lease(self, task, run, now) -> bool:
         try:

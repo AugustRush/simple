@@ -180,7 +180,7 @@ def test_a_failed_unread_run_appears_in_the_waiting_column(stores) -> None:
     (card,) = payload["board"]["waiting"]
     assert card["name"] == "构建检查"
     assert card["status"] == "failed"
-    assert card["detail"] == "provider 429"
+    assert card["detail"].startswith("被限流"), card["detail"]
     assert card["at_kind"] == "finished"
 
 
@@ -420,8 +420,9 @@ def test_a_task_whose_later_run_succeeded_still_waits_if_a_failure_is_unread(
     (card,) = payload["board"]["waiting"]
     assert card["name"] == "每天早上看日志"
     assert card["unread"] == 1
-    # The card quotes the failure it is about, not the run that replaced it.
-    assert card["detail"] == "429"
+    # The card quotes the failure it is about, not the run that replaced it --
+    # in the classified form a reader can act on.
+    assert card["detail"].startswith("被限流"), card["detail"]
     # ...and its time is that failure's, not the next run's. A card in the column
     # called "等你处理" that reads "22 小时后" is answering a question nobody
     # asked while hiding the one being asked.

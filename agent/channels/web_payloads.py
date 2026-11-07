@@ -33,7 +33,7 @@ one.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote
 
 from agent.scheduler.models import (
@@ -56,6 +56,20 @@ def task_in_flight(task: Any, latest_run: Any = None) -> bool:
     if getattr(task, "active_run_id", None):
         return True
     return str(getattr(latest_run, "status", "") or "") in RUN_IN_FLIGHT_STATUSES
+
+
+def _failure_reason_payload(text: Any) -> Optional[dict[str, Any]]:
+    from agent.scheduler.diagnostics import describe_failure
+
+    reason = describe_failure(text)
+    if reason is None:
+        return None
+    return {
+        "label": reason.label,
+        "hint": reason.hint,
+        "transient": reason.transient,
+        "raw": reason.raw,
+    }
 
 
 def scheduler_run_payload(run: Any, *, with_snapshot: bool = True) -> dict[str, Any]:
@@ -93,6 +107,11 @@ def scheduler_run_payload(run: Any, *, with_snapshot: bool = True) -> dict[str, 
         "duration_ms": duration_ms,
         "summary": str(getattr(run, "summary", "") or ""),
         "error": str(getattr(run, "error", "") or ""),
+        # The same failure in a person's terms: a short label, what it means,
+        # and whether trying again could end differently. `error` stays as the
+        # original text -- a support thread needs the words the provider used --
+        # and this is what every screen shows first.
+        "error_reason": _failure_reason_payload(getattr(run, "error", "")),
         "delivery_status": str(getattr(run, "delivery_status", "") or ""),
         # Two answers that are not the same question: ``status`` says whether
         # the run happened, ``verdict`` says whether what it produced met the
@@ -309,6 +328,11 @@ def attention_rows(store: Any, snapshot: dict[str, Any]) -> list[dict[str, Any]]
                 "status": run.status,
                 "missed_count": int(getattr(run, "missed_count", 0) or 0),
                 "error": str(getattr(run, "error", "") or ""),
+        # The same failure in a person's terms: a short label, what it means,
+        # and whether trying again could end differently. `error` stays as the
+        # original text -- a support thread needs the words the provider used --
+        # and this is what every screen shows first.
+        "error_reason": _failure_reason_payload(getattr(run, "error", "")),
                 "started_at": (
                     run.started_at.isoformat() if run.started_at else None
                 ),

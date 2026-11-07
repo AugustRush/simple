@@ -98,6 +98,16 @@ def build_report(
     body = _one_line(summary)
     detail = _one_line(text)
     problem = _one_line(error)
+    if clean_status != "succeeded" and problem:
+        # The report's sentence is the one a person reads first, so it is the
+        # classification ("连接中断：…") rather than the provider's own words,
+        # which read as `OpenDesign: connection lost mid-reply (unexpected EOF)`
+        # in a Chinese conversation. The original stays on the run.
+        from agent.scheduler.diagnostics import describe_failure
+
+        reason = describe_failure(problem)
+        if reason is not None and reason.hint:
+            problem = reason.summary
     if clean_status != "succeeded":
         # A failure always speaks: if nothing said what went wrong, the report
         # says that much rather than staying quiet.

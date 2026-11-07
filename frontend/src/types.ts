@@ -532,6 +532,13 @@ export interface VerificationInfo {
 }
 
 
+export interface FailureReason {
+  label: string
+  hint: string
+  transient: boolean
+  raw: string
+}
+
 export interface ScheduleRun {
   id: string
   task_id: string
@@ -542,6 +549,9 @@ export interface ScheduleRun {
   duration_ms?: number | null
   summary?: string
   error?: string
+  //: The same failure in a person's terms: a short label, what it means, and
+  //: whether a retry could end differently. `error` stays as the original text.
+  error_reason?: FailureReason | null
   delivery_status?: string
   //: Whether what the run produced met the bar the task was given. A
   //: different question from `status`, which only says whether the run
