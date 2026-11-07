@@ -805,6 +805,58 @@ html[data-theme='light'] .tool-trace-items {
   border-color: color-mix(in srgb, var(--red) 22%, transparent);
 }
 
+/* A scheduled run's result: the agent speaking unprompted.
+
+   A row, not a bubble: it is not replying to anything, so a speech bubble would
+   claim a turn it does not belong to. The left mark and the coloured edge say
+   "it came to you" without a heading, and the status chip is the one part that
+   has to survive a glance -- a failure nobody notices is the whole failure mode
+   this row exists to fix. */
+.report-row {
+  align-self: stretch;
+  display: flex;
+  /* One measure for every report, whatever the sentence's length: rows that
+     shrink to their text line up ragged in a column that is left-aligned, and
+     the width is what makes them read as one kind of row rather than loose
+     remarks. */
+  width: min(680px, 100%);
+  margin: 2px auto;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--focus-ring);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.report-row-failed,
+.report-row-interrupted { border-left-color: var(--red); }
+.report-mark { flex: 0 0 auto; color: var(--text-muted); font-size: 13px; line-height: 18px; }
+.report-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 auto; }
+.report-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.report-head strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.report-status {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  background: var(--surface-hover);
+  font-size: 10px;
+  line-height: 16px;
+}
+.report-row-failed .report-status,
+.report-row-interrupted .report-status { color: var(--red); background: var(--red-soft); }
+.report-at { flex: 0 0 auto; margin-left: auto; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.report-text { color: var(--text-secondary); font-size: 12px; line-height: 1.65; word-break: break-word; }
+.report-text p { margin: 0; }
+.report-text p + p { margin-top: 4px; }
+
 /* The model's thinking, above the reply it produced.
 
    One strip per turn, collapsed by default, carrying the same geometry as the

@@ -475,6 +475,95 @@ def test_the_board_shows_what_it_would_do(page, live_gateway):
     assert page.errors == [], page.errors
 
 
+def test_a_finished_run_says_so_in_the_conversation(page, live_gateway):
+    """The agent speaks without being asked: a run's result lands in the chat.
+
+    This is the whole difference between an agent and a dashboard. Before this, a
+    scheduled run that finished while the page was open produced nothing here --
+    it appeared on the board, and only if you went to look. A report is the
+    sentence that makes the work belong to the conversation it was asked for.
+
+    A `message` task is used rather than an agent turn: the run then costs no
+    model call, and what is under test is the delivery of the report, not a
+    provider.
+    """
+    import json
+    import urllib.request
+
+    # Open the app first: the conversation is created on boot, and a report has
+    # nowhere to go until it exists.
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.wait_for_selector(".home-room", timeout=20_000)
+
+    payload = {
+        "name": "报一下天气",
+        "action_type": "message",
+        "message_text": "今天多云，22 度",
+        "trigger_type": "interval",
+        "every": 24,
+        "unit": "hours",
+        # An interval counts from an anchor; the form sends one for the same
+        # reason. The run is started by the API below rather than by waiting for
+        # a clock: what is under test is the report, not the scheduler's timer.
+        "anchor_at": "2026-11-01T00:00:00+08:00",
+        "workspace_root": str(live_gateway["home"]),
+        "context_policy": "stateless",
+        "delivery_mode": "standalone",
+        "timeout_seconds": 300,
+        "retry_policy": {"max_attempts": 1, "backoff_seconds": 30},
+        "selected_skills": [],
+        "permission_profile": "inherit",
+        "timezone_name": "Asia/Shanghai",
+    }
+    request = urllib.request.Request(
+        f"{live_gateway['base_url']}/api/schedules",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            assert response.status in (200, 201), response.status
+            created = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise AssertionError(f"creating the task failed: {exc.code} {exc.read().decode()}") from exc
+
+    # Run it now, through the same endpoint the row's play button uses.
+    run_request = urllib.request.Request(
+        f"{live_gateway['base_url']}/api/schedules/{created['task']['id']}/run",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(run_request, timeout=20) as response:
+        # 202: the run was queued, not executed inline.
+        assert response.status in (200, 201, 202), response.status
+
+    # A new row, not "a row exists": other tests in this module leave reports in
+    # the same conversation, and waiting for the selector alone passes instantly
+    # on somebody else's sentence.
+    before = page.locator(".report-row").count()
+    page.wait_for_function(
+        f"document.querySelectorAll('.report-row').length > {before}",
+        timeout=60_000,
+    )
+    # By its own words, not by position: the gateway is shared with the other
+    # tests in this module, and one of them may leave a newer report behind.
+    row = page.locator(".report-row").filter(has_text="今天多云，22 度")
+    assert row.count() >= 1, "the live push did not reach the page"
+    assert "报一下天气" in row.last.inner_text(), "the row names the task that spoke"
+    assert "成功" in row.last.inner_text()
+
+    # A reload shows the same row: the report is journalled, not just pushed.
+    # (A push the history does not have is a message that vanishes on refresh.)
+    page.reload(wait_until="networkidle")
+    page.wait_for_selector(".report-row", timeout=30_000)
+    assert page.locator(".report-row").filter(has_text="今天多云，22 度").count() >= 1, (
+        "the report was pushed but not journalled: a message that vanishes on refresh"
+    )
+    assert page.errors == [], page.errors
+
+
 def test_the_app_opens_the_one_conversation(page):
     """One conversation, and it is already open.
 

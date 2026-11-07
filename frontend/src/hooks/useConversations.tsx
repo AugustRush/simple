@@ -452,6 +452,13 @@ export function useConversations(deps: Deps) {
               link,
               tool: item.tool,
               toolState: item.toolState as ToolState | undefined,
+              // A run report's facts. Without these the row survives a reload as
+              // bare text -- no task name, no status -- which is a different row
+              // from the one that arrived live.
+              title: item.title || undefined,
+              status: item.status || undefined,
+              taskId: item.taskId || undefined,
+              runId: item.runId || undefined,
               attachments: Array.isArray(item.attachments) ? item.attachments : undefined,
               // A message the user sent during the turn that answered it.  It
               // has to survive this mapping: without the flag the row reads as
@@ -1039,6 +1046,37 @@ export function useConversations(deps: Deps) {
             if (text) {
               const entry = queuedMessagesRef.current.find(item => item.id === pendingId)
               if (entry) entry.text = text
+            }
+          }
+          return
+        }
+
+        if (evt.type === 'run_report') {
+          // The agent speaking without being asked: a scheduled run finished and
+          // its result belongs here, where the person is, rather than in a panel
+          // they have to remember to open. The row arrives as the server's own
+          // display row (same shape as the reloaded history), so it is appended
+          // verbatim -- id included, which is what makes a reconnect that
+          // replays it a no-op rather than a duplicate.
+          const row = evt.message
+          if (row && row.role === 'report' && row.content) {
+            // The same id a reload gives this row (`seq:<n>`), so a socket that
+            // replays it after a reconnect cannot add a second copy.
+            const id = typeof row.seq === 'number' && row.seq > 0
+              ? `seq:${row.seq}`
+              : `report:${row.runId || row.content.slice(0, 40)}`
+            if (!messagesRef.current.some(item => item.id === id)) {
+              appendMessage({
+                id,
+                role: 'report',
+                content: String(row.content),
+                title: String(row.title || ''),
+                status: String(row.status || ''),
+                taskId: String(row.taskId || ''),
+                runId: String(row.runId || ''),
+                createdAt: row.created_at,
+                seq: typeof row.seq === 'number' ? row.seq : undefined,
+              })
             }
           }
           return

@@ -316,6 +316,26 @@ def _event_rows(
                 }
             )
             continue
+        if event_type == "run_report":
+            # A scheduled run's result, said once, in the conversation it
+            # belongs to. Rendered here rather than only pushed live, because a
+            # message you can only see while the page happens to be open is not
+            # a message -- the reload has to show what the push showed.
+            text = str(payload.get("text") or "").strip()
+            if text:
+                rows.append(
+                    {
+                        "role": "report",
+                        "content": text,
+                        "title": str(payload.get("task_name") or ""),
+                        "status": str(payload.get("status") or ""),
+                        "taskId": str(payload.get("task_id") or ""),
+                        "runId": str(payload.get("run_id") or ""),
+                        "created_at": str(getattr(event, "created_at", "") or ""),
+                        "seq": int(getattr(event, "seq", 0) or 0),
+                    }
+                )
+            continue
         if event_type == "command_result":
             text = str(payload.get("text") or "").strip()
             if text:
@@ -517,6 +537,35 @@ class SessionService:
             )
         except Exception:
             pass
+
+    def append_report(self, session_id: str, report: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Journal one run report and return the row a reader would see.
+
+        The row is built by the same converter the transcript read uses, so the
+        live push and the reloaded history cannot disagree about what a report
+        looks like -- the failure mode where a message changes shape after a
+        refresh.
+        """
+        clean = str(session_id or "").strip()
+        if not clean or not isinstance(report, dict):
+            return None
+        store = self._store_for_session(clean)
+        append = getattr(store, "append_agent_event", None) if store is not None else None
+        if not callable(append):
+            return None
+        from agent.reports import EVENT_TYPE
+
+        try:
+            event = append(
+                session_id=clean,
+                event_type=EVENT_TYPE,
+                payload=report,
+                turn_id="",
+            )
+        except Exception:
+            return None
+        rows = _event_rows([event], persisted_attachment_paths=set(), is_live=True)
+        return rows[0] if rows else None
 
     def create_session(self) -> str:
         """Return a fresh session id (the live state is created on first use)."""

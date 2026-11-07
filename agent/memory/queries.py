@@ -238,7 +238,11 @@ def transcript_window(conn,
                AND event_type IN (
                    'tool_started', 'tool_progress', 'tool_completed',
                    'tool_failed', 'tool_blocked', 'attachment',
-                   'command_result'
+                   'command_result',
+                   -- A scheduled run's report is a message in the conversation,
+                   -- not an operation of a turn: it has to be in the window or
+                   -- the live push and the reloaded history disagree.
+                   'run_report'
                )
              ORDER BY seq DESC
              LIMIT ?

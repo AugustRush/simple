@@ -257,6 +257,12 @@ LEDGER: tuple[StateEntry, ...] = (
                "Ctrl-C arming counter; meaningless outside one terminal."),
     StateEntry("_ACTIVE_TUI", "agent/cli.py", 1142, "REBOUND", "process", "stays", None,
                "The process's one live TUI."),
+    # ── Run reports ─────────────────────────────────────────────────────────
+    StateEntry("_listeners", "agent/reports.py", 53, "CONTAINER", "process", "stays", None,
+               "Channels that want a finished run's sentence. Process scope on purpose: "
+               "the publisher is the scheduler's task and the subscriber is the web "
+               "channel's socket, and neither owns the other. It is a bus, not cache -- "
+               "dropping it would leave a run with nowhere to speak."),
 )
 
 

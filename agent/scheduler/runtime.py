@@ -59,12 +59,19 @@ class SchedulerService:
         #: reaches them (a desktop banner here; nothing on a headless box).
         #: ``None`` means this deployment has no out-of-page channel.
         notifier: Optional[Callable[..., Awaitable[Any]]] = None,
+        #: "Say what happened, in the conversation", as one callable. Separate
+        #: from ``notifier`` because they answer different questions: a notifier
+        #: interrupts somebody who is elsewhere (a banner, "this needs you"), a
+        #: report joins the record where the work was asked for. A run can want
+        #: both, one, or neither.
+        reporter: Optional[Callable[..., Awaitable[Any]]] = None,
     ):
         self.store = store
         self.agent_executor = agent_executor
         self.system_executor = system_executor
         self.delivery = delivery
         self.notifier = notifier
+        self.reporter = reporter
         self.poll_seconds = poll_seconds
         self.lease_seconds = int(lease_seconds)
         if self.lease_seconds < 3:
@@ -876,6 +883,16 @@ class SchedulerService:
             await self._notify_attention(
                 task, run, status=status, summary=run_summary, error=error
             )
+            # Same rule as the banner above: after the record, never before. A
+            # report points at a run that already exists in history.
+            await self._report(
+                task,
+                run,
+                status=status,
+                summary=run_summary,
+                error=error,
+                text=str(getattr(result, "text_output", "") or ""),
+            )
         except asyncio.CancelledError:
             if run.id in self._cancel_requested:
                 await self._store_call(
@@ -937,6 +954,37 @@ class SchedulerService:
             # this method is ever entered.
             self._active_tasks.pop(run.id, None)
             self._cancel_requested.discard(run.id)
+
+    async def _report(
+        self,
+        task,
+        run,
+        *,
+        status: str,
+        summary: str = "",
+        error: str = "",
+        text: str = "",
+    ) -> None:
+        """Say what this run did, in the conversation it belongs to.
+
+        Swallowed like the notifier, and for the same reason: the run is already
+        recorded by the time this is called, and a channel that cannot carry the
+        sentence must not turn a finished run into a failed one.
+        """
+        reporter = self.reporter
+        if not callable(reporter):
+            return
+        try:
+            await reporter(
+                task=task,
+                run=run,
+                status=status,
+                summary=summary,
+                error=error,
+                text=text,
+            )
+        except Exception as exc:  # pragma: no cover - a channel's failure is its own
+            logger.debug("scheduled-run report failed: %s", exc)
 
     async def _notify_attention(
         self,

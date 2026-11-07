@@ -211,6 +211,11 @@ class WebChannel(Channel):
         ] = None
         self._sessions: dict[str, Any] = {}
         self._live_sinks: dict[str, set[WebOutputSink]] = {}
+        #: Sockets by session, kept for *idle* pushes. ``_live_sinks`` holds
+        #: one sink per in-flight turn and is empty the rest of the time, so a
+        #: sentence that arrives between turns (a scheduled run finishing) had
+        #: nowhere to go: the report was journalled and never pushed.
+        self._live_sockets: dict[str, set[Any]] = {}
         # Pending approval answers, keyed by session then confirmation token.
         # The waiter outlives the connection that created it: a tab switch,
         # a refresh, or a reconnect hands the session a new socket while the
@@ -276,6 +281,13 @@ class WebChannel(Channel):
         # asking for it is also what keeps this line from depending on the *inside* of
         # another service.
         store = resolve(components, "ltm_store")
+        # Runs speak into the conversation. The scheduler publishes; this is
+        # the consumer that can both journal the sentence and push it to a page
+        # that has the conversation open -- the two halves have to be the same
+        # sentence, or a reload shows what the push never did.
+        from agent import reports
+
+        reports.subscribe(self._on_run_report)
         self._session_service = SessionService(
             store=store,
             live_states=sessions,
@@ -286,6 +298,38 @@ class WebChannel(Channel):
                 else None
             ),
         )
+
+    def _on_run_report(self, report: dict) -> None:
+        """Journal one run report into the conversation, then push it live.
+
+        The journal first: a push for a row that failed to record would be a
+        message the reader can never see again. If nothing is recorded yet (a
+        gateway that has never been opened), there is no conversation to speak
+        into and the sentence is dropped -- a report with no home is not worth a
+        second store to hold it.
+        """
+        from agent.main_session import read_main_session_id
+
+        session_id = read_main_session_id()
+        if not session_id:
+            return
+        row = self._service().append_report(session_id, report)
+        if not row:
+            return
+        frame = {"type": "run_report", "message": row}
+        for websocket in tuple(self._live_sockets.get(session_id, set())):
+            try:
+                # A schedule on its own loop: this runs inside the scheduler's
+                # task, which is not the socket's. `create_task` keeps the send
+                # from blocking the run's completion on a slow tab.
+                asyncio.create_task(websocket.send_json(frame))
+            except Exception:
+                logger.debug("failed to push a run report", exc_info=True)
+        for live_sink in tuple(self._live_sinks.get(session_id, set())):
+            try:
+                live_sink.on_report(row)
+            except Exception:
+                logger.debug("failed to push a run report to a turn's sink", exc_info=True)
 
     def _service(self) -> SessionService:
         if self._session_service is None:
@@ -2565,6 +2609,9 @@ class WebChannel(Channel):
             await websocket.send_json({"type": "error", "error": "invalid session id"})
             await websocket.close(code=1008)
             return
+        # Registered before any turn starts: a report may arrive with nothing
+        # running, and this is the only handle on the page at that moment.
+        self._live_sockets.setdefault(session_id, set()).add(websocket)
         # A previous tab may have been switched away while this session was
         # still generating. Rebind its sinks to the new socket and publish the
         # text generated so far before receiving new input.
@@ -2766,6 +2813,11 @@ class WebChannel(Channel):
             # by the next WebSocket connection, allowing the reply to
             # continue and the partial snapshot to be restored.
             active_tasks.clear()
+            sockets = self._live_sockets.get(session_id)
+            if sockets is not None:
+                sockets.discard(websocket)
+                if not sockets:
+                    self._live_sockets.pop(session_id, None)
 
     async def _handle_text(
         self,

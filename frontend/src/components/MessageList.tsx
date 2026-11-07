@@ -29,6 +29,7 @@ import { fileHref, mediaKindForUrl } from '../lib/media'
 import { subagentCounts } from '../lib/subagent'
 import { isInTurnUserMessage, countToolStates, describeToolStates, summariseToolDots, toolAttentionLabel, toolStateLabel } from '../lib/tools'
 import type { Message, SubAgentNote } from '../types'
+import { RUN_STATUS_LABEL } from '../views/board'
 
 export interface MessageListProps {
   messages: Message[]
@@ -233,6 +234,42 @@ function ReasoningNote({ item, updateMessage }: {
 }
 
 
+/**
+ * A scheduled run's result, said in the conversation.
+ *
+ * Deliberately not a system note. A grey aside is how this screen reports what
+ * *happened to the page* ("连接已断开"); this is the agent telling you it did the
+ * thing you asked for, and it has to be findable by scrolling the way a reply
+ * is. So: the task's own name, the status as a chip (a failure must be legible
+ * without reading the sentence), and the sentence itself in normal text.
+ *
+ * No action button. The run detail lives on 自动化 and is one click from the
+ * task row there; a second way in from here would need the task record this row
+ * does not carry, and a button that has to look one up is a button that is
+ * sometimes wrong.
+ */
+function ReportRow({ item }: { item: Message }) {
+  const status = String(item.status || '')
+  const label = RUN_STATUS_LABEL[status] || status
+  return (
+    <div className={`report-row report-row-${status || 'unknown'}`}>
+      <span className="report-mark" aria-hidden="true"><RobotOutlined /></span>
+      <div className="report-main">
+        <div className="report-head">
+          <strong>{item.title || '一次定时任务'}</strong>
+          {label && <span className="report-status">{label}</span>}
+          {item.createdAt && (
+            <span className="report-at" title={formatDateTime(item.createdAt, true)}>
+              {relativeTime(item.createdAt)}
+            </span>
+          )}
+        </div>
+        <div className="report-text markdown" dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, null, '') }} />
+      </div>
+    </div>
+  )
+}
+
 function SystemNote({ item, activeSession, token }: {
   item: Message
   activeSession: string | null
@@ -281,6 +318,7 @@ const MemoToolEvent = memo(ToolEvent)
 const MemoSubAgentNote = memo(SubAgentNote)
 const MemoReasoningNote = memo(ReasoningNote)
 const MemoSystemNote = memo(SystemNote)
+const MemoReportRow = memo(ReportRow)
 const MemoInterjectionRow = memo(InterjectionRow)
 
 
@@ -387,6 +425,10 @@ function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyM
 
   if (item.role === 'command' || item.role === 'error') {
     return <MemoSystemNote item={item} activeSession={activeSession} token={token} />
+  }
+
+  if (item.role === 'report') {
+    return <MemoReportRow item={item} />
   }
 
   if (item.role === 'user' && isInTurnUserMessage(item)) {

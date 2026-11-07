@@ -325,6 +325,28 @@ def build_scheduler_service(
             enabled=notifications_on,
         )
 
+    async def _reporter(*, task, run, status, summary="", error="", text=""):
+        """Put the run's outcome in the conversation, once.
+
+        The body is chosen by `agent.reports.build_report` -- including its two
+        silences -- because "which runs deserve a sentence" is a rule, and a rule
+        restated at the delivery site is the copy that drifts.
+        """
+        from agent import reports
+
+        report = reports.build_report(
+            task_name=str(getattr(task, "name", "") or ""),
+            task_id=str(getattr(task, "id", "") or ""),
+            run_id=str(getattr(run, "id", "") or ""),
+            status=str(status or ""),
+            summary=str(summary or ""),
+            error=str(error or ""),
+            text=str(text or ""),
+            kind=str(getattr(task, "kind", "") or ""),
+        )
+        if report is not None:
+            reports.publish(report)
+
     async def _agent_executor(task, run):
         # `agent/__init__` imports this package, so these are reached here rather than
         # at module scope.  They are composition-root operations -- build a runtime for
@@ -611,6 +633,7 @@ def build_scheduler_service(
         max_concurrent_runs=max_concurrent_runs,
         signal_max_depth=signal_max_depth,
         notifier=_notifier,
+        reporter=_reporter,
     )
     # The process's tool layer can now start a run instead of queueing one.
     _publish_wake(registry, service)

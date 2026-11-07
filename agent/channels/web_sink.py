@@ -466,6 +466,16 @@ class WebOutputSink(OutputSink):
     def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
         self._emit({"type": "notification", "title": title, "body": body, "level": level})
 
+    def on_report(self, row: Any) -> None:
+        """A scheduled run's result, as it lands in the conversation.
+
+        The row is the *display* row the journal would produce -- built by the
+        server, not assembled here -- so the live frame and the reloaded history
+        are the same shape. A client that renders one differently from the other
+        is how a message changes appearance after a refresh.
+        """
+        self._emit({"type": "run_report", "message": _jsonable(row)})
+
     def on_workspace_changed(
         self,
         workspace_root: str,

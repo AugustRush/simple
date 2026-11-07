@@ -2,7 +2,9 @@
 
 
 
-export type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error' | 'subagent'
+//: `report` is the agent speaking unprompted: a scheduled run's result, said in
+//: the conversation instead of waiting to be found in a status panel.
+export type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error' | 'subagent' | 'report'
 
 export type ToolState = 'running' | 'done' | 'failed' | 'blocked' | 'interrupted'
 
@@ -99,6 +101,17 @@ export interface Message {
   messageId?: string
   /** When the message was said, as the server recorded it. */
   createdAt?: string
+  /**
+   * A run report's own facts: which task spoke, and how the run ended.
+   *
+   * Separate fields rather than a sentence baked into `content`, because the row
+   * shows the name and the status as chips -- a reader scanning the conversation
+   * should be able to see "失败" without reading the text.
+   */
+  title?: string
+  status?: string
+  taskId?: string
+  runId?: string
   /**
    * The row's position in the session's transcript, assigned by the server.
    *
