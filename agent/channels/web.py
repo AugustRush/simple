@@ -654,10 +654,25 @@ class WebChannel(Channel):
                 scheduler_store=scheduler_store,
                 proposal_store=self._proposal_store(),
                 sessions=sessions,
+                work_store=self._work_store(),
             )
         finally:
             if scheduler_store is not None:
                 scheduler_store.close()
+
+    def _work_store(self) -> Any:
+        """The Ralph task store, or None when nothing has ever started work.
+
+        Read straight from the store rather than through the service: the panel
+        only needs to *list* goals, and asking the service would mount the whole
+        iteration loop (agent, verifier, context) just to render a board.
+        """
+        try:
+            from agent.ralph import open_task_store
+
+            return open_task_store()
+        except Exception:
+            return None
 
     async def _autonomy_overview(self, request: Any) -> Any:
         return await web_autonomy._autonomy_overview(

@@ -37,7 +37,7 @@
  */
 
 import type { AppCtx } from '../app/AppCtx'
-import type { BoardCard } from '../types'
+import type { BoardCard, WorkingRow } from '../types'
 import { relativeTime } from '../lib/format'
 import { Button, Popconfirm, Tag } from 'antd'
 
@@ -179,6 +179,27 @@ function TaskRow({
   )
 }
 
+/** A goal it is working on across turns: a row with a progress count.
+ *
+ * Not clickable. A Ralph task has no page; the honest thing a row can offer is
+ * the goal and how far it has got. The count is `第 2/8 轮`, not a percentage:
+ * iterations are attempts, and an attempt can fail, so a percentage would promise
+ * a linearity the loop does not have.
+ */
+function WorkRow({ row }: { row: WorkingRow }) {
+  const progress = row.max_iterations ? `第 ${row.iteration}/${row.max_iterations} 轮` : ''
+  return (
+    <div className="panel-row panel-row-working">
+      <span className="panel-row-dot panel-row-dot-working" aria-hidden="true" />
+      <span className="panel-row-main">
+        <strong title={row.goal}>{row.goal}</strong>
+        <span>{progress || '进行中'}</span>
+      </span>
+      <span className="panel-row-when">{relativeTime(row.at)}</span>
+    </div>
+  )
+}
+
 /** The panel's contents: one summary line, then only the groups that have cards. */
 /** The record under the queue: what was answered, and how much it looked at.
  *
@@ -247,6 +268,7 @@ export function renderBoardPanel(ctx: AppCtx) {
   const waiting = board?.waiting ?? []
   const inFlight = board?.running ?? []
   const scheduled = board?.scheduled ?? []
+  const working = board?.working ?? []
   const scheduledTotal = Number(board?.scheduled_total || 0)
 
   /** Open a task's detail: the drawer lives on 自动化, so arriving there is part of
@@ -267,10 +289,12 @@ export function renderBoardPanel(ctx: AppCtx) {
     navigateTo('schedules')
   }
 
-  const nothingToDo = waiting.length + inFlight.length + scheduledTotal === 0
+  const nothingToDo =
+    waiting.length + inFlight.length + working.length + scheduledTotal === 0
 
   // The panel's first line, and the only sentence most visits need.
   const rest = [
+    working.length ? `${working.length} 件在做` : '',
     inFlight.length ? `${inFlight.length} 个在跑` : '',
     scheduledTotal ? `${scheduledTotal} 个已排期` : '',
   ].filter(Boolean)
@@ -309,6 +333,17 @@ export function renderBoardPanel(ctx: AppCtx) {
                   <AttentionCard key={card.task_id} card={card} onOpen={openTask} />
                 ),
               )}
+            </section>
+          )}
+
+          {working.length > 0 && (
+            <section className="panel-group panel-group-working">
+              <div className="panel-group-head">
+                正在做<span className="panel-group-count">{working.length}</span>
+              </div>
+              {working.map(row => (
+                <WorkRow key={row.id} row={row} />
+              ))}
             </section>
           )}
 

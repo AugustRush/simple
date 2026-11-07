@@ -371,7 +371,10 @@ def test_no_stores_is_an_empty_page_not_a_crash() -> None:
     assert status == 200
     assert body["needs"]["failures"] == 0
     assert body["board"] == {
-        "running": [], "waiting": [], "scheduled": [], "scheduled_total": 0
+        "running": [], "waiting": [], "scheduled": [], "scheduled_total": 0,
+        # No Ralph store in this composition is a configuration, not a gap:
+        # nothing is being worked on, and that is the honest answer.
+        "working": [],
     }
     assert body["activity"] == []
 
@@ -604,3 +607,45 @@ def test_the_ledger_says_when_the_agent_did_it_itself(stores) -> None:
     by_title = {entry["title"]: entry for entry in payload["activity"]}
     assert by_title["读一遍那 2 次失败的运行"]["origin"] == "autonomy"
     assert by_title["每天早上看日志"]["origin"] == "", "a person's task carries no marker"
+
+
+# ── goals in progress ───────────────────────────────────────────────────────
+
+
+def test_the_board_shows_a_goal_that_is_being_worked_on():
+    """A Ralph goal has no run row while it runs: it is *between* runs.
+
+    The panel answered "is anything happening" from runs alone, so a goal being
+    iterated on looked exactly like an idle agent. The goal is the thing the
+    person asked for; the runs are how it is being delivered.
+    """
+    from types import SimpleNamespace
+
+    from agent.channels import web_home
+
+    finished = SimpleNamespace(
+        id="done", goal="已经做完的事", status=SimpleNamespace(value="complete"),
+        current_iteration=3, max_iterations=5, created_at="2026-11-01T00:00:00+00:00",
+    )
+    running = SimpleNamespace(
+        id="live", goal="整理项目", status=SimpleNamespace(value="running"),
+        current_iteration=2, max_iterations=8, created_at="2026-11-02T00:00:00+00:00",
+    )
+
+    class _Store:
+        def list_tasks(self):
+            return [finished, running]
+
+    payload = web_home.build_home_overview(work_store=_Store())
+
+    working = payload["board"]["working"]
+    assert [row["id"] for row in working] == ["live"], "a finished goal is a result, not work in flight"
+    assert working[0]["goal"] == "整理项目"
+    assert (working[0]["iteration"], working[0]["max_iterations"]) == (2, 8)
+
+
+def test_a_board_with_no_work_store_still_answers():
+    """No Ralph in this composition is a configuration, not an error."""
+    from agent.channels import web_home
+
+    assert web_home.build_home_overview()["board"]["working"] == []

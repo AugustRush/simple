@@ -737,6 +737,50 @@ def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
     assert page.errors == [], page.errors
 
 
+def test_the_board_shows_a_goal_it_is_working_on(page, live_gateway):
+    """A long goal is on the board while it is being worked, not only after.
+
+    A Ralph task has no run row until a run of it is executing, so the panel used
+    to answer "is anything happening" from runs alone -- and a goal being
+    iterated on looked like an idle agent. Seeded through the same store the loop
+    writes, because starting a real loop would run model turns.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+
+    from agent.ralph import RalphTask, open_task_store
+
+    os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
+    from agent import shared
+
+    shared.AGENT_HOME = live_gateway["home"]
+    # Explicit directory: `open_task_store()` resolves the module-level
+    # SCHEDULER_DIR, which is this *test process's* home, not the gateway's.
+    store = open_task_store(live_gateway["home"] / "tasks")
+    try:
+        store.save(
+            RalphTask(
+                id="e2e-work-goal",
+                goal="把项目里所有 TODO 整理成一份清单",
+                max_iterations=8,
+                current_iteration=2,
+            )
+        )
+    finally:
+        pass
+
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.locator(".header-board").click()
+    page.wait_for_selector(".panel-row-working", timeout=20_000)
+
+    row = page.locator(".panel-row-working", has_text="整理成一份清单")
+    assert row.count() == 1, "the goal it is working on is not on the board"
+    assert "第 2/8 轮" in row.first.inner_text()
+    assert page.errors == [], page.errors
+
+
 def test_a_board_card_opens_its_task(page, live_gateway):
     """The first column is entirely things that need a person, so each card has to
     be a way in.

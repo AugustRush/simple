@@ -47,7 +47,13 @@ def _unavailable() -> Any:
 
 
 async def _home_overview(
-    request: Any, *, authorized, scheduler_store, proposal_store, sessions=None
+    request: Any,
+    *,
+    authorized,
+    scheduler_store,
+    proposal_store,
+    sessions=None,
+    work_store=None,
 ) -> Any:
     from starlette.responses import JSONResponse
 
@@ -58,6 +64,7 @@ async def _home_overview(
             scheduler_store=scheduler_store,
             proposal_store=proposal_store,
             sessions=sessions,
+            work_store=work_store,
         )
     except Exception as exc:
         return JSONResponse({"error": f"读取主页失败：{exc}"}, status_code=500)
@@ -103,6 +110,7 @@ def build_home_overview(
     scheduler_store: Any = None,
     proposal_store: Any = None,
     sessions: Optional[list[dict[str, Any]]] = None,
+    work_store: Any = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """The page's payload, from the stores that hold each fact.
@@ -113,9 +121,15 @@ def build_home_overview(
     """
     moment = now or datetime.now(UTC)
     activity = _activity(scheduler_store, sessions, moment=moment)
+    board = _board(scheduler_store, proposal_store=proposal_store, now=moment)
+    # What it is working *on*, as opposed to what it is running: a Ralph goal
+    # lives across turns and has no run row until one is executing. Without this
+    # the panel answered "is anything happening" from runs alone, so a goal being
+    # worked on looked like nothing at all.
+    board["working"] = _working(work_store)
     return {
         "needs": _needs(scheduler_store, proposal_store),
-        "board": _board(scheduler_store, proposal_store=proposal_store, now=moment),
+        "board": board,
         "activity": activity,
         # A full first page means there *may* be more, so the page needs a cursor
         # to ask with. Without this the "加载更早" link could never appear on the
@@ -312,6 +326,46 @@ def _detail(latest: Any, *, failure: Any, status: str, unread: int) -> str:
     if unread > 0:
         return f"{unread} 次运行结束得不好，还没有人看过"
     return ""
+
+
+#: How many running goals the board shows. A board is glanced at, and a goal
+#: list is a queue -- the number is what says there is more.
+BOARD_WORKING_PREVIEW = 3
+
+
+def _working(work_store: Any) -> list[dict[str, Any]]:
+    """The goals it is in the middle of, as board rows.
+
+    Only `running` ones: a finished goal is a result, and results are the
+    conversation's business (they are reported there). What the panel has to
+    answer is "is it doing something right now", and a completed task is not
+    doing anything.
+
+    Nothing here is clickable: a Ralph task has no page of its own, and a row
+    that opens nothing is worse than a row that says so. The goal text *is* the
+    information.
+    """
+    if work_store is None:
+        return []
+    try:
+        tasks = work_store.list_tasks()
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        if str(getattr(getattr(task, "status", ""), "value", "") or "") != "running":
+            continue
+        rows.append(
+            {
+                "id": str(getattr(task, "id", "") or ""),
+                "goal": str(getattr(task, "goal", "") or "")[:120],
+                "iteration": int(getattr(task, "current_iteration", 0) or 0),
+                "max_iterations": int(getattr(task, "max_iterations", 0) or 0),
+                "at": str(getattr(task, "created_at", "") or ""),
+            }
+        )
+    rows.sort(key=lambda item: item.get("at") or "")
+    return rows[:BOARD_WORKING_PREVIEW]
 
 
 def _proposal_cards(proposal_store: Any) -> list[dict[str, Any]]:

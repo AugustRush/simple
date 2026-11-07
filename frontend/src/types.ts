@@ -332,6 +332,15 @@ export interface HomeActivity {
 //: One card on the board. `at_kind` says what `at` means, because the three
 //: columns use it for three different facts (when it started / when it failed /
 //: when it will fire) and a single unlabelled timestamp would be ambiguous.
+//: One goal being worked on: the long-running unit of work.
+export interface WorkingRow {
+  id: string
+  goal: string
+  iteration: number
+  max_iterations: number
+  at: string
+}
+
 export interface BoardCard {
   task_id: string
   //: Set only for proposals: a candidate task has no task id yet, and the board
@@ -368,6 +377,9 @@ export interface HomeOverview {
     waiting: BoardCard[]
     scheduled: BoardCard[]
     scheduled_total: number
+    //: Goals it is in the middle of (a Ralph task), which have no run row of
+    //: their own. Not cards: there is nothing to act on, and no page to open.
+    working?: WorkingRow[]
   }
   activity: HomeActivity[]
   //: Cursor for the next page of the timeline. Empty when the first page came

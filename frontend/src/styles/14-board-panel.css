@@ -113,6 +113,12 @@
 .panel-row-main span { color: var(--text-muted); font-size: 11px; }
 .panel-row-when { flex: 0 0 auto; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
+/* A goal in progress: a row with a dot that keeps moving. It shares the task
+   row's geometry on purpose -- both are "something is happening", and the panel
+   should not teach a second shape for it. */
+.panel-row-working { cursor: default; }
+.panel-row-dot-working { background: var(--amber); box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 18%, transparent); }
+
 /* The record under the queue: a history, not a list of things to act on. Rows,
    not cards -- and no buttons anywhere, so nothing here can be mistaken for
    work. It is separated from the queue above by a rule rather than a heading
