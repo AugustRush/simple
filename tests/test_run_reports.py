@@ -288,3 +288,63 @@ def test_a_failed_run_speaks_in_the_conversation():
     exception_path = exception_path[: exception_path.index("        finally:")]
 
     assert "await self._report(" in exception_path
+
+
+def test_a_failure_is_mirrored_to_the_channel_the_task_reports_in():
+    """A task that speaks in Feishu must not go silent when it fails.
+
+    Its delivered output is the run's *result*, and a failed run has none -- so
+    the channel heard from it on every good day and never on the bad one.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import mirror_failure_to_channel
+
+    sent: list[tuple] = []
+
+    class _Delivery:
+        async def deliver_channel(self, *, target, text, output_dir=None):
+            sent.append((target, text))
+            return "sent"
+
+    task = SimpleNamespace(name="汇报", delivery_mode="channel", delivery_target=None)
+    run = SimpleNamespace(
+        config_snapshot={
+            "delivery_mode": "channel",
+            "delivery_target": {"target_type": "feishu_chat", "payload": {"chat_id": "c1"}},
+        }
+    )
+    report = {"status": "failed", "task_name": "汇报", "text": "连接中断：模型服务这次没有把回复发完。"}
+
+    asyncio.run(mirror_failure_to_channel(_Delivery(), task, run, report))
+
+    assert len(sent) == 1
+    assert "汇报 失败了" in sent[0][1]
+    assert "连接中断" in sent[0][1]
+
+
+def test_a_success_is_not_mirrored_twice():
+    """The output itself is already delivered; a second copy is a double message."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import mirror_failure_to_channel
+
+    sent: list[tuple] = []
+
+    class _Delivery:
+        async def deliver_channel(self, *, target, text, output_dir=None):
+            sent.append((target, text))
+            return "sent"
+
+    task = SimpleNamespace(name="汇报", delivery_mode="channel", delivery_target=None)
+    run = SimpleNamespace(config_snapshot={"delivery_mode": "channel"})
+
+    asyncio.run(
+        mirror_failure_to_channel(
+            _Delivery(), task, run, {"status": "succeeded", "text": "报告好了"}
+        )
+    )
+
+    assert sent == []

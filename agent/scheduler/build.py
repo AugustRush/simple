@@ -23,10 +23,13 @@ one is now four keys: ``output_dir`` at construction, and ``registry``,
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.shared import AGENT_HOME, DEFAULT_OUTPUT_DIR
+
+logger = logging.getLogger(__name__)
 from agent.core.agent import AgentContext
 from agent.memory.palace import MemoryPalace
 from agent.runtime.contracts import (
@@ -311,6 +314,42 @@ def _publish_wake(registry: Any, service: SchedulerService) -> None:
     set_context("scheduler_wake", service.start_now)
 
 
+async def mirror_failure_to_channel(
+    delivery: Any, task: Any, run: Any, report: dict[str, Any]
+) -> None:
+    """A task that reports to a channel must report its *failures* there too.
+
+    The delivered output is the run's result, and a failed run has none -- so a
+    task configured to speak in Feishu went silent exactly when it mattered.
+    Success is already covered by `delivery`; this covers the other half, and
+    only that: mirroring a success would double every message.
+    """
+    if str(report.get("status") or "") == "succeeded":
+        return
+    snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+    mode = str(snapshot.get("delivery_mode") or getattr(task, "delivery_mode", ""))
+    if mode != "channel":
+        return
+    raw_target = snapshot.get("delivery_target")
+    target = getattr(task, "delivery_target", None)
+    if isinstance(raw_target, dict) and raw_target.get("target_type"):
+        from agent.scheduler.models import DeliveryTarget
+
+        target = DeliveryTarget(
+            target_type=str(raw_target["target_type"]),
+            payload=dict(raw_target.get("payload") or {}),
+        )
+    if target is None:
+        return
+    try:
+        await delivery.deliver_channel(
+            target=target,
+            text=f"{report.get('task_name') or task.name} 失败了：{report.get('text')}",
+        )
+    except Exception as exc:  # noqa: BLE001 - a channel cannot fail the run
+        logger.warning("could not mirror a failure to its channel: %s", exc)
+
+
 def build_scheduler_service(
     cfg: dict,
     *,
@@ -392,6 +431,10 @@ def build_scheduler_service(
         )
         if report is not None:
             reports.publish(report)
+            await _mirror_to_channel(task, run, report)
+
+    async def _mirror_to_channel(task, run, report):
+        await mirror_failure_to_channel(delivery, task, run, report)
 
     async def _agent_executor(task, run):
         # `agent/__init__` imports this package, so these are reached here rather than
