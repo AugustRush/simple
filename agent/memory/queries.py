@@ -242,7 +242,10 @@ def transcript_window(conn,
                    -- A scheduled run's report is a message in the conversation,
                    -- not an operation of a turn: it has to be in the window or
                    -- the live push and the reloaded history disagree.
-                   'run_report'
+                   'run_report',
+                   -- A proposal the agent raised: the same rule -- if the live
+                   -- frame shows it, the reloaded history must too.
+                   'proposal_raised'
                )
              ORDER BY seq DESC
              LIMIT ?

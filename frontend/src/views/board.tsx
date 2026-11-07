@@ -69,7 +69,7 @@ const ANSWER_LABEL: Record<string, string> = {
   declined: '不要',
 }
 
-const REVERSIBILITY_LABEL: Record<string, string> = {
+export const REVERSIBILITY_LABEL: Record<string, string> = {
   reversible: '只读',
   workspace: '改工作区',
   irreversible: '不可逆',

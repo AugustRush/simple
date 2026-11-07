@@ -359,6 +359,19 @@ class PatrolService:
             self.store.record_tick(result, at=now)
         except Exception:  # noqa: BLE001 - the history is not worth a failed pass
             logger.exception("patrol could not record its own pass")
+        # Say it where the person is. A proposal is the agent having an idea
+        # about your work -- announcing it only on a panel is how an idea nobody
+        # opened the panel for goes unanswered for a day and then expires.
+        try:
+            from agent import reports
+
+            for row in result.get("proposals") or ():
+                message = reports.build_proposal_message(row)
+                if message is not None:
+                    reports.publish(message)
+        except Exception:  # noqa: BLE001 - a channel must not fail a pass
+            logger.exception("patrol could not announce a proposal")
+
         if result.get("proposed"):
             logger.info(
                 "patrol: %s proposals from %s sessions (dropped %s, duplicates %s)",

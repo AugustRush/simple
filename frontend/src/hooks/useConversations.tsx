@@ -459,6 +459,8 @@ export function useConversations(deps: Deps) {
               status: item.status || undefined,
               taskId: item.taskId || undefined,
               runId: item.runId || undefined,
+              proposalId: item.proposalId || undefined,
+              reversibility: item.reversibility || undefined,
               attachments: Array.isArray(item.attachments) ? item.attachments : undefined,
               // A message the user sent during the turn that answered it.  It
               // has to survive this mapping: without the flag the row reads as
@@ -1046,6 +1048,31 @@ export function useConversations(deps: Deps) {
             if (text) {
               const entry = queuedMessagesRef.current.find(item => item.id === pendingId)
               if (entry) entry.text = text
+            }
+          }
+          return
+        }
+
+        if (evt.type === 'proposal_raised') {
+          // The agent's idea, as a message. It has no buttons on purpose: the
+          // board is where a proposal is answered, and it is the only surface
+          // that knows whether this one is still pending.
+          const row = evt.message
+          if (row && row.role === 'proposal' && row.title) {
+            const id = typeof row.seq === 'number' && row.seq > 0
+              ? `seq:${row.seq}`
+              : `proposal:${row.proposalId || row.title}`
+            if (!messagesRef.current.some(item => item.id === id)) {
+              appendMessage({
+                id,
+                role: 'proposal',
+                content: String(row.content || ''),
+                title: String(row.title || ''),
+                reversibility: String(row.reversibility || ''),
+                proposalId: String(row.proposalId || ''),
+                createdAt: row.created_at,
+                seq: typeof row.seq === 'number' ? row.seq : undefined,
+              })
             }
           }
           return

@@ -857,6 +857,49 @@ html[data-theme='light'] .tool-trace-items {
 .report-text p { margin: 0; }
 .report-text p + p { margin-top: 4px; }
 
+/* The agent's idea, in the conversation.
+ *
+ * Same width as a report row, different edge: a proposal is not a result, it is
+ * a question, and the amber edge says "this wants you" without a second colour
+ * family. No buttons -- the answer lives on the board -- so the row ends with
+ * where the answer is, not with something to press. */
+.proposal-notice {
+  align-self: stretch;
+  display: flex;
+  gap: 10px;
+  width: min(680px, 100%);
+  margin: 2px auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--amber);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.proposal-notice-mark { flex: 0 0 auto; color: var(--amber); font-size: 13px; line-height: 18px; }
+.proposal-notice-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 auto; }
+.proposal-notice-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.proposal-notice-head strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proposal-notice-kind {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  background: var(--surface-hover);
+  font-size: 10px;
+  line-height: 16px;
+}
+.proposal-notice-at { flex: 0 0 auto; margin-left: auto; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.proposal-notice-text { color: var(--text-secondary); font-size: 12px; line-height: 1.65; word-break: break-word; }
+.proposal-notice-text p { margin: 0; }
+.proposal-notice-hint { color: var(--text-muted); font-size: 10px; }
+
 /* The model's thinking, above the reply it produced.
 
    One strip per turn, collapsed by default, carrying the same geometry as the

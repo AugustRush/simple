@@ -4,7 +4,18 @@
 
 //: `report` is the agent speaking unprompted: a scheduled run's result, said in
 //: the conversation instead of waiting to be found in a status panel.
-export type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error' | 'subagent' | 'report'
+export type MessageRole =
+  | 'user'
+  | 'assistant'
+  | 'tool'
+  | 'command'
+  | 'error'
+  | 'subagent'
+  //: The agent speaking first: a finished run's result, or an idea it wants a
+  //: decision on. Both arrive unprompted, which is why they are roles rather
+  //: than parts of a reply.
+  | 'report'
+  | 'proposal'
 
 export type ToolState = 'running' | 'done' | 'failed' | 'blocked' | 'interrupted'
 
@@ -112,6 +123,9 @@ export interface Message {
   status?: string
   taskId?: string
   runId?: string
+  /** A proposal message's row id and reversibility class. */
+  proposalId?: string
+  reversibility?: string
   /**
    * The row's position in the session's transcript, assigned by the server.
    *

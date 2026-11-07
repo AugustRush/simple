@@ -13,6 +13,7 @@ import type { MutableRefObject } from 'react'
 import React, { memo, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  BulbOutlined,
   CloseOutlined,
   CopyOutlined,
   DownOutlined,
@@ -29,7 +30,7 @@ import { fileHref, mediaKindForUrl } from '../lib/media'
 import { subagentCounts } from '../lib/subagent'
 import { isInTurnUserMessage, countToolStates, describeToolStates, summariseToolDots, toolAttentionLabel, toolStateLabel } from '../lib/tools'
 import type { Message, SubAgentNote } from '../types'
-import { RUN_STATUS_LABEL } from '../views/board'
+import { REVERSIBILITY_LABEL, RUN_STATUS_LABEL } from '../views/board'
 
 export interface MessageListProps {
   messages: Message[]
@@ -248,6 +249,42 @@ function ReasoningNote({ item, updateMessage }: {
  * does not carry, and a button that has to look one up is a button that is
  * sometimes wrong.
  */
+/**
+ * The agent's idea, raised without being asked.
+ *
+ * Deliberately without 同意/不要: answering happens on the board, which is the
+ * only surface that knows whether this proposal is still pending. A second set
+ * of buttons here would be a second way to answer the same question, and the two
+ * would disagree the moment one of them was clicked (the message is history; it
+ * does not update).
+ */
+function ProposalNoticeRow({ item }: { item: Message }) {
+  const kind = REVERSIBILITY_LABEL[item.reversibility || ''] || ''
+  return (
+    <div className="proposal-notice">
+      <span className="proposal-notice-mark" aria-hidden="true"><BulbOutlined /></span>
+      <div className="proposal-notice-main">
+        <div className="proposal-notice-head">
+          <strong>{item.title}</strong>
+          {kind && <span className="proposal-notice-kind">{kind}</span>}
+          {item.createdAt && (
+            <span className="proposal-notice-at" title={formatDateTime(item.createdAt, true)}>
+              {relativeTime(item.createdAt)}
+            </span>
+          )}
+        </div>
+        {item.content && (
+          <div
+            className="proposal-notice-text markdown"
+            dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, null, '') }}
+          />
+        )}
+        <span className="proposal-notice-hint">在「看板」里等你答复</span>
+      </div>
+    </div>
+  )
+}
+
 function ReportRow({ item }: { item: Message }) {
   const status = String(item.status || '')
   const label = RUN_STATUS_LABEL[status] || status
@@ -319,6 +356,7 @@ const MemoSubAgentNote = memo(SubAgentNote)
 const MemoReasoningNote = memo(ReasoningNote)
 const MemoSystemNote = memo(SystemNote)
 const MemoReportRow = memo(ReportRow)
+const MemoProposalNoticeRow = memo(ProposalNoticeRow)
 const MemoInterjectionRow = memo(InterjectionRow)
 
 
@@ -429,6 +467,10 @@ function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyM
 
   if (item.role === 'report') {
     return <MemoReportRow item={item} />
+  }
+
+  if (item.role === 'proposal') {
+    return <MemoProposalNoticeRow item={item} />
   }
 
   if (item.role === 'user' && isInTurnUserMessage(item)) {

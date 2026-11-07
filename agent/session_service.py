@@ -316,6 +316,25 @@ def _event_rows(
                 }
             )
             continue
+        if event_type == "proposal_raised":
+            # The patrol's idea, as a message. No buttons: the answer belongs to
+            # the board, which is the one place a decision is made (and the only
+            # place that knows whether it is still pending).
+            text = str(payload.get("text") or "").strip()
+            action = str(payload.get("title") or "").strip()
+            if action:
+                rows.append(
+                    {
+                        "role": "proposal",
+                        "content": text,
+                        "title": action,
+                        "reversibility": str(payload.get("reversibility") or ""),
+                        "proposalId": str(payload.get("id") or ""),
+                        "created_at": str(getattr(event, "created_at", "") or ""),
+                        "seq": int(getattr(event, "seq", 0) or 0),
+                    }
+                )
+            continue
         if event_type == "run_report":
             # A scheduled run's result, said once, in the conversation it
             # belongs to. Rendered here rather than only pushed live, because a
@@ -538,7 +557,13 @@ class SessionService:
         except Exception:
             pass
 
-    def append_report(self, session_id: str, report: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def append_report(
+        self,
+        session_id: str,
+        report: dict[str, Any],
+        *,
+        event_type: str = "",
+    ) -> Optional[dict[str, Any]]:
         """Journal one run report and return the row a reader would see.
 
         The row is built by the same converter the transcript read uses, so the
@@ -558,7 +583,7 @@ class SessionService:
         try:
             event = append(
                 session_id=clean,
-                event_type=EVENT_TYPE,
+                event_type=str(event_type or EVENT_TYPE),
                 payload=report,
                 turn_id="",
             )

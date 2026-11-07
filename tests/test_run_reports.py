@@ -213,3 +213,50 @@ def test_a_report_with_no_conversation_yet_is_dropped(tmp_path):
     channel._on_run_report(_sample_report())
 
     assert channel._service().list_sessions() == []
+
+
+def test_only_a_proposal_that_needs_you_speaks():
+    """An `auto` proposal already ran; announcing it is the noise to avoid."""
+    prepare = {
+        "id": "p1",
+        "action": "整理下载目录",
+        "reason": "里面有 12 个临时文件",
+        "reversibility": "workspace",
+        "admission": {"answer": "prepare", "reason": "额度用完"},
+    }
+    message = reports.build_proposal_message(prepare)
+    assert message is not None
+    assert message["kind"] == "proposal"
+    assert message["title"] == "整理下载目录"
+    assert message["text"] == "里面有 12 个临时文件"
+
+    assert reports.build_proposal_message({**prepare, "admission": {"answer": "auto"}}) is None
+    assert reports.build_proposal_message({**prepare, "action": ""}) is None
+    assert reports.build_proposal_message({"id": "p2"}) is None
+
+
+def test_a_proposal_is_journalled_as_its_own_kind_of_row(tmp_path):
+    """A proposal is not a report: the row carries the action and the answer is
+    elsewhere. Rendering it as a run's result would offer "成功" for a question."""
+    from agent import LTMStore
+    from agent.session_service import SessionService
+
+    service = SessionService(store=LTMStore(context_dir=tmp_path / "context"))
+    message = reports.build_proposal_message(
+        {
+            "id": "p3",
+            "action": "把截图目录归档",
+            "reason": "三天没动过",
+            "reversibility": "reversible",
+            "admission": {"answer": "prepare"},
+        }
+    )
+    row = service.append_report("s-main", message, event_type="proposal_raised")
+
+    assert row is not None
+    assert row["role"] == "proposal"
+    assert row["title"] == "把截图目录归档"
+    assert row["proposalId"] == "p3"
+    assert row["reversibility"] == "reversible"
+    stored = service.get_messages("s-main")["messages"]
+    assert [item["role"] for item in stored] == ["proposal"]

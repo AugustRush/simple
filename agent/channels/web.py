@@ -313,10 +313,11 @@ class WebChannel(Channel):
         session_id = read_main_session_id()
         if not session_id:
             return
-        row = self._service().append_report(session_id, report)
+        event_type = "proposal_raised" if report.get("kind") == "proposal" else "run_report"
+        row = self._service().append_report(session_id, report, event_type=event_type)
         if not row:
             return
-        frame = {"type": "run_report", "message": row}
+        frame = {"type": "run_report" if event_type == "run_report" else "proposal_raised", "message": row}
         for websocket in tuple(self._live_sockets.get(session_id, set())):
             try:
                 # A schedule on its own loop: this runs inside the scheduler's

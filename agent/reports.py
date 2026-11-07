@@ -118,6 +118,33 @@ def build_report(
     }
 
 
+def build_proposal_message(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """A proposal as something the agent *says*, not just a card on the board.
+
+    The patrol raising a proposal is the agent having an idea about your work.
+    Until now the idea lived on a panel you had to open; a person's assistant
+    telling them something they should decide is a sentence in the conversation.
+
+    Only `prepare` proposals speak. An `auto` one already ran (it is reversible,
+    so it did not need you), and announcing an errand it gave itself is the noise
+    this channel exists to avoid.
+    """
+    admission = row.get("admission") if isinstance(row, dict) else None
+    if not isinstance(admission, dict) or str(admission.get("answer") or "") != "prepare":
+        return None
+    action = _one_line(row.get("action"), 160)
+    if not action:
+        return None
+    return {
+        "kind": "proposal",
+        "id": str(row.get("id") or ""),
+        "text": _one_line(row.get("reason"), 400) or "它觉得这件事值得你看一眼。",
+        "title": action,
+        "reversibility": str(row.get("reversibility") or ""),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def publish(report: dict[str, Any]) -> None:
     """Hand one report to every listener, and never to a caller's exception.
 
