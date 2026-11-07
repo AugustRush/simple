@@ -89,7 +89,7 @@ ${ids}
 }
 
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, startNewSession, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
+  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, openConversation, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
 
 
   /**
@@ -292,7 +292,7 @@ export function renderSchedules(ctx: AppCtx) {
                       aria-label={`在对话里修改 ${row.name}`}
                       onClick={event => {
                         event.stopPropagation()
-                        void startNewSession(editAutomationSeed(row))
+                        void openConversation(editAutomationSeed(row))
                       }}
                     />
                   </Tooltip>
@@ -377,7 +377,7 @@ export function renderSchedules(ctx: AppCtx) {
                           type="text"
                           icon={<EditOutlined />}
                           aria-label={`在对话里修改 ${flow.name}`}
-                          onClick={() => void startNewSession(editAutomationSeed({
+                          onClick={() => void openConversation(editAutomationSeed({
                             kind: 'chain',
                             name: flow.name,
                             task_id: '',
@@ -507,7 +507,7 @@ export function renderSchedules(ctx: AppCtx) {
               <Button
                 type="primary"
                 icon={<MessageOutlined />}
-                onClick={() => void startNewSession(NEW_AUTOMATION_SEED)}
+                onClick={() => void openConversation(NEW_AUTOMATION_SEED)}
               >
                 对话新建
               </Button>
@@ -695,7 +695,7 @@ export function renderSchedules(ctx: AppCtx) {
             <Button icon={<ThunderboltOutlined />} onClick={() => runScheduleNow(selectedSchedule)} disabled={schedulerHealth.status !== 'online' || !!selectedSchedule.active_run_id}>立即运行</Button>
             <Button
               icon={<EditOutlined />}
-              onClick={() => void startNewSession(editAutomationSeed({
+              onClick={() => void openConversation(editAutomationSeed({
                 kind: 'task',
                 name: selectedSchedule.name,
                 task_id: selectedSchedule.id,
@@ -1047,7 +1047,7 @@ export function renderSchedules(ctx: AppCtx) {
                     />
                     <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
                     <Tooltip title={schedulerHealth.status === 'online' ? '立即运行' : '调度器离线'}><Button type="text" icon={<ThunderboltOutlined />} aria-label={`立即运行 ${task.name}`} disabled={schedulerHealth.status !== 'online' || !!task.active_run_id} onClick={() => runScheduleNow(task)} /></Tooltip>
-                    <Tooltip title="在对话里修改"><Button type="text" icon={<EditOutlined />} aria-label={`在对话里修改 ${task.name}`} onClick={() => void startNewSession(editAutomationSeed({ kind: 'task', name: task.name, task_id: task.id, workflow_id: '' }))} /></Tooltip>
+                    <Tooltip title="在对话里修改"><Button type="text" icon={<EditOutlined />} aria-label={`在对话里修改 ${task.name}`} onClick={() => void openConversation(editAutomationSeed({ kind: 'task', name: task.name, task_id: task.id, workflow_id: '' }))} /></Tooltip>
                     <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
                   </Space>
                 </div>

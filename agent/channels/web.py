@@ -1908,6 +1908,15 @@ class WebChannel(Channel):
         if not all(isinstance(item, str) and item.strip() for item in session_ids):
             return JSONResponse({"error": "session_ids must contain non-empty strings"}, status_code=400)
         result = await self._service().delete_sessions_async(session_ids)
+        # The pointer to the one conversation is authoritative (see
+        # agent/main_session.py), so deletion is the only thing that can make it
+        # point at nothing -- and it has to clear it here, or the next boot hands
+        # the app a thread whose history was just deleted.
+        from agent.main_session import clear_main_session_id, read_main_session_id
+
+        main_id = read_main_session_id()
+        if main_id and main_id in set(session_ids):
+            clear_main_session_id()
         return JSONResponse({"ok": not result["failed"], **result})
 
     async def _reveal_session(self, request: Any) -> Any:
@@ -2041,6 +2050,30 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return JSONResponse({"sessions": self._service().list_sessions()})
+
+    async def _main_session(self, request: Any) -> Any:
+        """The conversation the app opens, creating it the first time.
+
+        A POST, not a GET, because this may mint a session -- and a GET that
+        writes is the kind of thing that turns a prefetch into a second
+        conversation. The path is a singular ``/api/session/main`` on purpose: it
+        names *the* conversation, not a list of them.
+
+        Re-validated against the live list every time. A deleted conversation is
+        not the main one, and a stale pointer would boot the app into a thread
+        whose socket cannot be opened -- the failure the restore path already had
+        once and answered by silently starting over. This answers it by
+        re-creating on purpose.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.main_session import resolve_main_session
+
+        service = self._service()
+        session_id, created = resolve_main_session(create=service.create_session)
+        return JSONResponse({"session_id": session_id, "created": created})
 
     async def _create_session(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -3105,6 +3138,9 @@ class WebChannel(Channel):
             Route("/api/sessions/{session_id}/attachments", self._upload_attachment, methods=["POST"]),
             Route("/api/files", self._file, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
+            # The one conversation, as opposed to a list of them. See
+            # agent/main_session.py for why the app has one at all.
+            Route("/api/session/main", self._main_session, methods=["POST"]),
             Route("/api/sessions", self._create_session, methods=["POST"]),
             Route("/api/sessions", self._delete_sessions, methods=["DELETE"]),
             Route(

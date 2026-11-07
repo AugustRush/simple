@@ -111,8 +111,8 @@ export interface AppCtx {
   stopStreaming: () => void
   composerSendable: boolean
   creatingSession: boolean
-  startNewSession: (seed?: string) => Promise<void>
-  createSession: () => Promise<void>
+  //: Open the one conversation, optionally with a sentence already in the box.
+  openConversation: (seed?: string) => Promise<void>
   sendMessage: (overrideText?: string | undefined) => Promise<void>
   resolvedComposerText: string
   pageMeta: Record<string, { title: string; subtitle: string; }>

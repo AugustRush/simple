@@ -1194,7 +1194,14 @@ export function useConversations(deps: Deps) {
   )
 
   const selectSession = useCallback(
-    (sid: string) => {
+    (
+      sid: string,
+      //: Opening a conversation is normally also "go to the conversation". Boot
+      //: is the exception: a reload of `#/schedules` must stay on 自动化, and
+      //: the conversation it restores is the one the app always has, not a
+      //: navigation somebody asked for.
+      options: { stayOnView?: boolean } = {},
+    ) => {
       setPendingDeleteSessionId(null)
       followChatRef.current = true
       queuedMessagesRef.current = []
@@ -1202,7 +1209,7 @@ export function useConversations(deps: Deps) {
       setSessionState(null)
       activeSessionRef.current = sid
       setActiveSession(sid)
-      setView('home')
+      if (!options.stayOnView) setView('home')
       streamIdRef.current = null
       streamTurnRef.current = null
       setIsStreaming(false)
@@ -1257,28 +1264,40 @@ export function useConversations(deps: Deps) {
 
   useEffect(() => {
     let cancelled = false
-    // Read the remembered session before awaiting the fetch: the persist
-    // effect below clears the key while activeSession is still null. A session
-    // named in the address bar outranks it: that is the one the link was to.
-    const linked = parseRoute(window.location.hash).sessionId
-    const stored = linked || localStorage.getItem('agent_active_session')
+    // One conversation, and the server keeps it.
+    //
+    // The browser used to remember a session id and restore whichever one was
+    // last open -- which made "which conversation am I in" a piece of client
+    // state that could be lost (new profile, cleared storage) and that the
+    // server knew nothing about. It is now the install's, asked for once at
+    // boot: the answer cannot disagree with the sessions on disk because there
+    // is nothing on this side to disagree with.
+    //
+    // A session named in the address bar still outranks it: a link says *which*
+    // thread it meant, and that is the one thing a main conversation cannot
+    // guess.
+    const route = parseRoute(window.location.hash)
+    const linked = route.sessionId
     const restore = async () => {
-      // A browser refresh used to dump the user on the welcome screen even
-      // though their conversation was still on the server. Re-open the last
-      // session when it still exists; otherwise start clean.
-      const list = await loadSessions()
+      let main = ''
+      try {
+        const resp = await api('/api/session/main', { method: 'POST' })
+        const data = await resp.json()
+        main = String(data.session_id || '')
+      } catch {
+        // No conversation available (an older gateway, or a hard failure): the
+        // landing shows and the first message mints one, as before.
+      }
       if (cancelled) return
-      if (stored && list.some(item => item.session_id === stored)) {
-        selectSession(stored)
+      const target = linked || main
+      if (target) {
+        // Stay on the page the address names: a reload of `#/schedules` is a
+        // reload of 自动化, not a jump into the conversation behind it.
+        selectSession(target, { stayOnView: route.view !== 'home' })
         return
       }
-      // A linked session that is gone is not a conversation to show: drop it so
-      // the address bar follows the welcome screen instead of naming a session
-      // no socket can be opened against.
-      if (linked) {
-        activeSessionRef.current = null
-        setActiveSession(null)
-      }
+      activeSessionRef.current = null
+      setActiveSession(null)
     }
     restore()
     api('/api/commands')
@@ -1286,14 +1305,12 @@ export function useConversations(deps: Deps) {
       .then(data => setCommands(data.commands || []))
       .catch(() => {})
     return () => { cancelled = true }
-  }, [api, loadSessions, selectSession])
+  }, [api, selectSession])
 
-  // Remember the open conversation so a refresh can return to it. Deleting the
-  // active session clears the key and the next load starts fresh.
-  useEffect(() => {
-    if (activeSession) localStorage.setItem('agent_active_session', activeSession)
-    else localStorage.removeItem('agent_active_session')
-  }, [activeSession])
+  // No remembered-view key any more. Which conversation is open is the install's
+  // fact, not this browser's: a second browser, a cleared profile or a private
+  // window used to start a fresh conversation beside the real one. The server
+  // answers `POST /api/session/main` and the address bar names the open thread.
 
   useEffect(() => {
     if (activeSession) {
@@ -1720,7 +1737,7 @@ export function useConversations(deps: Deps) {
 
   const pickWorkspace = async () => {
     if (!activeSession) {
-      messageApi.info('请先选择或新建会话')
+      messageApi.info('请先打开对话')
       return
     }
     try {
@@ -1738,37 +1755,12 @@ export function useConversations(deps: Deps) {
     }
   }
 
-  const createSession = async () => {
-    try {
-      setCreatingSession(true)
-      const resp = await api('/api/sessions', { method: 'POST' })
-      const data = await resp.json()
-      activeSessionRef.current = data.session_id
-      await loadSessions()
-      selectSession(data.session_id)
-    } catch {
-      // Handled by api helper.
-    } finally {
-      setCreatingSession(false)
-    }
-  }
-
-  /**
-   * A new conversation, with the composer already holding *seed*.
-   *
-   * This is how a capability is offered now: the page does not know how to build the
-   * thing, so it opens a conversation about it and puts the first sentence in the box.
-   * The draft is keyed by the **new** session's id -- `setInput` writes to the *current*
-   * draft key, which is still the old session's at this point, so it would seed the
-   * conversation the person just left.
-   */
   /**
    * Re-read the list after a turn has been named.
    *
-   * The title is written by the server on the first message, and the sidebar is
+   * The title is written by the server on the first message, and the drawer is
    * the only place it shows. Without this the row stayed "未命名会话" until
-   * something else happened to reload the list -- which, for a new conversation,
-   * could be minutes.
+   * something else happened to reload the list.
    */
   const refreshSessionTitles = useCallback(async () => {
     try {
@@ -1784,17 +1776,30 @@ export function useConversations(deps: Deps) {
         }) as SessionInfo[],
       )
     } catch {
-      // A sidebar that cannot refresh keeps the names it had.
+      // A drawer that cannot refresh keeps the names it had.
     }
   }, [api])
 
-  const startNewSession = async (seed?: string) => {
+  /**
+   * Open the conversation, optionally with *seed* already in the box.
+   *
+   * This is how a capability is offered now: a page does not know how to build
+   * the thing, so it opens a conversation about it and puts the first sentence in
+   * the box. It used to mint a *new* session for that, which is how a product
+   * with one relationship accumulated dozens of half-conversations -- "在对话里修改"
+   * left your actual conversation behind to start a parallel one.
+   *
+   * The seed is keyed by the conversation's id because `setInput` writes to the
+   * *current* draft key, which is still the previous conversation's at this point.
+   */
+  const openConversation = async (seed?: string) => {
     try {
       setCreatingSession(true)
-      const resp = await api('/api/sessions', { method: 'POST' })
+      const resp = await api('/api/session/main', { method: 'POST' })
       const data = await resp.json()
       const sid = String(data.session_id || '')
-      if (sid && seed) setDrafts(prev => ({ ...prev, [sid]: seed }))
+      if (!sid) return
+      if (seed) setDrafts(prev => ({ ...prev, [sid]: seed }))
       activeSessionRef.current = sid
       await loadSessions()
       selectSession(sid)
@@ -1866,6 +1871,10 @@ export function useConversations(deps: Deps) {
         // ignore storage errors
       }
       if (activeSession === item.session_id) {
+        // Deleting the conversation does not leave the app without one: the
+        // next line asks for it again, which mints a fresh one (the server
+        // clears its pointer on delete). A null session here would show the
+        // landing page to somebody who just pressed 删除 on their history.
         activeSessionRef.current = null
         setActiveSession(null)
         setMessages([])
@@ -1912,7 +1921,7 @@ export function useConversations(deps: Deps) {
 
   const updateSessionPermissions = async (patch: { level?: string; sandbox?: string }) => {
     if (!activeSession) {
-      messageApi.info('请先选择或新建会话')
+      messageApi.info('请先打开对话')
       return
     }
     try {
@@ -2272,5 +2281,5 @@ export function useConversations(deps: Deps) {
     !isStreaming &&
     String(sessionState?.operation_state || 'idle') === 'idle'
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, startNewSession, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

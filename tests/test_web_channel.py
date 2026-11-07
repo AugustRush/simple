@@ -406,6 +406,57 @@ def test_web_health_and_sessions_endpoints():
         assert messages.json()["messages"] == []
 
 
+def test_the_app_asks_for_one_conversation_and_gets_the_same_one_back():
+    """The main conversation survives a reload, and a deleted one is replaced.
+
+    This is the whole difference between "a chat app" and "an agent". The first
+    asks which container a sentence belongs to; the second has one, and boots
+    into it. The endpoint is checked here rather than in the browser because what
+    matters is the *identity* that comes back -- the UI is a reader of it.
+    """
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = _echo_handler
+
+    with TestClient(channel.app) as client:
+        first = client.post("/api/session/main").json()
+        assert first["session_id"]
+        assert first["created"] is True, "the first call has to mint a conversation"
+
+        # Second call: the same conversation, and no second one created. A boot
+        # that mints on every call would leave a trail of empty sessions and no
+        # continuity at all.
+        second = client.post("/api/session/main").json()
+        assert second["session_id"] == first["session_id"]
+        assert second["created"] is False
+
+        # Deleting the conversation must not leave a pointer to a session that no
+        # longer exists: the next boot opens a fresh one instead of a thread whose
+        # history was just deleted -- and then that fresh one is the conversation.
+        client.request("DELETE", "/api/sessions", json={"session_ids": [first["session_id"]]})
+        third = client.post("/api/session/main").json()
+        assert third["session_id"] != first["session_id"]
+        assert third["created"] is True
+
+        fourth = client.post("/api/session/main").json()
+        assert fourth["session_id"] == third["session_id"]
+        assert fourth["created"] is False, "the fresh conversation has to stick"
+
+
+def test_the_main_conversation_is_behind_the_same_gate_as_everything_else():
+    from starlette.testclient import TestClient
+
+    channel = _channel(auth_token="secret")
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        resp = client.post("/api/session/main")
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "unauthorized"}
+
+
 def test_the_health_endpoint_is_behind_the_same_gate_as_everything_else():
     """With a token configured the operator closed the whole surface.
 

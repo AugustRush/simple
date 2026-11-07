@@ -475,45 +475,31 @@ def test_the_board_shows_what_it_would_do(page, live_gateway):
     assert page.errors == [], page.errors
 
 
-def test_the_app_opens_on_the_agent_not_on_a_thread(page):
-    """The landing view answers "is anything waiting for me", not "which thread".
+def test_the_app_opens_the_one_conversation(page):
+    """One conversation, and it is already open.
 
-    Opening on whichever conversation was last active was the right shape when the
-    product *was* a session manager. It is not any more: the agent has one
-    identity and one screen, so the landing page is a box and the record of what
-    the agent has been doing. Typing in the box starts a thread without a "new
-    conversation" click first.
+    The app used to open on a welcome screen and turn the first message into a
+    new thread. That shape belongs to a chat product: it asks which container a
+    sentence goes into. This one has a conversation -- the install remembers it
+    and hands it back at boot -- so `#/` *is* that conversation, the address
+    names it, and nothing stands in front of it.
     """
     page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.wait_for_selector(".home-room", timeout=20_000)
 
-    assert page.locator(".home-view").count() == 1, "the landing view must be 主页"
-    assert page.locator(".page-title").inner_text() == "主页"
-    # The box, and it says what it does.
-    composer = page.locator(".home-composer-input")
-    assert composer.count() == 1
-    # The placeholder says both ways in: a sentence, or a standing instruction.
-    # "不用先新建会话" was the earlier wording; the box now also advertises that a
-    # task is created by *asking*, because that is the only creation path this
-    # product has (a form here would be a second one).
-    placeholder = composer.get_attribute("placeholder")
-    assert "说一句话就开始" in placeholder
-    assert "每天早上提醒我" in placeholder
-    # The record: runs and conversations together, behind one line. Threads are
-    # rows in it and in a drawer, not a second navigation column.
+    assert page.locator(".home-view").count() == 0, (
+        "the landing page -- a box with a new-conversation click behind it -- is gone"
+    )
+    assert "#/t/" in page.url, f"the address names the open thread: {page.url}"
+    assert page.locator(".composer-wrap textarea").count() == 1
+    # What it did on its own is one line above the conversation, closed by
+    # default: while you are talking, that is background.
+    strip = page.locator(".self-activity-head")
+    assert strip.count() == 1
+    assert strip.get_attribute("aria-expanded") == "false"
+
+    # Navigation is one bar plus a menu, not a column.
     assert page.locator(".app-sider").count() == 0, "the sidebar is gone"
-    assert page.locator(".home-thread").count() == 0, "thread rows are record rows"
-    # The board is a panel now, so the page itself carries no board groups.
-    assert page.locator(".panel-group").count() == 0, "the board belongs to the panel"
-    if page.locator(".home-timeline-row").count():
-        assert page.locator(".home-timeline-row").first.inner_text().strip()
-    else:
-        text = page.inner_text(".home-view")
-        assert "还没有记录" in text
-        assert "框" in text, "the empty state names the way in"
-    # Navigation is one menu, not a column: the pages a person manages are behind
-    # ⋯, and threads behind their own drawer. A sidebar charged every screen for
-    # six entries, five of which are opened once a week.
-    # The bar carries what is used while working; the menu carries the rest.
     bar = [
         page.locator(".header-right .ant-btn").nth(i).inner_text().strip()
         for i in range(page.locator(".header-right .ant-btn").count())
@@ -527,62 +513,61 @@ def test_the_app_opens_on_the_agent_not_on_a_thread(page):
     ]
     assert "记忆" in labels and "设置" in labels, labels
     assert "会话管理" not in labels, labels
-    # 对话 is not a page any more: the conversation is this screen.
     assert "对话" not in labels, labels
-    # …and what is on the bar is not duplicated in the menu.
     assert "自动化" not in labels and "线程" not in labels, labels
     page.keyboard.press("Escape")
     assert page.errors == [], page.errors
 
 
-def test_typing_on_home_starts_a_thread(page):
-    """The first message *is* the thread: no create-then-send, no extra click."""
-    page.goto(page.url.split("#")[0], wait_until="networkidle")
-    before = len(page.url)
+def test_typing_sends_into_the_same_conversation(page):
+    """A message is not a new conversation -- it is the next turn of this one.
 
-    box = page.wait_for_selector(".home-composer-input", timeout=20_000)
-    box.fill("帮我看看昨天的构建")
-    page.locator(".home-box").locator("button[aria-label='发送']").click()
-
-    # The same screen becomes the conversation, and the address names the thread.
-    page.wait_for_selector(".home-room", timeout=20_000)
-    page.wait_for_timeout(1200)
-    assert "#/t/" in page.url, page.url
-    assert len(page.url) > before
-
-
-def test_a_new_conversation_shows_up_in_the_record(page):
-    """The record is where "what has it done" is answered, so a thread you just
-    had has to appear in it.
-
-    The end-to-end version of the two bugs found while building the page: the
-    effect that loads `/api/home` had neither `loadHome` nor `loadSessions` in
-    its dependency list, so arriving at the view a second time kept the first
-    visit's answer -- and the thread list showed "暂无会话" over sessions that
-    existed.
+    The old flow made the first message *create* a thread, which is why every
+    screen had a "new conversation" path. Here the conversation predates the
+    first message, so sending must leave the identity alone.
     """
     page.goto(page.url.split("#")[0], wait_until="networkidle")
-    page.wait_for_timeout(2500)
-    before = page.locator(".home-timeline-thread").count()
-
-    box = page.wait_for_selector(".home-composer-input", timeout=20_000)
-    box.fill("帮我总结当前项目")
-    page.locator(".home-box").locator("button[aria-label='发送']").click()
     page.wait_for_selector(".home-room", timeout=20_000)
-    page.wait_for_timeout(3500)
+    before = page.url
 
-    # Back to the landing the way a person does: 新对话 in the threads drawer, which
-    # is now the bar's 线程 button rather than an item in ⋯.
+    box = page.wait_for_selector(".composer-wrap textarea", timeout=20_000)
+    box.fill("帮我看看昨天的构建")
+    box.press("Enter")
+    page.wait_for_selector("text=帮我看看昨天的构建", timeout=30_000)
+    page.wait_for_timeout(1200)
+
+    assert page.url == before, f"the conversation changed under the message ({before} -> {page.url})"
+    assert page.errors == [], page.errors
+
+
+def test_the_drawer_lists_threads_and_offers_no_way_to_make_one(page):
+    """线程 is a list of work, not a set of documents to create.
+
+    It used to open with 新对话, which is the same question the landing page
+    asked, one door deeper: which container does this sentence belong to. The
+    button is gone -- the conversation already exists -- and what is left is the
+    record: the sessions work happened in, with the open one marked.
+    """
+    page.goto(page.url.split("#")[0], wait_until="networkidle")
+    page.wait_for_selector(".home-room", timeout=20_000)
+
+    box = page.wait_for_selector(".composer-wrap textarea", timeout=20_000)
+    box.fill("帮我总结当前项目")
+    box.press("Enter")
+    page.wait_for_selector("text=帮我总结当前项目", timeout=30_000)
+    page.wait_for_timeout(2000)
+
     page.locator(".header-right .ant-btn", has_text="线程").first.click()
-    page.wait_for_selector(".threads-new", timeout=10_000)
-    page.locator(".threads-new").click()
-    page.wait_for_timeout(2500)
+    page.wait_for_selector(".session-panel", timeout=10_000)
 
-    after = page.locator(".home-timeline-thread").count()
-    assert after > before, f"the record did not grow a thread ({before} -> {after})"
-    # The row exists; its title may still be 未命名线程 for a turn that has not
-    # finished, which is the backend's business, not this screen's.
-    assert page.locator(".home-timeline-thread").first.inner_text().strip()
+    assert page.locator(".threads-new").count() == 0, (
+        "a conversation is not something the person creates"
+    )
+    rows = page.locator(".session-item")
+    assert rows.count() >= 1, "the thread the turn happened in must be listed"
+    assert rows.first.inner_text().strip()
+    assert page.locator(".session-item.active").count() == 1, "the open thread is marked"
+
     assert page.errors == [], page.errors
 
 
@@ -792,6 +777,10 @@ def test_the_timeline_can_load_older_pages(page, live_gateway):
         store.close()
 
     page.goto(page.url.split("#")[0], wait_until="networkidle")
+    # The record lives inside the conversation's strip now (the landing page that
+    # used to hold it open by default is gone), so it has to be opened first.
+    page.wait_for_selector(".self-activity-head", timeout=20_000)
+    page.locator(".self-activity-head").click()
     page.wait_for_selector(".home-timeline-row", timeout=20_000)
     before = page.locator(".home-timeline-row").count()
 

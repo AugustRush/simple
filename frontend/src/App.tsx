@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MoonOutlined, MoreOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, CodeOutlined, DeleteOutlined, EditOutlined, FolderOpenOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SearchOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
 import { Badge, Button, ConfigProvider, Drawer, Dropdown, Empty, Input, Layout, Modal, Skeleton, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
@@ -88,7 +88,7 @@ function App() {
 
   const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
-  const { activateTurnIndex, activeSession, startNewSession, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSendShortcut, setSessionSearch, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
+  const { activateTurnIndex, activeSession, openConversation, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSendShortcut, setSessionSearch, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
@@ -236,8 +236,7 @@ function App() {
     stopStreaming,
     composerSendable,
     creatingSession,
-    createSession,
-    startNewSession,
+    openConversation,
     sendMessage,
     resolvedComposerText,
     pageMeta,
@@ -565,21 +564,11 @@ function App() {
         title="线程"
         styles={{ body: { padding: '10px 12px 16px' } }}
       >
-        {/* Not "新建会话" in the old sense: a thread is something a conversation
-            creates. This just clears the open thread so the next message starts
-            a new one -- which is what "new" means in a product whose unit of
-            conversation is the message, not the document. */}
-        <Button
-          block
-          icon={<PlusOutlined />}
-          className="threads-new"
-          onClick={() => {
-            selectSession('')
-            setThreadsOpen(false)
-          }}
-        >
-          新对话
-        </Button>
+        {/* No "新对话" button. Starting a conversation was never the work: the
+            app has one, it is always open, and the first sentence in the box is
+            what makes it say something. This list is the *threads* -- the
+            sessions work happened in, including the ones a scheduled task ran
+            in -- and a row here is a place to look, not a thing to create. */}
       <div className="session-panel">
         <div className="session-panel-label">
           线程
