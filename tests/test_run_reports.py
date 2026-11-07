@@ -260,3 +260,31 @@ def test_a_proposal_is_journalled_as_its_own_kind_of_row(tmp_path):
     assert row["reversibility"] == "reversible"
     stored = service.get_messages("s-main")["messages"]
     assert [item["role"] for item in stored] == ["proposal"]
+
+
+def test_a_failed_run_speaks_in_the_conversation():
+    """A failure that only shows on the board never reached the person.
+
+    Found by auditing the implementation the day after shipping it: the runtime
+    called the reporter on the success path and *not* on the exception path --
+    which is the path a dropped connection or a timeout ends in. So
+    `build_report`'s rule ("a failure always speaks") was never executed for the
+    exact runs it was written for, and the two failed tasks on this machine had
+    said nothing in the conversation.
+
+    Source-level, because driving a raised executor through the whole runtime
+    would test the composition rather than this rule. What it pins is that both
+    completion paths reach the reporter.
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "agent" / "scheduler" / "runtime.py"
+    ).read_text(encoding="utf-8")
+    # Two call sites: the one that ends a succeeded run, and the one that ends a
+    # raised one. The second is what was missing.
+    assert source.count("await self._report(") >= 2
+    exception_path = source[source.index("        except Exception as exc:\n            status = ("):]
+    exception_path = exception_path[: exception_path.index("        finally:")]
+
+    assert "await self._report(" in exception_path

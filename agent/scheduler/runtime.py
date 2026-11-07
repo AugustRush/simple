@@ -42,7 +42,12 @@ logger = logging.getLogger(__name__)
 
 
 def automatic_retry_at(
-    task, run, finished_at: datetime, error: str
+    task,
+    run,
+    finished_at: datetime,
+    error: str,
+    *,
+    produced: bool = True,
 ) -> Optional[datetime]:
     snapshot = dict(getattr(run, "config_snapshot", {}) or {})
     retry_policy = snapshot.get("retry_policy")
@@ -68,6 +73,13 @@ def automatic_retry_at(
 
         reason = describe_failure(error)
         if attempt != 1 or reason is None or not reason.transient:
+            return None
+        if produced:
+            # The turn finished and something came out of it: a retry would do
+            # the work a second time (write the file again, send the message
+            # again). A transient *transport* failure is the only case where
+            # repeating is safe, and it is the case where the turn has nothing
+            # to hand over.
             return None
         if shared.is_account_exhausted_text(error):
             return None
@@ -649,9 +661,17 @@ class SchedulerService:
         )
 
     def _automatic_retry_at(
-        self, task, run, finished_at: datetime, error: str
+        self,
+        task,
+        run,
+        finished_at: datetime,
+        error: str,
+        *,
+        produced: bool = True,
     ) -> Optional[datetime]:
-        return automatic_retry_at(task, run, finished_at, error)
+        return automatic_retry_at(
+            task, run, finished_at, error, produced=produced
+        )
 
     async def _owns_unexpired_lease(self, task, run, now) -> bool:
         try:
@@ -976,12 +996,36 @@ class SchedulerService:
                 # anybody, because nothing downstream runs on a failure.
                 products=self._measure_products(task, run),
                 retry_at=(
-                    self._automatic_retry_at(task, run, finished_at, str(exc))
+                    self._automatic_retry_at(
+                        task,
+                        run,
+                        finished_at,
+                        str(exc),
+                        # Nothing came out of it: the turn raised before it had
+                        # a result to hand over. That is the case a retry can
+                        # safely repeat -- the other one (a finished turn that
+                        # failed delivery or acceptance) has already done its
+                        # work, and doing it twice is worse than not doing it.
+                        produced=result is not None,
+                    )
                     if status in RETRYABLE_RUN_STATUSES
                     else None
                 ),
             )
             await self._notify_attention(task, run, status=status, error=str(exc))
+            # A failure has to say so in the conversation as well as on the
+            # banner. This path is where a raised turn ends -- the connection
+            # that dropped, the timeout -- and it used to record, notify and
+            # then stop: `build_report`'s rule "a failure always speaks" was
+            # never reached, so the two failed tasks on this machine sat on the
+            # board having said nothing in the conversation at all.
+            await self._report(
+                task,
+                run,
+                status=status,
+                summary="",
+                error=str(exc),
+            )
         finally:
             # Only the run's own bookkeeping is dropped here.  The lease renewal
             # and the cancellation watcher are owned by `_execute_with_limit`,

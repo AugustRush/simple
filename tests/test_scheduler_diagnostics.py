@@ -121,7 +121,7 @@ def test_a_transient_failure_gets_one_retry_even_though_the_policy_says_one_atte
 
     run, task = _run()
     when = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
-    retry = automatic_retry_at(task, run, when, "connection lost mid-reply")
+    retry = automatic_retry_at(task, run, when, "connection lost mid-reply", produced=False)
 
     assert retry is not None
     assert retry > when, "the retry has to be in the future, not a busy loop"
@@ -171,3 +171,22 @@ def test_an_exhausted_account_is_not_retried_even_when_transient_looking():
     run, task = _run()
 
     assert automatic_retry_at(task, run, when, "429 account quota exceeded") is None
+
+
+def test_a_finished_turn_is_never_grace_retried():
+    """The work happened: a retry would do it a second time.
+
+    A dropped connection mid-turn means the provider never answered; a turn that
+    *finished* and then failed delivery has already written the file, sent the
+    message, or charged the card. Repeating that is worse than reporting it.
+    """
+    from datetime import datetime, timezone
+
+    from agent.scheduler.runtime import automatic_retry_at
+
+    run, task = _run()
+    when = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+
+    assert automatic_retry_at(
+        task, run, when, "connection lost mid-reply", produced=True
+    ) is None
