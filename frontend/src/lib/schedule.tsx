@@ -384,6 +384,36 @@ export function scheduleRunAttentionReason(run: { status?: string; missed_count?
  * self-report has no verdict, and inventing one would be the collapse this
  * exists to undo.
  */
+/**
+ * What one run was actually told to do.
+ *
+ * Read from the run's own snapshot, not from the task: a run is a promise that
+ * was made at a moment, and editing the task afterwards changes the promise but
+ * not the history. A person looking at "why did it do that" months later needs
+ * the words of *that* run, which is the only copy that cannot have moved.
+ *
+ * The three payload kinds are different questions (`prompt` is an instruction,
+ * `message_text` is a literal message, `job_name` an internal job), so they are
+ * not flattened into one field name.
+ */
+export function describeRunInstruction(run: ScheduleRun): string {
+  const payload = run?.config_snapshot?.payload
+  if (!payload || typeof payload !== 'object') return ''
+  const record = payload as Record<string, unknown>
+  for (const key of ['prompt', 'instruction', 'message_text']) {
+    const value = record[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  const job = record['job_name']
+  return typeof job === 'string' && job.trim() ? `内部作业：${job.trim()}` : ''
+}
+
+/** The permission envelope this run executed under, when it named one. */
+export function describeRunProfile(run: ScheduleRun): string {
+  const profile = run?.config_snapshot?.permission_profile
+  return typeof profile === 'string' ? profile.trim() : ''
+}
+
 export function scheduleRunVerdictLabel(run: ScheduleRun): string | null {
   if (run.verdict === 'failed') return '未达验收标准'
   if (run.verdict === 'passed') return '已达验收标准'

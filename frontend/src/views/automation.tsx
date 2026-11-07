@@ -11,6 +11,8 @@ import {
 import { markdownToHtml } from '../lib/markdown'
 import {
   describeAcceptance,
+  describeRunInstruction,
+  describeRunProfile,
   describeCascade,
   describeElapsed,
   describeFreshness,
@@ -900,6 +902,21 @@ export function renderSchedules(ctx: AppCtx) {
                         )}
                         <div><small>运行模型</small><span>{selectedScheduleRun.config_snapshot?.model_override || '默认模型'}</span></div>
                       </div>
+
+                      {/* What this run was told, from its own snapshot. The
+                          task's definition may have changed since; the words
+                          below are the ones that produced what follows. */}
+                      {describeRunInstruction(selectedScheduleRun) && (
+                        <div className="schedule-run-instruction">
+                          <div className="schedule-output-head">
+                            <strong>这次运行的指令</strong>
+                            {describeRunProfile(selectedScheduleRun) && (
+                              <span>{permissionProfileLabel(describeRunProfile(selectedScheduleRun))}</span>
+                            )}
+                          </div>
+                          <pre>{describeRunInstruction(selectedScheduleRun)}</pre>
+                        </div>
+                      )}
 
                       {scheduleRunVerdictLabel(selectedScheduleRun) && (
                         <div className={`schedule-run-verdict verdict-${selectedScheduleRun.verdict || 'unknown'}`}>

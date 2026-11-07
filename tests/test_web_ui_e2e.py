@@ -737,6 +737,74 @@ def test_the_board_answers_a_proposal_where_it_shows_it(page, live_gateway):
     assert page.errors == [], page.errors
 
 
+def test_a_run_detail_says_what_the_run_was_told(page, live_gateway):
+    """History has to be readable after the task is edited or deleted.
+
+    A run is a promise made at a moment. The detail already showed what came back
+    (summary, output, artifacts, the acceptance check); what it did not show was
+    the words that produced it. Read from the run's own snapshot, so an edit made
+    afterwards cannot rewrite the past.
+    """
+    import json
+    import urllib.request
+
+    payload = {
+        "name": "记下这次运行的指令",
+        "action_type": "message",
+        "message_text": "这句话应该出现在这次运行的历史里",
+        "trigger_type": "interval",
+        "every": 24,
+        "unit": "hours",
+        "anchor_at": "2026-11-01T00:00:00+08:00",
+        "workspace_root": str(live_gateway["home"]),
+        "context_policy": "stateless",
+        "delivery_mode": "standalone",
+        "timeout_seconds": 300,
+        "retry_policy": {"max_attempts": 1, "backoff_seconds": 30},
+        "selected_skills": [],
+        "permission_profile": "inherit",
+        "timezone_name": "Asia/Shanghai",
+    }
+    request = urllib.request.Request(
+        f"{live_gateway['base_url']}/api/schedules",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        created = json.loads(response.read().decode("utf-8"))
+    task_id = created["task"]["id"]
+
+    run_request = urllib.request.Request(
+        f"{live_gateway['base_url']}/api/schedules/{task_id}/run",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(run_request, timeout=20) as response:
+        assert response.status in (200, 202), response.status
+
+    # Wait for the run to finish, then open its detail.
+    for _ in range(40):
+        with urllib.request.urlopen(
+            f"{live_gateway['base_url']}/api/schedules/{task_id}/runs", timeout=10
+        ) as response:
+            runs = json.loads(response.read().decode("utf-8")).get("runs", [])
+        if runs and runs[0].get("status") not in ("queued", "running"):
+            break
+        page.wait_for_timeout(500)
+
+    open_page(page, "自动化")
+    page.wait_for_selector("text=记下这次运行的指令", timeout=20_000)
+    page.locator(".schedule-list").get_by_text("记下这次运行的指令").first.click()
+    page.wait_for_selector(".schedule-run-instruction", timeout=20_000)
+
+    instruction = page.locator(".schedule-run-instruction").first.inner_text()
+    assert "这句话应该出现在这次运行的历史里" in instruction, instruction
+    assert "这次运行的指令" in instruction
+    assert page.errors == [], page.errors
+
+
 def test_the_board_shows_a_goal_it_is_working_on(page, live_gateway):
     """A long goal is on the board while it is being worked, not only after.
 
