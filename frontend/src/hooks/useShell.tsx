@@ -345,7 +345,12 @@ export function useShell(deps: Deps) {
 
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
     home: {
-      title: activeSession ? '当前对话' : '主页',
+      // The open conversation's own name, not "当前对话". With one conversation
+      // the phrase was a placeholder that never became informative; the name the
+      // agent or the person gave it is the only thing up here that can change.
+      title: activeSession
+        ? (sessions.find(item => item.session_id === activeSession)?.title || '对话')
+        : '对话',
       // The subtitle is the connection state once a thread is open: it is the
       // part that changes while you read, and the thread's own name is in the
       // title. Three states, not two -- a socket that has not opened yet is not

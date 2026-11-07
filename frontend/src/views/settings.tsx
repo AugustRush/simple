@@ -635,7 +635,7 @@ export function createSettingsView(ctx: AppCtx) {
                     tooltip={
                       '这个 Provider 的模型想多深。「默认（不干预）」不发送任何思考参数，'
                       + '由服务商自己决定；「关闭」会明确要求不要思考；低/中/高逐级加深。'
-                      + '修改后随「保存设置」写入，对之后的新对话生效。'
+                      + '修改后随「保存设置」写入，对之后的对话生效。'
                     }
                   >
                     <Select options={thinkingEffortOptions} />

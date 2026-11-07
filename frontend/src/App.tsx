@@ -565,13 +565,8 @@ function App() {
             sessions work happened in, including the ones a scheduled task ran
             in -- and a row here is a place to look, not a thing to create. */}
       <div className="session-panel">
-        <div className="session-panel-label">
-          线程
-          {/* No "全部 N" link. It opened a page whose only unique job was
-              bulk delete, and the row menu already renames and deletes; a
-              screen that lists the same threads as this list, one click
-              deeper, was the page saying nothing twice. */}
-        </div>
+        {/* No section label: the drawer's own title says 线程, and a second one
+            40px below it was the page saying the same word twice. */}
         {loadingSessions ? (
           <Skeleton active paragraph={{ rows: 5 }} title={false} />
         ) : filteredSessions.length === 0 ? (

@@ -502,7 +502,8 @@ export function renderSchedules(ctx: AppCtx) {
             // Creating is a conversation, not a form. The page does not know what an
             // automation should look like for this person; the agent does, and it can
             // ask one question at a time instead of showing eleven fields and hoping.
-            // So this opens a new session with the first sentence already in the box.
+            // So this puts the first sentence in the box of the one conversation -- it
+            // used to start a *new* session, which left the real conversation behind.
             <Tooltip title="在对话里说清楚要什么，agent 会把任务或流程建好">
               <Button
                 type="primary"

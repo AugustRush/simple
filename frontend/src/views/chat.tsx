@@ -130,7 +130,7 @@ export function renderChat(ctx: AppCtx) {
                repeated it one click inside a thread the reader had already
                chosen. This says the one thing that is true of an empty thread. */
             <div className="chat-empty chat-empty-bare">
-              <p>这条线程还没有消息，说一句话就开始。</p>
+              <p>还没有消息。说一句话，它就动起来。</p>
             </div>
           ) : (
             <>
