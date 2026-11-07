@@ -239,6 +239,52 @@ def describe_upstream_results(snapshot: dict) -> str:
     )
 
 
+def previous_attempt_note(
+    previous_runs: Any,
+    *,
+    run_id: str,
+    attempt: int,
+) -> str:
+    """What the last failed attempt of this task got wrong, as a prompt block.
+
+    Empty when this is the first attempt, or when nothing failed before it: a
+    block that says "be careful" without a reason is noise the model cannot use.
+
+    The *newest* failure, not the oldest: after two failed attempts, the second
+    one is the state of the problem. The summary is included as well as the
+    error -- a run can fail its own acceptance check while the error is empty,
+    and the summary is then the only account of what it did claim.
+    """
+    if int(attempt or 1) <= 1:
+        return ""
+    failures = [
+        item
+        for item in (previous_runs or ())
+        if str(getattr(item, "id", "") or "") != str(run_id or "")
+        and str(getattr(item, "status", "") or "") in {"failed", "interrupted"}
+    ]
+    if not failures:
+        return ""
+    last = failures[-1]
+    reason = str(getattr(last, "error", "") or "").strip()
+    summary = str(getattr(last, "summary", "") or "").strip()
+    if not reason and not summary:
+        return ""
+    lines = [
+        f"This is attempt {int(attempt)} of the task. The previous attempt did not "
+        "pass its acceptance check.",
+    ]
+    if reason:
+        lines.append(f"Why it failed:\n{reason[:1500]}")
+    if summary:
+        lines.append(f"What it claimed to have done:\n{summary[:800]}")
+    lines.append(
+        "Fix that cause before doing anything else. Repeating the approach that "
+        "produced this will produce it again."
+    )
+    return "\n\n".join(lines)
+
+
 def _publish_wake(registry: Any, service: SchedulerService) -> None:
     """Expose "start a run now" to whatever a tool call can see.
 
@@ -473,9 +519,22 @@ def build_scheduler_service(
         self_report_token = None
         try:
             system_prompt = run_components["system_prompt"]
+            list_runs = getattr(store, "list_runs", None)
+            previous_runs = list_runs(task.id) if callable(list_runs) else []
+            # A retry that is not told what went wrong last time is not a retry,
+            # it is the same attempt again: it repeats the approach that failed
+            # and spends its budget arriving at the same error. The scheduler
+            # already knew the attempt number and already stored the reason --
+            # it just never handed the second to the run that needed it.
+            attempt_note = previous_attempt_note(
+                previous_runs,
+                run_id=run_id,
+                attempt=int(getattr(run, "attempt", 1) or 1),
+            )
+            if attempt_note:
+                system_prompt += "\n\n" + attempt_note
             if context_policy == "task_history":
-                list_runs = getattr(store, "list_runs", None)
-                previous = list_runs(task.id) if callable(list_runs) else []
+                previous = previous_runs
                 summaries = [
                     item.summary.strip()
                     for item in previous

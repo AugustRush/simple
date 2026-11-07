@@ -2477,3 +2477,90 @@ def test_a_failed_run_reaches_out_of_the_page_and_a_successful_one_does_not(tmp_
             assert [item["status"] for item in seen] == [expected_status], seen
             assert "boom" in seen[0]["error"], seen
         store.close()
+
+
+# ── a retry is told what the last attempt got wrong ─────────────────────────
+
+
+def test_a_retry_is_told_why_the_last_attempt_failed():
+    """The second attempt used to be the first attempt again.
+
+    The scheduler stored the reason and knew the attempt number, but never gave
+    the reason to the next run -- so a task whose build failed twice failed for
+    the same cause twice, once per attempt, until it ran out.
+    """
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import previous_attempt_note
+
+    previous = [
+        SimpleNamespace(id="run-1", attempt=1, status="failed", error="", summary=""),
+        SimpleNamespace(
+            id="run-2", attempt=1, status="failed",
+            error="verify_command exited 1: npm test -- 3 specs failed",
+            summary="modified src/app.ts",
+        ),
+    ]
+
+    note = previous_attempt_note(previous, run_id="run-3", attempt=2)
+
+    assert "attempt 2" in note
+    assert "3 specs failed" in note, "the reason is the whole point"
+    assert "modified src/app.ts" in note, "what it claimed, when the error is thin"
+    assert "Repeating the approach" in note, "a reason without a consequence is trivia"
+
+
+def test_the_first_attempt_gets_no_note():
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import previous_attempt_note
+
+    previous = [SimpleNamespace(id="run-1", status="failed", error="boom", summary="")]
+    assert previous_attempt_note(previous, run_id="run-2", attempt=1) == ""
+
+
+def test_a_retry_after_a_clean_history_gets_no_note():
+    """No failure before it, nothing to say: an empty block is still tokens."""
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import previous_attempt_note
+
+    previous = [
+        SimpleNamespace(id="run-1", status="succeeded", error="", summary="done"),
+        SimpleNamespace(id="run-2", status="failed", error="", summary=""),
+    ]
+    assert previous_attempt_note(previous, run_id="run-3", attempt=3) == ""
+
+
+def test_the_note_uses_the_newest_failure_and_stays_bounded():
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import previous_attempt_note
+
+    previous = [
+        SimpleNamespace(id="run-1", status="failed", error="old cause", summary=""),
+        SimpleNamespace(id="run-2", status="failed", error="new cause " + "x" * 5000, summary=""),
+    ]
+    note = previous_attempt_note(previous, run_id="run-3", attempt=3)
+
+    assert "new cause" in note and "old cause" not in note
+    assert len(note) < 3000, "a prompt block is a paragraph, not a log"
+
+
+def test_the_executor_actually_hands_the_failure_to_the_next_attempt():
+    """The note is only useful if the run's own prompt carries it.
+
+    A source-level check, because the alternative is driving the whole
+    composition for a three-line block: the failure this catches is the block
+    being dropped in a refactor while `previous_attempt_note` itself stays green.
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "agent" / "scheduler" / "build.py"
+    ).read_text(encoding="utf-8")
+    executor = source[source.index("async def _agent_executor"):]
+
+    assert "previous_attempt_note(" in executor
+    assert "attempt=int(getattr(run, \"attempt\", 1) or 1)" in executor
+    assert "system_prompt += \"\\n\\n\" + attempt_note" in executor

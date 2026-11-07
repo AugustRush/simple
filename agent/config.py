@@ -1428,6 +1428,15 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "having done its job, and a task with no criterion is judged "
                 "only on whether its result was delivered."
             )
+            lines.append(
+                "Work that can fail for a reason a second try could fix — a "
+                "build, a network call, a check that depends on something "
+                "outside your control — deserves `retry_policy.max_attempts` "
+                "above 1. A retry is told, in its prompt, why the previous "
+                "attempt did not pass, so set the count when you know how the "
+                "task can go wrong; do not set it to paper over a criterion "
+                "that is itself impossible."
+            )
         if "schedule_runs" in builtin_names:
             lines.append(
                 "A scheduled task runs with nobody watching, so read back what "
