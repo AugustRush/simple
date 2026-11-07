@@ -941,12 +941,12 @@ export function renderSchedules(ctx: AppCtx) {
                                   (unexpected EOF)` is not a sentence a person
                                   can act on, but it is what a support thread
                                   needs, so both are here. */}
-                              <strong>
-                                {selectedScheduleRun.error_reason.label}
-                                {selectedScheduleRun.error_reason.transient && (
-                                  <span className="schedule-run-error-retry">会自动重试一次</span>
-                                )}
-                              </strong>
+                              {/* No "will retry" badge here: this run already
+                                  ended, and the retry (if the policy allows
+                                  one) is a different run with its own row. A
+                                  promise about the future printed on the past
+                                  is how a person learns not to trust labels. */}
+                              <strong>{selectedScheduleRun.error_reason.label}</strong>
                               {selectedScheduleRun.error_reason.hint && (
                                 <p className="schedule-run-error-hint">
                                   {selectedScheduleRun.error_reason.hint}

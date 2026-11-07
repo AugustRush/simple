@@ -64,7 +64,7 @@ _RULES: tuple[tuple[re.Pattern[str], str, str, bool], ...] = (
         re.compile(r"connection lost|unexpected eof|connection reset|broken pipe|"
                    r"econnreset|server disconnected|remote end closed", re.I),
         "连接中断",
-        "模型服务这次没有把回复发完，多半是暂时的；会先自动重试一次。",
+        "模型服务这次没有把回复发完。这类中断多半是暂时的，重试通常就能过。",
         True,
     ),
     (
