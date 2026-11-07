@@ -2564,3 +2564,23 @@ def test_the_executor_actually_hands_the_failure_to_the_next_attempt():
     assert "previous_attempt_note(" in executor
     assert "attempt=int(getattr(run, \"attempt\", 1) or 1)" in executor
     assert "system_prompt += \"\\n\\n\" + attempt_note" in executor
+
+
+def test_the_conversation_report_does_not_carry_the_downtime_note():
+    """The report is "what this run did"; the gap is about the scheduler.
+
+    After a restart every task's first run carries the missed-occurrence prefix.
+    Passing that into the report put eight lines about the process being down
+    into the conversation, where they read as eight things it had done. The note
+    stays on the run's own record.
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "agent" / "scheduler" / "runtime.py"
+    ).read_text(encoding="utf-8")
+    report_call = source[source.index("await self._report("):]
+    report_call = report_call[: report_call.index("\n            )")]
+
+    assert "summary=result.summary" in report_call
+    assert "summary=run_summary" not in report_call

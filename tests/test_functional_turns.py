@@ -331,6 +331,11 @@ def write_config(home_dir, provider: _ScriptedProvider, **extra: Any) -> dict:
             }
         },
         "channels": {"web": {"enabled": False}, "feishu": {"enabled": False}},
+        # Desktop banners: off, and not because the feature is under test. A
+        # gateway started by the suite runs real tasks, and on macOS a failing
+        # one posts a *real* notification to the machine running the tests --
+        # which is somebody's screen. The suite has no business there.
+        "notifications": {"desktop": False},
         "plugins": {},
         "memory": {},
         "orchestration": {},

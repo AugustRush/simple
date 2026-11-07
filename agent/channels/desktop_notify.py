@@ -11,11 +11,14 @@ default.
 
 What is deliberately narrow
 ---------------------------
-Only runs that a person has to look at get a notification -- the same population
-the badge counts (`ATTENTION_STATUSES`, plus the "earlier occurrences were
-skipped while nothing was running" note). A notification per successful run
-would be noise, and noise is how the one that mattered gets dismissed without
-being read.
+Only runs that a person has to *act* on get a notification: the failure statuses
+in `ATTENTION_STATUSES`.
+
+Missed occurrences are excluded on purpose. The badge counts them -- a number you
+can ignore until you look -- but a banner interrupts, and after any downtime
+*every* task has them, so the badge's rule produced one banner per task per
+restart to report that the scheduler had not been running. Noise is how the one
+that mattered gets dismissed without being read.
 
 Only on macOS, and only when ``osascript`` exists. Elsewhere this is a silent
 no-op rather than a logged error on every run: a headless Linux gateway has no
@@ -40,7 +43,7 @@ import logging
 import shutil
 import sys
 
-from agent.scheduler.models import ATTENTION_STATUSES, status_wants_a_person
+from agent.scheduler.models import ATTENTION_STATUSES
 
 __all__ = [
     "desktop_notifications_enabled",
@@ -87,14 +90,24 @@ def desktop_notifications_enabled(cfg: object) -> bool:
 
 
 def should_notify_run(status: str, missed_count: int = 0) -> bool:
-    """The badge's rule, borrowed rather than restated.
+    """Which runs are worth interrupting somebody for.
 
-    A second definition of "needs a person" would drift from the red badge and
-    from the acknowledgement logic, and the drift would be invisible until a
-    failure stopped producing either one.  ``status_wants_a_person`` is that one
-    definition; this name exists so the notifier's callers read like prose.
+    Failures only. Missed occurrences are deliberately *not* here, and this used
+    to be the badge's rule verbatim -- which was wrong for a banner precisely
+    because it is right for a badge.
+
+    A badge is a number you can ignore; a banner takes the screen. After any
+    period with the process down, *every* task has missed occurrences, so the
+    borrowed rule fired one banner per task per restart: eight tasks, eight
+    interruptions, to report that the scheduler had not been running while it
+    was not running. The run that carries that note usually succeeded, and the
+    only thing a person could do about it is nothing.
+
+    The gap is still recorded where a gap belongs: the run's own record, and the
+    count on the badge. What a banner says is "this needs you now", and a
+    failure is the only thing here that does.
     """
-    return status_wants_a_person(status, missed_count)
+    return str(status or "") in ATTENTION_STATUSES
 
 
 async def notify(title: str, message: str, *, timeout: float = 5.0) -> bool:
@@ -159,7 +172,4 @@ async def notify_run_needs_attention(
     reason = str(error or "").strip() or str(summary or "").strip() or "运行结束"
     first_line = reason.splitlines()[0] if reason else ""
     label = str(task_name or "").strip() or "定时任务"
-    detail = f"{label}：{first_line}"
-    if int(missed_count or 0) > 0:
-        detail = f"{label}：有 {int(missed_count)} 次触发在停机期间被跳过"
-    return await notify("Simple Agent", detail)
+    return await notify("Simple Agent", f"{label}：{first_line}")

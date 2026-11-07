@@ -57,8 +57,16 @@ def _darwin(monkeypatch, process: _FakeProcess | None = None):
     return calls
 
 
-def test_the_notification_population_is_the_badges_population():
-    """Two definitions of "needs a person" would drift; there is one."""
+def test_the_notification_population_is_failures_only():
+    """A banner is for something to act on; the badge may count more than that.
+
+    Measured on the machine this runs on: after the gateway had been down, every
+    task carried a "6 次触发在停机期间被跳过" note, and the badge's rule fired a
+    banner for each one -- eight tasks, eight interruptions, all saying the
+    scheduler had not been running while it was not running. The note belongs on
+    the badge (a number you can ignore) and in the run's record, not on a screen
+    that takes the whole display.
+    """
     from agent.scheduler.models import ATTENTION_STATUSES
 
     for status in ATTENTION_STATUSES:
@@ -66,9 +74,8 @@ def test_the_notification_population_is_the_badges_population():
 
     assert desktop_notify.should_notify_run("succeeded") is False
     assert desktop_notify.should_notify_run("cancelled") is False
-    # A run that *succeeded* after nothing was running is the only thing that
-    # will ever mention the gap, so it is in the population too.
-    assert desktop_notify.should_notify_run("succeeded", missed_count=3) is True
+    # The rule that caused the burst, pinned so it cannot come back quietly.
+    assert desktop_notify.should_notify_run("succeeded", missed_count=6) is False
 
 
 def test_notifications_are_on_unless_turned_off():
@@ -194,10 +201,10 @@ def test_a_failed_run_says_what_failed(monkeypatch):
     assert "second line ignored" not in message
 
 
-def test_the_missed_occurrence_note_wins_over_the_summary(monkeypatch):
-    """It is the only thing that will ever mention the gap, so it is the message."""
+def test_a_successful_run_after_a_gap_does_not_interrupt(monkeypatch):
+    """The gap is history, and the run succeeded: there is nothing to do."""
     calls = _darwin(monkeypatch)
-    asyncio.run(
+    sent = asyncio.run(
         desktop_notify.notify_run_needs_attention(
             task_name="每日简报",
             status="succeeded",
@@ -205,8 +212,8 @@ def test_the_missed_occurrence_note_wins_over_the_summary(monkeypatch):
             missed_count=4,
         )
     )
-    assert "4 次" in calls[0][3]
-    assert "report is ready" not in calls[0][3]
+    assert sent is False
+    assert calls == [], "no banner, and no subprocess either"
 
 
 def test_disabled_means_disabled(monkeypatch):

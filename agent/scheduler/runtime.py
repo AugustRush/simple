@@ -18,7 +18,7 @@ from agent.verification import (
 )
 
 from .models import (
-    status_wants_a_person,
+    ATTENTION_STATUSES,
     DEFAULT_SIGNAL_MAX_DEPTH,
     RETRYABLE_RUN_STATUSES,
     RUN_SUCCESS_STATUS,
@@ -889,7 +889,11 @@ class SchedulerService:
                 task,
                 run,
                 status=status,
-                summary=run_summary,
+                # `result.summary`, not `run_summary`: the missed-occurrence
+                # prefix is a fact about the scheduler's downtime, and a report
+                # is "what this run did". Mixing them put eight lines about the
+                # process being down into the conversation after every restart.
+                summary=result.summary,
                 error=error,
                 text=str(getattr(result, "text_output", "") or ""),
             )
@@ -1007,8 +1011,15 @@ class SchedulerService:
             return
         # The *when* is this class's decision, not the channel's: a notifier
         # that also had to decide which runs want a person would be a second
-        # copy of the badge's rule, and the first thing to drift from it.
-        if not status_wants_a_person(status, getattr(run, "missed_count", 0)):
+        # copy of that rule, and the first thing to drift from it.
+        #
+        # Failures only -- deliberately narrower than the badge, which also
+        # counts missed occurrences. A badge is a number you can ignore; a
+        # banner takes the screen, and after any downtime every task has missed
+        # occurrences, so counting them here was one interruption per task per
+        # restart to say the scheduler had not been running. See
+        # `desktop_notify.should_notify_run`.
+        if str(status or "") not in ATTENTION_STATUSES:
             return
         try:
             await notifier(
