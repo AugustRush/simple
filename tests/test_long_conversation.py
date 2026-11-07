@@ -109,3 +109,63 @@ def test_a_short_conversation_is_not_touched():
     )
 
     assert fitted == messages
+
+
+def test_a_fact_the_window_dropped_is_still_reachable(tmp_path):
+    """Continuity after compaction is two things, and only one is the window.
+
+    A permanent conversation eventually pushes its beginning out of the model's
+    view. What keeps it from being *forgotten* is retrieval: the turn carries the
+    relevant older material back into the prompt. This test states a fact at the
+    very start, then checks that (a) the window really did drop it and (b) it
+    still comes back when the question is about it -- a compaction that silently
+    loses the facts would pass every other test in this file.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_consolidation import make_ctx_manager
+
+    ctx = make_ctx_manager(tmp_path)
+    store = ctx.store
+    # The manager's own session: history retrieval is scoped to the session it
+    # is asked on behalf of, so writing elsewhere would test the scope instead.
+    session_id = ctx.staging.session_id
+    fact = "我的项目在 ~/work/atlas，部署脚本是 deploy.sh"
+    store.append_conversation_exchange(
+        session_id=session_id,
+        user_content=f"记住：{fact}",
+        assistant_content="记下了。",
+        channel="web",
+        message_id="turn-0",
+    )
+    for index in range(80):
+        store.append_conversation_exchange(
+            session_id=session_id,
+            user_content=f"第 {index} 个问题：聊聊别的，部署的事先放放。",
+            assistant_content=f"第 {index} 个回答。" + "细节" * 40,
+            channel="web",
+            message_id=f"turn-{index + 1}",
+        )
+
+    messages: list[dict] = []
+    for turn in store.recent_conversation_turns(session_id=session_id, limit=400):
+        messages.append({"role": turn.role, "content": turn.content})
+
+    fitted = fit_to_budget(
+        messages,
+        input_token_budget=1500,
+        estimate_tokens=lambda unit: sum(
+            max(1, len(str(item.get("content", ""))) // 3) for item in unit
+        ),
+    )
+    assert "~/work/atlas" not in " ".join(str(m.get("content", "")) for m in fitted), (
+        "the test needs the fact to be out of the window for this to mean anything"
+    )
+
+    # The question has to be one the system recognises as "look back": history
+    # retrieval is routed, not unconditional (`_is_episode_recall_query`), so a
+    # plain lookup would test the router rather than the reachability.
+    retrieved = ctx.retrieve_history_context("我们之前聊过 atlas 项目吗")
+    assert "~/work/atlas" in retrieved, "retrieval must still reach what the window dropped"
