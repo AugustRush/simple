@@ -581,11 +581,13 @@ def test_the_app_opens_the_one_conversation(page):
     )
     assert "#/t/" in page.url, f"the address names the open thread: {page.url}"
     assert page.locator(".composer-wrap textarea").count() == 1
-    # What it did on its own is one line above the conversation, closed by
-    # default: while you are talking, that is background.
-    strip = page.locator(".self-activity-head")
-    assert strip.count() == 1
-    assert strip.get_attribute("aria-expanded") == "false"
+    # One feed, not two. The strip that used to sit above the chat ("它自己做的事")
+    # listed runs and threads the conversation now carries itself: a report row for
+    # what it did, and the transcript's own paging for what came before.
+    assert page.locator(".self-activity").count() == 0, (
+        "the agent's activity is the conversation, not a second list above it"
+    )
+    assert page.locator(".home-timeline-row").count() == 0
 
     # Navigation is one bar plus a menu, not a column.
     assert page.locator(".app-sider").count() == 0, "the sidebar is gone"
@@ -806,77 +808,4 @@ def test_a_board_card_opens_its_task(page, live_gateway):
     # the first one would report the panel's title as the task's.
     title = page.locator(".ant-drawer-open .ant-drawer-title").first.inner_text()
     assert "看板测试任务" in title, title
-    assert page.errors == [], page.errors
-
-
-def test_the_timeline_can_load_older_pages(page, live_gateway):
-    """The home timeline is a preview; the history is behind "加载更早".
-
-    It used to offer "全部任务" instead, which sends somebody who asked "what
-    happened" into the screen where tasks are *managed*. Different question, so the
-    history now continues in place.
-
-    Seeded because the e2e gateway's home starts empty: a first page shorter than
-    the limit carries no cursor, which is the correct behaviour and the wrong
-    fixture.
-    """
-    import os
-    import sys
-
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-    from datetime import datetime, timedelta, timezone
-    from pathlib import Path as _Path
-
-    from agent.scheduler import (
-        DeliveryTarget,
-        NewScheduledTask,
-        SchedulerStore,
-        TriggerSpec,
-    )
-
-    os.environ["SIMPLE_AGENT_HOME"] = str(live_gateway["home"])
-
-    now = datetime.now(timezone.utc)
-    # Explicit path: `open_store()` resolves a module-level default that is only
-    # rewritten by `_set_agent_home`, so it would point at the developer's home.
-    store = SchedulerStore(db_path=_Path(live_gateway["home"]) / "tasks" / "scheduler.db")
-    try:
-        for index in range(11):
-            moment = now - timedelta(hours=index + 1)
-            task = store.create_task(
-                NewScheduledTask(
-                    name=f"历史任务 {index}",
-                    kind="agent_prompt",
-                    trigger=TriggerSpec.once(moment.isoformat(), "UTC"),
-                    payload={"prompt": "p"},
-                    delivery_mode="standalone",
-                    delivery_target=DeliveryTarget.standalone(),
-                )
-            )
-            claimed = store.claim_task_now(task.id, now=moment)
-            if claimed is not None:
-                store.complete_run(
-                    task.id,
-                    claimed.run.id,
-                    finished_at=moment,
-                    status="succeeded",
-                    summary=f"第 {index} 次",
-                )
-    finally:
-        store.close()
-
-    page.goto(page.url.split("#")[0], wait_until="networkidle")
-    # The record lives inside the conversation's strip now (the landing page that
-    # used to hold it open by default is gone), so it has to be opened first.
-    page.wait_for_selector(".self-activity-head", timeout=20_000)
-    page.locator(".self-activity-head").click()
-    page.wait_for_selector(".home-timeline-row", timeout=20_000)
-    before = page.locator(".home-timeline-row").count()
-
-    more = page.wait_for_selector(".home-timeline-more", timeout=20_000)
-    more.click()
-    page.wait_for_timeout(2000)
-
-    after = page.locator(".home-timeline-row").count()
-    assert after > before, f"the timeline did not grow ({before} -> {after})"
     assert page.errors == [], page.errors

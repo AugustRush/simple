@@ -373,6 +373,7 @@ export function renderMemory(ctx: AppCtx) {
     <Empty
       image={Empty.PRESENTED_IMAGE_SIMPLE}
       description="还没有形成任何结论。它会在对话里慢慢总结出关于你的事实。"
+      className="page-empty"
     />
   )
 

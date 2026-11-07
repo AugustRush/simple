@@ -92,82 +92,10 @@
    Two states, one page: the conversation (with a strip of background above it),
    or the landing (a box and the record). */
 .home-room { display: flex; flex-direction: column; height: 100%; }
-.home-room > .self-activity { padding: 10px 24px 0; flex: 0 0 auto; }
 .home-room-thread { flex: 1 1 auto; min-height: 0; }
-
-/* The box: one card, the field and the send control on the same line. Not a
-   form -- there is nothing to submit but a sentence. */
-.home-box {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 12px 12px 12px 16px;
-  border: 1px solid var(--border-strong);
-  border-radius: 16px;
-  background: var(--surface);
-  box-shadow: var(--shadow-soft, 0 1px 2px rgba(0, 0, 0, 0.25));
-  transition: border-color .15s ease, box-shadow .15s ease;
-}
-.home-box:focus-within {
-  border-color: var(--focus-ring);
-  box-shadow: 0 0 0 3px var(--primary-soft);
-}
-.home-box .home-composer-input.ant-input {
-  flex: 1 1 auto;
-  padding: 4px 0;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  font-size: 14px;
-  line-height: 1.6;
-  box-shadow: none;
-  resize: none;
-}
-.home-box .home-composer-input.ant-input::placeholder { color: var(--text-muted); opacity: 1; }
-.home-box .home-composer-input.ant-input:focus { box-shadow: none; }
-.home-box .home-send.ant-btn {
-  width: 34px;
-  height: 34px;
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-}
-/* Empty input: still a button, just a quiet one. A ring with a barely visible
-   arrow reads as "broken", which is how it looked in light mode. */
-.home-box .home-send.ant-btn[disabled],
-.home-box .home-send.ant-btn[disabled]:hover {
-  background: var(--surface-hover);
-  border: 1px solid var(--border-strong);
-  color: var(--text-secondary);
-  opacity: 1;
-}
-
-/* The record as one line that opens. The line is the whole cost of "has it done
-   anything"; the list behind it is the whole answer if the line is not enough. */
-.self-activity { display: flex; flex-direction: column; }
-.self-activity-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 7px 10px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-  transition: background .14s ease;
-}
-.self-activity-head:hover { background: var(--surface-hover); }
-.self-activity-head:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-.self-activity-title { flex: 0 0 auto; font-weight: 600; color: var(--text-secondary); }
-.self-activity-summary { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.self-activity-head .anticon { flex: 0 0 auto; color: var(--text-muted); font-size: 10px; }
-.self-activity-body { padding: 2px 0 0; }
-.self-activity-empty.ant-empty { margin: 8px 0; }
-.self-activity-empty .ant-empty-description { color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+/* The one moment with no conversation: the boot request has not answered yet.
+   A skeleton, not a landing page -- there is nothing here to click. */
+.home-boot { max-width: 860px; margin: 40px auto 0; padding: 0 24px; opacity: .7; }
 
 /* ── management pages ───────────────────────────────────────────────────────
    The sidebar used to give these pages a right edge for free. Without it the

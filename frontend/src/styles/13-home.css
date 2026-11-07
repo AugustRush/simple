@@ -1,115 +1,13 @@
-/* The landing view.
+/* The agent's screen. One conversation, filling the frame.
  *
- * One agent, one box, and what needs a person. The layout is a single column on
- * purpose: this page is read top-to-bottom ("anything for me? -> ask something"),
- * not scanned, and a two-column dashboard would make the input compete with
- * things that are fine. */
-.home-view {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 4px 0 24px;
-}
-
-.home-section-title {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-bottom: 10px;
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .04em;
-}
-
-/* ── the timeline ────────────────────────────────────────────────────────── */
-.home-timeline { display: flex; flex-direction: column; gap: 1px; }
-/* A day boundary, not a divider: the label sits on its own line so scanning
-   down the list answers "what did it do today" without reading eight relative
-   timestamps and doing the arithmetic. */
-.home-day { display: flex; flex-direction: column; gap: 1px; }
-.home-day + .home-day { margin-top: 14px; }
-.home-day-label {
-  padding: 0 10px 6px;
-  color: var(--text-muted);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: .04em;
-}
-/* The ledger takes the rest of the page. Without this the landing view ended two
-   thirds of the way down and the remaining third was empty surface, which reads
-   as a page that failed to finish loading rather than as a list that is short. */
-.home-activity { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-/* Under the last day heading, at the left edge of the list it extends. Centred
-   under a left-aligned ledger it looked like a page footer rather than a control. */
-.home-timeline-more.ant-btn {
-  align-self: flex-start;
-  margin-top: 10px;
-  padding-left: 10px;
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-.home-timeline-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  transition: background .14s ease;
-}
-.home-timeline-row:hover { background: var(--surface-hover); }
-.home-timeline-thread { cursor: pointer; }
-.home-timeline-thread:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
-.home-timeline-icon {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  flex: 0 0 auto;
-  padding-top: 1px;
-  color: var(--text-muted);
-  font-size: 11px;
-}
-.home-timeline-row.is-failed .home-timeline-icon { color: var(--red); }
-.home-timeline-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
-.home-timeline-body strong {
-  overflow: hidden;
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* "This one it did by itself." A word rather than an icon: the ledger's icons
-   already mean how a run ended, and a second icon in the same slot would have to
-   be learned. */
-.home-timeline-own {
-  margin-right: 6px;
-  padding: 1px 5px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text-muted);
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: .02em;
-}
-/* One line. The detail is now failure-only and short; a second line on a feed row
-   makes rows uneven and pushes the next one down for no reason a glance needs. */
-.home-timeline-body span {
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 11px;
-  line-height: 1.5;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.home-timeline-at {
-  flex: 0 0 auto;
-  padding-top: 1px;
-  color: var(--text-muted);
-  font-size: 10px;
-}
+ * The landing page and its activity feed are gone (`views/home.tsx` has the
+ * reasoning): what it used to list -- runs, other threads, older history -- is
+ * now the conversation itself, the 线程 drawer, and the transcript's own paging.
+ * What is left to style here is the room the transcript lives in, which needs no
+ * rules of its own: the chat already fills its parent.
+ *
+ * Kept as a file rather than deleted because the memory rules below share it.
+ */
 
 /* ── memory: ticks, the selection bar, and the one irreversible button ──── */
 .memory-row { display: flex; align-items: flex-start; gap: 8px; }
