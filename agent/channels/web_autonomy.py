@@ -114,7 +114,7 @@ async def _autonomy_proposals(request: Any, *, authorized, store) -> Any:
     )
 
 
-async def _autonomy_decide(request: Any, *, authorized, store) -> Any:
+async def _autonomy_decide(request: Any, *, authorized, store, registry=None) -> Any:
     """Answer one proposal: accepted or declined.
 
     Both answers are final and both are *kept*.  A decline is the fact this whole
@@ -153,6 +153,10 @@ async def _autonomy_decide(request: Any, *, authorized, store) -> Any:
             status_code=400,
         )
     try:
+        proposal = store.get_proposal(proposal_id) if state == "accepted" else None
+    except Exception:
+        proposal = None
+    try:
         ok = store.decide(proposal_id, state, by="page")
     except Exception as exc:
         return JSONResponse({"error": f"记录决定失败：{exc}"}, status_code=500)
@@ -160,7 +164,18 @@ async def _autonomy_decide(request: Any, *, authorized, store) -> Any:
         # Already decided, or expired.  Not an error the caller should retry --
         # the row has an answer and that answer is the state it is in.
         return JSONResponse({"ok": False, "reason": "已经答复过或已过期"}, status_code=409)
-    return JSONResponse({"ok": True, "id": proposal_id, "state": state})
+    # A "yes" to a prepared proposal carries out the call that was written down.
+    # Anything else would be a consent form with no consequence: the row said
+    # "accepted" and the machine stayed exactly as it was.
+    applied: dict[str, Any] = {}
+    if state == "accepted" and proposal is not None:
+        from agent.autonomy.execute import apply_prepared
+
+        try:
+            applied = await apply_prepared(registry, proposal)
+        except Exception as exc:  # pragma: no cover - the applier already answers
+            applied = {"applied": False, "reason": f"执行失败：{exc}"}
+    return JSONResponse({"ok": True, "id": proposal_id, "state": state, **applied})
 
 
 def _proposal_payload(proposal: Any) -> dict[str, Any]:

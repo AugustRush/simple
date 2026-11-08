@@ -1873,6 +1873,14 @@ def _autonomy_session_rows(
                         # credential need different answers, and the classified
                         # label is what tells them apart.
                         "failures": _task_failure_history(scheduler_store, task.id),
+                        # What the task is set to *now*, so a proposal can name
+                        # an exact change instead of "make it longer".
+                        "timeout_seconds": int(
+                            getattr(task, "timeout_seconds", 0) or 0
+                        ),
+                        "retry_policy": dict(
+                            getattr(task, "retry_policy", {}) or {}
+                        ),
                     }
                 )
             # The row's ``last_activity`` has to be real: the warm/stale gates
@@ -1935,12 +1943,21 @@ def _autonomy_session_rows(
                         str(fact["task_id"]): str(fact.get("name") or "")
                         for fact in task_facts
                     }
+                    settings = {
+                        str(fact["task_id"]): {
+                            "timeout_seconds": fact.get("timeout_seconds") or 0,
+                            "retry_policy": fact.get("retry_policy") or {},
+                        }
+                        for fact in task_facts
+                    }
                     row["tasks"] = [
                         {
                             "task_id": task_id,
                             "name": names.get(task_id, ""),
                             "attention": count,
                             "failures": history.get(task_id, []),
+                            "timeout_seconds": settings.get(task_id, {}).get("timeout_seconds", 0),
+                            "retry_policy": settings.get(task_id, {}).get("retry_policy") or {},
                         }
                         for task_id, count in attention_counts.items()
                         if task_id in session_task_ids.get(session_id, ())

@@ -548,6 +548,8 @@ def unowned_task_rows(
                         "name": str(task.get("name") or ""),
                         "attention": attention,
                         "failures": list(task.get("failures") or []),
+                        "timeout_seconds": int(task.get("timeout_seconds") or 0),
+                        "retry_policy": dict(task.get("retry_policy") or {}),
                     }
                 ],
             }

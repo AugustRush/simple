@@ -686,8 +686,22 @@ class WebChannel(Channel):
 
     async def _autonomy_decide(self, request: Any) -> Any:
         return await web_autonomy._autonomy_decide(
-            request, authorized=self._authorized, store=self._proposal_store()
+            request,
+            authorized=self._authorized,
+            store=self._proposal_store(),
+            # Answering a prepared proposal carries out the call it wrote down,
+            # so the page needs the tool layer, not just the proposal store.
+            registry=self._tool_registry(),
         )
+
+    def _tool_registry(self) -> Any:
+        """The tool registry this process serves turns with, or None."""
+        try:
+            from agent.kernel.service import resolve
+
+            return resolve(self._components or {}, "registry")
+        except Exception:
+            return None
 
     def _proposal_store(self) -> Any:
         """The proposals store, or None when the patrol has never run.

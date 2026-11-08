@@ -289,6 +289,13 @@ export function useAutomation(deps: Deps) {
       const data = await resp.json().catch(() => ({}))
       if (!data.ok) {
         messageApi.warning(String(data.reason || data.error || '没有记录这次答复'))
+      } else if (state === 'accepted' && data.applied) {
+        // A "yes" to a prepared proposal carries out the call it wrote down, so
+        // the toast says what changed -- not "已记下", which was the whole
+        // story back when answering changed nothing.
+        messageApi.success('已按建议调整')
+      } else if (state === 'accepted' && data.reason) {
+        messageApi.warning(`已记下，但没有自动执行：${data.reason}`)
       } else {
         messageApi.success(state === 'accepted' ? '已记下：你会同意这件事' : '已记下：不做这件事')
       }

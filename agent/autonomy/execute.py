@@ -49,7 +49,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-__all__ = ["execute_proposal", "ExecutionOutcome"]
+__all__ = ["apply_prepared", "execute_proposal", "ExecutionOutcome"]
 
 UTC = timezone.utc
 
@@ -280,3 +280,82 @@ def _runner(proposal: Any) -> str:
     "queued" from being read as "running".
     """
     return "external"
+
+
+#: The tools a person's "yes" may apply. A stored proposal is data, and data
+#: that names a tool is a call waiting to happen -- so the set of calls is
+#: enumerated, not taken from the row. Everything here changes *this machine's*
+#: configuration and can be put back with the same call.
+APPLICABLE_PREPARED_TOOLS = ("schedule_update", "schedule_set_enabled")
+
+
+async def apply_prepared(registry: Any, proposal: Any) -> dict[str, Any]:
+    """Run the exact call a "prepare" proposal wrote down, after a person said yes.
+
+    Why this exists
+    ---------------
+    Answering a prepared proposal used to set `state=accepted` and change
+    nothing. The row said "会准备好等你", the person pressed 同意, and the
+    machine stayed exactly as it was -- which is a consent form with no
+    consequence. The call was already written down at admission time; this is
+    what carries it out.
+
+    Why it is the *call* and not an agent turn
+    ------------------------------------------
+    An approved proposal is approval for the sentence that was shown, not for a
+    fresh turn that might do more. Running the recorded tool with the recorded
+    arguments is the narrowest possible reading of "yes", and it needs no model.
+
+    The registry is passed in rather than resolved here: this module is the
+    bridge, and where tools live is the composition's business.
+    """
+    admission = (getattr(proposal, "context", {}) or {}).get("admission") or {}
+    prepared = admission.get("prepared") if isinstance(admission, dict) else None
+    if not isinstance(prepared, dict):
+        return {"applied": False, "reason": "这条提议没有写下要执行什么"}
+    tool = str(prepared.get("tool") or "").strip()
+    arguments = prepared.get("arguments")
+    if tool not in APPLICABLE_PREPARED_TOOLS:
+        return {
+            "applied": False,
+            "reason": f"{tool or '这个工具'} 不能在这里替你执行，请手动处理",
+        }
+    if not isinstance(arguments, dict) or not arguments:
+        return {"applied": False, "reason": "这条提议没有记下具体参数"}
+    if registry is None:
+        return {"applied": False, "reason": "这个进程没有工具可用"}
+    # The schedule tools require `intent`: inside a turn it is checked against
+    # what the person asked for, and here the person's click *is* the request.
+    # The sentence they read on the card is the honest value for it.
+    call = dict(arguments)
+    if "intent" not in call:
+        call["intent"] = str(getattr(proposal, "action", "") or "按建议调整这个任务")
+    try:
+        result = await registry.call(tool, call)
+    except Exception as exc:
+        return {"applied": False, "reason": f"执行失败：{exc}"}
+    # A tool reports its own failures as data (`{"ok": false, "error": …}`), not
+    # by raising. Returning "applied" on that shape is how this was wrong the
+    # first time: the endpoint said 已按建议调整 and the task was untouched.
+    failure = _tool_error(result)
+    if failure:
+        return {"applied": False, "reason": failure}
+    return {"applied": True, "tool": tool, "result": result}
+
+
+def _tool_error(result: Any) -> str:
+    """The message a tool's own failure payload carries, or ``""``."""
+    payload = result
+    if isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("ok") is False:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or error.get("code") or "工具拒绝了这次调用")
+        return str(error or "工具拒绝了这次调用")
+    return ""

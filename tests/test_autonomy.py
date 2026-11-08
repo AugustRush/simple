@@ -358,9 +358,13 @@ def test_a_task_without_a_session_gets_its_own_row() -> None:
         "the newest run's time is real activity; the task's creation time is not"
     )
     assert rows[1]["last_activity"] == created, "no run time: fall back to the task's own"
-    assert rows[0]["tasks"] == [
-        {"task_id": "t1", "name": "日报", "attention": 2, "failures": []}
-    ]
+    task_row = rows[0]["tasks"][0]
+    assert task_row["task_id"] == "t1"
+    assert task_row["name"] == "日报"
+    assert task_row["attention"] == 2
+    assert task_row["failures"] == []
+    # What the task is set to now, so a remedy can be an exact call.
+    assert "timeout_seconds" in task_row and "retry_policy" in task_row
 
 
 # ── the exact call reaches the proposal and the run ────────────────────────
@@ -741,7 +745,15 @@ def test_the_same_task_failing_the_same_way_twice_is_proposed_as_a_decision():
 
     assert len(repeated) == 1
     proposal = repeated[0]
-    assert "汇报" in proposal.action
+    # The action is the exact change, not "decide what to do": agreeing to it
+    # has to be agreeing to something a machine can carry out.
+    assert "重试次数" in proposal.action
+    assert proposal.tool == "schedule_update"
+    assert proposal.context["arguments"] == {
+        "task_id": "t1",
+        "retry_policy": {"max_attempts": 3, "backoff_seconds": 30},
+    }
+    assert "汇报" in proposal.reason
     assert "连接中断" in proposal.reason
     assert proposal.context["occurrences"] == 2
     assert proposal.context["task_id"] == "t1"
@@ -795,3 +807,99 @@ def test_the_most_repeated_cause_is_the_one_reported():
 
     assert repeated[0].context["cause"] == "连接中断"
     assert repeated[0].context["occurrences"] == 2
+
+
+# ── a "yes" to a prepared proposal carries out the call ────────────────────
+
+
+def _prepared_proposal(arguments=None, tool="schedule_update"):
+    from agent.autonomy import Proposal
+
+    return Proposal(
+        source="task:t1",
+        reason="「汇报」最近 2 次都是同一个原因失败（连接中断）。",
+        action="把这个任务的重试次数从 1 提到 3",
+        tool=tool,
+        reversibility="workspace",
+        confidence=0.75,
+        context={
+            "rule": "repeated-task-failure",
+            "task_id": "t1",
+            "admission": {
+                "answer": "prepare",
+                "reason": "会改任务定义",
+                "prepared": {
+                    "tool": tool,
+                    "arguments": arguments
+                    if arguments is not None
+                    else {"task_id": "t1", "retry_policy": {"max_attempts": 3}},
+                },
+            },
+        },
+    )
+
+
+def test_accepting_a_prepared_proposal_runs_the_call_it_wrote_down():
+    """Before this, 同意 set a row's state and changed nothing on the machine."""
+    import asyncio
+
+    from agent.autonomy.execute import apply_prepared
+
+    calls: list[tuple[str, dict]] = []
+
+    class _Registry:
+        async def call(self, name, arguments):
+            calls.append((name, arguments))
+            return {"ok": True}
+
+    outcome = asyncio.run(apply_prepared(_Registry(), _prepared_proposal()))
+
+    assert outcome["applied"] is True
+    # `intent` is what the card said, because outside a turn the person's click
+    # is the request the tools' quote check would otherwise look for.
+    assert calls == [
+        (
+            "schedule_update",
+            {
+                "task_id": "t1",
+                "retry_policy": {"max_attempts": 3},
+                "intent": "把这个任务的重试次数从 1 提到 3",
+            },
+        )
+    ]
+
+
+def test_a_proposal_naming_a_tool_outside_the_whitelist_is_not_run():
+    """A stored row is data. Data that names a tool is a call waiting to happen."""
+    import asyncio
+
+    from agent.autonomy.execute import apply_prepared
+
+    calls: list[tuple[str, dict]] = []
+
+    class _Registry:
+        async def call(self, name, arguments):
+            calls.append((name, arguments))
+            return {}
+
+    outcome = asyncio.run(
+        apply_prepared(_Registry(), _prepared_proposal(tool="shell"))
+    )
+
+    assert outcome["applied"] is False
+    assert calls == []
+    assert "手动" in outcome["reason"]
+
+
+def test_a_prepared_proposal_without_arguments_applies_nothing():
+    import asyncio
+
+    from agent.autonomy.execute import apply_prepared
+
+    class _Registry:
+        async def call(self, name, arguments):  # pragma: no cover - must not run
+            raise AssertionError("nothing to run")
+
+    outcome = asyncio.run(apply_prepared(_Registry(), _prepared_proposal(arguments={})))
+
+    assert outcome["applied"] is False

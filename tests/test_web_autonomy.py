@@ -255,3 +255,86 @@ def test_the_overview_carries_what_was_answered_and_what_came_of_it(store) -> No
     assert answered["state"] == "acted"
     assert answered["outcome"]["status"] == "succeeded"
     assert answered["outcome"]["summary"] == "读完了"
+
+
+# ── a "yes" carries out the call the proposal wrote down ───────────────────
+
+
+def _seed_prepared(store, *, tool="schedule_update", arguments=None) -> str:
+    proposal = Proposal(
+        source="task:t1",
+        reason="「汇报」最近 2 次都是同一个原因失败（连接中断）。",
+        action="把这个任务的重试次数从 1 提到 3",
+        tool=tool,
+        reversibility="workspace",
+        confidence=0.75,
+    )
+    proposal.context["admission"] = {
+        "answer": "prepare",
+        "reason": "会改任务定义",
+        "prepared": {
+            "tool": tool,
+            "arguments": arguments
+            if arguments is not None
+            else {"task_id": "t1", "retry_policy": {"max_attempts": 3}},
+        },
+    }
+    store.record(proposal)
+    return proposal.id
+
+
+def test_accepting_applies_the_recorded_call(store) -> None:
+    """同意 used to set a state and change nothing; the call was already written."""
+    proposal_id = _seed_prepared(store)
+    calls: list[tuple[str, dict]] = []
+
+    class _Registry:
+        async def call(self, name, arguments):
+            calls.append((name, arguments))
+            return {"ok": True}
+
+    response = asyncio.run(
+        web_autonomy._autonomy_decide(
+            _Request({"id": proposal_id, "state": "accepted"}),
+            authorized=_authorized,
+            store=store,
+            registry=_Registry(),
+        )
+    )
+    body = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert body["applied"] is True
+    assert calls == [
+        (
+            "schedule_update",
+            {
+                "task_id": "t1",
+                "retry_policy": {"max_attempts": 3},
+                "intent": "把这个任务的重试次数从 1 提到 3",
+            },
+        )
+    ]
+
+
+def test_declining_applies_nothing(store) -> None:
+    proposal_id = _seed_prepared(store)
+    calls: list[str] = []
+
+    class _Registry:
+        async def call(self, name, arguments):  # pragma: no cover - must not run
+            calls.append(name)
+            return {}
+
+    response = asyncio.run(
+        web_autonomy._autonomy_decide(
+            _Request({"id": proposal_id, "state": "declined"}),
+            authorized=_authorized,
+            store=store,
+            registry=_Registry(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert calls == []
+    assert json.loads(response.body).get("applied") is None

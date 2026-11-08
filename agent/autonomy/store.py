@@ -237,6 +237,19 @@ class ProposalStore:
                 ).fetchall()
         return [self._row_to_proposal(row) for row in rows]
 
+    def get_proposal(self, proposal_id: str) -> Optional["Proposal"]:
+        """One row by id, or ``None``.
+
+        Needed by the accept path: the call to carry out is written on the row,
+        and re-reading it from the store (rather than from the request) is what
+        keeps a stale page from applying something else.
+        """
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM proposals WHERE id = ?", (str(proposal_id or ""),)
+            ).fetchone()
+        return self._row_to_proposal(row) if row is not None else None
+
     def counts(self) -> dict[str, int]:
         """How many proposals in each state.  The number the page leads with."""
         with self._transaction() as conn:

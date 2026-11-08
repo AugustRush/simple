@@ -90,6 +90,67 @@ def _ago(now: datetime, seconds: float) -> datetime:
     return now - timedelta(seconds=seconds)
 
 
+#: Which failures get which remedy, and why each is reversible.
+#:
+#: A retry count and a timeout are settings, not commitments: raising either can
+#: be put back with the same call, and neither changes what the task is *for*.
+#: A broken credential is different -- no setting fixes it, so the honest move is
+#: to stop the task repeating a failure that cannot succeed until somebody looks,
+#: and saying so in the proposal. Both classes are "workspace": they change this
+#: machine, not the world.
+_REMEDY_BY_CAUSE: dict[str, str] = {
+    "超时": "timeout",
+    "连接中断": "retry",
+    "被限流": "retry",
+    "服务端错误": "retry",
+    "鉴权失败": "pause",
+    "额度用尽": "pause",
+}
+
+#: The tools a "yes" may apply. A stored proposal is data, and data that names a
+#: tool is a call waiting to happen -- so the set of calls is enumerated here
+#: rather than taken from the row.
+APPLICABLE_PREPARED_TOOLS = ("schedule_update", "schedule_set_enabled")
+
+
+def _remedy_for(
+    cause: str,
+    *,
+    task_id: str,
+    timeout_seconds: int,
+    retry_policy: dict[str, Any],
+) -> tuple[Optional[str], dict[str, Any], str]:
+    """The exact call this cause deserves, or ``None`` when there is no safe one."""
+    kind = _REMEDY_BY_CAUSE.get(cause)
+    if kind == "timeout":
+        target = max(int(timeout_seconds or 1800) * 2, 600)
+        return (
+            "schedule_update",
+            {"task_id": task_id, "timeout_seconds": target},
+            f"把超时从 {int(timeout_seconds or 1800) // 60} 分钟调到 {target // 60} 分钟",
+        )
+    if kind == "retry":
+        attempts = max(3, int(retry_policy.get("max_attempts") or 1) + 2)
+        return (
+            "schedule_update",
+            {
+                "task_id": task_id,
+                "retry_policy": {
+                    "max_attempts": attempts,
+                    "backoff_seconds": int(retry_policy.get("backoff_seconds") or 30),
+                },
+            },
+            f"把这个任务的重试次数从 {int(retry_policy.get('max_attempts') or 1)} 提到 {attempts}",
+        )
+    if kind == "pause":
+        return (
+            "schedule_set_enabled",
+            {"task_id": task_id, "enabled": False},
+            "先把它停掉，等凭证或额度修好再开",
+        )
+    return None, {}, ""
+
+
 def rule_candidates(
     session: dict[str, Any],
     *,
@@ -207,6 +268,14 @@ def rule_candidates(
         )
         if len(occurrences) < 2:
             continue
+        remedy_tool, remedy_arguments, remedy_text = _remedy_for(
+            cause,
+            task_id=task_id,
+            timeout_seconds=int(task.get("timeout_seconds") or 0),
+            retry_policy=task.get("retry_policy") or {},
+        )
+        if remedy_tool is None:
+            continue
         found.append(
             Proposal(
                 source=session_id,
@@ -214,14 +283,10 @@ def rule_candidates(
                     f"「{task_name}」最近 {len(occurrences)} 次都是同一个原因失败"
                     f"（{cause}）。上一次是 {str(occurrences[-1].get('at') or '')[:10]}。"
                 )[:MAX_PROPOSAL_REASON_CHARS],
-                action=(
-                    f"决定「{task_name}」怎么办：调大超时或重试次数，还是先停掉"
-                )[:MAX_PROPOSAL_ACTION_CHARS],
+                action=remedy_text[:MAX_PROPOSAL_ACTION_CHARS],
                 # A task definition is the person's own sentence, so changing it
-                # is a "prepare": the agent names the change and waits. It is
-                # not read-only either -- that would be a proposal that does
-                # nothing and calls it a decision.
-                tool="schedule_create",
+                # is a "prepare": the agent names the exact change and waits.
+                tool=remedy_tool,
                 reversibility="workspace",
                 confidence=0.75,
                 context={
@@ -231,6 +296,11 @@ def rule_candidates(
                     "task_name": task_name,
                     "cause": cause,
                     "occurrences": len(occurrences),
+                    # The exact call a "yes" applies. Without it, agreeing to a
+                    # prepare proposal is agreeing to a sentence -- which is
+                    # what it was until now: the row said "accepted" and
+                    # nothing on the machine changed.
+                    "arguments": remedy_arguments,
                 },
             )
         )
