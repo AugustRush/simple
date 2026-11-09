@@ -610,6 +610,14 @@ export interface SchedulerHealth {
 }
 
 
+//: One row of a scheduled run's own record: the prompt, a tool call, the reply.
+export interface RunTranscriptRow {
+  role: string
+  content: string
+  tool?: string
+  toolState?: string
+}
+
 export interface ScheduleRunOutput {
   run_id: string
   available: boolean

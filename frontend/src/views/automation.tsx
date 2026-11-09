@@ -91,7 +91,7 @@ ${ids}
 }
 
 export function renderSchedules(ctx: AppCtx) {
-  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, openConversation, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
+  const { acknowledgeScheduleRun, attentionByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, editingWorkflow, cancelScheduleRun, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, filteredSchedules, filteredWorkflows, loadAutomations, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, openScheduleDetails, permissionProfileLabel, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleDetailOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowQuery, openConversation, loadRunTranscript, runTranscript, runTranscriptLoading, setRunTranscript, startingWorkflowIds, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowQuery, workflows } = ctx
 
 
   /**
@@ -962,6 +962,54 @@ export function renderSchedules(ctx: AppCtx) {
                           )}
                         </div>
                       )}
+
+                      {/* The run's own record: what it was asked, which tools it
+                          called, what came back. A run used to leave only its
+                          summary, so "why did it fail" could be answered by the
+                          run's account of itself and nothing else. */}
+                      <div className="schedule-transcript">
+                        <div className="schedule-output-head">
+                          <strong>过程</strong>
+                          <Button
+                            size="small"
+                            type="link"
+                            loading={runTranscriptLoading}
+                            onClick={() => {
+                              if (runTranscript) setRunTranscript(null)
+                              else void loadRunTranscript(
+                                selectedScheduleRun.task_id,
+                                selectedScheduleRun.id,
+                              )
+                            }}
+                          >
+                            {runTranscript ? '收起' : '看它做了什么'}
+                          </Button>
+                        </div>
+                        {runTranscript && (
+                          runTranscript.length === 0 ? (
+                            <div className="schedule-output-state muted">
+                              这次运行没有留下过程记录（早于记录功能开启的运行）
+                            </div>
+                          ) : (
+                            <ol className="schedule-transcript-list">
+                              {runTranscript.map((row, index) => (
+                                <li key={`${index}:${row.role}`} className={`schedule-transcript-row is-${row.role}`}>
+                                  <span className="schedule-transcript-role">
+                                    {row.role === 'user'
+                                      ? '指令'
+                                      : row.role === 'assistant'
+                                        ? '回答'
+                                        : row.role === 'tool'
+                                          ? row.tool || '工具'
+                                          : row.role}
+                                  </span>
+                                  <span className="schedule-transcript-text">{row.content}</span>
+                                </li>
+                              ))}
+                            </ol>
+                          )
+                        )}
+                      </div>
 
                       <div className="schedule-output-head">
                         <strong>完整输出</strong>

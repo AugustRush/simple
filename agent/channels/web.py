@@ -1460,6 +1460,34 @@ class WebChannel(Channel):
             return JSONResponse({"error": "运行不存在或已经结束"}, status_code=409)
         return JSONResponse({"ok": True}, status_code=202)
 
+    async def _schedule_run_transcript(self, request: Any) -> Any:
+        """The run's own record: what it was asked, what it did, what came back.
+
+        Read from the session journal the executor writes under
+        ``scheduler:<task>:<run>``. A run is not a conversation, so it has its
+        own session id -- this is the one screen that asks for it by name.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        task_id = str(request.path_params["task_id"])
+        run_id = str(request.path_params["run_id"])
+        from agent.scheduler.build import run_transcript_session
+
+        session_id = run_transcript_session(task_id, run_id)
+        try:
+            page = self._service().get_messages(session_id, limit=200)
+        except Exception as exc:
+            return JSONResponse({"error": f"读取运行记录失败：{exc}"}, status_code=500)
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "messages": page.get("messages") or [],
+                "has_more": bool(page.get("has_more")),
+            }
+        )
+
     async def _acknowledge_schedule_run(self, request: Any) -> Any:
         """Record that a person has now seen one run's failure."""
         from starlette.responses import JSONResponse
@@ -3198,6 +3226,15 @@ class WebChannel(Channel):
                 "/api/schedules/{task_id}/runs/{run_id}/acknowledge",
                 self._acknowledge_schedule_run,
                 methods=["POST"],
+            ),
+            # What the run did, in its own words: the prompt it was given, the
+            # tools it called, what they returned. A scheduled run used to leave
+            # only its final summary, so "why did it fail" could be answered by
+            # nothing but the run's own account of itself.
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/transcript",
+                self._schedule_run_transcript,
+                methods=["GET"],
             ),
             Route(
                 "/api/schedules/{task_id}/runs/{run_id}/output",

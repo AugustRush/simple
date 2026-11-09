@@ -1912,7 +1912,7 @@ def _autonomy_session_rows(
     try:
         from agent.memory.store import LTMStore
 
-        memory_store = LTMStore(shared.AGENT_HOME / "context" / "palace.db")
+        memory_store = LTMStore(shared.AGENT_HOME / "context")
     except Exception:
         memory_store = None
 

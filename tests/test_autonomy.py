@@ -903,3 +903,34 @@ def test_a_prepared_proposal_without_arguments_applies_nothing():
     outcome = asyncio.run(apply_prepared(_Registry(), _prepared_proposal(arguments={})))
 
     assert outcome["applied"] is False
+
+
+def test_a_session_with_unfinished_work_reaches_the_rules(tmp_path, monkeypatch):
+    """The patrol reads working state from the memory store -- and got the path wrong.
+
+    `LTMStore` is built from the *context directory*; this file used to pass it
+    `context/palace.db`, which is a file, so the constructor raised, the caller
+    swallowed it, and `session["task"]` was never set. The `session-ended-mid-task`
+    rule could therefore never fire: a rule that looked wired and was blind.
+    """
+    from agent import shared
+    from agent.cli import _autonomy_session_rows
+    from agent.memory.store import LTMStore
+    from agent.session_service import _WebSessionRegistry
+
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path)
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir)
+    store.save_session_working_state(
+        "sess-1", {"active_goal": "把下载目录整理完", "status": "running"}
+    )
+    store.close()
+    registry = _WebSessionRegistry(tmp_path / "web" / "sessions" / "index.db")
+    registry.upsert("sess-1")
+
+    rows = _autonomy_session_rows(limit=10, live_sessions=None)
+    by_id = {row["session_id"]: row for row in rows}
+
+    assert "sess-1" in by_id, by_id.keys()
+    assert by_id["sess-1"].get("task"), "the unfinished work has to reach the rules"
+    assert "整理" in str(by_id["sess-1"]["task"].get("active_goal", ""))

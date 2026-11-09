@@ -1308,3 +1308,50 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
   font-size: 12px;
   line-height: 1.6;
 }
+
+/* A run's process: an ordered list, because order is the whole of "what did it
+   do". Role first in a fixed column so the shape of a run can be scanned down
+   the left edge without reading the sentences. */
+.schedule-transcript { margin: 14px 0; }
+.schedule-transcript-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow: auto;
+}
+.schedule-transcript-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-hover);
+}
+.schedule-transcript-role {
+  flex: 0 0 56px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.schedule-transcript-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+.schedule-transcript-row.is-tool .schedule-transcript-text { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

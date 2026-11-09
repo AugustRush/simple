@@ -350,6 +350,62 @@ async def mirror_failure_to_channel(
         logger.warning("could not mirror a failure to its channel: %s", exc)
 
 
+def run_transcript_session(task_id: str, run_id: str) -> str:
+    """The session id a run's own record is filed under.
+
+    A run is not a conversation, so it gets its own id rather than being mixed
+    into the person's. The prefix says where it came from; the two ids say which
+    run, which is what the run detail asks with.
+    """
+    return f"scheduler:{task_id}:{run_id}"
+
+
+class _RunTranscript:
+    """Writes one run's process down as it happens.
+
+    Why not give the run a context manager and let the turn recorder do it
+    (the obvious way): that manager also retrieves memory into the prompt and
+    stages turns for consolidation, and a `stateless` run means neither. This is
+    the narrow thing -- record, nothing else -- and a failure here never fails
+    the run.
+    """
+
+    def __init__(self, store: Any, session_id: str) -> None:
+        self._store = store
+        self._session_id = session_id
+
+    def event(self, event_type: str, payload: dict) -> None:
+        append = getattr(self._store, "append_agent_event", None)
+        if not callable(append):
+            return
+        append(
+            session_id=self._session_id,
+            event_type=str(event_type),
+            payload=dict(payload or {}),
+        )
+
+    def close(self) -> None:
+        """Release the store this run opened for its own record."""
+        close_store = getattr(self._store, "close", None)
+        if callable(close_store):
+            try:
+                close_store()
+            except Exception:  # pragma: no cover - closing must not fail a run
+                pass
+
+    def turn(self, prompt: str, reply: str) -> None:
+        """The pair a reader needs first: what it was asked, what it answered."""
+        write = getattr(self._store, "write_conversation_exchange", None)
+        if not callable(write):
+            return
+        write(
+            session_id=self._session_id,
+            user_content=str(prompt or "")[:4000],
+            assistant_content=str(reply or "")[:8000],
+            channel="scheduler",
+        )
+
+
 def build_scheduler_service(
     cfg: dict,
     *,
@@ -459,7 +515,30 @@ def build_scheduler_service(
         task_id = str(getattr(task, "id", "") or "scheduler-task")
         run_id = str(getattr(run, "id", "") or "scheduler-run")
         audit = UnattendedAudit(task_id=task_id, run_id=run_id, profile=profile)
-        unattended_sink = UnattendedOutputSink(audit=audit)
+        # What the run does is written down as it happens, into the same
+        # database the transcript reader reads (the memory store).
+        transcript: Any = None
+        try:
+            # The store, opened by its own path rather than reached through the
+            # palace: `.store` is not part of the `MemoryService` contract, and
+            # a reader that expects it is what the memory seam's guard exists to
+            # stop. One connection per run, closed with the run.
+            from agent.memory.store import LTMStore
+
+            store_for_transcript = LTMStore(AGENT_HOME / "context")
+            transcript = _RunTranscript(
+                store_for_transcript, run_transcript_session(task_id, run_id)
+            )
+        except Exception:  # pragma: no cover - recording is best effort
+            # Best effort, and *logged*: the first version swallowed this and
+            # the transcripts were silently empty for a day. A recording that
+            # cannot start is worth one line in the log, not a mystery.
+            logger.warning("could not start a run transcript", exc_info=True)
+            transcript = None
+        unattended_sink = UnattendedOutputSink(
+            audit=audit,
+            journal=(transcript.event if transcript is not None else None),
+        )
         if requested_profile and requested_profile != profile.key:
             audit.note(
                 f"未知的权限档位 `{requested_profile}`，已按更保守的 "
@@ -681,6 +760,15 @@ def build_scheduler_service(
                 sink=unattended_sink,
             )
             result = execution.result
+            if transcript is not None:
+                # The pair first, before any repair: what it was asked and what
+                # it answered is the spine the tool calls hang on. A failed turn
+                # records the error as its answer, because "it said nothing" and
+                # "it died" are different things to read.
+                try:
+                    transcript.turn(prompt, result.text or result.error or "")
+                except Exception:  # pragma: no cover - recording is best effort
+                    pass
             if result.error:
                 raise RuntimeError(result.error)
             content = result.text or ""
@@ -705,6 +793,10 @@ def build_scheduler_service(
                 self_report_reason=self_report.reason,
             )
         finally:
+            if transcript is not None:
+                close_store = getattr(transcript, "close", None)
+                if callable(close_store):
+                    close_store()
             if self_report_token is not None:
                 _active_run_self_report.reset(self_report_token)
             await factory.close(run_components)

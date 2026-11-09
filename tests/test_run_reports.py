@@ -348,3 +348,59 @@ def test_a_success_is_not_mirrored_twice():
     )
 
     assert sent == []
+
+
+# ── a run's process is written down as it happens ──────────────────────────
+
+
+def test_the_unattended_sink_journals_what_the_run_did(tmp_path):
+    """The run's own account of itself was all a failure left behind.
+
+    A scheduled run wrote its summary and nothing else: no prompt, no tool
+    calls, no refusals. "Why did it fail" could only be answered by asking the
+    thing that failed -- which is exactly what an audit is not.
+    """
+    from agent import LTMStore
+    from agent.scheduler.build import _RunTranscript, run_transcript_session
+    from agent.scheduler.unattended import UnattendedAudit, UnattendedOutputSink
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    transcript = _RunTranscript(store, run_transcript_session("t1", "r1"))
+    sink = UnattendedOutputSink(
+        audit=UnattendedAudit(task_id="t1", run_id="r1"),
+        journal=transcript.event,
+    )
+
+    sink.on_tool_start("shell", {"command": "ls -la"}, operation_id="op1")
+    sink.on_tool_end("shell", "file1\nfile2", operation_id="op1", ok=True)
+    sink.on_tool_start("http_get", {"url": "https://example.com"}, operation_id="op2")
+    sink.on_tool_end("http_get", "boom", operation_id="op2", ok=False)
+    transcript.turn("整理一下下载目录", "整理好了，删了 3 个临时文件")
+
+    from agent.session_service import SessionService
+
+    messages = SessionService(store=store).get_messages(
+        run_transcript_session("t1", "r1")
+    )["messages"]
+    roles = [item["role"] for item in messages]
+    assert roles.count("tool") == 2, roles
+    assert roles[-1] in {"user", "assistant"}, roles
+    joined = " ".join(str(item.get("content", "")) for item in messages)
+    assert "整理一下下载目录" in joined
+    assert "整理好了" in joined
+
+
+def test_the_run_transcript_survives_a_missing_store():
+    """Recording is best effort: a run must not fail because its diary could not open."""
+    from agent.scheduler.build import _RunTranscript
+
+    class _Broken:
+        def append_agent_event(self, **_kwargs):
+            raise RuntimeError("disk is full")
+
+        def write_conversation_exchange(self, **_kwargs):
+            raise RuntimeError("disk is full")
+
+    transcript = _RunTranscript(_Broken(), "scheduler:t:r")
+    with pytest.raises(RuntimeError):
+        transcript.event("tool_started", {})

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent.core.output import OutputSink
 
@@ -159,14 +159,87 @@ class UnattendedAudit:
         return path
 
 
+def _clip_arguments(inputs: Any, limit: int = 300) -> str:
+    """A tool call's arguments, short enough to read in a row.
+
+    Not JSON-dumped for fidelity: the transcript is for a person answering "what
+    did it try", and the first 300 characters of the command usually are the
+    whole story. Full fidelity lives in the run's own output file.
+    """
+    if not isinstance(inputs, dict):
+        return str(inputs or "")[:limit]
+    parts = [f"{key}={value}" for key, value in inputs.items()]
+    return " ".join(parts)[:limit]
+
+
 class UnattendedOutputSink(OutputSink):
     """Non-interactive sink that answers "may I?" with a recorded refusal."""
 
     #: No live UI is attached to a scheduled run; streams would be discarded.
     streaming = False
 
-    def __init__(self, *, audit: Optional[UnattendedAudit] = None) -> None:
+    def __init__(
+        self,
+        *,
+        audit: Optional[UnattendedAudit] = None,
+        journal: Optional[Callable[[str, dict], None]] = None,
+    ) -> None:
         self.audit = audit if audit is not None else UnattendedAudit()
+        #: Where a run writes down what it did. An unattended run used to leave
+        #: nothing but its final summary: the tool calls, the refusals and the
+        #: order they happened in were gone the moment the process moved on, so
+        #: "why did it fail" could only be answered by the run's own account of
+        #: itself. `journal(event_type, payload)` records one line.
+        self._journal = journal
+
+    def _record(self, event_type: str, payload: dict) -> None:
+        if self._journal is None:
+            return
+        try:
+            self._journal(event_type, payload)
+        except Exception:  # pragma: no cover - a recording must not fail a run
+            pass
+
+    def on_tool_start(
+        self, name: str, inputs: dict, *, operation_id: str = ""
+    ) -> None:
+        self._record(
+            "tool_started",
+            {
+                "name": str(name or ""),
+                "operation_id": str(operation_id or ""),
+                "arguments": _clip_arguments(inputs),
+            },
+        )
+
+    def on_tool_end(
+        self,
+        name: str,
+        result: str,
+        *,
+        operation_id: str = "",
+        ok: bool = True,
+    ) -> None:
+        self._record(
+            "tool_completed" if ok else "tool_failed",
+            {
+                "name": str(name or ""),
+                "operation_id": str(operation_id or ""),
+                "result": str(result or "")[:400],
+            },
+        )
+
+    def on_tool_blocked(
+        self, name: str, reason: str, *, operation_id: str = ""
+    ) -> None:
+        self._record(
+            "tool_blocked",
+            {
+                "name": str(name or ""),
+                "operation_id": str(operation_id or ""),
+                "reason": str(reason or "")[:300],
+            },
+        )
 
     @property
     def interactive_confirmation(self) -> bool:

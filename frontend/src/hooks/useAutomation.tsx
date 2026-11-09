@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
 import { msUntilNextRun } from '../lib/schedule'
 import { stepContent } from '../lib/workflow'
-import type { AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
+import type { AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, RunTranscriptRow, ProposalRow, PermissionProfileOption, ScheduleArtifact, ScheduleInfo, ScheduleRun, ScheduleRunOutput, SchedulerHealth, WorkflowInfo } from '../types'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -74,6 +74,10 @@ export function useAutomation(deps: Deps) {
   const [scheduleRunOutput, setScheduleRunOutput] = useState<ScheduleRunOutput | null>(null)
 
   const [scheduleArtifacts, setScheduleArtifacts] = useState<ScheduleArtifact[]>([])
+  //: One run's own record, loaded on demand: a run detail is read rarely, and
+  //: fetching the process for every row in the list would be a request per click.
+  const [runTranscript, setRunTranscript] = useState<RunTranscriptRow[] | null>(null)
+  const [runTranscriptLoading, setRunTranscriptLoading] = useState(false)
 
   const [scheduleOutputLoading, setScheduleOutputLoading] = useState(false)
 
@@ -766,6 +770,32 @@ export function useAutomation(deps: Deps) {
   // from a list that only knows where it came from -- the attention list holds
   // ids, and asking it to first find the whole task definition would put a
   // dependency between "clear this" and "the tasks are loaded".
+  const loadRunTranscript = useCallback(
+    async (taskId: string, runId: string) => {
+      setRunTranscriptLoading(true)
+      try {
+        const resp = await api(
+          `/api/schedules/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/transcript`,
+        )
+        const data = await resp.json()
+        const rows = Array.isArray(data.messages) ? data.messages : []
+        setRunTranscript(
+          rows.map((row: any) => ({
+            role: String(row.role || ''),
+            content: String(row.content || ''),
+            tool: String(row.tool || ''),
+            toolState: String(row.toolState || ''),
+          })),
+        )
+      } catch {
+        messageApi.warning('没能读到这次运行的记录')
+      } finally {
+        setRunTranscriptLoading(false)
+      }
+    },
+    [api, messageApi],
+  )
+
   const acknowledgeScheduleRun = async (taskId: string, runId: string) => {
     try {
       const resp = await api(
@@ -836,5 +866,5 @@ export function useAutomation(deps: Deps) {
     () => workflows.find(item => item.id === editingWorkflowId) || null,
     [workflows, editingWorkflowId],
   )
-  return { acknowledgeScheduleRun, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadAutonomy, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
+  return { acknowledgeScheduleRun, loadRunTranscript, runTranscript, runTranscriptLoading, setRunTranscript, decideProposal, answeredProposals, funnel, home, homeLoaded, loadHome, loadAutonomy, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationKind, automationQuery, automations, automationsLoaded, automationTab, bulkScheduleAction, cancelScheduleRun, clearScheduleAttention, deleteSchedule, deleteWorkflow, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, loadAutomations, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadUnseenFailures, loadWorkflows, openScheduleDetails, permissionProfileLabel, permissionProfiles, retryScheduleRun, runScheduleNow, runWorkflowNow, scheduleArtifacts, scheduleDetailOpen, scheduleOutputLoading, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationKind, setAutomationQuery, setAutomationTab, setEditingWorkflowId, setScheduleArtifacts, setScheduleDetailOpen, setScheduleOutputLoading, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setUnseenFailures, setWorkflowQuery, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowQuery, workflows } as const
 }
