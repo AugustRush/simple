@@ -3936,3 +3936,56 @@ def test_a_conversation_creates_an_automation(home):
             store.close()
     finally:
         provider.close()
+
+
+# ── a promise made in a conversation ────────────────────────────────────────
+
+
+def test_promising_something_writes_it_down_as_a_commitment(home):
+    """The end-to-end shape of a promise: model -> tool -> a row that survives.
+
+    "晚点给你" said only in prose dies with the turn that said it. This is the
+    whole feature in one test: a scripted model calls `commit`, the tool writes a
+    one-off task marked as the agent's own, and the promise is still owed after
+    the turn is over -- which is the only property that matters.
+    """
+    provider = scripted(
+        {
+            "tool": (
+                "commit",
+                {
+                    "what": "给用户整理一份下载目录清单",
+                    "when": "2h",
+                    "said": "我两个小时后给你一份清单",
+                },
+            )
+        },
+        {"text": "好，两个小时后我把清单给你。"},
+    )
+    write_config(home, provider)
+    try:
+        from typer.testing import CliRunner
+
+        from agent.cli import app
+
+        result = CliRunner().invoke(app, ["chat", "晚点给我一份下载目录的清单"])
+
+        assert result.exit_code == 0, result.output
+        assert "两个小时后" in result.output, result.output
+
+        # The promise is a row, not a sentence: it is still owed after the turn.
+        from agent.scheduler import open_store
+        from agent.tools.schedule_tools import open_commitments
+
+        store = open_store()
+        try:
+            owed = open_commitments(store)
+        finally:
+            store.close()
+
+        assert len(owed) == 1, [task.payload for task in owed]
+        assert owed[0].payload["origin"] == "commitment"
+        assert owed[0].payload["commitment"]["said"] == "我两个小时后给你一份清单"
+        assert "整理一份下载目录清单" in owed[0].payload["prompt"]
+    finally:
+        provider.close()
