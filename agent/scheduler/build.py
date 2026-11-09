@@ -314,8 +314,33 @@ def _publish_wake(registry: Any, service: SchedulerService) -> None:
     set_context("scheduler_wake", service.start_now)
 
 
+def _default_notify_chat(cfg: Any) -> dict[str, str]:
+    """Where failures go when a task names no channel of its own.
+
+    `channels.feishu.notify_chat_id` is "tell me here when something breaks".
+    Empty means off -- there is no sensible default chat, and picking one would
+    be this code deciding who reads the agent's failures.
+    """
+    section = cfg.get("channels") if isinstance(cfg, dict) else None
+    feishu = section.get("feishu") if isinstance(section, dict) else None
+    if not isinstance(feishu, dict):
+        return {}
+    chat_id = str(feishu.get("notify_chat_id") or "").strip()
+    if not chat_id:
+        return {}
+    # `receive_id_type` rather than a chat_type guess: the chat list this id
+    # comes from only hands out chat_ids, and the heuristic would read "p2p" and
+    # send an open_id that means nothing in that namespace.
+    return {"chat_id": chat_id, "receive_id_type": "chat_id"}
+
+
 async def mirror_failure_to_channel(
-    delivery: Any, task: Any, run: Any, report: dict[str, Any]
+    delivery: Any,
+    task: Any,
+    run: Any,
+    report: dict[str, Any],
+    *,
+    default_chat: Optional[dict[str, str]] = None,
 ) -> None:
     """A task that reports to a channel must report its *failures* there too.
 
@@ -328,16 +353,27 @@ async def mirror_failure_to_channel(
         return
     snapshot = dict(getattr(run, "config_snapshot", {}) or {})
     mode = str(snapshot.get("delivery_mode") or getattr(task, "delivery_mode", ""))
-    if mode != "channel":
-        return
     raw_target = snapshot.get("delivery_target")
-    target = getattr(task, "delivery_target", None)
+    # A task speaks in a channel only when it was configured to; otherwise its
+    # only audience is the page. The default chat below is the install's own
+    # "tell me where I am", and it applies to both kinds of task.
+    target = getattr(task, "delivery_target", None) if mode == "channel" else None
     if isinstance(raw_target, dict) and raw_target.get("target_type"):
         from agent.scheduler.models import DeliveryTarget
 
         target = DeliveryTarget(
             target_type=str(raw_target["target_type"]),
             payload=dict(raw_target.get("payload") or {}),
+        )
+    if target is None and default_chat:
+        # No channel on the task: fall back to the install's "tell me here".
+        # That is the difference between "this task reports to a chat" and
+        # "warn me wherever I am", which is what a person wants when they are
+        # not looking at the page.
+        from agent.scheduler.models import DeliveryTarget
+
+        target = DeliveryTarget(
+            target_type="feishu_chat", payload=dict(default_chat)
         )
     if target is None:
         return
@@ -490,7 +526,9 @@ def build_scheduler_service(
             await _mirror_to_channel(task, run, report)
 
     async def _mirror_to_channel(task, run, report):
-        await mirror_failure_to_channel(delivery, task, run, report)
+        await mirror_failure_to_channel(
+            delivery, task, run, report, default_chat=_default_notify_chat(cfg)
+        )
 
     async def _agent_executor(task, run):
         # `agent/__init__` imports this package, so these are reached here rather than

@@ -404,3 +404,66 @@ def test_the_run_transcript_survives_a_missing_store():
     transcript = _RunTranscript(_Broken(), "scheduler:t:r")
     with pytest.raises(RuntimeError):
         transcript.event("tool_started", {})
+
+
+def test_a_failure_goes_to_the_default_chat_when_the_task_names_none():
+    """Not every task has a chat; the person still wants to hear about breakage."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import mirror_failure_to_channel
+
+    sent: list[tuple] = []
+
+    class _Delivery:
+        async def deliver_channel(self, *, target, text, output_dir=None):
+            sent.append((target, text))
+            return "sent"
+
+    task = SimpleNamespace(name="汇报", delivery_mode="standalone", delivery_target=None)
+    run = SimpleNamespace(config_snapshot={"delivery_mode": "standalone"})
+    report = {"status": "failed", "task_name": "汇报", "text": "连接中断"}
+
+    asyncio.run(
+        mirror_failure_to_channel(
+            _Delivery(),
+            task,
+            run,
+            report,
+            default_chat={"chat_id": "c9", "receive_id_type": "chat_id"},
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0].target_type == "feishu_chat"
+    assert sent[0][0].payload["chat_id"] == "c9"
+
+
+def test_no_chat_configured_means_no_message():
+    """There is no sensible default recipient; guessing one is deciding who reads it."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent.scheduler.build import _default_notify_chat, mirror_failure_to_channel
+
+    assert _default_notify_chat({}) == {}
+    assert _default_notify_chat({"channels": {"feishu": {"enabled": True}}}) == {}
+    assert _default_notify_chat(
+        {"channels": {"feishu": {"notify_chat_id": " c1 "}}}
+    ) == {"chat_id": "c1", "receive_id_type": "chat_id"}
+
+    sent: list[tuple] = []
+
+    class _Delivery:
+        async def deliver_channel(self, *, target, text, output_dir=None):
+            sent.append((target, text))
+
+    asyncio.run(
+        mirror_failure_to_channel(
+            _Delivery(),
+            SimpleNamespace(name="汇报", delivery_mode="standalone", delivery_target=None),
+            SimpleNamespace(config_snapshot={}),
+            {"status": "failed", "task_name": "汇报", "text": "x"},
+        )
+    )
+    assert sent == []

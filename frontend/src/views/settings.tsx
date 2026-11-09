@@ -480,7 +480,7 @@ function ProvidersCard({
 }
 
 export function createSettingsView(ctx: AppCtx) {
-  const { activateProvider, applyToken, config, configText, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   const renderSettings = () => {
@@ -693,6 +693,27 @@ export function createSettingsView(ctx: AppCtx) {
                       </Form.Item>
                     </div>
                   ))}
+                </div>
+                {/* Where a failure goes when nobody is looking at the page.
+                    Not per-task: a task may have no channel at all, and "warn
+                    me where I am" is a property of the person, not of the task.
+                    Empty means off -- there is no sensible default recipient. */}
+                <div className="settings-pref settings-notify-chat">
+                  <div className="settings-pref-copy">
+                    <span className="settings-pref-name">失败通知发到</span>
+                    <span className="settings-pref-desc">
+                      只发失败。设了它，关掉页面也能收到；不设就只有本机通知。
+                    </span>
+                  </div>
+                  <Form.Item name="notify_chat_id" noStyle>
+                    <Select
+                      allowClear
+                      className="settings-pref-control settings-pref-select"
+                      placeholder="不发送"
+                      onDropdownVisibleChange={open => { if (open && !feishuChats.length) void loadFeishuChats() }}
+                      options={feishuChats.map(chat => ({ value: chat.chat_id, label: chat.name || chat.chat_id }))}
+                    />
+                  </Form.Item>
                 </div>
               </section>
             </Form>

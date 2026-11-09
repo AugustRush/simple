@@ -162,6 +162,11 @@ export function useSettings(deps: Deps) {
         thinking_effort: thinkingEffortOf(active),
         web_enabled: !!(cfg.channels?.web?.enabled),
         feishu_enabled: !!(cfg.channels?.feishu?.enabled),
+        // Where failures go when a task names no channel of its own. Empty is
+        // "off": there is no sensible default recipient.
+        // `undefined`, not '': antd shows a placeholder only for an empty
+        // value, and '' is a value -- the picker rendered as a blank box.
+        notify_chat_id: cfg.channels?.feishu?.notify_chat_id || undefined,
       })
     } catch {
       // Handled by api helper.
@@ -209,6 +214,14 @@ export function useSettings(deps: Deps) {
     cfg.channels.feishu = {
       ...(cfg.channels.feishu || {}),
       enabled: values.feishu_enabled,
+    }
+    // An empty pick removes the key rather than writing "" -- "no destination"
+    // and "a destination with an empty id" are the same thing to the code and
+    // two different things to read in the config.
+    if (values.notify_chat_id) {
+      cfg.channels.feishu.notify_chat_id = values.notify_chat_id
+    } else {
+      delete cfg.channels.feishu.notify_chat_id
     }
     return cfg
   }
@@ -407,6 +420,7 @@ export function useSettings(deps: Deps) {
       thinking_effort: thinkingEffortOf(active),
       web_enabled: !!config?.channels?.web?.enabled,
       feishu_enabled: !!config?.channels?.feishu?.enabled,
+      notify_chat_id: config?.channels?.feishu?.notify_chat_id || undefined,
     })
   }
 
