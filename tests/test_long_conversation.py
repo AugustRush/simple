@@ -169,3 +169,26 @@ def test_a_fact_the_window_dropped_is_still_reachable(tmp_path):
     # plain lookup would test the router rather than the reachability.
     retrieved = ctx.retrieve_history_context("我们之前聊过 atlas 项目吗")
     assert "~/work/atlas" in retrieved, "retrieval must still reach what the window dropped"
+
+
+def test_the_compaction_notice_says_how_to_reach_what_it_dropped(tmp_path):
+    """A pointer the model cannot follow is worse than none: it stops looking.
+
+    The notice told the model "use context_retrieve to search this session".
+    That call only searches conversation history for recall-shaped questions
+    (之前/刚才/聊过), because searching it for every passing topic mention is
+    noise -- a decision this codebase keeps a test for. So the sentence was
+    promising something the tool would refuse for exactly the query a model
+    would write ("deploy.sh 在哪").
+
+    The fix is the promise, not the retrieval policy: say which shape of
+    question reaches the dropped turns.
+    """
+    from agent.memory.fitting import _EVICTION_SENTINEL, _eviction_notice
+
+    notice = _eviction_notice(12)["content"]
+
+    assert notice.startswith(_EVICTION_SENTINEL)
+    assert "12" in notice
+    assert "之前" in notice or "刚才" in notice, "say the shape that reaches history"
+    assert "bare topic lookup" in notice or "topic lookup" in notice

@@ -273,9 +273,12 @@ def _eviction_notice(dropped_count: int) -> dict:
         "role": "user",
         "content": (
             f"{_EVICTION_SENTINEL} {dropped_count} earlier message(s) were "
-            "dropped to fit the input budget. They are recoverable: use "
-            "context_retrieve to search this session before assuming anything "
-            "about them, rather than guessing or asking the user to repeat."
+            "dropped to fit the input budget. They are recoverable: "
+            "`context_retrieve` searches this session, but only for questions "
+            "shaped like recall (\"we talked about X earlier\", 之前 / 刚才 / 聊过) "
+            "-- a bare topic lookup is answered from memory and will not reach "
+            "them. Ask it that way before assuming anything, rather than "
+            "guessing or asking the user to repeat."
         ),
     }
 
