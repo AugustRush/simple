@@ -41,8 +41,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from agent import shared
 from agent.scheduler.models import LOCAL_TIMEZONE, normalize_products
@@ -183,6 +186,137 @@ def _run_detail(run: Any) -> dict[str, Any]:
         "products": handoff["products"],
         "products_missing": handoff["products_missing"],
     }
+
+
+#: The payload marker that makes a one-off task a *commitment*: something the
+#: agent said it would do, rather than something a person scheduled. The patrol
+#: treats these differently from its own errands (``autonomy``) and from the
+#: person's tasks, so the value is a contract, not a label.
+COMMITMENT_ORIGIN = "commitment"
+
+#: How many promises may be open at once. A cap, not a ranking: the failure it
+#: prevents is the agent promising more than it can hold, which turns a promise
+#: into a queue nobody reads.
+MAX_OPEN_COMMITMENTS = 5
+
+#: What "later" means when the model does not say. Thirty minutes is a guess,
+#: and the reply always states it, so the person can correct the guess in one
+#: sentence instead of discovering it tomorrow.
+COMMITMENT_DEFAULT_DELAY_SECONDS = 30 * 60
+
+_COMMITMENT_DELAY = re.compile(r"^\s*(\d+)\s*(m|min|minute|minutes|h|hour|hours|d|day|days)\s*$", re.I)
+
+
+def commitment_due(
+    when: str,
+    *,
+    now: Optional[datetime] = None,
+    timezone_name: str = "",
+) -> Optional[datetime]:
+    """When a promise made with *when* comes due, or ``None`` when unreadable.
+
+    Three shapes, because they are the three a model actually writes:
+
+    * a delay -- ``30m``, ``2h``, ``1d`` (and their long spellings);
+    * tomorrow / 明天 -- the next 09:00 in the person's own timezone, because
+      "tomorrow" said at 23:00 rarely means 23:00 again;
+    * an ISO timestamp, passed through.
+
+    An empty string is not an error: it means "soon", and the reply says how soon.
+    Anything else unreadable returns ``None`` so the caller can refuse rather
+    than promise a time nobody can compute.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+
+    from agent.scheduler.models import local_timezone_name
+
+    zone = timezone_name or local_timezone_name()
+    moment = now or _dt.now(timezone.utc)
+    text = str(when or "").strip()
+    if not text:
+        return moment + _td(seconds=COMMITMENT_DEFAULT_DELAY_SECONDS)
+    lowered = text.lower()
+    if lowered in {"tomorrow", "明天", "明早", "明儿"}:
+        local = moment.astimezone(ZoneInfo(zone))
+        tomorrow = (local + _td(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        return tomorrow.astimezone(timezone.utc)
+    match = _COMMITMENT_DELAY.match(text)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2).lower()[0]
+        factor = {"m": 60, "h": 3600, "d": 86400}[unit]
+        return moment + _td(seconds=amount * factor)
+    try:
+        parsed = _dt.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=ZoneInfo(zone))
+
+
+def is_commitment(task: Any) -> bool:
+    """Whether *task* is a promise rather than a schedule or an errand."""
+    payload = getattr(task, "payload", None)
+    return isinstance(payload, dict) and payload.get("origin") == COMMITMENT_ORIGIN
+
+
+def commitment_open(task: Any, runs: Any) -> bool:
+    """Whether this promise is still owed.
+
+    Read from the run history rather than from ``next_run_at``: a manually
+    started run leaves the schedule untouched, so "has a next run" is not the
+    same question as "has it been tried". A promise is owed until something
+    runs for it -- after that it has either been kept or been reported as
+    broken, and both close it.
+    """
+    if not is_commitment(task) or not bool(getattr(task, "enabled", True)):
+        return False
+    return not list(runs or ())
+
+
+def open_commitments(store: Any) -> list[Any]:
+    """Every promise still owed, newest deadline last."""
+    try:
+        tasks = list(store.list_tasks())
+    except Exception:
+        return []
+    open_ones = []
+    for task in tasks:
+        if not is_commitment(task):
+            continue
+        try:
+            runs = store.list_runs(task.id)
+        except Exception:
+            runs = []
+        if commitment_open(task, runs):
+            open_ones.append(task)
+    return open_ones
+
+
+def commitment_goal(task: Any) -> str:
+    payload = getattr(task, "payload", None)
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("prompt") or "").strip()
+
+
+def commitment_key(text: str) -> str:
+    """A comparable form of a promise, so the same one twice is one row."""
+    return " ".join(str(text or "").split()).lower()
+
+
+def _describe_due(due: datetime, *, now: Optional[datetime] = None) -> str:
+    """A due time as a person would say it, relative when that is the point."""
+    moment = now or datetime.now(timezone.utc)
+    delta = (due - moment).total_seconds()
+    if delta <= 0:
+        return "已经到点了"
+    # Rounded, not floored: 2h59m59s read as "约 2 小时后", which is the kind of
+    # small lie that makes a person distrust the rest of the sentence.
+    if delta < 3600:
+        return f"约 {max(1, round(delta / 60))} 分钟后"
+    if delta < 86400:
+        return f"约 {max(1, round(delta / 3600))} 小时后"
+    return due.astimezone().strftime("%m-%d %H:%M")
 
 
 class ScheduleTools:
@@ -558,6 +692,131 @@ class ScheduleTools:
                 raise ValueError("`job_name` is required for system_job actions")
             return "system_job", {"job_name": text}
         raise ValueError(f"Unsupported action_type '{action_type}'")
+
+    def commit(
+        self,
+        what: str,
+        when: str = "",
+        said: str = "",
+        intent: str = "",
+    ) -> dict[str, Any]:
+        """Write down something you said you would do, at the time you said it.
+
+        The whole point is that "later" is not a time. A promise kept only in
+        prose dies with the turn that made it, and the person has no way to tell
+        a forgotten promise from one that was never made -- which is worse than
+        saying nothing, because they planned around it.
+
+        Deliberately narrower than `automation_create`: a promise needs what and
+        when, and the other nine fields of a scheduled task are questions nobody
+        asked. It is also deliberately *not* a schedule: `origin=commitment`
+        tells the patrol these are the agent's own promises, so their failures
+        are followed up as broken promises rather than as a task that needs
+        reading.
+        """
+        goal = str(what or "").strip()
+        if not goal:
+            return self._error(
+                "what 不能为空：写下你要做的那件事，用一句你自己的话。"
+            )
+        due = commitment_due(when)
+        if due is None:
+            return self._error(
+                f"读不懂时间「{when}」。用 30m / 2h / 1d、tomorrow（明天）、"
+                "或者一个 ISO 时间戳；留空就是 30 分钟后。"
+            )
+        store = self._schedule_store()
+        open_ones = open_commitments(store)
+
+        key = commitment_key(goal)
+        for task in open_ones:
+            if commitment_key(commitment_goal(task)) != key:
+                continue
+            # The same promise twice is one promise with a later time, not two
+            # commitments. Re-aiming rather than adding is also what keeps the
+            # cap below honest: "I will get to it" repeated five times is one
+            # intention, and five rows would fill the list with it.
+            reaimed = self.schedule_update(
+                task.id, intent=intent, trigger_type="once", at=due.isoformat()
+            )
+            if reaimed.get("ok") is False:
+                return reaimed
+            return self._ok(
+                task_id=task.id,
+                due_at=due.isoformat(),
+                due_text=_describe_due(due),
+                already_open=True,
+                note="这件事已经在手上了，我把时间改到了新的那一个。",
+            )
+
+        if len(open_ones) >= MAX_OPEN_COMMITMENTS:
+            return self._error(
+                f"手上已经有 {len(open_ones)} 件答应的事没做完，先完成或放弃一件再记新的。"
+                "用 commitments 看现在欠着什么。"
+            )
+
+        from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
+
+        made_at = datetime.now(timezone.utc)
+        payload = {
+            "prompt": goal,
+            "origin": COMMITMENT_ORIGIN,
+            "commitment": {
+                # What the person actually heard, kept beside the goal: the goal
+                # is written for the run, the quote is what was promised.
+                "said": str(said or "").strip()[:500],
+                "made_at": made_at.isoformat(),
+                "due_at": due.isoformat(),
+                "session_id": str(self.registry.get_context("turn_session_id") or ""),
+            },
+        }
+        try:
+            task = store.create_task(
+                NewScheduledTask(
+                    name=goal[:80],
+                    kind="agent_prompt",
+                    trigger=TriggerSpec.once(due.isoformat(), "UTC"),
+                    payload=payload,
+                    delivery_mode="standalone",
+                    delivery_target=DeliveryTarget.standalone(),
+                    workspace_root=str(self._active_workspace_root()),
+                    permission_profile="inherit",
+                    session_id=str(self.registry.get_context("turn_session_id") or ""),
+                )
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return self._error(f"记不下来：{exc}")
+        return self._ok(
+            task_id=task.id,
+            due_at=due.isoformat(),
+            due_text=_describe_due(due),
+            open_count=len(open_ones) + 1,
+            note=(
+                "记下了。到时间它自己会做；做不到我会说，不会装作没答应过。"
+            ),
+        )
+
+    def commitments(self) -> dict[str, Any]:
+        """What is still owed: the promises whose time has not come (or has)."""
+        store = self._schedule_store()
+        now = datetime.now(timezone.utc)
+        items = []
+        for task in open_commitments(store):
+            due = getattr(task, "next_run_at", None)
+            payload = getattr(task, "payload", None) or {}
+            commitment = payload.get("commitment") if isinstance(payload, dict) else {}
+            items.append(
+                {
+                    "task_id": str(getattr(task, "id", "")),
+                    "goal": commitment_goal(task),
+                    "due_at": due.astimezone(timezone.utc).isoformat() if due else "",
+                    "due_text": _describe_due(due) if due else "",
+                    "overdue": bool(due is not None and due <= now),
+                    "said": str((commitment or {}).get("said") or ""),
+                }
+            )
+        items.sort(key=lambda item: item["due_at"])
+        return self._ok(count=len(items), items=items)
 
     def schedule_list(self) -> dict[str, Any]:
         """Every task, with how its last run ended.

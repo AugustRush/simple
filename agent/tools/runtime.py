@@ -362,6 +362,11 @@ class ToolRegistry:
         ("builtin", "context_retrieve"): frozenset({"read"}),
         ("builtin", "schedule_list"): frozenset({"read"}),
         ("builtin", "schedule_runs"): frozenset({"read"}),
+        ("builtin", "commitments"): frozenset({"read"}),
+        # A promise is a row written to this machine's scheduler, so it is a
+        # state write -- but not `requires_intent`: a promise may be the
+        # agent's own initiative, and there is no user sentence to quote.
+        ("builtin", "commit"): frozenset({"state_write"}),
         ("builtin", "web_search"): frozenset({"read"}),
         ("builtin", "web_fetch"): frozenset({"read"}),
         ("builtin", "tavily_search"): frozenset({"read"}),

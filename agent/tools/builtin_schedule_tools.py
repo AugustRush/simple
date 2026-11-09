@@ -349,6 +349,66 @@ def register_schedule_tools(
         )
     
         r.register(
+            "commit",
+            (
+                "Write down something you said you would do, and when. Use this "
+                "the moment you promise something in a conversation -- \"我晚点给你\", "
+                "\"明天整理一份清单\", \"我查一下再回你\". A promise kept only in prose "
+                "dies with the turn that made it, and the person cannot tell a "
+                "forgotten promise from one that was never made -- they planned "
+                "around it. `when` takes 30m / 2h / 1d, tomorrow（明天）, or an ISO "
+                "timestamp; an empty value means 30 minutes. Then say the time out "
+                "loud in your reply, so a wrong guess costs the person one sentence. "
+                "Do not promise what you cannot start: if the work needs several "
+                "attempts, say so rather than promising a deadline you will miss."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "what": {
+                        "type": "string",
+                        "description": (
+                            "The thing you will do, in your own words, as the "
+                            "instruction for the run that will do it."
+                        ),
+                    },
+                    "when": {
+                        "type": "string",
+                        "description": (
+                            "When it comes due: 30m / 2h / 1d, tomorrow（明天）, "
+                            "or an ISO timestamp. Empty means 30 minutes."
+                        ),
+                        "default": "",
+                    },
+                    "said": {
+                        "type": "string",
+                        "description": (
+                            "What you actually said to the person, verbatim -- the "
+                            "promise as they heard it."
+                        ),
+                        "default": "",
+                    },
+                },
+                "required": ["what"],
+            },
+            schedule_tools.commit,
+            source="builtin",
+        )
+
+        r.register(
+            "commitments",
+            (
+                "List the promises still owed: what you said you would do, when it "
+                "is due, and whether it is already overdue. Read it before "
+                "promising a sixth thing, and when the person asks what you still "
+                "have outstanding."
+            ),
+            {"type": "object", "properties": {}, "required": []},
+            schedule_tools.commitments,
+            source="builtin",
+        )
+
+        r.register(
             "schedule_list",
             "List persistent scheduled tasks.",
             {"type": "object", "properties": {}, "required": []},

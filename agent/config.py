@@ -1437,6 +1437,15 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "task can go wrong; do not set it to paper over a criterion "
                 "that is itself impossible."
             )
+        if "commit" in builtin_names:
+            lines.append(
+                "When you say you will do something later — 一会儿 / 晚点 / 明天给你 / "
+                "我查一下再回你 — that is not a figure of speech: call `commit` with the "
+                "thing and the time, and say the time out loud in your reply. A "
+                "a later that was never written down is a forgotten promise, and the "
+                "person plans around promises. Ask yourself: if this process restarted "
+                "right after this turn, would this still be owed?"
+            )
         if "schedule_runs" in builtin_names:
             lines.append(
                 "A scheduled task runs with nobody watching, so read back what "

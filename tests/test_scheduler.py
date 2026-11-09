@@ -2584,3 +2584,141 @@ def test_the_conversation_report_does_not_carry_the_downtime_note():
 
     assert "summary=result.summary" in report_call
     assert "summary=run_summary" not in report_call
+
+
+# ── commitments: what it said it would do ──────────────────────────────────
+
+
+def _commit_tools(tmp_path):
+    from pathlib import Path
+
+    from agent.scheduler import SchedulerStore
+    from agent.tools.schedule_tools import ScheduleTools
+
+    store = SchedulerStore(db_path=Path(tmp_path) / "tasks" / "scheduler.db")
+
+    class _Registry:
+        def get_context(self, name):
+            return "sess-1" if name == "turn_session_id" else None
+
+    tools = ScheduleTools(
+        registry=_Registry(),
+        schedule_store=lambda: store,
+        active_workspace_root=lambda: Path(tmp_path),
+        chosen_workspace_root=lambda: None,
+        ok=lambda **kw: {"ok": True, **kw},
+        error=lambda message, **kw: {"ok": False, "error": message, **kw},
+    )
+    return tools, store
+
+
+def test_a_promise_is_a_one_off_task_marked_as_the_agents_own(tmp_path):
+    """The marker is the contract: the patrol reads promises differently."""
+    from agent.autonomy import is_own_errand
+    from agent.tools.schedule_tools import commitment_open, open_commitments
+
+    tools, store = _commit_tools(tmp_path)
+    try:
+        result = tools.commit("给用户整理一份清单", "2h", said="我两个小时后给你一份清单")
+        assert result["ok"] is True, result
+        assert "2" in result["due_text"] and "小时" in result["due_text"]
+
+        (task,) = store.list_tasks()
+        assert task.payload["origin"] == "commitment"
+        assert task.payload["commitment"]["said"] == "我两个小时后给你一份清单"
+        assert task.kind == "agent_prompt"
+        assert commitment_open(task, []) is True
+        # Own work, like the patrol's own errands: its failure is followed up as
+        # a broken promise, not as "a task nobody read".
+        assert is_own_errand(task.payload) is False, "commitment is its own origin"
+    finally:
+        store.close()
+
+
+def test_the_same_promise_twice_is_one_promise_with_a_later_time(tmp_path):
+    from agent.tools.schedule_tools import commitment_open, open_commitments
+
+    tools, store = _commit_tools(tmp_path)
+    try:
+        first = tools.commit("整理清单", "1h")
+        second = tools.commit(" 整理清单 ", "3h")
+
+        assert second["ok"] is True
+        assert second["already_open"] is True
+        assert second["task_id"] == first["task_id"]
+        assert len(open_commitments(store)) == 1
+        assert "3" in second["due_text"]
+    finally:
+        store.close()
+
+
+def test_a_sixth_promise_is_refused(tmp_path):
+    """The cap is the whole anti-promise-inflation mechanism."""
+    from agent.tools.schedule_tools import MAX_OPEN_COMMITMENTS
+
+    tools, store = _commit_tools(tmp_path)
+    try:
+        for index in range(MAX_OPEN_COMMITMENTS):
+            assert tools.commit(f"第 {index} 件事", "1h")["ok"] is True
+        refused = tools.commit("第六件事", "1h")
+
+        assert refused["ok"] is False
+        assert "答应的事" in refused["error"]
+        assert len([t for t in store.list_tasks() if t.payload.get("origin") == "commitment"]) == (
+            MAX_OPEN_COMMITMENTS
+        )
+    finally:
+        store.close()
+
+
+def test_an_unreadable_time_is_refused_rather_than_guessed(tmp_path):
+    tools, store = _commit_tools(tmp_path)
+    try:
+        refused = tools.commit("整理清单", "下周找个时间")
+
+        assert refused["ok"] is False
+        assert "读不懂时间" in refused["error"]
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_commitments_lists_what_is_still_owed(tmp_path):
+    tools, store = _commit_tools(tmp_path)
+    try:
+        tools.commit("整理清单", "2h", said="我两个小时后给你")
+        listed = tools.commitments()
+
+        assert listed["ok"] is True
+        assert listed["count"] == 1
+        item = listed["items"][0]
+        assert item["goal"] == "整理清单"
+        assert item["said"] == "我两个小时后给你"
+        assert item["overdue"] is False
+        assert item["due_at"]
+    finally:
+        store.close()
+
+
+def test_a_kept_promise_closes_itself(tmp_path):
+    """`next_run_at` going away is the close: one source of truth, no bookkeeping."""
+    from datetime import datetime, timezone
+
+    from agent.tools.schedule_tools import commitment_open, open_commitments
+
+    tools, store = _commit_tools(tmp_path)
+    try:
+        tools.commit("整理清单", "1h")
+        (task,) = store.list_tasks()
+        claimed = store.claim_task_now(task.id, now=datetime.now(timezone.utc))
+        assert claimed is not None
+        store.complete_run(task.id, claimed.run.id, finished_at=datetime.now(timezone.utc), status="succeeded")
+        after = store.get_task(task.id)
+        assert after is not None
+        assert commitment_open(after, store.list_runs(task.id)) is False, (
+            "a promise that has been attempted is not owed any more -- it was "
+            "either kept or reported as broken"
+        )
+        assert tools.commitments()["count"] == 0
+    finally:
+        store.close()
