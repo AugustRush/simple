@@ -113,6 +113,15 @@
 .panel-row-main span { color: var(--text-muted); font-size: 11px; }
 .panel-row-when { flex: 0 0 auto; color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
+/* A promise: same row geometry as everything else on this panel, with the one
+   thing a promise has that a task does not -- a time it was supposed to happen.
+   Late is marked, because that is the fact a person would otherwise have to
+   work out from the clock. */
+.panel-row-promised { cursor: default; }
+.panel-row-dot-promised { background: var(--text-secondary); }
+.panel-row-promised.is-overdue .panel-row-dot-promised { background: var(--amber); }
+.panel-row-promised.is-overdue .panel-row-main span { color: var(--amber); }
+
 /* A goal in progress: a row with a dot that keeps moving. It shares the task
    row's geometry on purpose -- both are "something is happening", and the panel
    should not teach a second shape for it. */

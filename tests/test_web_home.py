@@ -375,6 +375,7 @@ def test_no_stores_is_an_empty_page_not_a_crash() -> None:
         # No Ralph store in this composition is a configuration, not a gap:
         # nothing is being worked on, and that is the honest answer.
         "working": [],
+        "commitments": [],
     }
     assert body["activity"] == []
 
@@ -680,3 +681,56 @@ def test_a_proposal_about_a_task_says_which_task(monkeypatch, tmp_path):
 
     assert card["target_task_id"] == "t1"
     assert card["kind"] == "proposal"
+
+
+def test_the_board_shows_what_it_promised_to_do(tmp_path):
+    """A promise is owed until something runs for it; the panel says what is owed."""
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.channels import web_home
+
+    store = SchedulerStore(db_path=Path(tmp_path) / "scheduler.db")
+    now = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+    try:
+        for goal, hours in (("整理清单", 2), ("写周报", -1)):
+            store.create_task(
+                NewScheduledTask(
+                    name=goal,
+                    kind="agent_prompt",
+                    trigger=TriggerSpec.once((now + timedelta(hours=hours)).isoformat(), "UTC"),
+                    payload={
+                        "prompt": goal,
+                        "origin": "commitment",
+                        "commitment": {"said": f"我晚点{goal}", "due_at": ""},
+                    },
+                    delivery_mode="standalone",
+                    delivery_target=DeliveryTarget.standalone(),
+                    workspace_root=str(tmp_path),
+                )
+            )
+        # A scheduled task is not a promise and must not appear here.
+        store.create_task(
+            NewScheduledTask(
+                name="每天早上看日志",
+                kind="agent_prompt",
+                trigger=TriggerSpec.once((now + timedelta(hours=5)).isoformat(), "UTC"),
+                payload={"prompt": "看日志"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+                workspace_root=str(tmp_path),
+            )
+        )
+
+        payload = web_home.build_home_overview(scheduler_store=store, now=now)
+    finally:
+        store.close()
+
+    rows = payload["board"]["commitments"]
+    goals = [row["goal"] for row in rows]
+    assert goals == ["写周报", "整理清单"], "soonest first, and only promises"
+    assert rows[0]["overdue"] is True
+    assert "晚了" in rows[0]["due_text"]
+    assert "小时" in rows[1]["due_text"]
+    assert rows[1]["said"] == "我晚点整理清单"

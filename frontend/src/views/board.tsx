@@ -280,6 +280,7 @@ export function renderBoardPanel(ctx: AppCtx) {
   const inFlight = board?.running ?? []
   const scheduled = board?.scheduled ?? []
   const working = board?.working ?? []
+  const promised = board?.commitments ?? []
   const scheduledTotal = Number(board?.scheduled_total || 0)
 
   /** Open a task's detail: the drawer lives on 自动化, so arriving there is part of
@@ -301,10 +302,14 @@ export function renderBoardPanel(ctx: AppCtx) {
   }
 
   const nothingToDo =
-    waiting.length + inFlight.length + working.length + scheduledTotal === 0
+    waiting.length + inFlight.length + working.length + promised.length + scheduledTotal === 0
 
   // The panel's first line, and the only sentence most visits need.
   const rest = [
+    // Promises first among the counts that are not "action needed": an owing
+    // promise is a claim on the person's plan, and it is the one number here
+    // that is about *them* rather than about the machinery.
+    promised.length ? `${promised.length} 件答应过你` : '',
     working.length ? `${working.length} 件在做` : '',
     inFlight.length ? `${inFlight.length} 个在跑` : '',
     scheduledTotal ? `${scheduledTotal} 个已排期` : '',
@@ -345,6 +350,31 @@ export function renderBoardPanel(ctx: AppCtx) {
                   <AttentionCard key={card.task_id} card={card} onOpen={openTask} />
                 ),
               )}
+            </section>
+          )}
+
+          {promised.length > 0 && (
+            <section className="panel-group panel-group-promised">
+              <div className="panel-group-head">
+                它答应你的事<span className="panel-group-count">{promised.length}</span>
+              </div>
+              {promised.map(row => (
+                <div
+                  className={`panel-row panel-row-promised${row.overdue ? ' is-overdue' : ''}`}
+                  key={row.task_id}
+                  // No click: a promise has no page. The row is the whole
+                  // message -- what it said it would do, and when.
+                  title={row.said || undefined}
+                >
+                  <span className="panel-row-dot panel-row-dot-promised" aria-hidden="true" />
+                  <span className="panel-row-main">
+                    <strong>{row.goal}</strong>
+                    {/* `due_text` already reads as a phrase ("40 分钟后" / "已经晚了 5 分钟");
+                        prefixing it with 还有 produced "还有 40 分钟后". */}
+                    <span>{row.due_text}</span>
+                  </span>
+                </div>
+              ))}
             </section>
           )}
 

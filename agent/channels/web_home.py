@@ -122,6 +122,10 @@ def build_home_overview(
     moment = now or datetime.now(UTC)
     activity = _activity(scheduler_store, sessions, moment=moment)
     board = _board(scheduler_store, proposal_store=proposal_store, now=moment)
+    # What it said it would do, and when. Read through the scheduler store the
+    # board already has: a promise *is* a one-off task, and a second source would
+    # be a second answer to "what is it on the hook for".
+    board["commitments"] = _commitments(scheduler_store, now=moment)
     # What it is working *on*, as opposed to what it is running: a Ralph goal
     # lives across turns and has no run row until one is executing. Without this
     # the panel answered "is anything happening" from runs alone, so a goal being
@@ -327,6 +331,60 @@ def _detail(latest: Any, *, failure: Any, status: str, unread: int) -> str:
 #: How many running goals the board shows. A board is glanced at, and a goal
 #: list is a queue -- the number is what says there is more.
 BOARD_WORKING_PREVIEW = 3
+
+
+#: How many promises the panel shows. A board is glanced at; the rest are one
+#: click away on 自动化.
+BOARD_COMMITMENTS_PREVIEW = 3
+
+
+def _commitments(scheduler_store: Any, *, now: datetime) -> list[dict[str, Any]]:
+    """Promises still owed, soonest first, with whether each is already late.
+
+    Visibility only: there is no "nudge" beside this, because the scheduler
+    already runs an overdue one-off task on its next pass (`missed_run_policy`
+    is `coalesce`), and a commitment whose run *fails* already speaks in the
+    conversation. A reminder on top of those two would be a third voice saying
+    the same thing.
+    """
+    if scheduler_store is None:
+        return []
+    try:
+        from agent.tools.schedule_tools import open_commitments
+
+        tasks = open_commitments(scheduler_store)
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        payload = getattr(task, "payload", None) or {}
+        commitment = payload.get("commitment") if isinstance(payload, dict) else {}
+        due = getattr(task, "next_run_at", None)
+        rows.append(
+            {
+                "task_id": str(getattr(task, "id", "")),
+                "goal": str((payload or {}).get("prompt") or "")[:120],
+                "due_at": due.astimezone(UTC).isoformat() if due else "",
+                "due_text": _due_text(due, now=now) if due else "",
+                "overdue": bool(due is not None and due <= now),
+                "said": str((commitment or {}).get("said") or "")[:120],
+            }
+        )
+    rows.sort(key=lambda item: item["due_at"])
+    return rows[:BOARD_COMMITMENTS_PREVIEW]
+
+
+def _due_text(due: datetime, *, now: datetime) -> str:
+    """How long until (or since) a promise comes due, in one short phrase."""
+    seconds = (due - now).total_seconds()
+    if seconds <= 0:
+        overdue_minutes = max(1, int(-seconds // 60))
+        return f"已经晚了 {overdue_minutes} 分钟" if overdue_minutes < 120 else "已经过期"
+    if seconds < 3600:
+        return f"{max(1, round(seconds / 60))} 分钟后"
+    if seconds < 86400:
+        return f"{max(1, round(seconds / 3600))} 小时后"
+    return f"{round(seconds / 86400)} 天后"
 
 
 def _working(work_store: Any) -> list[dict[str, Any]]:

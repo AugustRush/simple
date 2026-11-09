@@ -333,6 +333,16 @@ export interface HomeActivity {
 //: columns use it for three different facts (when it started / when it failed /
 //: when it will fire) and a single unlabelled timestamp would be ambiguous.
 //: One goal being worked on: the long-running unit of work.
+//: One promise: what it said it would do, and when it comes due.
+export interface CommitmentRow {
+  task_id: string
+  goal: string
+  due_at: string
+  due_text: string
+  overdue: boolean
+  said: string
+}
+
 export interface WorkingRow {
   id: string
   goal: string
@@ -382,6 +392,8 @@ export interface HomeOverview {
     //: Goals it is in the middle of (a Ralph task), which have no run row of
     //: their own. Not cards: there is nothing to act on, and no page to open.
     working?: WorkingRow[]
+    //: Promises it made in conversation and has not kept yet.
+    commitments?: CommitmentRow[]
   }
   activity: HomeActivity[]
   //: Cursor for the next page of the timeline. Empty when the first page came
