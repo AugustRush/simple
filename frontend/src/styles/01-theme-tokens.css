@@ -38,6 +38,14 @@
   --red-soft: rgba(240, 163, 163, 0.12);
   --amber: #d6c7a3;
   --amber-soft: rgba(214, 199, 163, 0.12);
+  /* The one colour in the app. Everything else is deliberately monochrome —
+   * the accent earns its visibility by being rare: the user's own words, the
+   * agent's mark, the send button, a link. A second saturated colour would
+   * dilute it, so there isn't one. */
+  --accent: #7c6cff;
+  --accent-strong: #6a59f2;
+  --accent-soft: rgba(124, 108, 255, 0.14);
+  --accent-contrast: #ffffff;
   --shadow: 0 14px 34px rgba(0, 0, 0, 0.2);
   --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
@@ -69,6 +77,10 @@ html[data-theme='light'] {
   --red-soft: rgba(143, 79, 79, 0.1);
   --amber: #806f4b;
   --amber-soft: rgba(128, 111, 75, 0.1);
+  --accent: #6c56f0;
+  --accent-strong: #5a43dd;
+  --accent-soft: rgba(108, 86, 240, 0.1);
+  --accent-contrast: #ffffff;
   --shadow: 0 14px 34px rgba(39, 39, 42, 0.1);
   --shadow-soft: 0 1px 2px rgba(39, 39, 42, 0.06);
 }
@@ -136,12 +148,12 @@ html[data-theme='light'] {
   background: var(--selection-bg);
 }
 
-/* The user bubble is a light chip with dark text in both themes (see
- * 10-secondary-glass.css), so the dark theme's light tint would vanish into
- * it. It takes the same dark tint the light theme uses everywhere. */
+/* The user bubble is violet with white text (see 09-search-workspace.css), so
+ * the default light-grey tint would smear across the gradient. Selection there
+ * is a white wash — the same gesture the rest of the app uses, inverted. */
 .bubble-user ::selection,
 .bubble-user::selection {
-  background: rgba(22, 23, 25, 0.18);
+  background: rgba(255, 255, 255, 0.28);
 }
 
 ::-webkit-scrollbar {

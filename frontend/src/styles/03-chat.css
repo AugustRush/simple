@@ -214,17 +214,26 @@ kbd {
 .message-avatar {
   flex: 0 0 auto;
   margin-top: 20px;
-  border: 1px solid var(--border);
+  border: 0;
+  /* A filled mark, not a bordered circle: at 32px a border is the only thing
+   * you can see, and two bordered circles flanking every row read as form
+   * controls rather than as people. */
+  width: 30px;
+  height: 30px;
+  line-height: 30px;
+  font-size: 14px;
+  border-radius: 10px;
 }
 
 .message-avatar.assistant {
-  color: #fff;
-  background: var(--primary);
+  color: var(--accent-contrast);
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
 }
 
 .message-avatar.user {
-  color: var(--primary);
-  background: var(--primary-soft);
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
 }
 
 .message-stack {

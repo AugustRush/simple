@@ -575,17 +575,22 @@ html[data-theme='light'] .schedule-card-attention { color: #7d4646; }
 }
 
 .bubble-user {
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  color: #f4f4f5;
-  background: #2a2a2e;
+  padding: 11px 16px;
+  border: 1px solid transparent;
+  border-radius: 18px 18px 5px 18px;
+  color: #ffffff;
+  /* The user's own words carry the app's one accent. A grey chip next to a
+   * grey page had no voice: in a list of two bubble shapes the eye could not
+   * tell "me" from "it" without reading the author line. Violet reads as
+   * intentional colour rather than as a highlight, and it keeps white text at
+   * 5.0:1 (dark) / 5.5:1 (light). */
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
 }
 
 html[data-theme='light'] .bubble-user {
-  color: #f7f7f8;
-  background: #2b2b2e;
-  border-color: #2b2b2e;
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  border-color: transparent;
 }
 
 .bubble-user .markdown,
@@ -598,7 +603,7 @@ html[data-theme='light'] .bubble-user {
 
 .bubble-user .markdown code {
   color: #ffffff;
-  background: rgba(255, 255, 255, .13);
+  background: rgba(255, 255, 255, 0.2);
 }
 
 .bubble-user .markdown a {

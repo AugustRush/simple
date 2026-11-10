@@ -65,9 +65,10 @@
   border-radius: 11px;
   /* A filled mark, not an outlined box: every modern app icon is a filled
      squircle, and a bordered square at 30px read as a checkbox that wandered
-     into the corner. Light fill + dark glyph in both themes, like bubble-user. */
-  background: var(--primary);
-  color: var(--bg);
+     into the corner. The same accent the send button and the user's own words
+     carry — three places, one colour, and the app has an identity. */
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  color: var(--accent-contrast);
   font-size: 16px;
   cursor: pointer;
   transition: transform .15s ease, filter .15s ease;

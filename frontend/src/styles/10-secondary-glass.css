@@ -333,16 +333,20 @@ html[data-theme='light'] .app-header {
 .bubble-user {
   padding: 12px 17px;
   border-radius: 20px 20px 6px 20px;
-  color: #161719;
-  background: #f1f1f2;
-  border-color: rgba(255, 255, 255, 0.3);
-  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+  color: #ffffff;
+  /* The accent, with a soft shadow that lifts the bubble off the page. The
+   * shape and padding live here; the colour itself is set in 09-search-workspace
+   * and the gradient survives both. */
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  border-color: transparent;
+  box-shadow: 0 6px 20px rgba(108, 86, 240, 0.28);
 }
 
 html[data-theme='light'] .bubble-user {
-  color: #161719;
-  background: #e7e8ea;
-  border-color: rgba(17, 18, 21, 0.08);
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  border-color: transparent;
+  box-shadow: 0 6px 20px rgba(108, 86, 240, 0.22);
 }
 
 .bubble-user .markdown,
@@ -412,9 +416,9 @@ html[data-theme='light'] .composer {
 }
 
 .send-button.ant-btn-primary:not(:disabled) {
-  color: #17181a !important;
-  background: #f1f1f2 !important;
-  border-color: #f1f1f2 !important;
+  color: var(--accent-contrast) !important;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
+  border-color: transparent !important;
 }
 
 /* The `.send-button.ant-btn-primary:not(:disabled):hover` rule that used to sit

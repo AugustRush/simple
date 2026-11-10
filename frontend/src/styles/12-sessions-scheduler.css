@@ -897,15 +897,15 @@ html[data-theme='light'] .composer:focus-within {
 }
 
 .send-button.ant-btn-primary:not(:disabled) {
-  color: var(--bg) !important;
-  border-color: var(--text) !important;
-  background: var(--text) !important;
+  color: var(--accent-contrast) !important;
+  border-color: transparent !important;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
 }
 
 .send-button.ant-btn-primary:not(:disabled):hover {
-  color: var(--bg) !important;
-  border-color: var(--text) !important;
-  background: var(--text) !important;
+  color: var(--accent-contrast) !important;
+  border-color: transparent !important;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
   filter: brightness(1.08);
 }
 
