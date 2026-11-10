@@ -58,6 +58,16 @@ def post_turn_maintenance(
             ctx_mgr, "consume_memory_clear_suppression", None
         )
         if callable(consume_suppression) and consume_suppression():
+            # The turn is deliberately *not* journaled: it happened around a
+            # memory wipe, and writing it down would put back what the person
+            # just erased. What that left behind was its tool events -- written
+            # as they happened, so the conversation then showed a bare "工具轨迹 ·
+            # 18 步" with no request and no answer around it. A trace that belongs
+            # to a turn nobody kept is not a record, it is a loose end.
+            discard_events = getattr(ctx_mgr, "discard_turn_events", None)
+            if callable(discard_events):
+                with shared._suppress_with_log("turn event discard skipped"):
+                    discard_events(str(record_kwargs.get("message_id") or "") if isinstance(record_kwargs, dict) else "")
             save_checkpoint = getattr(ctx_mgr, "save_provider_checkpoint", None)
             if callable(save_checkpoint):
                 with shared._suppress_with_log("provider checkpoint save skipped"):

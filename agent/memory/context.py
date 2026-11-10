@@ -305,6 +305,18 @@ class ContextManager:
         jobs.on_memory_cleared(queue=self._queue)
 
 
+    def discard_turn_events(self, turn_id: str) -> int:
+        """Remove the runtime events this turn wrote.
+
+        Called on the path where the turn is deliberately not journaled (a
+        memory wipe happened around it): the tool events were written as they
+        happened, and a trace with no request and no answer around it is a
+        loose end rather than a record.
+        """
+        return self.store.delete_turn_events(
+            session_id=self.staging.session_id, turn_id=str(turn_id or "")
+        )
+
     def consume_memory_clear_suppression(self) -> bool:
         return jobs.consume_memory_clear_suppression(queue=self._queue)
 

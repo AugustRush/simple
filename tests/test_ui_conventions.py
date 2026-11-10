@@ -105,3 +105,29 @@ def test_the_automation_status_is_not_an_antd_tag() -> None:
         )
 
 
+
+
+def test_buttocks_use_the_project_focus_ring_not_antds_double_border() -> None:
+    """antd's own focus ring reads as a second border on a solid primary.
+
+    Measured on the memory toolbar: `outline: 3px solid rgb(82,82,83)` at a 1px
+    offset around the dark 新增记忆 pill, left on screen after a *mouse* click
+    (antd hands focus back to a modal's trigger, and Chromium counts that as
+    :focus-visible). Every hand-written control here rings at 2px of
+    --focus-ring with a 2px offset, so the antd ones follow the same rule.
+    """
+    offenders = [
+        (where, line)
+        for where, line in _rules_mentioning(".ant-btn:focus-visible")
+    ]
+
+    assert offenders, "the antd focus ring must be overridden, not inherited"
+
+    text = (STYLES / "15-shell.css").read_text()
+    keyboard = text[text.index("html[data-input='keyboard'] .ant-btn:focus-visible") :][:400]
+    assert "2px solid var(--focus-ring)" in keyboard, keyboard
+    assert "outline-offset: 2px" in keyboard, keyboard
+    # Only the keyboard draws it: a pointer click that leaves focus behind (antd
+    # does this when a modal closes) must not leave a ring on a solid button.
+    pointer = text[text.index("html[data-input='pointer'] .ant-btn:focus-visible") :][:400]
+    assert "outline: none" in pointer, pointer

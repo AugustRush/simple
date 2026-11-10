@@ -470,6 +470,26 @@ def append_conversation_turn(conn, *,
     return _row_mappers._row_to_conversation_turn(row) if row else None
 
 
+def delete_turn_events(conn, *, session_id: str, turn_id: str) -> int:
+    """Remove the runtime events one turn wrote, and nothing else.
+
+    Used when a turn is deliberately not journaled (a memory wipe happened
+    around it): its tool events were written as they happened, and leaving them
+    makes the conversation show a trace of a turn that does not exist.
+    """
+    clean_session = str(session_id or "").strip()
+    clean_turn = str(turn_id or "").strip()
+    if not clean_session or not clean_turn:
+        return 0
+    return int(
+        conn.execute(
+            "DELETE FROM agent_events WHERE session_id = ? AND turn_id = ?",
+            (clean_session, clean_turn),
+        ).rowcount
+        or 0
+    )
+
+
 def truncate_transcript(
     conn,
     *,

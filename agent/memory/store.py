@@ -621,6 +621,13 @@ class LTMStore:
                 seqs=seqs,
             )
 
+    def delete_turn_events(self, *, session_id: str, turn_id: str) -> int:
+        """Drop the events one turn wrote (see ``queries.delete_turn_events``)."""
+        with self._connect() as conn:
+            return queries.delete_turn_events(
+                conn, session_id=session_id, turn_id=turn_id
+            )
+
     def conversation_turn_count(self, *, session_id: Optional[str] = None) -> int:
         """How many journaled turns exist, so a capped read can say it was capped."""
         with self._connect() as conn:

@@ -467,3 +467,60 @@ def test_no_chat_configured_means_no_message():
         )
     )
     assert sent == []
+
+
+# ── a wipe does not leave a trace behind ───────────────────────────────────
+
+
+def test_the_transcript_hides_a_trace_whose_turns_are_gone(tmp_path):
+    """The screen showed "工具轨迹 · 18 步" with no request and no answer.
+
+    Measured on this machine: after the agent cleared memory, the turn around
+    the wipe was deliberately not journaled (writing it would put back what was
+    just erased) -- but its tool events were already on disk, because they are
+    written as they happen. The reader then drew a trace of a turn that did not
+    exist.
+
+    Two holes were closed: the writer discards those events now, and the reader
+    refuses to draw a trace for a session with no turns (which is what the rows
+    already on disk need).
+    """
+    from agent import LTMStore
+    from agent.memory.store import LTMStore as _Store
+    from agent.session_service import SessionService
+
+    store = _Store(context_dir=tmp_path / "context")
+    store.append_agent_event(
+        session_id="s-wiped",
+        event_type="tool_started",
+        payload={"tool_name": "schedule_list", "operation_id": "op1"},
+        turn_id="turn-1",
+    )
+    store.append_agent_event(
+        session_id="s-wiped",
+        event_type="tool_completed",
+        payload={"tool_name": "schedule_list", "operation_id": "op1"},
+        turn_id="turn-1",
+    )
+
+    messages = SessionService(store=store).get_messages("s-wiped")["messages"]
+
+    assert messages == [], [row.get("role") for row in messages]
+
+
+def test_a_report_is_still_shown_when_the_session_has_no_turns(tmp_path):
+    """Only *tool* rows are hidden: a scheduled run's report is its own record."""
+    from agent import reports
+    from agent.memory.store import LTMStore
+    from agent.session_service import SessionService
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    service = SessionService(store=store)
+    report = reports.build_report(
+        task_name="汇报", task_id="t1", run_id="r1", status="failed", error="connection lost"
+    )
+    service.append_report("s-report", report)
+
+    messages = service.get_messages("s-report")["messages"]
+
+    assert [row["role"] for row in messages] == ["report"]

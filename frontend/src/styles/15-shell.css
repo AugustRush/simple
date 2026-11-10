@@ -107,3 +107,29 @@
   margin: 0 auto;
 }
 .settings-view .settings-grid { max-width: none; }
+
+/* ── one focus ring for antd controls ───────────────────────────────────────
+   antd draws its own at 3px with a 1px offset. On a solid primary that offset
+   leaves no air between ring and fill, so it reads as a *second border* rather
+   than a focus indicator -- and it is not a keyboard-only affair: antd returns
+   focus to the button that opened a modal, which Chromium treats as
+   `:focus-visible`, so a mouse click leaves the ring on screen. Measured on the
+   memory toolbar: `outline: 3px solid rgb(82,82,83); offset 1px` around the
+   dark 新增记忆 pill, right after clicking it.
+
+   Every hand-written control in this app already uses one ring -- 2px of
+   --focus-ring at a 2px offset. antd controls now use the same one. */
+html[data-input='keyboard'] .ant-btn:focus-visible,
+html[data-input='keyboard'] .ant-input:focus-visible,
+html[data-input='keyboard'] .ant-select-selector:focus-visible {
+  outline: 2px solid var(--focus-ring) !important;
+  outline-offset: 2px !important;
+}
+/* A pointer is not an affordance that needs a ring: the click was visible
+   enough. `data-input` is set in main.tsx -- see the note there for why
+   `:focus-visible` alone leaves a ring on a button that was clicked. */
+html[data-input='pointer'] .ant-btn:focus-visible,
+html[data-input='pointer'] .ant-input:focus-visible,
+html[data-input='pointer'] .ant-select-selector:focus-visible {
+  outline: none !important;
+}

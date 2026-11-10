@@ -267,6 +267,7 @@ def _event_rows(
     *,
     persisted_attachment_paths: set[str],
     is_live: bool,
+    drop_tool_rows: bool = False,
 ) -> list[dict[str, Any]]:
     """Turn runtime events into one display row per operation.
 
@@ -375,6 +376,9 @@ def _event_rows(
             "tool_failed",
             "tool_blocked",
         }:
+            continue
+        if drop_tool_rows:
+            # See `get_messages`: a trace with no turn around it is not a record.
             continue
         operation_id = str(payload.get("operation_id") or "")
         if not operation_id:
@@ -1269,11 +1273,27 @@ class SessionService:
             before_seq=before_seq,
         )
         messages, persisted_attachment_paths = _messages_from_turns(turns)
+        # A session with no turns at all has no conversation to draw a trace on.
+        # That is not hypothetical: a turn that ran around a memory wipe is
+        # deliberately not journaled, and its tool events used to survive it, so
+        # the screen showed "工具轨迹 · 18 步" with no request and no answer. The
+        # writer no longer leaves those behind; this covers the ones already on
+        # disk from before the fix -- and any future path that loses a turn but
+        # keeps its events.
+        drop_tool_rows = False
+        if not turns:
+            counter = getattr(target_store, "conversation_turn_count", None)
+            if callable(counter):
+                try:
+                    drop_tool_rows = int(counter(session_id=str(session_id or "").strip())) == 0
+                except Exception:
+                    drop_tool_rows = False
         messages.extend(
             _event_rows(
                 events,
                 persisted_attachment_paths=persisted_attachment_paths,
                 is_live=session_id in self._live_states,
+                drop_tool_rows=drop_tool_rows,
             )
         )
         ordered = _order_display_messages(messages)
