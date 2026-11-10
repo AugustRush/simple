@@ -1,12 +1,13 @@
 /** The settings view. Rendered by the App container from its context object. */
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import type { AppCtx } from '../app/AppCtx'
 import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
 import { renderCapabilities } from './extensions'
 import { ApiOutlined, CheckCircleFilled, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
+  Affix,
   Button,
   Card,
   Col,
@@ -483,39 +484,54 @@ export function createSettingsView(ctx: AppCtx) {
   const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
+  // The save controls must survive a scroll: the page is longer than the
+  // viewport once a few providers are present, and the controls used to scroll
+  // away with the header -- so a person who had edited the model at the bottom
+  // had to hunt for the way to keep it. The Affix holds the controls at the
+  // top of the scrolling column, not the window (the column is the scroller).
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+
   const renderSettings = () => {
     // "Unsaved" has to mean everything pending on this page, or the badge
     // reassures the user about a token they have not applied yet.
     const unsaved = settingsDirty || tokenDirty
     const blocked = settingsDirty && !jsonStatus.valid
     return (
-    <div className="page-view settings-view">
+    <div className="page-view settings-view" ref={scrollRef}>
       {/* The bar above names the page; this row carries the one sentence that
           describes it and the save controls, not a second copy of the title. */}
       <div className="page-head settings-page-head">
         <p className="page-lead">配置访问权限、模型偏好与消息频道。</p>
-        <Space>
-          <span className={`save-state ${unsaved ? 'dirty' : ''} ${blocked ? 'blocked' : ''}`}>
-            <span className="save-state-dot" />
-            {blocked ? 'JSON 格式有误，无法保存' : unsaved ? '有未保存更改' : '已同步'}
-          </span>
-          <Button
-            icon={<ReloadOutlined />}
-            onClick={resetSettings}
-            disabled={!unsaved}
-          >
-            放弃更改
-          </Button>
-          <Button
-            className="settings-save-button"
-            type="primary"
-            icon={<CheckCircleFilled />}
-            onClick={saveSettings}
-            disabled={!settingsDirty || !jsonStatus.valid}
-          >
-            保存设置
-          </Button>
-        </Space>
+        <Affix
+          className="settings-affix"
+          target={() => scrollRef.current}
+          offsetTop={0}
+        >
+          <div className="settings-affix-bar">
+            <Space>
+              <span className={`save-state ${unsaved ? 'dirty' : ''} ${blocked ? 'blocked' : ''}`}>
+                <span className="save-state-dot" />
+                {blocked ? 'JSON 格式有误，无法保存' : unsaved ? '有未保存更改' : '已同步'}
+              </span>
+              <Button
+                icon={<ReloadOutlined />}
+                onClick={resetSettings}
+                disabled={!unsaved}
+              >
+                放弃更改
+              </Button>
+              <Button
+                className="settings-save-button"
+                type="primary"
+                icon={<CheckCircleFilled />}
+                onClick={saveSettings}
+                disabled={!settingsDirty || !jsonStatus.valid}
+              >
+                保存设置
+              </Button>
+            </Space>
+          </div>
+        </Affix>
       </div>
 
       {loadingView ? (

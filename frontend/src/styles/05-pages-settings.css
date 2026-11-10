@@ -642,3 +642,18 @@ html[data-theme='light'] .settings-json {
   background: #111827;
   color: #e5e7eb;
 }
+
+/* The save controls stay reachable while the page scrolls (see the Affix in
+   settings.tsx). The bar needs its own ground: without a background the page
+   text scrolls straight through it. A soft pill keeps it looking like a
+   control bar whether it is floating or resting in the header. */
+.settings-affix { z-index: 6; }
+.settings-affix-bar {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-soft);
+}

@@ -320,7 +320,7 @@ export function renderMemory(ctx: AppCtx) {
           // One entry, not two: the toolbar already has 新增记忆, and a second
           // primary button here was the same action in a louder place. The
           // sentence points at both ways in, which is what an empty state is for.
-          : '还什么都没记住。可以在对话里说「记住……」，也可以用右上角的「新增记忆」手写一条。'
+          : '还什么都没记住。可以在对话里说「记住……」，或者点上面的「新增记忆」手写一条。'
       }
     />
   )
@@ -440,8 +440,11 @@ export function renderMemory(ctx: AppCtx) {
 
   return (
     <div className="page-view memory-view">
+      {/* The bar above already says 它记得的关于你的事 —— 看得见，也改得动;
+          repeating it here read like the page could not decide what it was.
+          This line keeps only what the subtitle does not: what an edit means. */}
       <p className="page-lead">
-        它记得的关于你的事。改一条，就是改它下一轮的认知；删一条，就是让它忘掉。
+        改一条，它下一轮就按新的认知来；删一条，就等于让它忘掉。
       </p>
 
       {memoryUnavailable ? (
