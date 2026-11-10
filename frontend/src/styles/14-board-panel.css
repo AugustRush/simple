@@ -43,6 +43,7 @@
   border: 1px solid var(--border);
   border-left: 3px solid var(--red);
   border-radius: 10px;
+  /* The panel floats over glass; its cards inherit the page's corner scale. */
   background: var(--surface);
 }
 .panel-card strong {

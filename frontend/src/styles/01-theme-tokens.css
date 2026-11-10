@@ -2,6 +2,11 @@
 
 :root {
   color-scheme: dark;
+  /* One corner scale. Controls (antd `borderRadius`) are 10; the surfaces that
+   * hold them are 12; small inline chips stay at 6-8 where they are named
+   * locally. Before this token the same card could be 8px (12-sessions) or
+   * 20px (10-glass) depending on which partial won the cascade. */
+  --radius-surface: 12px;
   --bg: #0e0e0f;
   --bg-soft: #151516;
   --surface: #1b1b1d;

@@ -28,13 +28,17 @@
   gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-surface);
   background: var(--surface);
-  transition: border-color 140ms ease, background 140ms ease;
 }
 .memory-row:hover {
   border-color: var(--border-strong);
   background: var(--surface-raised);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
+}
+.memory-row {
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, box-shadow 140ms ease;
 }
 
 /* A pinned row is marked, not decorated: the left edge is the one thing that

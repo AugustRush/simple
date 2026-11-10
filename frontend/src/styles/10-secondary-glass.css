@@ -467,7 +467,7 @@ html[data-theme='light'] .global-search-modal .ant-modal-content {
 .session-card,
 .entity-card,
 .settings-card {
-  border-radius: 20px;
+  border-radius: var(--radius-surface);
   background: var(--surface-raised);
   backdrop-filter: blur(18px) saturate(125%);
   -webkit-backdrop-filter: blur(18px) saturate(125%);

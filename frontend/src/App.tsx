@@ -356,7 +356,11 @@ function App() {
           colorSuccess: themeMode === 'dark' ? '#d4d4d8' : '#52525b',
           colorWarning: themeMode === 'dark' ? '#d6c7a3' : '#806f4b',
           colorError: themeMode === 'dark' ? '#f0a3a3' : '#a16262',
-          borderRadius: 8,
+          // 10, not antd's 6: the surfaces here are glassy (see 10-secondary-
+          // glass.css) and a 6px corner on a translucent card pinches the glass
+          // into a hard point. 10px reads as one soft sheet; controls inherit
+          // it and stay visibly rounder than the cards they sit in.
+          borderRadius: 10,
           // One control height for every control. Raising only `Button` to 38
           // left Input/Select/InputNumber/DatePicker at antd's 32, so any row
           // holding two of them disagreed about its own height -- and inside a
@@ -377,10 +381,11 @@ function App() {
           },
           Button: {
             // antd's default is `0 2px 0 <colour>`, a hard 2px bar under every
-            // primary button. In light mode the primary is near-black and that
-            // bar is near-white: a button with a second edge under it. Nothing
-            // here wants a fake bevel, and in a toolbar it read as a rendering
-            // fault rather than a style.
+            // button — measured on the memory toolbar: 刷新 (a default button)
+            // carried `rgba(255,255,255,0.04) 0 2px 0` while 清空 beside it had
+            // none, so the row looked like one button hovering above the others.
+            // Nothing here wants a fake bevel.
+            defaultShadow: 'none',
             primaryShadow: 'none',
             dangerShadow: 'none',
           },
