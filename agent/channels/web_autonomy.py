@@ -37,6 +37,36 @@ __all__ = [
 ]
 
 
+def _decided_within(item: Any, since: Any) -> bool:
+    """Whether an answered proposal was answered inside the panel's window.
+
+    Falls back to created_at when there is no decision time -- a row nobody
+    dated is shown rather than hidden, because "gone" is a stronger claim than
+    "old", and a history that silently drops what it cannot date is a history
+    that lies about how much there was.
+    """
+    from datetime import datetime
+
+    for attr in ("decided_at", "created_at"):
+        stamp = getattr(item, attr, None)
+        if not stamp:
+            continue
+        try:
+            moment = (
+                stamp
+                if isinstance(stamp, datetime)
+                else datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            )
+        except ValueError:
+            return True  # undatable is not "outside the window"
+        if moment.tzinfo is None:
+            from datetime import timezone
+
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment >= since
+    return True
+
+
 def _unavailable() -> Any:
     from starlette.responses import JSONResponse
 
@@ -69,16 +99,25 @@ async def _autonomy_overview(request: Any, *, authorized, store) -> Any:
         # What was answered, and what happened to it. A page that only shows the
         # queue is a page where approving is a leap of faith repeated every time:
         # the run's result would exist and nobody would ever read it.
+        # Answered rows, capped by *time* rather than by count. A count cap
+        # (the 20-per-state that used to be here) still grows without bound in
+        # what it renders: sixty rows is a third screen of history in a rail
+        # whose job is one glance, and the rows arrived pre-2009-of-patrol
+        # anyway -- the funnel line under them says 近 7 天, so the history the
+        # panel shows is the same seven days the numbers describe. One window,
+        # one meaning of "recent".
+        from datetime import datetime, timedelta, timezone
+
+        since = datetime.now(timezone.utc) - timedelta(days=7)
         answered = [
             item
             for state in ("acted", "accepted", "declined")
-            for item in store.list_proposals(state=state, limit=20)
+            for item in store.list_proposals(state=state, limit=50)
+            if _decided_within(item, since)
         ]
         # The funnel's own numbers, read with the rows: a page about proposals
         # that cannot say how much was looked at to find them invites the reader
         # to guess whether "nothing proposed" means "nothing to do".
-        from datetime import datetime, timedelta, timezone
-
         funnel = store.tick_stats(since=datetime.now(timezone.utc) - timedelta(days=7))
     except Exception as exc:
         return JSONResponse({"error": f"读取提议失败：{exc}"}, status_code=500)

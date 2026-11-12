@@ -257,6 +257,63 @@ def test_the_overview_carries_what_was_answered_and_what_came_of_it(store) -> No
     assert answered["outcome"]["summary"] == "读完了"
 
 
+def test_answered_rows_outside_the_panel_window_do_not_load_the_rail(store) -> None:
+    """The answered list is a *recent* history, not a scroll.
+
+    The panel's funnel line says 近 7 天 -- the answered rows now say the same
+    thing. Before this, three states × 20 rows each rendered every answered
+    proposal ever kept, which turned a one-glance rail into a third screen of
+    history that only grows.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from agent.autonomy import Proposal
+
+    old = Proposal(
+        source="s1", reason="r", action="很久以前读过的运行",
+        tool="schedule_runs", reversibility="reversible", confidence=0.8,
+    )
+    store.record(old)
+    with store._transaction() as conn:
+        stamp = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        conn.execute(
+            "UPDATE proposals SET state='acted', decided_at=? WHERE id=?",
+            (stamp, old.id),
+        )
+
+    fresh = Proposal(
+        source="s1", reason="r", action="这周读过的运行",
+        tool="schedule_runs", reversibility="reversible", confidence=0.8,
+    )
+    store.record(fresh)
+    store.decide(fresh.id, "acted", by="person")
+
+    _status, body = _call(web_autonomy._autonomy_overview, _Request(), store)
+
+    actions = [row["action"] for row in body["answered"]]
+    assert actions == ["这周读过的运行"], "a 30-day-old answer is history, not the rail"
+
+
+def test_an_answered_row_that_cannot_be_dated_is_shown_rather_than_hidden(store) -> None:
+    """Undatable is not "outside the window": hiding is the stronger claim."""
+    from agent.autonomy import Proposal
+
+    proposal = Proposal(
+        source="s1", reason="r", action="没有时间的回答",
+        tool="schedule_runs", reversibility="reversible", confidence=0.8,
+    )
+    store.record(proposal)
+    with store._transaction() as conn:
+        conn.execute(
+            "UPDATE proposals SET state='acted', decided_at='' WHERE id=?",
+            (proposal.id,),
+        )
+
+    _status, body = _call(web_autonomy._autonomy_overview, _Request(), store)
+
+    assert [row["action"] for row in body["answered"]] == ["没有时间的回答"]
+
+
 # ── a "yes" carries out the call the proposal wrote down ───────────────────
 
 

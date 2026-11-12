@@ -58,37 +58,40 @@
  * pick the primary button's *text* colour per theme (near-black in dark, near
  * white in light) to suit a near-white/near-black `colorPrimary`, at a
  * specificity of `html[data-theme='dark'] .ant-btn-primary`. These two buttons
- * paint their own blue fill, so that text colour is wrong for them -- near
- * black on #2563eb is 3.44:1. Matching the specificity and landing after it
- * lets one white label serve both themes. */
+ * paint their own accent fill, so that text colour is wrong for them -- near
+ * black on the accent is unreadable. Matching the specificity and landing
+ * after it lets one white label serve both themes. */
 html[data-theme] .settings-save-button,
 html[data-theme] .settings-inline-save {
-  color: #fff !important;
-  /* #3b82f6 carried white text at 3.52:1 -- under the 4.5:1 the 14px label
-   * needs, on the one button on the page that is meant to be the loud one.
-   * #2563eb is 5.19:1, so the resting state is now the readable one and the
-   * hover/active steps below get darker from there. */
-  background: #2563eb !important;
-  border-color: #2563eb !important;
+  color: var(--accent-contrast) !important;
+  /* The app's one accent (see --accent in 01-theme-tokens.css) -- the same
+   * colour the user's own bubble, the send button and the brand mark carry.
+   * This used to be its own blue (#2563eb), chosen when the app had no colour
+   * at all; after the accent arrived it was the last saturated colour standing
+   * alone, which is exactly the dilution a one-accent palette exists to
+   * avoid. White on --accent measures 4.6:1 (dark) and 5.5:1 (light); the
+   * hover/active steps below darken from there. */
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
+  border-color: transparent !important;
   font-weight: 650;
-  box-shadow: 0 6px 14px rgba(37,99,235,.22);
+  box-shadow: 0 6px 14px rgba(108, 86, 240, 0.22);
 }
 html[data-theme] .settings-save-button:hover:not(:disabled),
 html[data-theme] .settings-inline-save:hover:not(:disabled) {
-  color: #fff !important;
-  background: #1d4ed8 !important;
-  border-color: #1d4ed8 !important;
+  color: var(--accent-contrast) !important;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
+  border-color: transparent !important;
+  filter: brightness(1.1);
 }
-/* Both buttons darkened on hover and then stopped, so a press looked exactly
- * like a hover. Same shape as `.brand-action`: an `!important` hover with no
- * `:active` to follow it. A third step, plus a dip, makes the press legible --
- * the shadow shrinks at the same time, which is what sells the movement. */
+/* The press is legible: brightness dips and the shadow shrinks, which is what
+   sells the movement -- the same third step the rest of the app uses. */
 html[data-theme] .settings-save-button:active:not(:disabled),
 html[data-theme] .settings-inline-save:active:not(:disabled) {
-  color: #fff !important;
-  background: #1e40af !important;
-  border-color: #1e40af !important;
-  box-shadow: 0 2px 6px rgba(30,64,175,.3);
+  color: var(--accent-contrast) !important;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
+  border-color: transparent !important;
+  filter: brightness(0.92);
+  box-shadow: 0 2px 6px rgba(108, 86, 240, 0.3);
   transform: translateY(1px);
 }
 /* Disabled is the usual state of both buttons -- there is nothing to save most

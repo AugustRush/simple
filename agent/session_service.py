@@ -1063,12 +1063,21 @@ class SessionService:
         return cut.rstrip("。.,、!！?？;；:： ") + "…"
 
     def ensure_auto_title(self, session_id: str, first_message: str) -> str:
-        """Give a session its default title, if it does not have one yet.
+        """Give a session its default title, if it does not have one worth keeping.
 
         Only when the title is still empty: a conversation somebody renamed must
         not have its name overwritten by its own first message the next time the
         title is recomputed. Returns the title in force afterwards (empty when
         there is nothing to set).
+
+        One exception, measured on a real install: a session whose **entire
+        content was erased** keeps its old title forever, so the bar read
+        "删除所有的任务和会话记录" -- the topic of a conversation that no longer
+        exists -- over an empty page. Wiping the record is the one act that
+        retires a title: it described turns that are no longer there, and this
+        call is the moment a new conversation begins inside the same session
+        id. A rename the person typed is honoured the same way -- it is gone
+        with the turns it named, which is what erasing a conversation means.
         """
         clean = str(session_id or "").strip()
         if not clean:
@@ -1082,7 +1091,17 @@ class SessionService:
             except Exception:
                 current = ""
         if current:
-            return current
+            # An old title survives only if the conversation it described does.
+            # Read from the store's own count, so "erased" means what the reader
+            # of this session sees, not a parallel bookkeeping the wipe has to
+            # remember to update.
+            counter = getattr(target_store, "conversation_turn_count", None)
+            try:
+                surviving = int(counter(session_id=clean)) if callable(counter) else 1
+            except Exception:
+                surviving = 1  # unreadable is not "erased"; never clear on a guess
+            if surviving > 0:
+                return current
         proposed = self.title_from_message(first_message)
         if not proposed:
             return ""

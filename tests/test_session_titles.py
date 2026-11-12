@@ -85,14 +85,19 @@ def test_an_empty_message_yields_no_title() -> None:
 
 
 class _Store:
-    """Just the two calls the service makes: read the titles, set one."""
+    """Just the calls the service makes: read the titles, set one, count turns."""
 
     def __init__(self) -> None:
         self.titles: dict[str, str] = {}
         self.writes: list[tuple[str, str]] = []
+        self.turn_counts: dict[str, int] = {}
 
     def list_session_titles(self) -> dict[str, str]:
         return dict(self.titles)
+
+    def conversation_turn_count(self, *, session_id=None) -> int:
+        # Unrecorded means "has content": only an explicit 0 says erased.
+        return int(self.turn_counts.get(session_id or "", 1))
 
     def set_session_title(self, session_id: str, title: str) -> None:
         self.titles[session_id] = title
@@ -123,6 +128,59 @@ def test_a_name_somebody_chose_is_not_overwritten() -> None:
 
     assert title == "我自己起的名"
     assert store.writes == [], "an existing title must not be rewritten"
+
+
+def test_a_wiped_conversation_gets_a_new_title_for_its_new_topic() -> None:
+    """An erased conversation's title described turns that no longer exist.
+
+    Measured on a real install: the bar said 删除所有的任务和会话记录 -- the topic
+    of a conversation that had been wiped -- above an empty page, and it stayed
+    there for every new topic that came after. Wiping the record is the one act
+    that retires a title; the next first message re-names the session.
+    """
+    service, store = _service()
+    store.titles["s1"] = "删除所有的任务和会话记录"
+    store.turn_counts["s1"] = 0  # the wipe left nothing to describe
+
+    title = service.ensure_auto_title("s1", "打开红果短剧帮我点击广告")
+
+    assert title == "打开红果短剧帮我点击广告"
+    assert ("s1", "打开红果短剧帮我点击广告") in store.writes
+
+
+def test_a_title_survives_while_the_turns_it_named_still_exist() -> None:
+    """Retiring is about the content, not the clock: turns still there, name kept."""
+    service, store = _service()
+    store.titles["s1"] = "帮我查一下昨天的构建失败"
+    store.turn_counts["s1"] = 4
+
+    title = service.ensure_auto_title("s1", "换一个话题")
+
+    assert title == "帮我查一下昨天的构建失败"
+    assert store.writes == []
+
+
+def test_an_unreadable_turn_count_never_clears_a_title() -> None:
+    """A store that cannot answer the count keeps its names: guessing is worse.
+
+    Unreadable is not "erased" -- clearing a live conversation's title on a
+    store hiccup renames the session under the person who is reading it.
+    """
+    service, store = _service()
+    store.titles["s1"] = "我还活着"
+
+    class _Blind:
+        def list_session_titles(self):
+            return {"s1": "我还活着"}
+
+        def conversation_turn_count(self, *, session_id=None):
+            raise RuntimeError("store under maintenance")
+
+    service._store_for_session = lambda session_id: _Blind()  # type: ignore[attr-defined]
+
+    title = service.ensure_auto_title("s1", "新的第一句")
+
+    assert title == "我还活着"
 
 
 def test_a_second_message_does_not_rename_the_conversation() -> None:
