@@ -517,3 +517,137 @@ def test_an_unknown_provider_is_a_404_everywhere(config_file):
         assert client.delete("/api/providers/nope").status_code == 404
         assert client.post("/api/providers/nope/activate").status_code == 404
         assert client.post("/api/providers/nope/test").status_code == 404
+        assert client.get("/api/providers/nope/models").status_code == 404
+
+
+# ── the model list: fetched through the provider's own client ───────────────
+
+
+def test_the_model_list_goes_through_the_providers_own_client(config_file):
+    """Same rule as the connection test: the real client, the real headers.
+
+    A hand-rolled GET /v1/models would pass while the agent's own calls
+    failed, and the editor fills a dropdown from this answer -- so the
+    ids returned are the ones the agent would send back as `model`.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen: list[dict[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if not self.path.startswith("/v1/models"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            seen.append({k.lower(): v for k, v in self.headers.items()})
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": "zeta-9", "object": "model"},
+                        {"id": "alpha-1", "object": "model"},
+                        {"id": "alpha-1", "object": "model"},  # a duplicate, on purpose
+                        {"id": "", "object": "model"},  # and an empty one
+                    ],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        from starlette.testclient import TestClient
+
+        _seed(
+            config_file,
+            {
+                "active_provider": "a",
+                "providers": {
+                    "a": {"api_format": "openai", "api_key": "k", "default_model": "m"},
+                    "gw": {
+                        "api_format": "openai",
+                        "api_key": "sk-gw",
+                        "base_url": f"http://127.0.0.1:{server.server_address[1]}/v1",
+                        "default_model": "alpha-1",
+                        "headers": {"x-opencode-session": "{session}"},
+                    },
+                },
+            },
+        )
+        with TestClient(_channel().app) as client:
+            resp = client.get("/api/providers/gw/models")
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        # Sorted, deduplicated, empty ids dropped: the editor turns this list
+        # straight into dropdown options, and what arrives must be what the
+        # agent can act on.
+        assert result["models"] == ["alpha-1", "zeta-9"]
+        assert result["count"] == 2
+        assert seen and seen[0]["authorization"] == "Bearer sk-gw"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_model_list_failure_is_a_reported_result_not_an_empty_success(config_file):
+    """"No models" and "could not reach the gateway" are different facts.
+
+    The editor fills a dropdown from this answer; an empty success would render
+    a dropdown that claims the provider has nothing.
+    """
+    from starlette.testclient import TestClient
+
+    _seed(
+        config_file,
+        {
+            "active_provider": "a",
+            "providers": {
+                "a": {
+                    "api_format": "openai",
+                    "api_key": "sk-x",
+                    "base_url": "http://127.0.0.1:9/v1",  # nothing listens
+                    "default_model": "m",
+                }
+            },
+        },
+    )
+    with TestClient(_channel().app) as client:
+        resp = client.get("/api/providers/a/models")
+
+    assert resp.status_code == 502
+    result = resp.json()
+    assert result["error"], "the failure must say why, not just fail"
+
+
+def test_a_format_without_a_listing_endpoint_says_so(config_file):
+    """A wire format the SDKs cannot list for is a 400, not a silent empty."""
+    from starlette.testclient import TestClient
+
+    _seed(
+        config_file,
+        {
+            "active_provider": "a",
+            "providers": {
+                "a": {
+                    "api_format": "openai",
+                    "api_key": "k",
+                    "default_model": "m",
+                },
+                "weird": {"api_format": "stdio", "api_key": "k", "default_model": "m"},
+            },
+        },
+    )
+    with TestClient(_channel().app) as client:
+        resp = client.get("/api/providers/weird/models")
+
+    assert resp.status_code == 400
+    assert "没有模型列表端点" in resp.json()["error"]

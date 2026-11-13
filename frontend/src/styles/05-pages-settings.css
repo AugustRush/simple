@@ -657,3 +657,20 @@ html[data-theme='light'] .settings-json {
   border-radius: 10px;
   box-shadow: var(--shadow-soft);
 }
+
+/* 获取列表 in the label row: small and quiet, because it is an action on the
+   field rather than a page action -- but visible, because typing model ids by
+   hand is exactly the tedium this exists to end. */
+.provider-fetch-models.ant-btn {
+  margin-left: 8px;
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+.provider-fetch-models.ant-btn:hover:not(:disabled) {
+  color: var(--accent-contrast);
+  background: var(--accent);
+}

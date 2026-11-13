@@ -537,6 +537,13 @@ class WebChannel(Channel):
         )
 
 
+    async def _provider_models(self, request: Any) -> Any:
+        """List the model ids a provider offers, through its own SDK client."""
+        return await web_providers._provider_models(
+            request=request, config=self._config
+        )
+
+
     async def _config_save(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -3088,6 +3095,11 @@ class WebChannel(Channel):
                 "/api/providers/{provider_name}/test",
                 self._provider_test,
                 methods=["POST"],
+            ),
+            Route(
+                "/api/providers/{provider_name}/models",
+                self._provider_models,
+                methods=["GET"],
             ),
             Route("/api/plugins", self._plugins, methods=["GET"]),
             Route("/api/skills", self._skills, methods=["GET"]),

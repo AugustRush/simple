@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 __all__ = [
     "_provider_test",
+    "_provider_models",
     "_provider_save",
     "_provider_write_error",
     "_authorized",
@@ -76,6 +77,74 @@ def _provider_write_error(
         return errors[0]
     return None
 
+
+
+async def _provider_models(
+    request: Any,
+    *,
+    config,
+) -> Any:
+    """List the model ids a provider offers, through its own SDK client.
+
+    Same construction as ``_provider_test`` and for the same reason: the point
+    is to prove *this* block's base_url, key, headers work, so a hand-rolled
+    GET would pass while the agent's own calls failed. The SDK's models.list
+    is the call being made -- it is what the provider documents for exactly
+    this purpose.
+
+    Failures are returned, not swallowed into an empty list: "no models" and
+    "could not reach the gateway" are different facts, and the editor fills a
+    dropdown from the answer -- an empty success would render a dropdown that
+    claims the provider has nothing.
+    """
+    from starlette.responses import JSONResponse
+
+    if not _authorized(request, config=config):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    name = str(request.path_params.get("provider_name") or "").strip()
+    from agent.config import load_config
+    from agent.core.providers import build_client
+    from agent.shared import provider_headers
+
+    cfg, _ = load_config()
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict) or name not in providers:
+        return JSONResponse({"error": f"找不到 provider '{name}'"}, status_code=404)
+    provider_cfg = providers.get(name) or {}
+    if not isinstance(provider_cfg, dict):
+        return JSONResponse({"error": f"provider '{name}' 不是一个对象"}, status_code=400)
+    api_format = str(provider_cfg.get("api_format") or "openai")
+    if api_format not in ("openai", "anthropic"):
+        return JSONResponse(
+            {"error": f"接口格式 {api_format!r} 没有模型列表端点"}, status_code=400
+        )
+
+    try:
+        # Named, because a section on disk does not carry the key it is filed
+        # under and credential errors report ``provider: <name>``.
+        client = build_client({**provider_cfg, "name": name}, api_format)
+        if api_format == "anthropic":
+            page = await client.models.list(limit=1000)
+            entries = list(getattr(page, "data", []) or [])
+        else:
+            page = await client.models.list()
+            entries = list(getattr(page, "data", []) or [])
+    except Exception as exc:  # noqa: BLE001 - any SDK/network error is the answer
+        return JSONResponse(
+            {"error": f"获取模型列表失败：{exc}"}, status_code=502
+        )
+
+    # The id is the whole answer: it is the string the agent sends back as
+    # `model`. Display names are decoration the editor cannot act on.
+    ids: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        model_id = str(getattr(entry, "id", "") or "").strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            ids.append(model_id)
+    ids.sort()
+    return JSONResponse({"ok": True, "models": ids, "count": len(ids)})
 
 async def _provider_save(
     request: Any,

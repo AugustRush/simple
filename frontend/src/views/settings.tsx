@@ -39,6 +39,20 @@ const MASK = '******'
  * point of the table, and the reason this is a switch on `kind` rather than a
  * form spelled out for the providers we happen to ship.
  */
+/** Model ids fetched from a provider, shared by the two fields that use them.
+
+ * Keyed by *field key* rather than provider name: both fields sit in the same
+ * editor draft for the same provider, and one fetch answers both. Empty means
+ * "not fetched yet" -- the fields then fall back to free typing, so a provider
+ * whose gateway offers no listing stays perfectly usable.
+ */
+const fetchedModels: Record<string, string[]> = {}
+
+function optionsFor(spec: ProviderFieldSpec): { value: string; label: string }[] {
+  const ids = fetchedModels[spec.key] || []
+  return ids.map(id => ({ value: id, label: id }))
+}
+
 function providerFieldControl(
   spec: ProviderFieldSpec,
   value: unknown,
@@ -50,6 +64,42 @@ function providerFieldControl(
   controlId: string,
 ) {
   switch (spec.kind) {
+    case 'string':
+      // `default_model` is the one string field a fetched list can fill; it
+      // upgrades to a searchable dropdown when one has arrived (see the
+      // fetch beside its label) and stays the plain Input it always was
+      // otherwise -- no gateway listing, no behaviour change.
+      if (spec.key === 'default_model') {
+        const ids = fetchedModels[spec.key] || []
+        if (ids.length) {
+          return (
+            <Select
+              id={controlId}
+              showSearch
+              style={{ width: '100%' }}
+              value={typeof value === 'string' && value ? value : undefined}
+              onChange={next => onChange(next)}
+              options={ids.map(id => ({ value: id, label: id }))}
+              placeholder="选择或输入模型 id"
+            />
+          )
+        }
+        return (
+          <Input
+            id={controlId}
+            value={typeof value === 'string' ? value : ''}
+            onChange={event => onChange(event.target.value)}
+            placeholder="模型 id，或点「获取列表」"
+          />
+        )
+      }
+      return (
+        <Input
+          id={controlId}
+          value={typeof value === 'string' ? value : ''}
+          onChange={event => onChange(event.target.value)}
+        />
+      )
     case 'bool':
       return (
         <Switch
@@ -93,7 +143,12 @@ function providerFieldControl(
           style={{ width: '100%' }}
           value={Array.isArray(value) ? (value as string[]) : []}
           onChange={next => onChange(next)}
-          placeholder="输入后回车添加"
+          // Suggestions when they exist (the fetched list), free typing always:
+          // the point of 「获取列表」 is to save typing, not to gate it -- a
+          // model id the gateway does not list is still a valid entry, and a
+          // tags-select without options already behaves that way.
+          options={optionsFor(spec)}
+          placeholder="输入后回车添加，或点「获取列表」"
           tokenSeparators={[',', ' ']}
         />
       )
@@ -173,17 +228,37 @@ function ProviderFieldRow({
   value,
   onChange,
   idPrefix,
+  onFetchModels,
+  fetching,
 }: {
   spec: ProviderFieldSpec
   value: unknown
   onChange: (next: unknown) => void
   idPrefix: string
+  //: Only the two model fields get it; every other row passes nothing.
+  onFetchModels?: () => void
+  fetching?: boolean
 }) {
   return (
     <div className={`provider-field provider-field-${spec.kind}`}>
       <label className="settings-field-label" htmlFor={`${idPrefix}-${spec.key}`}>
         {spec.label}
         {spec.required && <span className="provider-field-required"> *</span>}
+        {/* 获取列表 sits in the label row, not under the control: it is an
+            action on the field, and putting it in the help line would read as
+            part of the explanation. Only one of the two model fields shows it
+            (the first), because one fetch fills both. */}
+        {onFetchModels && (
+          <Button
+            size="small"
+            type="text"
+            className="provider-fetch-models"
+            loading={fetching}
+            onClick={onFetchModels}
+          >
+            获取列表
+          </Button>
+        )}
       </label>
       {providerFieldControl(spec, value, onChange, `${idPrefix}-${spec.key}`)}
       {spec.help && <div className="settings-hint">{spec.help}</div>}
@@ -213,7 +288,9 @@ function ProvidersCard({
   //: The app's message API rather than antd's static one: the static call
   //: cannot see the app's ConfigProvider, so it renders with the default theme
   //: and locale -- a different-looking toast from every other toast here.
-  notify: { error: (text: string) => void }
+  //: `error` and `success` are the two the editor uses; the type is the
+  //: narrowest thing the caller (messageApi) satisfies.
+  notify: { error: (text: string) => void; success: (text: string) => void }
   onSave: (name: string, values: Record<string, unknown>) => Promise<boolean>
   onDelete: (name: string) => Promise<boolean>
   onActivate: (name: string) => Promise<boolean>
@@ -224,6 +301,7 @@ function ProvidersCard({
   const [newName, setNewName] = useState('')
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [saving, setSaving] = useState(false)
+  const [fetchingModels, setFetchingModels] = useState(false)
 
   const providers: Record<string, any> = config?.providers || {}
   const names = Object.keys(providers).filter(name => !name.startsWith('_'))
@@ -281,6 +359,49 @@ function ProvidersCard({
     setAdding(true)
     setNewName('')
     setDraft(seeded)
+  }
+
+  // Fetch the model list for the provider being edited, through the
+  // gateway's own client. On success both model fields share the answer (one
+  // fetch fills both dropdowns); on failure the toast says the reason and the
+  // fields stay in free-typing mode -- the honest state for "no list".
+  const fetchModels = async () => {
+    const name = adding ? newName.trim() : String(editing || '')
+    if (!name) {
+      notify.error('先填好这个服务商的名称')
+      return
+    }
+    setFetchingModels(true)
+    try {
+      const resp = await fetch(
+        `/api/providers/${encodeURIComponent(name)}/models`,
+        { headers: { Accept: 'application/json' } },
+      )
+      const body = await resp.json().catch(() => ({}))
+      if (!resp.ok) {
+        notify.error(String(body?.error || `获取失败（${resp.status}）`))
+        return
+      }
+      const ids: string[] = Array.isArray(body?.models) ? body.models : []
+      if (!ids.length) {
+        notify.error('这个接口返回了空的模型列表')
+        return
+      }
+      fetchedModels.models = ids
+      fetchedModels.default_model = ids
+      // When the list has arrived and the default is still empty, the first
+      // id is a better seed than nothing: it is the one field the provider
+      // form cannot leave blank. An existing choice is never overwritten.
+      const current = String(draft.default_model ?? '').trim()
+      if (!current) {
+        setDraft(prev => ({ ...prev, default_model: ids[0] }))
+      }
+      notify.success(`${ids.length} 个模型已载入`)
+    } catch (err) {
+      notify.error(`获取模型列表失败：${err}`)
+    } finally {
+      setFetchingModels(false)
+    }
   }
 
   // Only what the user actually changed.  Sending the whole block back would
@@ -427,6 +548,12 @@ function ProvidersCard({
                       value={draft[spec.key]}
                       onChange={next => setDraft(prev => ({ ...prev, [spec.key]: next }))}
                       idPrefix={name}
+                      // The button lives on the first model field only: one
+                      // fetch fills both, and two buttons would promise two.
+                      onFetchModels={
+                        spec.key === 'default_model' ? fetchModels : undefined
+                      }
+                      fetching={fetchingModels}
                     />
                   ))}
                   <Space className="provider-editor-actions">
@@ -461,6 +588,10 @@ function ProvidersCard({
                 value={draft[spec.key]}
                 onChange={next => setDraft(prev => ({ ...prev, [spec.key]: next }))}
                 idPrefix="new"
+                onFetchModels={
+                  spec.key === 'default_model' ? fetchModels : undefined
+                }
+                fetching={fetchingModels}
               />
             ))}
           </div>
