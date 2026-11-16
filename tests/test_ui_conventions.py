@@ -131,3 +131,51 @@ def test_buttocks_use_the_project_focus_ring_not_antds_double_border() -> None:
     # does this when a modal closes) must not leave a ring on a solid button.
     pointer = text[text.index("html[data-input='pointer'] .ant-btn:focus-visible") :][:400]
     assert "outline: none" in pointer, pointer
+
+
+def test_the_delivery_choice_is_offered_only_while_a_turn_is_running() -> None:
+    """插话 / 等回复后 differ only mid-turn; idle, both start a turn at once.
+
+    A control offering a distinction that does not apply teaches nothing, so the
+    chip is gated on `isStreaming`. This guard is about that gate existing.
+    """
+    chat = (VIEWS / "chat.tsx").read_text()
+    assert "deliver-mode-button" in chat, "the mode chip should exist"
+    gate = chat.index("{isStreaming && (")
+    chip = chat.index("deliver-mode-button")
+    assert gate < chip, "the chip must sit inside the isStreaming gate"
+
+
+def test_a_deferred_message_is_not_labelled_as_an_interjection() -> None:
+    """The two mailboxes are different promises and the row must say which.
+
+    `isInTurnUserMessage` is true for both (queued OR interjection), so the row
+    used to print 插话 for a message the person had asked to hold until the
+    answer finished -- claiming it was interrupting the answer it was waiting
+    for.
+    """
+    rows = (STYLES.parent / "components" / "MessageList.tsx").read_text()
+    assert "const deferred = !item.interjection" in rows, (
+        "the row must distinguish a deferred message from an interjection"
+    )
+    assert "{deferred ? '排队' : '插话'}" in rows
+    assert "{deferred ? '等本轮结束' : '待读'}" in rows
+
+
+def test_the_composer_cannot_be_stretched_by_its_own_footer() -> None:
+    """Measured at 375px: the mode chip grew `.composer` from 355px to 465px.
+
+    `.composer-wrap` is a grid, so its track was sized by the widest child's
+    max-content -- the composer grew to fit its footer and pushed the send
+    button off-screen. `min-width: 0` hands sizing back to the container.
+    """
+    composer = (STYLES / "04-composer.css").read_text()
+    # Wide enough to span the block's own comment: the note explaining the
+    # measurement sits above the declarations it justifies.
+    block = composer[composer.index(".composer {") :][:700]
+    assert "min-width: 0" in block, block
+    assert "max-width: 100%" in block, block
+    # And the chip collapses like the workspace/permission chips already do.
+    narrow = composer[composer.index("@media (max-width: 640px)") :][:400]
+    assert ".deliver-mode-button.ant-btn" in narrow
+    assert ".deliver-mode-label { display: none; }" in narrow

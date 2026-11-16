@@ -1223,3 +1223,14 @@ html[data-theme='light'] .tool-trace-items {
 
 /* Reduced motion is handled in one place for the whole app; see
  * `07-motion-responsive.css`. */
+
+/* A deferred message shares the interjection row's geometry but is a different
+   promise: it waits for the turn to end instead of interrupting it. The mark
+   says 排队 and the accent stays off — nothing here is changing the turn in
+   flight. */
+.message-interjection.is-deferred {
+  border-left-color: var(--border);
+}
+.message-interjection.is-deferred .message-interjection-mark {
+  color: var(--text-muted);
+}

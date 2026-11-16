@@ -486,7 +486,12 @@ class EvolutionPlugin:
             return
 
         try:
-            store.write_entry(
+            # ``add_entry`` is the store's public write. ``write_entry`` never
+            # existed on LTMStore -- it is the name of the *private* row helper
+            # (``_write_entry_row``), so every strategy this plugin tried to keep
+            # died as "strategy storage error: 'LTMStore' object has no attribute
+            # 'write_entry'" and the plugin learned nothing at all.
+            store.add_entry(
                 _agent_mod.LTMEntry(
                     id=entry_id,
                     content=content,

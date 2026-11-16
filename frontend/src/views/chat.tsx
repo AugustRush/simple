@@ -27,7 +27,7 @@ import React from 'react'
 const { TextArea } = Input
 
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, canRewind, editLastTurn, regenerateLastTurn, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, sessionUsage, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, canRewind, editLastTurn, regenerateLastTurn, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, deliverMode, deliverModeLabel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, sessionUsage, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setDeliverMode, setInput, setPendingAttachments, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
   return (
@@ -182,7 +182,20 @@ export function renderChat(ctx: AppCtx) {
           <div className="message-queue-banner">
             <div className="message-queue-head">
               <span className="message-queue-dot" />
-              <span>已排队 {queueView.length} 条消息，将按顺序处理</span>
+              {/* The header counts, the rows say which. "按顺序处理" was true
+                  but uninformative: an interjection is read by the turn running
+                  now, a deferred message becomes its own turn afterwards, and
+                  a person waiting on an answer needs to know which of the two
+                  they just asked for. */}
+              <span>
+                {(() => {
+                  const folded = queueView.filter(item => item.kind === 'interjection').length
+                  const deferred = queueView.length - folded
+                  if (folded && deferred) return `${folded} 条插话 · ${deferred} 条等本轮结束`
+                  if (deferred) return `${deferred} 条消息等本轮结束后发送`
+                  return `${folded} 条插话待本轮读到`
+                })()}
+              </span>
               {queueView.some(item => item.withdrawable) && (
                 <button
                   type="button"
@@ -199,6 +212,9 @@ export function renderChat(ctx: AppCtx) {
             <ul className="message-queue-list">
               {queueView.map((item, index) => (
                 <li key={item.id || `queued-${index}`}>
+                  <span className={`message-queue-kind is-${item.kind}`}>
+                    {item.kind === 'interjection' ? '插话' : '排队'}
+                  </span>
                   <span className="message-queue-text">
                     {truncate(item.text, 60) || '（无文字内容）'}
                   </span>
@@ -483,6 +499,57 @@ export function renderChat(ctx: AppCtx) {
                       <span className="permission-button-label">{permissionLabel}</span>
                     </Button>
                   </Dropdown>
+                  {/* Where a message sent *now* will land. Only while a turn is
+                      running, because that is the only moment the question
+                      exists -- when the session is idle both choices start a
+                      turn immediately, and a control offering a distinction
+                      that does not apply is a control that teaches nothing.
+
+                      A visible chip rather than a hidden split-button menu: the
+                      choice has to be readable *before* pressing send, since
+                      pressing send is the moment it takes effect. */}
+                  {isStreaming && (
+                    <Dropdown
+                      trigger={['click']}
+                      placement="topLeft"
+                      menu={{
+                        selectedKeys: [deliverMode],
+                        items: [
+                          {
+                            key: 'interject',
+                            icon: <ApiOutlined />,
+                            label: (
+                              <span className="deliver-mode-option">
+                                <strong>插话</strong>
+                                <small>本轮就读到，可能改变它正在做的事</small>
+                              </span>
+                            ),
+                            onClick: () => setDeliverMode('interject'),
+                          },
+                          {
+                            key: 'after',
+                            icon: <ClockCircleOutlined />,
+                            label: (
+                              <span className="deliver-mode-option">
+                                <strong>等回复后发送</strong>
+                                <small>不打断本轮，结束后作为新一轮开始</small>
+                              </span>
+                            ),
+                            onClick: () => setDeliverMode('after'),
+                          },
+                        ],
+                      }}
+                    >
+                      <Button
+                        type="text"
+                        className={`deliver-mode-button is-${deliverMode}`}
+                        icon={deliverMode === 'after' ? <ClockCircleOutlined /> : <ApiOutlined />}
+                        aria-label={`发送方式：${deliverModeLabel}，点击更改`}
+                      >
+                        <span className="deliver-mode-label">{deliverModeLabel}</span>
+                      </Button>
+                    </Dropdown>
+                  )}
                   <Select
                     value={currentModel || undefined}
                     placeholder={modelSelectPlaceholder}
@@ -551,11 +618,25 @@ export function renderChat(ctx: AppCtx) {
                     />
                   </Tooltip>
                 )}
-                <Tooltip title={isStreaming ? '排队发送' : `发送 (${sendShortcutLabel})`}>
+                <Tooltip
+                  title={
+                    isStreaming
+                      ? deliverMode === 'after'
+                        ? '等本轮回复结束后发送'
+                        : `插话，本轮就读到 (${sendShortcutLabel})`
+                      : `发送 (${sendShortcutLabel})`
+                  }
+                >
                   <Button
                     type="primary"
                     className="send-button"
-                    aria-label={isStreaming ? '排队发送' : '发送'}
+                    aria-label={
+                      isStreaming
+                        ? deliverMode === 'after'
+                          ? '等回复后发送'
+                          : '插话发送'
+                        : '发送'
+                    }
                     icon={<ArrowUpOutlined />}
                     disabled={!isStreaming && (!composerSendable || creatingSession)}
                     onClick={() => sendMessage(resolvedComposerText)}

@@ -242,7 +242,19 @@ class CommandCoordinator:
                 )
                 return None
             if state.operation_state == "active":
-                if state.accepts_interjections:
+                # Who decides between speaking now and waiting: the submitter.
+                # A turn is running and this message has somewhere to be — the
+                # interjection mailbox folds it into the running turn, the
+                # restart queue starts a fresh turn when it ends — and the two
+                # are different promises to the person typing. "interject" is
+                # the default so every existing channel keeps its behaviour;
+                # "after" is a deliberate "let it finish first", asked for by
+                # the web composer's split send button (see web.py).
+                wants_interjection = (
+                    str(turn_input.metadata.get("deliver_mode") or "interject")
+                    != "after"
+                )
+                if state.accepts_interjections and wants_interjection:
                     self._queue_interjection(turn_input, sink, state, ready=sink_ready)
                     self._safe_queued_notice(
                         sink,

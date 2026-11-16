@@ -3271,6 +3271,120 @@ def test_active_model_turn_queues_interjection_then_promotes_late_mailbox() -> N
     asyncio.run(scenario())
 
 
+def _turn_with_mode(text: str, mode: str, *, message_id: str = "m-2") -> TurnInput:
+    """A message whose submitter chose how it should be delivered mid-turn."""
+    return TurnInput.from_text(
+        text,
+        session_id="s-1",
+        channel_name="web",
+        metadata={"message_id": message_id, "user_id": "u-1", "deliver_mode": mode},
+    )
+
+
+def test_a_message_asked_to_wait_is_queued_not_folded_into_the_running_turn() -> None:
+    """"Let it finish first" is a different promise from "hear me now".
+
+    Both mailboxes already existed; what did not exist was a way for the person
+    typing to choose. Every mid-turn message became an interjection, so a
+    follow-up meant for *after* the answer was read mid-answer and folded into
+    it -- changing the turn the person was waiting for.
+    """
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def block_first(turn_input, state, sink):
+            if turn_input.text == "first":
+                started.set()
+                await release.wait()
+
+        core = _CoordinatorCore(block_first)
+        coordinator, _ = _coordinator(core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+        running = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await started.wait()
+        await coordinator.handle(
+            _turn_with_mode("等它做完再说", "after"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+
+        # The running turn must not see it at all.
+        assert state.pending_interjections == []
+        assert [entry["text"] for entry in state.restart_queue] == ["等它做完再说"]
+        release.set()
+        await running
+
+        # It runs as its own turn, after the first one finished.
+        assert [call.text for call in core.calls] == ["first", "等它做完再说"]
+        assert state.restart_queue == []
+
+    asyncio.run(scenario())
+
+
+def test_interject_is_still_the_default_for_a_message_that_says_nothing() -> None:
+    """Every channel that predates the choice keeps its behaviour."""
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def block_first(turn_input, state, sink):
+            if turn_input.text == "first":
+                started.set()
+                await release.wait()
+
+        core = _CoordinatorCore(block_first)
+        coordinator, _ = _coordinator(core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+        running = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await started.wait()
+        await coordinator.handle(
+            _turn("顺便说一句", message_id="m-2"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+
+        assert [entry["text"] for entry in state.pending_interjections] == ["顺便说一句"]
+        assert state.restart_queue == []
+        release.set()
+        await running
+
+    asyncio.run(scenario())
+
+
+def test_an_unrecognised_delivery_mode_falls_back_to_interjecting() -> None:
+    """A typo in the field must not silently defer somebody's message."""
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def block_first(turn_input, state, sink):
+            if turn_input.text == "first":
+                started.set()
+                await release.wait()
+
+        core = _CoordinatorCore(block_first)
+        coordinator, _ = _coordinator(core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+        running = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await started.wait()
+        await coordinator.handle(
+            _turn_with_mode("现在听我说", "whenever"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+
+        assert [entry["text"] for entry in state.pending_interjections] == ["现在听我说"]
+        assert state.restart_queue == []
+        release.set()
+        await running
+
+    asyncio.run(scenario())
+
+
 def test_active_non_interjection_command_queues_restart_fifo() -> None:
     async def scenario() -> None:
         started = asyncio.Event()

@@ -212,6 +212,30 @@ export function useConversations(deps: Deps) {
 
   const sendShortcutLabel = sendShortcut === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'
 
+  //: How a message sent *while a turn is running* should be delivered.
+  //:
+  //: Both destinations already existed on the server -- the interjection
+  //: mailbox folds a message into the running turn, the restart queue starts a
+  //: fresh turn once it ends -- but the composer had no way to choose, so every
+  //: mid-turn message became an interjection. A follow-up meant for *after* the
+  //: answer was read mid-answer and folded into it, changing the very turn the
+  //: person was waiting for.
+  //:
+  //: 'interject' stays the default: it is what every existing habit expects,
+  //: and changing it silently would move the ground under people who never
+  //: asked for a choice. Remembered across visits because it is a preference
+  //: about how *this person* works, not a per-message decision.
+  const [deliverMode, setDeliverModeState] = useState<'interject' | 'after'>(
+    () => (localStorage.getItem('agent_deliver_mode') === 'after' ? 'after' : 'interject'),
+  )
+  const deliverModeRef = useRef<'interject' | 'after'>(deliverMode)
+  const setDeliverMode = (next: 'interject' | 'after') => {
+    deliverModeRef.current = next
+    setDeliverModeState(next)
+    localStorage.setItem('agent_deliver_mode', next)
+  }
+  const deliverModeLabel = deliverMode === 'after' ? '等回复后发送' : '插话'
+
   const [sessionState, setSessionState] = useState<SessionState | null>(null)
 
   // The transcript is a window onto a longer conversation. ``hasMoreHistory``
@@ -1042,9 +1066,7 @@ export function useConversations(deps: Deps) {
             setQueuedMessages([...queuedMessagesRef.current])
             setActivity('这条插话已交给正在进行的回合')
           } else {
-            setActivity(
-              `已排队 ${queuedMessagesRef.current.length || 1} 条消息，将在本回合结束后处理`,
-            )
+            setActivity('这条会在本轮结束后作为新一轮开始')
             if (text) {
               const entry = queuedMessagesRef.current.find(item => item.id === pendingId)
               if (entry) entry.text = text
@@ -1459,9 +1481,22 @@ export function useConversations(deps: Deps) {
     followChatRef.current = true
     const queueWhileBusy =
       isStreaming && !/^\/(?:cancel|now)(?:\s|$)/i.test(text)
+    // Read through the ref: the mode chip and this call can land in the same
+    // tick, and a stale closure would send the choice the person just changed
+    // away from.
+    const mode = deliverModeRef.current
     const messageId = makeId()
     const attachments = await uploadPendingAttachments()
-    appendMessage({ id: messageId, role: 'user', content: text, queued: queueWhileBusy, attachments })
+    appendMessage({
+      id: messageId,
+      role: 'user',
+      content: text,
+      queued: queueWhileBusy,
+      // Marked for what it is *now*, so the row reads correctly before the
+      // server's message_queued echo arrives to confirm it.
+      interjection: queueWhileBusy && mode === 'interject' ? true : undefined,
+      attachments,
+    })
     setInput('')
     setPendingAttachments([])
     setActivity('等待模型响应')
@@ -1480,7 +1515,11 @@ export function useConversations(deps: Deps) {
       }
       queuedMessagesRef.current = [...queuedMessagesRef.current, queued]
       setQueuedMessages([...queuedMessagesRef.current])
-      setActivity(`已排队 ${queuedMessagesRef.current.length} 条消息`)
+      // The strip above already carries the count and the destination; this
+      // line is the transient confirmation, so it names the promise instead of
+      // repeating the tally. Two lines saying "已排队 1 条…结束后处理" was the
+      // same fact twice.
+      setActivity(mode === 'after' ? '已排到本轮之后' : '插话已送出，等本轮读到')
       // The server's restart queue grew, which is what the session list's
       // 排队中 badge reads -- without this the badge appears only after some
       // later list refresh happens to run.
@@ -1532,6 +1571,10 @@ export function useConversations(deps: Deps) {
         text,
         model: currentModelRef.current,
         attachments,
+        // Which mailbox this belongs in when a turn is already running. The
+        // coordinator reads it; when the session is idle both mean the same
+        // thing, so it costs nothing there.
+        deliver_mode: mode,
       }))
       return
     }
@@ -1553,10 +1596,20 @@ export function useConversations(deps: Deps) {
         id: item.id,
         text: item.text,
         withdrawable: Boolean(item.id),
+        // The server names the mailbox, so the strip can say which promise
+        // each waiting message is: folded into the running turn, or its own
+        // turn afterwards. Guessing from the wording is what made a deferred
+        // message read as 插话.
+        kind: item.kind === 'interjection' ? 'interjection' as const : 'restart' as const,
       })),
       ...queuedMessages
         .filter(item => !seen.has(item.id))
-        .map(item => ({ id: item.id, text: item.text, withdrawable: false })),
+        .map(item => ({
+          id: item.id,
+          text: item.text,
+          withdrawable: false,
+          kind: deliverModeRef.current === 'after' ? 'restart' as const : 'interjection' as const,
+        })),
     ]
   })()
 
@@ -2216,5 +2269,5 @@ export function useConversations(deps: Deps) {
     !isStreaming &&
     String(sessionState?.operation_state || 'idle') === 'idle'
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPermissionLevel, setQueuedMessages, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, deliverMode, deliverModeLabel, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDeliverMode, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPermissionLevel, setQueuedMessages, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

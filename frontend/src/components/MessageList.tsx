@@ -335,16 +335,30 @@ function InterjectionRow({ item, activeSession, token }: {
   activeSession: string | null
   token: string
 }) {
+  // Two different promises share this row's geometry, and the label is the
+  // only thing that tells them apart. An *interjection* is folded into the turn
+  // running now; a *deferred* message waits and becomes its own turn afterwards.
+  // Both used to read 插话, so a message the person had asked to hold until the
+  // answer finished claimed it was interrupting that answer.
+  const deferred = !item.interjection
   return (
-    <div className={`message-interjection ${item.queued ? 'is-pending' : ''}`}>
-      <span className="message-interjection-mark" aria-hidden="true">插话</span>
+    <div
+      className={`message-interjection ${item.queued ? 'is-pending' : ''} ${deferred ? 'is-deferred' : ''}`}
+    >
+      <span className="message-interjection-mark" aria-hidden="true">
+        {deferred ? '排队' : '插话'}
+      </span>
       <div className="message-interjection-body">
         <div
           className="markdown"
           dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
         />
       </div>
-      {item.queued && <span className="message-interjection-state">待读</span>}
+      {item.queued && (
+        <span className="message-interjection-state">
+          {deferred ? '等本轮结束' : '待读'}
+        </span>
+      )}
     </div>
   )
 }

@@ -2738,6 +2738,7 @@ class WebChannel(Channel):
             message_id: str,
             model: str | None,
             attachment_payload: Any = None,
+            deliver_mode: str = "interject",
         ) -> None:
             # Each incoming message gets its own sink.  The coordinator owns
             # per-session serialization and can therefore queue a message
@@ -2762,6 +2763,7 @@ class WebChannel(Channel):
                     message_id=message_id,
                     model_override=model,
                     attachments=self._parse_uploaded_attachments(session_id, attachment_payload),
+                    deliver_mode=deliver_mode,
                 )
                 await sink.flush_attachments()
                 # A queued message intentionally has no turn_complete event;
@@ -2843,7 +2845,13 @@ class WebChannel(Channel):
                     await websocket.send_json({"type": "error", "error": str(exc)})
                     continue
                 task = asyncio.create_task(
-                    process_message(text, message_id, model, data.get("attachments")),
+                    process_message(
+                        text,
+                        message_id,
+                        model,
+                        data.get("attachments"),
+                        str(data.get("deliver_mode") or "interject"),
+                    ),
                     name=f"web-message-{message_id}",
                 )
                 active_tasks.add(task)
@@ -2893,7 +2901,13 @@ class WebChannel(Channel):
         message_id: str,
         model_override: str | None = None,
         attachments: tuple[MessageAttachment, ...] = (),
+        deliver_mode: str = "interject",
     ) -> None:
+        # "interject" or "after": the composer's split send button decides,
+        # and the coordinator reads it when a turn is already running (see
+        # CommandCoordinator._route). Both mean the same thing when the
+        # session is idle, so the value costs nothing there.
+        clean_mode = deliver_mode if deliver_mode in ("interject", "after") else "interject"
         assert self._handler is not None
         service = self._service()
         service.touch_session(session_id, status="active")
@@ -2926,6 +2940,7 @@ class WebChannel(Channel):
                 "message_id": message_id,
                 "model_override": model_override,
                 "attachments": attachment_metadata,
+                "deliver_mode": clean_mode,
             },
             attachments=attachments,
         )

@@ -684,3 +684,105 @@ def test_rule_store_exposes_only_retired_rules_to_the_proposer(tmp_path):
     assert store.retired_rule_texts() == ["Always greet the user by name"]
     assert store.is_repeat_of_retired("Always greet the user by name") is True
     assert store.is_repeat_of_retired("Never edit a file without showing the diff") is False
+
+
+# ── learned strategies actually reach the memory store ───────────────────────
+
+
+def test_a_high_scoring_session_is_written_to_the_memory_store(tmp_path):
+    """The write has to use the store's *public* API, and land a real row.
+
+    This plugin called ``store.write_entry`` -- a name LTMStore never had (the
+    private helper is ``_write_entry_row``). Every strategy it tried to keep
+    died as "strategy storage error: 'LTMStore' object has no attribute
+    'write_entry'", printed dim to a console nobody was reading, so the plugin
+    learned nothing across every session it ever scored.
+
+    A real store, not a fake: a fake with a ``write_entry`` method would have
+    agreed with the bug.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(tmp_path / "context")
+    plugin = EvolutionPlugin()
+    plugin._store = store
+    # The guard only asks whether an engine with memory exists; the write path
+    # itself touches neither.
+    plugin._engine = SimpleNamespace(memory=object())
+    try:
+        asyncio.run(
+            plugin._store_session_strategies(
+                {"score": 9.0},
+                task_summary="整理下载目录并给出清单",
+                tools_used=["list_files", "read_file"],
+            )
+        )
+        entries = store.all_entries()
+    finally:
+        store.close()
+
+    assert len(entries) == 1, "the strategy must be stored, not merely attempted"
+    entry = entries[0]
+    assert entry.memory_type == "learned_strategy"
+    assert entry.category == "procedures"
+    assert "整理下载目录并给出清单" in entry.content
+    assert entry.importance == 0.6
+
+
+def test_a_corrected_low_scoring_session_is_written_as_a_caution(tmp_path):
+    """The other branch of the same write: a poor session with corrections."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(tmp_path / "context")
+    plugin = EvolutionPlugin()
+    plugin._store = store
+    plugin._engine = SimpleNamespace(memory=object())
+    plugin._session_correction_count = 3
+    try:
+        asyncio.run(
+            plugin._store_session_strategies(
+                {"score": 2.0},
+                task_summary="改配置却改错了文件",
+                tools_used=["edit"],
+            )
+        )
+        entries = store.all_entries()
+    finally:
+        store.close()
+
+    assert len(entries) == 1
+    assert entries[0].importance == 0.3
+    assert "Corrections: 3" in entries[0].content
+
+
+def test_a_middling_session_writes_nothing(tmp_path):
+    """Neither branch applies: no row, and no error either."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(tmp_path / "context")
+    plugin = EvolutionPlugin()
+    plugin._store = store
+    plugin._engine = SimpleNamespace(memory=object())
+    try:
+        asyncio.run(
+            plugin._store_session_strategies(
+                {"score": 5.0}, task_summary="普通的一轮", tools_used=[]
+            )
+        )
+        entries = store.all_entries()
+    finally:
+        store.close()
+
+    assert entries == []

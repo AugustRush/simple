@@ -68,7 +68,13 @@ export interface AppCtx {
   sendConfirm: (decision: ConfirmDecision) => void
   dismissConfirm: () => void
   attachApprovalCommand: (element: HTMLDivElement | null) => void
-  queueView: { id: string; text: string; withdrawable: boolean; }[]
+  queueView: {
+    id: string
+    text: string
+    withdrawable: boolean
+    /** Which mailbox holds it: the running turn's, or the next turn's. */
+    kind: "interjection" | "restart"
+  }[]
   withdrawQueuedMessages: (messageIds: string[]) => Promise<void>
   sessionState: SessionState | null
   resumingTaskId: string | null
@@ -88,6 +94,11 @@ export interface AppCtx {
   inlineCommandOpen: boolean
   inlineCommandEmpty: boolean
   sendShortcutLabel: "Ctrl/Cmd + Enter" | "Enter"
+  /** Where a message sent mid-turn lands: folded into the running turn, or its
+   *  own turn once that one ends. Only meaningful while a turn is running. */
+  deliverMode: "interject" | "after"
+  deliverModeLabel: string
+  setDeliverMode: (next: "interject" | "after") => void
   filteredCommands: CommandInfo[]
   commandItemRefs: MutableRefObject<Record<string, HTMLButtonElement | null>>
   commandIndex: number

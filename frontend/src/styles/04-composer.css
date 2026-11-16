@@ -149,6 +149,13 @@
 
 .composer {
   width: min(820px, 100%);
+  /* `.composer-wrap` is a grid, so its track was sized by the widest child's
+   * max-content: measured at 375px, the footer's chips grew this box from
+   * 355px to 465px and pushed the send button off-screen. `min-width: 0` hands
+   * sizing back to the container, and the context strip's own
+   * `overflow: hidden` then clips instead of stretching. */
+  min-width: 0;
+  max-width: 100%;
   margin: 0 auto;
   padding: 10px 12px 8px;
   /* Positioning context for .command-popover: anchoring to the composer box
@@ -494,4 +501,92 @@
   color: var(--text-muted);
   text-align: center;
   font-size: 12px;
+}
+
+/* ── 发送方式：插话 / 等回复后 ────────────────────────────────────────────────
+   Only on screen while a turn is running, because that is the only moment the
+   two destinations differ. It sits with the other composer chips (workspace,
+   permission, model) so it reads as one more property of the message being
+   composed rather than as a modal decision. */
+.deliver-mode-button.ant-btn {
+  flex: 0 0 auto;
+  height: 32px;
+  padding: 0 9px;
+  border-radius: 999px !important;
+  color: var(--text-secondary) !important;
+  font-size: 11px;
+  transition: color .15s ease, background-color .15s ease;
+}
+.deliver-mode-button.ant-btn:hover {
+  color: var(--text) !important;
+  background: var(--surface-hover) !important;
+}
+/* 插话 is the accent because it changes the turn in flight — the louder of the
+   two promises. 等回复后 is the quiet one: it waits, so it does not need to
+   shout. Colour carries that difference; the label carries the meaning. */
+.deliver-mode-button.is-interject.ant-btn {
+  color: var(--accent) !important;
+  background: var(--accent-soft) !important;
+}
+.deliver-mode-button.is-after.ant-btn {
+  color: var(--text-secondary) !important;
+  background: var(--surface-hover) !important;
+}
+.deliver-mode-label { white-space: nowrap; }
+
+/* The menu explains the consequence, not just the name: "插话" alone does not
+   say that it may change what the agent is doing right now. */
+.deliver-mode-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0;
+  max-width: 260px;
+}
+.deliver-mode-option strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.deliver-mode-option small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+/* Each waiting message says which mailbox holds it. Same two-colour rule as
+   the chip above, so the strip and the control agree. */
+.message-queue-kind {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+}
+.message-queue-kind.is-interjection {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.message-queue-kind.is-restart {
+  color: var(--text-muted);
+  background: var(--surface-hover);
+}
+
+/* ── 窄屏：发送方式收成图标，且底栏永不撑破输入框 ─────────────────────────────
+   The chip follows the same collapse the workspace and permission chips
+   already use at this width: icon only, colour and aria-label carrying the
+   meaning. An icon that still opens the full two-option menu loses nothing but
+   the width. (The other half of that fix -- the composer refusing to be
+   stretched by its footer -- lives on `.composer` itself.) */
+@media (max-width: 640px) {
+  .deliver-mode-button.ant-btn {
+    width: 30px;
+    min-width: 30px;
+    flex: 0 0 30px;
+    padding: 0;
+    justify-content: center;
+  }
+  .deliver-mode-label { display: none; }
 }
