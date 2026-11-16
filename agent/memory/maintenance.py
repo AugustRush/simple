@@ -96,6 +96,14 @@ def apply_decay(
         writes them back one row at a time (the old per-row _write_entry_row
         also re-synced each entry's FTS row individually).  Mirrors
         apply_retention, which already does this for episodes.
+
+        ``pinned = 0`` on both statements, because a pin is a promise: the
+        person said "keep this".  This function used to decay and then
+        **delete** pinned entries like any other, which made the one memory
+        somebody explicitly protected the only one guaranteed to be lost if
+        anything ever called it.  Nothing in production does call it today --
+        ``apply_retention`` is the live policy -- but a primitive that breaks
+        the pin's promise is a trap for the next caller, not a spare part.
         """
     now = _now()
     conn.execute(
@@ -104,6 +112,7 @@ def apply_decay(
                 SET importance = importance * ?,
                     updated_at = ?
                 WHERE status NOT IN ('archived', 'superseded')
+                  AND pinned = 0
                 """,
         (factor, now),
     )
@@ -114,6 +123,7 @@ def apply_decay(
                     SELECT id FROM memory_items
                     WHERE status NOT IN ('archived', 'superseded')
                       AND importance < ?
+                      AND pinned = 0
                     """,
             (shared.MIN_IMPORTANCE,),
         ).fetchall()

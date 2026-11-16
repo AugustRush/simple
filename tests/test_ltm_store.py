@@ -24,6 +24,21 @@ def make_entry(
     )
 
 
+def _pinned_entry(cid: str, *, importance: float):
+    """One entry the person pinned: retention must never remove it."""
+    from agent import LTMEntry
+
+    return LTMEntry(
+        id=cid,
+        content="keep this",
+        importance=importance,
+        category="code_context",
+        created_at="2026-01-01",
+        updated_at="2026-01-01",
+        pinned=1,
+    )
+
+
 def test_add_and_read_entry(tmp_path):
     store = make_store(tmp_path)
     entry = make_entry()
@@ -680,3 +695,40 @@ def test_corpus_stats_caps_latin_counts_for_ubiquitous_terms(tmp_path):
 
     assert stats.document_frequencies["deployment"] == stats.total_documents
     assert stats.idf("deployment", fallback_n=200) < 0.05
+
+
+def test_decay_never_touches_a_pinned_entry(tmp_path):
+    """A pin is the person saying "keep this" -- decay must not overrule it.
+
+    ``apply_decay`` used to decay and then **delete** pinned entries like any
+    other, so the one memory somebody explicitly protected was the only one
+    guaranteed to be lost if anything called it. Nothing in production calls
+    it today (``apply_retention`` is the live policy and does honour pins), but
+    a primitive that breaks the pin's promise is a trap for the next caller.
+    """
+    store = make_store(tmp_path)
+    store.add_entry(_pinned_entry(cid="kept", importance=0.06))
+    store.add_entry(make_entry(cid="fades", importance=0.06))
+
+    for _ in range(20):
+        store.apply_decay(factor=0.5)
+
+    survivors = {entry.id for entry in store.all_entries()}
+    assert survivors == {"kept"}, (
+        "the pinned entry must survive every decay pass, at its original score"
+    )
+
+
+def test_a_pinned_entry_keeps_its_importance_through_decay(tmp_path):
+    """Not just survival: the score the person protected stays put.
+
+    A pinned entry that survived but decayed to 0.0001 would still be dropped
+    by the next reader that sorts or filters on importance.
+    """
+    store = make_store(tmp_path)
+    store.add_entry(_pinned_entry(cid="kept", importance=0.9))
+
+    store.apply_decay(factor=0.5)
+
+    (entry,) = store.all_entries()
+    assert entry.importance == pytest.approx(0.9)
