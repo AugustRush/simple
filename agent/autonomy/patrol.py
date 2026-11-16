@@ -359,6 +359,17 @@ class PatrolService:
             self.store.record_tick(result, at=now)
         except Exception:  # noqa: BLE001 - the history is not worth a failed pass
             logger.exception("patrol could not record its own pass")
+        # The pass keeps its own house. Nothing else deletes these rows: every
+        # pass appends one and `tick_stats` only reads a window, so without this
+        # the table is append-only for the life of the install. Pruning here --
+        # next to the append, once a pass, best effort -- is what keeps the
+        # retention from needing a separate job that has to be remembered.
+        try:
+            pruned = self.store.prune_ticks(now=now)
+            if pruned:
+                logger.info("pruned %d old patrol passes", pruned)
+        except Exception:  # noqa: BLE001 - housekeeping must not fail a pass
+            logger.exception("patrol could not prune its own history")
         # Say it where the person is. A proposal is the agent having an idea
         # about your work -- announcing it only on a panel is how an idea nobody
         # opened the panel for goes unanswered for a day and then expires.

@@ -934,3 +934,60 @@ def test_a_session_with_unfinished_work_reaches_the_rules(tmp_path, monkeypatch)
     assert "sess-1" in by_id, by_id.keys()
     assert by_id["sess-1"].get("task"), "the unfinished work has to reach the rules"
     assert "整理" in str(by_id["sess-1"]["task"].get("active_goal", ""))
+
+
+# ── the pass history keeps itself bounded ───────────────────────────────────
+
+
+def test_old_passes_are_pruned_and_recent_ones_kept(store) -> None:
+    """Nothing else deletes these rows, so the pass has to.
+
+    Every pass appends one and `tick_stats` only ever reads a window -- measured
+    on a real install, 696 of 1609 rows were already past the point where
+    anything would look at them, and no code path removed them.
+    """
+    from datetime import timedelta
+
+    old = NOW - timedelta(days=90)
+    store.record_tick({"examined": 5}, at=old)
+    store.record_tick({"examined": 7}, at=NOW - timedelta(days=3))
+    store.record_tick({"examined": 9}, at=NOW)
+
+    pruned = store.prune_ticks(now=NOW)
+
+    assert pruned == 1
+    stats = store.tick_stats(since=NOW - timedelta(days=7))
+    assert stats["passes"] == 2, "the recent passes must survive"
+    assert stats["examined"] == 16
+
+
+def test_pruning_is_by_time_not_by_row_count(store) -> None:
+    """A row cap would change what "how far back can I see" means.
+
+    At a ten-minute pass 5000 rows is 35 days; at a one-minute pass it is 3.5.
+    A window says the same thing at any cadence, which is why this is measured
+    in days.
+    """
+    from datetime import timedelta
+
+    for days in (40, 35, 31):
+        store.record_tick({"examined": 1}, at=NOW - timedelta(days=days))
+    for days in (29, 10, 1):
+        store.record_tick({"examined": 1}, at=NOW - timedelta(days=days))
+
+    removed = store.prune_ticks(now=NOW)
+
+    assert removed == 3, "everything past the 30-day window"
+    assert store.tick_stats()["passes"] == 3
+
+
+def test_a_patrol_pass_prunes_its_own_history(store) -> None:
+    """The housekeeping rides along with the append, so it cannot be forgotten."""
+    from datetime import timedelta
+
+    store.record_tick({"examined": 1}, at=NOW - timedelta(days=120))
+
+    patrol_tick(store=store, sessions=[], now=NOW, suggest=rule_candidates)
+
+    # Only the pass that just ran is inside the window.
+    assert store.tick_stats()["passes"] == 1
