@@ -143,7 +143,8 @@ def test_unloading_a_plugin_removes_only_its_own_target_type() -> None:
 
     one.unload()
 
-    assert registry.types() == ("beta",)
+    # The built-in survives: it is installed by the constructor, not by a plugin.
+    assert registry.types() == ("beta", "feishu_chat")
 
 
 def test_a_sender_that_raises_is_what_deliver_retries() -> None:

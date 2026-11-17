@@ -31,7 +31,6 @@ from agent.shared import AGENT_HOME, DEFAULT_OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
 from agent.core.agent import AgentContext
-from agent.memory.palace import MemoryPalace
 from agent.runtime.contracts import (
     RuntimeSessionState,
     TurnInput,
@@ -459,6 +458,8 @@ def build_scheduler_service(
     config_loader: Optional[Callable[[], dict]] = None,
     runtime_factory: Any = None,
     store: Any = None,
+    system_jobs: Any = None,
+    delivery_targets: Any = None,
 ):
     """Build the scheduler service and the executor its runs go through.
 
@@ -481,11 +482,20 @@ def build_scheduler_service(
     # callers that have no container (a test, a one-off script) working.
     if store is None:
         store = scheduler_store()
+    # Taken from the composition when it has them, and from the process-wide
+    # defaults when it does not: a target type or a job a plugin registered must
+    # be the same registry the runs read. A second registry built here would be
+    # a second answer to "what can this install deliver to / run".
+    from .delivery_targets import shared_registry as _default_delivery_targets
+    from .system_jobs import shared_registry as _default_system_jobs
+
     delivery = SchedulerDelivery(
         cfg=cfg,
         output_root=(output_dir or DEFAULT_OUTPUT_DIR)
         / "scheduler",
+        targets=delivery_targets or _default_delivery_targets(),
     )
+    jobs = system_jobs or _default_system_jobs()
     # The out-of-page channel.  Built here rather than in the runtime because
     # the *how* depends on config and platform, and the runtime only decides
     # *when*: it calls this for a run that needs a person, and this either
@@ -840,20 +850,29 @@ def build_scheduler_service(
             await factory.close(run_components)
 
     async def _system_executor(task, run):
+        """Run whichever job claims this task's ``job_name``.
+
+        The lookup is the whole change: this used to be
+        ``if job_name == "memory_tidy"``, so a plugin could not add periodic
+        maintenance -- the scheduler already had the trigger, the run row, the
+        history and the failure report, and the only missing piece was that the
+        body had to be written here. The refusal names the jobs that do exist,
+        because "Unsupported system job: reindex" leaves the reader guessing
+        whether the name is wrong or the capability is missing.
+        """
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
         payload = snapshot.get("payload")
         if not isinstance(payload, dict):
             payload = task.payload
         job_name = str(payload.get("job_name", "")).strip()
-        if job_name == "memory_tidy":
-            memory_palace: MemoryPalace = memory
-            memory_palace.force_tidy()
-            await memory_palace.tidy()
-            return ExecutionResult(
-                summary="memory tidied",
-                text_output="",
+        job = jobs.job_for(job_name)
+        if job is None:
+            available = ", ".join(jobs.names()) or "(none registered)"
+            raise RuntimeError(
+                f"Unsupported system job: {job_name!r}; "
+                f"this install has: {available}"
             )
-        raise RuntimeError(f"Unsupported system job: {job_name}")
+        return await job(task=task, run=run, payload=payload, cfg=cfg)
 
     service = SchedulerService(
         store=store,

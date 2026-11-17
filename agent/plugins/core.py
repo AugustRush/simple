@@ -102,6 +102,18 @@ def _skill_catalog(_: CoreContext) -> Any:
     return SkillCatalogPlugin()
 
 
+def _system_jobs(_: CoreContext) -> Any:
+    from agent.scheduler.system_jobs_plugin import SystemJobsPlugin
+
+    return SystemJobsPlugin()
+
+
+def _memory_tidy_job(_: CoreContext) -> Any:
+    from agent.memory.system_job import MemoryTidyJobPlugin
+
+    return MemoryTidyJobPlugin()
+
+
 def _delivery_targets(_: CoreContext) -> Any:
     from agent.scheduler.delivery_targets_plugin import DeliveryTargetsPlugin
 
@@ -200,6 +212,20 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         name="channel.feishu",
         summary="the Feishu channel; contributes when `channels.feishu.enabled` is set",
         factory=_feishu_channel,
+    ),
+    CorePlugin(
+        name="system_jobs",
+        summary=(
+            "the scheduled maintenance registry; provides `system_jobs`, which a "
+            "plugin contributes a job to"
+        ),
+        factory=_system_jobs,
+        provides=("system_jobs",),
+    ),
+    CorePlugin(
+        name="system_job.memory_tidy",
+        summary="the memory-tidy job; contributes to `system_jobs`",
+        factory=_memory_tidy_job,
     ),
     CorePlugin(
         name="delivery_targets",

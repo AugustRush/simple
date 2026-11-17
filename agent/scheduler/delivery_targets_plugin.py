@@ -27,12 +27,11 @@ class DeliveryTargetsPlugin:
     inject = ()
 
     def setup(self, ctx: Any) -> None:
-        from agent.scheduler.delivery_targets import shared_registry
+        from agent.scheduler.delivery_targets import DeliveryTargetRegistry
 
-        # The process-wide registry, not a fresh one: a ``SchedulerDelivery``
-        # built without a composition takes the same one, so a target type a
-        # plugin adds here is visible to the runs that deliver. A second
-        # registry would be a second answer to "what can this install deliver
-        # to", and the two would disagree the first time somebody registered a
-        # plugin target.
-        ctx.provide("delivery_targets", shared_registry())
+        # One registry per composition, not the process-wide fallback. A
+        # plugin's contribution must not land in a singleton: two compositions in
+        # one process (a test suite is the obvious one) would collide on the
+        # second ``add``. The built-in senders are installed by the constructor,
+        # so a fresh registry is never empty.
+        ctx.provide("delivery_targets", DeliveryTargetRegistry())

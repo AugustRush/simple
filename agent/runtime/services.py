@@ -212,6 +212,16 @@ SERVICES: tuple[ServiceDeclaration, ...] = (
         ),
     ),
     ServiceDeclaration(
+        name="system_jobs",
+        plugin_visible=True,
+        contract="agent/scheduler/protocols.py:SystemJobService",
+        summary=(
+            "The scheduled-maintenance registry.  A plugin contributes a job with "
+            "``ctx.system_jobs.add(name, runner)``, which is what makes \"run my "
+            "reindex every night\" a plugin rather than an edit to the scheduler."
+        ),
+    ),
+    ServiceDeclaration(
         name="delivery_targets",
         plugin_visible=True,
         contract="agent/scheduler/protocols.py:DeliveryTargetService",

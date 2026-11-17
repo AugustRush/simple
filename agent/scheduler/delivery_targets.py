@@ -68,6 +68,20 @@ class DeliveryTargetRegistry:
         #: Kept because "which plugin owns this" is the question a broken
         #: delivery asks, and the registry is the only place that knows.
         self._owners: dict[str, str] = {}
+        self._install_builtins()
+
+    def _install_builtins(self) -> None:
+        """The senders every install has, in every registry.
+
+        In the constructor rather than only on the process-wide instance,
+        because a composition provides its **own** registry: a fresh one with no
+        Feishu sender would refuse to deliver to a chat the built-in one handles,
+        and the failure would read as "this plugin broke delivery".
+        """
+        from .delivery_feishu import TARGET_TYPE, send_feishu_chat
+
+        self._senders[TARGET_TYPE] = send_feishu_chat
+        self._owners[TARGET_TYPE] = ""
 
     # -- writing ------------------------------------------------------------
 
@@ -169,12 +183,16 @@ class ScopedDeliveryTargets(ScopedContribution):
         return self._registry.sender_for(target_type) is not None
 
 
-#: The registry the process uses.  Module-level for the same reason
-#: ``agent/core/providers.py`` keeps one: a delivery target is a property of the
-#: process (which integrations this install has), not of a session, and the two
-#: callers that construct a ``SchedulerDelivery`` without a composition -- the
-#: notification test endpoint, and tests -- must see the same set a run does.
-#: A composition may hand its own registry instead; nothing here requires it.
+#: The fallback registry, for callers that have **no composition**: the
+#: notification test endpoint, and tests.
+#:
+#: Deliberately not what a composition provides. A plugin's contribution must not
+#: land in a process-wide singleton: two compositions in one process -- which is
+#: what a test suite is -- would then collide, the second ``add`` raising "already
+#: provided by the first". Measured exactly that before this split: a plugin's
+#: ``memory_tidy`` job from an earlier test made a later composition's identical
+#: plugin fail its setup. Each composition builds its own registry; this one
+#: carries only the built-ins.
 _SHARED = DeliveryTargetRegistry()
 
 
@@ -192,16 +210,3 @@ def register_delivery_target(
     _SHARED.register(target_type, sender, owner="", replace=replace)
 
 
-# The one sender every install has, registered at import so a
-# ``SchedulerDelivery`` built without a composition still delivers to Feishu.
-# Same precedent as ``agent/core/providers.py``, which registers its two wire
-# formats at module level for the same reason.  A plugin that replaces it does
-# so through ``ScopedDeliveryTargets.add(..., replace=True)``, which is visible
-# as an owner change rather than as a silent substitution.
-def _install_builtin() -> None:
-    from .delivery_feishu import TARGET_TYPE, send_feishu_chat
-
-    _SHARED.register(TARGET_TYPE, send_feishu_chat)
-
-
-_install_builtin()

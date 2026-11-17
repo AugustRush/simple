@@ -25,10 +25,13 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
 
-__all__ = ["DeliverySender", "DeliveryTargetService"]
+__all__ = ["DeliverySender", "DeliveryTargetService", "SystemJob", "SystemJobService"]
 
 #: ``async def send(*, target, text, cfg, output_dir) -> str``
 DeliverySender = Callable[..., Awaitable[str]]
+
+#: ``async def run(*, task, run, payload, cfg) -> ExecutionResult``
+SystemJob = Callable[..., Awaitable[Any]]
 
 
 @runtime_checkable
@@ -53,6 +56,39 @@ class DeliveryTargetService(Protocol):
 
     def unregister(self, target_type: str) -> None:
         """Drop one target type, whatever registered it."""
+
+    def scoped(self, ctx: Any) -> Any:
+        """A per-plugin view: ``add`` is attributed and unwinds with the plugin."""
+
+
+@runtime_checkable
+class SystemJobService(Protocol):
+    """What a provider of ``system_jobs`` has to offer.
+
+    Four members and the view factory, each with a caller: ``job_for`` and
+    ``names`` are the executor's lookup and its refusal message,
+    ``register``/``unregister`` are the contribution and its undo, and ``scoped``
+    is how a plugin reaches this as ``ctx.system_jobs``.
+    """
+
+    def job_for(self, job_name: str) -> Optional[SystemJob]:
+        """The runner for one job name, or ``None`` when nothing claims it."""
+
+    def names(self) -> "tuple[str, ...]":
+        """Every job name this install can run."""
+
+    def register(
+        self,
+        job_name: str,
+        job: SystemJob,
+        *,
+        owner: str = "",
+        replace: bool = False,
+    ) -> Callable[[], None]:
+        """Add one job; returns the undo that removes or restores it."""
+
+    def unregister(self, job_name: str) -> None:
+        """Drop one job, whatever registered it."""
 
     def scoped(self, ctx: Any) -> Any:
         """A per-plugin view: ``add`` is attributed and unwinds with the plugin."""

@@ -112,6 +112,11 @@ def test_it_declares_what_it_reads_without_requiring() -> None:
         "workspace_root",
         "registry",
         "scheduler_config_loader",
+        # The two contribution registries a run reads. Optional, not injected:
+        # a composition with neither still schedules, and the builder's defaults
+        # carry the built-ins.
+        "system_jobs",
+        "delivery_targets",
     }
 
 

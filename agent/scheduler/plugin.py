@@ -64,6 +64,12 @@ class SchedulerPlugin:
         "workspace_root",
         "registry",
         "scheduler_config_loader",
+        # The two contribution registries a run reads. Optional rather than
+        # injected: a composition with neither still schedules (the builder's
+        # defaults carry the built-ins), and requiring them would make a minimal
+        # composition unable to schedule at all.
+        "system_jobs",
+        "delivery_targets",
     )
 
     def setup(self, ctx: Any) -> None:
@@ -97,6 +103,13 @@ class SchedulerPlugin:
             # nothing used, while the service's connection stayed open -- two handles to
             # one file and only one of them ever closed.
             store=store,
+            # The composition's registries, when it has them. This is the seam
+            # that makes a plugin's contribution reach a run: the target types
+            # and system jobs live in the composition's registry, and a builder
+            # that fell back to the process-wide one would run a set that no
+            # plugin ever contributed to -- silently, because both are valid.
+            system_jobs=ctx.get("system_jobs", None),
+            delivery_targets=ctx.get("delivery_targets", None),
         )
         ctx.provide("scheduler", service)
 

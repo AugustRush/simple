@@ -73,6 +73,13 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "commands",
     ),
     (
+        "agent.scheduler.system_jobs",
+        "SystemJobRegistry",
+        "agent.scheduler.protocols",
+        "SystemJobService",
+        "system_jobs",
+    ),
+    (
         "agent.scheduler.delivery_targets",
         "DeliveryTargetRegistry",
         "agent.scheduler.protocols",
