@@ -293,7 +293,11 @@ function ReportRow({ item }: { item: Message }) {
       <span className="report-mark" aria-hidden="true"><RobotOutlined /></span>
       <div className="report-main">
         <div className="report-head">
-          <strong>{item.title || '一次定时任务'}</strong>
+          {/* A report is no longer only a scheduled run's verdict -- the agent
+              also reports on its own goals here. The old fallback named a
+              scheduled task, so a goal report appeared to be about a task
+              that did not exist. */}
+          <strong>{item.title || '来自它'}</strong>
           {label && <span className="report-status">{label}</span>}
           {item.createdAt && (
             <span className="report-at" title={formatDateTime(item.createdAt, true)}>

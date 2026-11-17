@@ -29,7 +29,7 @@ from typing import Any
 __all__ = ["_notify_test"]
 
 
-async def _notify_test(request: Any, *, authorized, config) -> Any:
+async def _notify_test(request: Any, *, authorized) -> Any:
     """Send one real notification down every configured path.
 
     Returns per-path results rather than a single boolean: "the banner did not
@@ -131,12 +131,24 @@ async def _send_feishu_test(chat_id: str, text: str) -> dict[str, Any]:
     send, and a check that builds its own request would pass while the agent's
     own deliveries failed. That is the same rule the provider test follows.
     """
+    from agent.config import load_config
+
+    cfg, _ = load_config()
+    # Ask before sending, so the answer is a sentence about the config rather
+    # than the delivery layer's own English error ("Feishu delivery requires
+    # app_id and app_secret") shown in a Chinese settings page. The existing
+    # /api/feishu/test says the same thing in the same words; two buttons that
+    # test the same channel must not explain the same problem differently.
+    feishu = _feishu_section(cfg)
+    if not feishu.get("app_id") or not feishu.get("app_secret"):
+        return {
+            "ok": False,
+            "detail": "还没有配置飞书应用（app_id / app_secret），在下面「高级 JSON」里填",
+        }
     try:
-        from agent.config import load_config
         from agent.scheduler import DeliveryTarget
         from agent.scheduler.delivery import SchedulerDelivery
 
-        cfg, _ = load_config()
         service = SchedulerDelivery(cfg)
         target = DeliveryTarget(
             target_type="feishu_chat",

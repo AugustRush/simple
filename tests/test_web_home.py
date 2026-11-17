@@ -379,6 +379,7 @@ def test_no_stores_is_an_empty_page_not_a_crash() -> None:
         # Nothing was ever set, which is different from "it decided nothing" --
         # the list is empty because there is no autonomy store to hold one.
         "goals": [],
+        "goals_total": 0,
     }
     assert body["activity"] == []
 

@@ -3989,3 +3989,51 @@ def test_promising_something_writes_it_down_as_a_commitment(home):
         assert "整理一份下载目录清单" in owed[0].payload["prompt"]
     finally:
         provider.close()
+
+
+def _registry_with(*tools: tuple[str, str]):
+    """A registry whose only tools are the ones named, for prompt rendering."""
+
+    class _Reg:
+        _prompt_generation = 1
+
+        def __init__(self) -> None:
+            self._tools = {
+                name: type("T", (), {"description": desc, "source": "builtin"})()
+                for name, desc in tools
+            }
+
+        def get_context(self, _key):
+            # The renderer asks for paths and a vision flag; the prompt lines
+            # this test is about do not depend on either.
+            return None
+
+    return _Reg()
+
+
+def test_the_goal_prompt_line_reaches_the_model(home):
+    """A tool nobody is told about is a tool the model never calls.
+
+    The prompt has one line per capability that needs a *habit* rather than a
+    call site, and this one is the only thing that makes the agent decide to set
+    a goal at all. It is also where a typo reaches the model verbatim, which is
+    how "A a later" survived two commits in the commit line while a commit
+    message claimed it was fixed -- so the assertion is on the rendered text,
+    not on the source.
+    """
+    from pathlib import Path
+
+    from agent import config as config_module
+
+    inputs = config_module._static_prompt_inputs(
+        "base",
+        _registry_with(("set_goal", "Record a goal."), ("commit", "Record a promise.")),
+        Path("/ws"),
+        Path("/out"),
+        None,
+    )
+    prompt = config_module._render_static_prompt(inputs)
+
+    assert "set_goal" in prompt, "the goal habit must be stated"
+    assert "A a later" not in prompt, "the doubled article must not come back"
+    assert "A later that was never written down" in prompt

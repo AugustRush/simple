@@ -274,7 +274,7 @@ def test_the_test_button_reports_every_path_separately(monkeypatch):
 
     response = asyncio.run(
         web_notify._notify_test(
-            _notify_test_request(), authorized=lambda _r: True, config=None
+            _notify_test_request(), authorized=lambda _r: True
         )
     )
     import json
@@ -309,7 +309,7 @@ def test_an_unconfigured_chat_is_reported_as_skipped_not_failed(monkeypatch):
 
     response = asyncio.run(
         web_notify._notify_test(
-            _notify_test_request(), authorized=lambda _r: True, config=None
+            _notify_test_request(), authorized=lambda _r: True
         )
     )
     body = json.loads(bytes(response.body).decode())
@@ -344,7 +344,7 @@ def test_turning_desktop_off_is_said_rather_than_attempted(monkeypatch):
 
     response = asyncio.run(
         web_notify._notify_test(
-            _notify_test_request(), authorized=lambda _r: True, config=None
+            _notify_test_request(), authorized=lambda _r: True
         )
     )
     body = json.loads(bytes(response.body).decode())

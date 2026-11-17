@@ -1069,3 +1069,24 @@ def test_the_board_shows_a_goal_the_moment_it_is_set(store) -> None:
     assert len(goals) == 1
     assert goals[0]["goal"] == "整理一下这个项目的 README"
     assert goals[0]["why"] == "它现在过时了"
+
+
+def test_the_heading_counts_goals_not_rows(store) -> None:
+    """Three shown out of five is five on the heading, not three.
+
+    The panel previews a few and the heading is the only place the total can be
+    said. `scheduled_total` exists for exactly this reason; goals needed the
+    same field, and without it "它给自己定的目标 3" became a lie the moment it
+    set a fourth.
+    """
+    from agent.channels import web_home
+
+    for index in range(5):
+        store.set_goal(f"第 {index} 件事")
+
+    payload = web_home.build_home_overview(
+        scheduler_store=None, proposal_store=store
+    )
+
+    assert len(payload["board"]["goals"]) == web_home.BOARD_GOALS_PREVIEW
+    assert payload["board"]["goals_total"] == 5

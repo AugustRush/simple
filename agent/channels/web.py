@@ -2426,7 +2426,7 @@ class WebChannel(Channel):
     async def _notify_test(self, request: Any) -> Any:
         """Send one real notification down every configured path."""
         return await web_notify._notify_test(
-            request, authorized=self._authorized, config=self._config
+            request, authorized=self._authorized
         )
 
 

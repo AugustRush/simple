@@ -135,7 +135,12 @@ def build_home_overview(
     # commitment (owed to a person, at a time) and from a run (a task with an
     # instruction): a goal is an intention, and the panel is where an intention
     # becomes something the person can see and judge.
-    board["goals"] = _goals(proposal_store)
+    goals, goals_total = _goals(proposal_store)
+    board["goals"] = goals
+    # The panel shows three; the number on its heading has to be the number
+    # there are, or "它给自己定的目标 3" is a lie the moment it sets a fourth.
+    # Same shape as `scheduled_total`, for the same reason.
+    board["goals_total"] = goals_total
     return {
         "needs": _needs(scheduler_store, proposal_store),
         "board": board,
@@ -348,7 +353,7 @@ BOARD_COMMITMENTS_PREVIEW = 3
 BOARD_GOALS_PREVIEW = 3
 
 
-def _goals(proposal_store: Any) -> list[dict[str, Any]]:
+def _goals(proposal_store: Any) -> tuple[list[dict[str, Any]], int]:
     """The agent's own open intentions, oldest first.
 
     Read from the autonomy store rather than from the proposals table: a goal
@@ -358,12 +363,12 @@ def _goals(proposal_store: Any) -> list[dict[str, Any]]:
     the moment the person most wants to know.
     """
     if proposal_store is None:
-        return []
+        return [], 0
     try:
         rows = proposal_store.list_goals()
     except Exception:
-        return []
-    return [
+        return [], 0
+    preview = [
         {
             "goal_id": str(row.get("id") or ""),
             "goal": str(row.get("goal") or "")[:160],
@@ -373,6 +378,7 @@ def _goals(proposal_store: Any) -> list[dict[str, Any]]:
         }
         for row in rows[:BOARD_GOALS_PREVIEW]
     ]
+    return preview, len(rows)
 
 
 def _commitments(scheduler_store: Any, *, now: datetime) -> list[dict[str, Any]]:

@@ -282,6 +282,8 @@ export function renderBoardPanel(ctx: AppCtx) {
   const working = board?.working ?? []
   const promised = board?.commitments ?? []
   const goals = board?.goals ?? []
+  // The heading counts goals, not rows: three shown out of five is five.
+  const goalsTotal = Number(board?.goals_total ?? goals.length)
   const scheduledTotal = Number(board?.scheduled_total || 0)
 
   /** Open a task's detail: the drawer lives on 自动化, so arriving there is part of
@@ -311,7 +313,7 @@ export function renderBoardPanel(ctx: AppCtx) {
     // promise is a claim on the person's plan, and it is the one number here
     // that is about *them* rather than about the machinery.
     promised.length ? `${promised.length} 件答应过你` : '',
-    goals.length ? `${goals.length} 个自己的目标` : '',
+    goalsTotal ? `${goalsTotal} 个自己的目标` : '',
     working.length ? `${working.length} 件在做` : '',
     inFlight.length ? `${inFlight.length} 个在跑` : '',
     scheduledTotal ? `${scheduledTotal} 个已排期` : '',
@@ -358,7 +360,7 @@ export function renderBoardPanel(ctx: AppCtx) {
           {goals.length > 0 && (
             <section className="panel-group panel-group-goals">
               <div className="panel-group-head">
-                它给自己定的目标<span className="panel-group-count">{goals.length}</span>
+                它给自己定的目标<span className="panel-group-count">{goalsTotal}</span>
               </div>
               {goals.map(row => (
                 <div

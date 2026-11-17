@@ -405,6 +405,8 @@ export interface HomeOverview {
     commitments?: CommitmentRow[]
     //: Goals it set for itself, on its own initiative.
     goals?: GoalRow[]
+    //: How many there are, when the preview shows fewer.
+    goals_total?: number
   }
   activity: HomeActivity[]
   //: Cursor for the next page of the timeline. Empty when the first page came

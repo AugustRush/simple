@@ -347,7 +347,14 @@ def _event_rows(
                     {
                         "role": "report",
                         "content": text,
-                        "title": str(payload.get("task_name") or ""),
+                        # `task_name` is what a run report carries; `title` is
+                        # what a report about something that is *not* a run
+                        # carries (a goal the agent decided to drop). Both land
+                        # in the same row, so the reader sees a heading either
+                        # way -- without the fallback the goal report rendered
+                        # under the placeholder "一次定时任务", which said the
+                        # wrong thing about where the sentence came from.
+                        "title": str(payload.get("task_name") or payload.get("title") or ""),
                         "status": str(payload.get("status") or ""),
                         "taskId": str(payload.get("task_id") or ""),
                         "runId": str(payload.get("run_id") or ""),

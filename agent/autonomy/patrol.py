@@ -322,6 +322,10 @@ class PatrolService:
         try:
             from agent import reports
 
+            # `title`, not `task_name`: this is not a run, and naming it as one
+            # is how the row came to render under "一次定时任务". The journaler
+            # prefers `task_name` and falls back to `title` (see
+            # SessionService._event_rows).
             reports.publish(
                 {
                     "kind": "goal_abandoned",
