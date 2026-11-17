@@ -49,6 +49,7 @@ from agent.core.turn_context import (
     preview_text as _preview_text,
     trace_latency as _trace_latency,
 )
+from agent.core.outstanding import outstanding_block
 from agent.core.turn_state import _ContentFilterRecovery, _TurnLoopState
 from agent.core.event_domains import TurnStarted
 from agent.core.tool_watchdog import ToolLoopWatchdog
@@ -443,6 +444,15 @@ def prepare_turn(
                 + html.escape(checkpoint_summary, quote=False)
                 + "\n</session_checkpoint>"
             )
+        # What it is already on the hook for: promises it made and goals it set
+        # for itself. Neither was ever mentioned to the agent after being
+        # written down, so a promise made on Monday was invisible on Tuesday and
+        # a goal could only be rediscovered by calling `list_goals` for no
+        # reason. It rides here rather than in the system prompt for the same
+        # reason the clock does -- it changes whenever one is kept or closed.
+        outstanding = outstanding_block()
+        if outstanding:
+            turn_blocks.append(outstanding)
         # retrieve_implicit_context() covers both recent staging-buffer turns
         # (not yet consolidated) and historical LTM hits.  Skipping the
         # staging side would let recently-compacted turns drop from view.
