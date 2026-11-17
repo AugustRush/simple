@@ -612,7 +612,7 @@ function ProvidersCard({
 }
 
 export function createSettingsView(ctx: AppCtx) {
-  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   // The save controls must survive a scroll: the page is longer than the
@@ -852,15 +852,33 @@ export function createSettingsView(ctx: AppCtx) {
                       只发失败。设了它，关掉页面也能收到；不设就只有本机通知。
                     </span>
                   </div>
-                  <Form.Item name="notify_chat_id" noStyle>
-                    <Select
-                      allowClear
-                      className="settings-pref-control settings-pref-select"
-                      placeholder="不发送"
-                      onDropdownVisibleChange={open => { if (open && !feishuChats.length) void loadFeishuChats() }}
-                      options={feishuChats.map(chat => ({ value: chat.chat_id, label: chat.name || chat.chat_id }))}
-                    />
-                  </Form.Item>
+                  <Space.Compact className="settings-pref-control">
+                    <Form.Item name="notify_chat_id" noStyle>
+                      <Select
+                        allowClear
+                        className="settings-pref-select"
+                        placeholder="不发送"
+                        onDropdownVisibleChange={open => { if (open && !feishuChats.length) void loadFeishuChats() }}
+                        options={feishuChats.map(chat => ({ value: chat.chat_id, label: chat.name || chat.chat_id }))}
+                      />
+                    </Form.Item>
+                    {/* The settings are a promise the page cannot verify on its
+                        own: a banner needs a notification centre and a terminal
+                        with permission; a Feishu mirror needs the app's send
+                        scope and a chat id the bot can post in. The moment you
+                        find out is a failed run nobody heard -- so the page
+                        sends one now, down every path, and says per path what
+                        happened. It reads the *saved* config, which is why it
+                        sits here rather than pretending to test the form. */}
+                    <Tooltip title="按已保存的配置，真的发一条到每个通道">
+                      <Button
+                        loading={notifyTesting}
+                        onClick={() => void testNotification()}
+                      >
+                        测试通知
+                      </Button>
+                    </Tooltip>
+                  </Space.Compact>
                 </div>
               </section>
             </Form>

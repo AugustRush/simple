@@ -225,3 +225,131 @@ def test_disabled_means_disabled(monkeypatch):
     )
     assert sent is False
     assert calls == []
+
+
+# ── proving, from the settings page, that a failure would reach you ─────────
+
+
+def _notify_test_request():
+    """A minimal request object: the handler reads nothing but auth headers."""
+
+    class _Request:
+        headers: dict[str, str] = {}
+
+    return _Request()
+
+
+def test_the_test_button_reports_every_path_separately(monkeypatch):
+    """\"The banner failed but the chat message went\" is the answer that helps.
+
+    A single boolean would throw away which path to fix.
+    """
+    import asyncio
+
+    from agent.channels import web_notify
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_desktop(title, message, **_kw):
+        sent.append(("desktop", message))
+        return True
+
+    async def fake_feishu(chat_id, text):
+        sent.append(("feishu", chat_id))
+        return {"ok": True, "detail": "已发到选定的会话，去飞书看一眼"}
+
+    monkeypatch.setattr(
+        "agent.channels.desktop_notify.notify", fake_desktop, raising=False
+    )
+    monkeypatch.setattr(web_notify, "_send_feishu_test", fake_feishu)
+    monkeypatch.setattr(
+        web_notify,
+        "_feishu_section",
+        lambda cfg: {"notify_chat_id": "oc-1"},
+    )
+    monkeypatch.setattr(
+        "agent.config.load_config",
+        lambda: ({"notifications": {"desktop": True}, "channels": {}}, ""),
+    )
+
+    response = asyncio.run(
+        web_notify._notify_test(
+            _notify_test_request(), authorized=lambda _r: True, config=None
+        )
+    )
+    import json
+
+    body = json.loads(bytes(response.body).decode())
+
+    assert body["ok"] is True
+    by_channel = {item["channel"]: item for item in body["channels"]}
+    assert by_channel["desktop"]["ok"] is True
+    assert by_channel["feishu"]["ok"] is True
+    assert {name for name, _ in sent} == {"desktop", "feishu"}
+
+
+def test_an_unconfigured_chat_is_reported_as_skipped_not_failed(monkeypatch):
+    """\"Nothing is set up\" and \"it is set up and broken\" are different answers."""
+    import asyncio
+    import json
+
+    from agent.channels import web_notify
+
+    async def fake_desktop(title, message, **_kw):
+        return True
+
+    monkeypatch.setattr(
+        "agent.channels.desktop_notify.notify", fake_desktop, raising=False
+    )
+    monkeypatch.setattr(web_notify, "_feishu_section", lambda cfg: {})
+    monkeypatch.setattr(
+        "agent.config.load_config",
+        lambda: ({"notifications": {"desktop": True}}, ""),
+    )
+
+    response = asyncio.run(
+        web_notify._notify_test(
+            _notify_test_request(), authorized=lambda _r: True, config=None
+        )
+    )
+    body = json.loads(bytes(response.body).decode())
+    by_channel = {item["channel"]: item for item in body["channels"]}
+
+    assert by_channel["feishu"]["skipped"] is True
+    assert by_channel["feishu"]["ok"] is False
+    assert "还没选" in by_channel["feishu"]["detail"]
+
+
+def test_turning_desktop_off_is_said_rather_than_attempted(monkeypatch):
+    """A disabled channel is skipped, not silently reported as working."""
+    import asyncio
+    import json
+
+    from agent.channels import web_notify
+
+    attempted: list[str] = []
+
+    async def fake_desktop(title, message, **_kw):
+        attempted.append(message)
+        return True
+
+    monkeypatch.setattr(
+        "agent.channels.desktop_notify.notify", fake_desktop, raising=False
+    )
+    monkeypatch.setattr(web_notify, "_feishu_section", lambda cfg: {})
+    monkeypatch.setattr(
+        "agent.config.load_config",
+        lambda: ({"notifications": {"desktop": False}}, ""),
+    )
+
+    response = asyncio.run(
+        web_notify._notify_test(
+            _notify_test_request(), authorized=lambda _r: True, config=None
+        )
+    )
+    body = json.loads(bytes(response.body).decode())
+    by_channel = {item["channel"]: item for item in body["channels"]}
+
+    assert attempted == [], "a disabled channel must not be attempted"
+    assert by_channel["desktop"]["skipped"] is True
+    assert body["ok"] is False, "nothing left, so nothing reached the person"

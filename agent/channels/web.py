@@ -9,6 +9,7 @@ response for non-streaming calls).
 from __future__ import annotations
 from agent.channels import web_signals
 from agent.channels import web_uploads
+from agent.channels import web_notify
 from agent.channels import web_providers
 from agent.channels import web_requests
 from agent.channels import web_assets
@@ -2422,6 +2423,13 @@ class WebChannel(Channel):
                 f"飞书消息发送失败：code={resp.code} msg={resp.msg}"
             )
 
+    async def _notify_test(self, request: Any) -> Any:
+        """Send one real notification down every configured path."""
+        return await web_notify._notify_test(
+            request, authorized=self._authorized, config=self._config
+        )
+
+
     async def _feishu_test(self, request: Any) -> Any:
         """A short test message to one chat, before the user trusts the form.
 
@@ -3216,6 +3224,10 @@ class WebChannel(Channel):
             Route("/api/fs/pick-directory", self._pick_directory, methods=["POST"]),
             Route("/api/feishu/chats", self._feishu_chats, methods=["GET"]),
             Route("/api/feishu/test", self._feishu_test, methods=["POST"]),
+            # One real notification down every configured path, so the settings
+            # page can answer "would a failure actually reach me?" before the
+            # failure does.
+            Route("/api/notify/test", self._notify_test, methods=["POST"]),
             Route("/api/signals", self._signals, methods=["GET"]),
             Route("/api/workflows", self._workflows, methods=["GET"]),
             Route("/api/workflows", self._create_workflow, methods=["POST"]),

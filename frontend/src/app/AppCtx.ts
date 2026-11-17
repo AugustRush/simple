@@ -208,6 +208,9 @@ export interface AppCtx {
   feishuChats: FeishuChatInfo[]
   feishuTesting: boolean
   sendFeishuTest: (chatId: string) => Promise<void>
+  /** Send one real notification down every configured path and report each. */
+  testNotification: () => Promise<void>
+  notifyTesting: boolean
   feishuChatsError: string
   loadFeishuChats: () => Promise<void>
   feishuChatsLoaded: boolean

@@ -26,6 +26,7 @@ export function useSettings(deps: Deps) {
   const [feishuChatsError, setFeishuChatsError] = useState('')
 
   const [feishuTesting, setFeishuTesting] = useState(false)
+  const [notifyTesting, setNotifyTesting] = useState(false)
 
   const [pickingDirectory, setPickingDirectory] = useState(false)
 
@@ -113,6 +114,35 @@ export function useSettings(deps: Deps) {
       // already surfaced as a toast; there is nothing more specific to say.
     } finally {
       setFeishuTesting(false)
+    }
+  }, [api, messageApi])
+
+  /** Send one real notification down every configured path.
+   *
+   * The settings are a promise the page cannot otherwise verify: a banner
+   * depends on the platform, a Feishu mirror on the app's send scope and on the
+   * chat id naming a chat the bot can post in. The moment you find out is a
+   * failed run nobody heard, so the page asks now, and reports per path.
+   */
+  const testNotification = useCallback(async () => {
+    setNotifyTesting(true)
+    try {
+      const resp = await api('/api/notify/test', { method: 'POST' })
+      const body = await resp.json().catch(() => ({}))
+      const channels: { channel: string; ok: boolean; skipped: boolean; detail: string }[] =
+        Array.isArray(body?.channels) ? body.channels : []
+      for (const item of channels) {
+        const label = item.channel === 'desktop' ? '本机通知' : '飞书'
+        const text = `${label}：${item.detail}`
+        if (item.ok) messageApi.success(text)
+        else if (item.skipped) messageApi.info(text)
+        else messageApi.error(text)
+      }
+      if (!channels.length) messageApi.warning('没有任何可用的通知通道')
+    } catch {
+      // The server's own message already surfaced as a toast.
+    } finally {
+      setNotifyTesting(false)
     }
   }, [api, messageApi])
 
@@ -500,5 +530,5 @@ export function useSettings(deps: Deps) {
     setCurrentModel(model)
   }
 
-  return { activateProvider, activeProviderName, applyToken, config, configText, currentProvider, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, loadSettings, mergeSettingsForm, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, setConfig, setConfigText, setCurrentProvider, setFeishuChats, setFeishuChatsError, setFeishuChatsLoaded, setFeishuChatsLoading, setFeishuTesting, setPickingDirectory, setSettingsDirty, setThinkingEffortOptions, setTokenDraft, settingsDirty, settingsModelOptions, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } as const
+  return { activateProvider, activeProviderName, applyToken, config, configText, currentProvider, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, notifyTesting, testNotification, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, loadSettings, mergeSettingsForm, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, setConfig, setConfigText, setCurrentProvider, setFeishuChats, setFeishuChatsError, setFeishuChatsLoaded, setFeishuChatsLoading, setFeishuTesting, setPickingDirectory, setSettingsDirty, setThinkingEffortOptions, setTokenDraft, settingsDirty, settingsModelOptions, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } as const
 }
