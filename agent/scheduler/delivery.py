@@ -5,13 +5,24 @@ from pathlib import Path
 from typing import Optional
 
 from agent import shared
+from .delivery_targets import DeliveryTargetRegistry, shared_registry
 from .models import DeliveryResult, DeliveryTarget
 
 
 class SchedulerDelivery:
-    def __init__(self, cfg: dict, output_root: Optional[Path] = None):
+    def __init__(
+        self,
+        cfg: dict,
+        output_root: Optional[Path] = None,
+        targets: Optional[DeliveryTargetRegistry] = None,
+    ):
         self.cfg = cfg
         self.output_root = output_root or (shared.DEFAULT_OUTPUT_DIR / "scheduler")
+        # Taken, not built: a composition that registered a target type must be
+        # the same registry the runs read, and the process-wide default is what
+        # the two callers with no composition get.  A registry built here would
+        # be a second answer to "what can this install deliver to".
+        self.targets = targets if targets is not None else shared_registry()
 
     async def deliver_standalone(
         self, task_id: str, run_id: str, text: str
@@ -31,36 +42,28 @@ class SchedulerDelivery:
         text: str,
         output_dir: Optional[Path] = None,
     ) -> str:
-        if target.target_type != "feishu_chat":
-            raise ValueError(f"Unsupported channel target: {target.target_type}")
-        from agent.channels.feishu import FeishuConfig, FeishuOutputSink, build_feishu_client
+        """Hand *text* to whichever sender claims this target type.
 
-        feishu_cfg = self.cfg.get("channels", {}).get("feishu", {})
-        if not feishu_cfg.get("app_id") or not feishu_cfg.get("app_secret"):
-            raise RuntimeError("Feishu delivery requires app_id and app_secret")
-        # An explicit receive_id_type wins over the chat_type heuristic: the
-        # schedule editor writes one because every chat it offers came from
-        # the bot's chat list, which only hands out chat_ids -- and the
-        # heuristic would read "p2p" and try open_id on a value that is not
-        # one.  Old targets without the field keep guessing as before.
-        receive_id_type = str(target.payload.get("receive_id_type", "")).strip()
-        if not receive_id_type:
-            receive_id_type = (
-                "chat_id"
-                if target.payload.get("chat_type", "p2p") == "group"
-                else "open_id"
+        The lookup is the whole change: this used to be
+        ``if target.target_type != "feishu_chat": raise``, so the only way to
+        deliver anywhere else was to edit this file. The refusal now names the
+        types that *are* available, because "Unsupported channel target: slack"
+        leaves the reader guessing whether the name is wrong or the capability
+        is missing -- and those want different fixes.
+        """
+        sender = self.targets.sender_for(target.target_type)
+        if sender is None:
+            available = ", ".join(self.targets.types()) or "(none registered)"
+            raise ValueError(
+                f"Unsupported channel target: {target.target_type!r}; "
+                f"this install can deliver to: {available}"
             )
-        sink = FeishuOutputSink(
-            client=build_feishu_client(FeishuConfig(**feishu_cfg)),
-            receive_id_type=receive_id_type,
-            receive_id=target.payload["chat_id"],
-            reply_message_id=None,
+        return await sender(
+            target=target,
+            text=text,
+            cfg=self.cfg,
             output_dir=output_dir,
-            streaming=False,
         )
-        await sink._send_response_async(text)
-        await sink.drain()
-        return "delivered"
 
     async def deliver(
         self,

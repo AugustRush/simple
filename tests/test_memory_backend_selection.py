@@ -40,6 +40,7 @@ def test_a_default_composition_is_unchanged() -> None:
         "channels",
         "channel.web",
         "channel.feishu",
+        "delivery_targets",
         "registry",
         "skill_catalog",
         "ralph",

@@ -212,6 +212,16 @@ SERVICES: tuple[ServiceDeclaration, ...] = (
         ),
     ),
     ServiceDeclaration(
+        name="delivery_targets",
+        plugin_visible=True,
+        contract="agent/scheduler/protocols.py:DeliveryTargetService",
+        summary=(
+            "Where a run's output can be delivered.  A plugin contributes a target type "
+            "with ``ctx.delivery_targets.add(name, sender)``, which is what turns "
+            "\"deliver to Slack\" from an edit to the scheduler into a plugin."
+        ),
+    ),
+    ServiceDeclaration(
         name="agent_core",
         plugin_visible=False,
         contract="agent/runtime/protocols.py:AgentCoreService",

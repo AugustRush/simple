@@ -28,6 +28,10 @@ def test_the_declaration_names_every_core_plugin() -> None:
         "channels",
         "channel.web",
         "channel.feishu",
+        # Where a run's output can be delivered. A core plugin rather than a
+        # branch in `SchedulerDelivery`, so a plugin can add a target type the
+        # way it can add a channel or a tool.
+        "delivery_targets",
         "registry",
         "skill_catalog",
         "ralph",

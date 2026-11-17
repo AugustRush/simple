@@ -102,6 +102,12 @@ def _skill_catalog(_: CoreContext) -> Any:
     return SkillCatalogPlugin()
 
 
+def _delivery_targets(_: CoreContext) -> Any:
+    from agent.scheduler.delivery_targets_plugin import DeliveryTargetsPlugin
+
+    return DeliveryTargetsPlugin()
+
+
 def _ralph(_: CoreContext) -> Any:
     from agent.ralph.plugin import RalphPlugin
 
@@ -194,6 +200,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         name="channel.feishu",
         summary="the Feishu channel; contributes when `channels.feishu.enabled` is set",
         factory=_feishu_channel,
+    ),
+    CorePlugin(
+        name="delivery_targets",
+        summary=(
+            "where a run's output can be delivered; provides `delivery_targets`, "
+            "which a plugin contributes a target type to"
+        ),
+        factory=_delivery_targets,
+        provides=("delivery_targets",),
     ),
     CorePlugin(
         name="registry",
