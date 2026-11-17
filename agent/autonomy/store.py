@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -69,6 +70,40 @@ CREATE TABLE IF NOT EXISTS patrol_ticks (
 );
 CREATE INDEX IF NOT EXISTS idx_patrol_ticks_at
     ON patrol_ticks(tick_at);
+
+-- What the agent decided to work towards on its own.  Three other tables look
+-- adjacent and are each a different promise:
+--
+--   proposals   -- "here is something I found; may I?"  (the patrol's guess)
+--   goals       -- "I intend to bring this about"       (its own intention)
+--
+-- A goal is not a scheduled task either: a task is an instruction with a time,
+-- a goal is a desired state it may reach however it likes.  Keeping them
+-- separate is what lets "it is working towards something" be a fact the board
+-- can show without pretending it is a schedule.
+CREATE TABLE IF NOT EXISTS goals (
+    id TEXT PRIMARY KEY,
+    goal TEXT NOT NULL,
+    -- Why it decided this was worth doing.  Written for the person, not for the
+    -- model: a goal with no stated reason is indistinguishable from a whim, and
+    -- the person is the one who has to decide whether to trust it.
+    why TEXT NOT NULL DEFAULT '',
+    -- How it will know it is done.  Empty is allowed (some goals are "keep an
+    -- eye on X"), but a goal that can never be checked can never be closed
+    -- either, so the page says so when it is missing.
+    done_when TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    -- How many times the patrol has proposed working on it.  Bounded, because a
+    -- goal that keeps being proposed and never progresses is a goal that should
+    -- be abandoned rather than retried forever.
+    attempts INTEGER NOT NULL DEFAULT 0,
+    source_session TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_goals_status
+    ON goals(status, created_at);
 """
 
 
@@ -450,6 +485,129 @@ class ProposalStore:
             ).fetchone()
         return str(row["state"]) if row is not None else None
 
+
+    # -- goals: what it decided to work towards on its own -----------------
+
+    #: How many times the patrol may propose continuing one goal before it is
+    #: abandoned. Bounded on purpose: a goal that keeps being offered and never
+    #: moves is not persistence, it is a loop that has stopped being useful.
+    MAX_GOAL_ATTEMPTS = 3
+
+    def set_goal(
+        self,
+        goal: str,
+        *,
+        why: str = "",
+        done_when: str = "",
+        source_session: str = "",
+        now: Optional[datetime] = None,
+    ) -> str:
+        """Record one intention of the agent's own. Returns its id.
+
+        The same goal twice is one goal: an agent that restates its intention
+        every turn would fill the list with copies of itself, and the board
+        would read as "it is doing three things" when it is doing one.
+        """
+        text = " ".join(str(goal or "").split())
+        if not text:
+            raise ValueError("goal must not be empty")
+        moment = _iso(now or datetime.now(UTC))
+        with self._transaction() as conn:
+            existing = conn.execute(
+                "SELECT id FROM goals WHERE status = 'open' AND lower(trim(goal)) = lower(trim(?))",
+                (text,),
+            ).fetchone()
+            if existing is not None:
+                # Refreshing the reason is the useful half of a restatement; the
+                # attempt count stays, because restating a goal is not progress.
+                conn.execute(
+                    "UPDATE goals SET why = ?, done_when = ?, updated_at = ? WHERE id = ?",
+                    (
+                        str(why or "").strip(),
+                        str(done_when or "").strip(),
+                        moment,
+                        existing["id"],
+                    ),
+                )
+                return str(existing["id"])
+            goal_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO goals (id, goal, why, done_when, status, attempts,
+                                   source_session, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'open', 0, ?, ?, ?)
+                """,
+                (
+                    goal_id,
+                    text,
+                    str(why or "").strip(),
+                    str(done_when or "").strip(),
+                    str(source_session or ""),
+                    moment,
+                    moment,
+                ),
+            )
+        return goal_id
+
+    def list_goals(self, *, status: str = "open") -> list[dict[str, Any]]:
+        """Goals in one state, oldest first (the thing waiting longest goes first)."""
+        with self._transaction() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM goals WHERE status = ? ORDER BY created_at ASC",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM goals ORDER BY created_at ASC"
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def close_goal(
+        self,
+        goal_id: str,
+        *,
+        status: str = "done",
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Finish or abandon one goal. ``False`` when it was not open."""
+        if status not in ("done", "abandoned"):
+            raise ValueError(f"not a closing status: {status}")
+        moment = _iso(now or datetime.now(UTC))
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE goals SET status = ?, closed_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'open'",
+                (status, moment, moment, str(goal_id or "").strip()),
+            ).rowcount
+        return bool(changed)
+
+    def note_goal_attempt(
+        self, goal_id: str, *, now: Optional[datetime] = None
+    ) -> int:
+        """Count one more proposal to continue this goal; abandon it at the cap.
+
+        Returns the attempt count afterwards. The abandonment is *not* silent --
+        the caller reports it, because "I stopped trying" is exactly the kind of
+        thing an autonomous agent must say out loud rather than let fade.
+        """
+        moment = _iso(now or datetime.now(UTC))
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE goals SET attempts = attempts + 1, updated_at = ? WHERE id = ?",
+                (moment, str(goal_id or "").strip()),
+            )
+            row = conn.execute(
+                "SELECT attempts FROM goals WHERE id = ?", (str(goal_id or "").strip(),)
+            ).fetchone()
+            attempts = int(row["attempts"]) if row is not None else 0
+            if attempts >= self.MAX_GOAL_ATTEMPTS:
+                conn.execute(
+                    "UPDATE goals SET status = 'abandoned', closed_at = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'open'",
+                    (moment, moment, str(goal_id or "").strip()),
+                )
+        return attempts
 
 def open_proposal_store(home: Optional[Path] = None) -> ProposalStore:
     """``<agent home>/autonomy/proposals.db``."""

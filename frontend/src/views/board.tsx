@@ -281,6 +281,7 @@ export function renderBoardPanel(ctx: AppCtx) {
   const scheduled = board?.scheduled ?? []
   const working = board?.working ?? []
   const promised = board?.commitments ?? []
+  const goals = board?.goals ?? []
   const scheduledTotal = Number(board?.scheduled_total || 0)
 
   /** Open a task's detail: the drawer lives on 自动化, so arriving there is part of
@@ -302,7 +303,7 @@ export function renderBoardPanel(ctx: AppCtx) {
   }
 
   const nothingToDo =
-    waiting.length + inFlight.length + working.length + promised.length + scheduledTotal === 0
+    waiting.length + inFlight.length + working.length + promised.length + goals.length + scheduledTotal === 0
 
   // The panel's first line, and the only sentence most visits need.
   const rest = [
@@ -310,6 +311,7 @@ export function renderBoardPanel(ctx: AppCtx) {
     // promise is a claim on the person's plan, and it is the one number here
     // that is about *them* rather than about the machinery.
     promised.length ? `${promised.length} 件答应过你` : '',
+    goals.length ? `${goals.length} 个自己的目标` : '',
     working.length ? `${working.length} 件在做` : '',
     inFlight.length ? `${inFlight.length} 个在跑` : '',
     scheduledTotal ? `${scheduledTotal} 个已排期` : '',
@@ -350,6 +352,33 @@ export function renderBoardPanel(ctx: AppCtx) {
                   <AttentionCard key={card.task_id} card={card} onOpen={openTask} />
                 ),
               )}
+            </section>
+          )}
+
+          {goals.length > 0 && (
+            <section className="panel-group panel-group-goals">
+              <div className="panel-group-head">
+                它给自己定的目标<span className="panel-group-count">{goals.length}</span>
+              </div>
+              {goals.map(row => (
+                <div
+                  className="panel-row panel-row-goal"
+                  key={row.goal_id}
+                  // No click: a goal has no page of its own, and the row already
+                  // carries the two things that matter -- what it intends and
+                  // why it decided that.
+                  title={row.why || undefined}
+                >
+                  <span className="panel-row-dot panel-row-dot-goal" aria-hidden="true" />
+                  <span className="panel-row-main">
+                    <strong>{row.goal}</strong>
+                    {row.why && <span>{row.why}</span>}
+                  </span>
+                  {row.attempts > 0 && (
+                    <span className="panel-row-when">提过 {row.attempts} 次</span>
+                  )}
+                </div>
+              ))}
             </section>
           )}
 

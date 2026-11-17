@@ -33,6 +33,7 @@ from . import builtin_web_tools
 from . import builtin_plugin_tools
 from . import builtin_schedule_tools
 from . import builtin_memory_tools
+from . import builtin_goal_tools
 from . import builtin_file_tools
 from .memory_tools import MemoryTools
 from .output_tools import OutputTools
@@ -43,6 +44,7 @@ from .shell_tools import ShellTools
 from .plugin_tools import PluginTools
 from .signal_tools import SignalTools
 from .schedule_tools import ScheduleTools
+from .goal_tools import GoalTools, goal_store
 from .step_output_tools import (
     READ_STEP_OUTPUT_DEFAULT_CHARS,
     READ_STEP_OUTPUT_MAX_CHARS,
@@ -147,6 +149,9 @@ class BuiltinTools:
         self._context_tools = ContextTools(
             self.registry, context_manager, self._ok, self._error
         )
+        self._goal_tools = GoalTools(
+            self.registry, goal_store, self._ok, self._error
+        )
         self._plugin_tools = PluginTools(self.registry)
         self._cached_schedule_store: Any = None
         self._register()
@@ -195,6 +200,8 @@ class BuiltinTools:
         builtin_memory_tools.register_memory_tools(r, memory_tools=self._memory_tools, context_tools=self._context_tools)
 
         builtin_schedule_tools.register_schedule_tools(r, schedule_tools=self._schedule_tools)
+
+        builtin_goal_tools.register_goal_tools(r, goal_tools=self._goal_tools)
 
         builtin_signal_tools.register_signal_tools(r, signal_tools=self._signal_tools, step_output_tools=self._step_output_tools)
 

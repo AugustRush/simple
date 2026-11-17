@@ -203,3 +203,12 @@
   font-size: 13px !important;
   font-weight: 600 !important;
 }
+
+/* A goal it set for itself: the one group on this panel that is neither owed to
+   the person nor running right now. It gets the accent dot rather than the
+   running group's amber — amber means "in flight", and a goal may be waiting
+   for nothing at all. The attempt count is the honest signal: a goal proposed
+   three times has been tried, not just imagined. */
+.panel-row-goal { cursor: default; }
+.panel-row-dot-goal { background: var(--accent); }
+.panel-row-goal .panel-row-main span { color: var(--text-muted); }

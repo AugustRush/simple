@@ -131,6 +131,11 @@ def build_home_overview(
     # the panel answered "is anything happening" from runs alone, so a goal being
     # worked on looked like nothing at all.
     board["working"] = _working(work_store)
+    # What it decided to work towards on its own. A different promise from a
+    # commitment (owed to a person, at a time) and from a run (a task with an
+    # instruction): a goal is an intention, and the panel is where an intention
+    # becomes something the person can see and judge.
+    board["goals"] = _goals(proposal_store)
     return {
         "needs": _needs(scheduler_store, proposal_store),
         "board": board,
@@ -336,6 +341,38 @@ BOARD_WORKING_PREVIEW = 3
 #: How many promises the panel shows. A board is glanced at; the rest are one
 #: click away on 自动化.
 BOARD_COMMITMENTS_PREVIEW = 3
+
+
+#: How many goals the rail shows. A board is glanced at; the rest live in the
+#: autonomy page.
+BOARD_GOALS_PREVIEW = 3
+
+
+def _goals(proposal_store: Any) -> list[dict[str, Any]]:
+    """The agent's own open intentions, oldest first.
+
+    Read from the autonomy store rather than from the proposals table: a goal
+    exists the moment it is set, whether or not the patrol has offered to
+    continue it yet. Showing only goals that already have a proposal would make
+    the panel silent exactly when the agent first decided something -- which is
+    the moment the person most wants to know.
+    """
+    if proposal_store is None:
+        return []
+    try:
+        rows = proposal_store.list_goals()
+    except Exception:
+        return []
+    return [
+        {
+            "goal_id": str(row.get("id") or ""),
+            "goal": str(row.get("goal") or "")[:160],
+            "why": str(row.get("why") or "")[:160],
+            "attempts": int(row.get("attempts") or 0),
+            "created_at": str(row.get("created_at") or ""),
+        }
+        for row in rows[:BOARD_GOALS_PREVIEW]
+    ]
 
 
 def _commitments(scheduler_store: Any, *, now: datetime) -> list[dict[str, Any]]:

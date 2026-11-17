@@ -207,7 +207,11 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         # `request_quote` are not a session id, which is what the patrol's first
         # attempt to join on them assumed.
         writers=("agent/core/turn_loop.py",),
-        readers=("agent/tools/schedule_tools.py",),
+        # Two readers now, for the same reason: a commitment records the
+        # conversation that made it, and a goal records the conversation that
+        # decided it. Both are "why does this row exist" questions that cannot
+        # be answered from the row's own text.
+        readers=("agent/tools/schedule_tools.py", "agent/tools/goal_tools.py"),
     ),
     ContextKey(
         key="live_sessions",

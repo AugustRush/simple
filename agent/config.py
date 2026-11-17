@@ -1446,6 +1446,17 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "person plans around promises. Ask yourself: if this process restarted "
                 "right after this turn, would this still be owed?"
             )
+        if "set_goal" in builtin_names:
+            lines.append(
+                "You are not only reactive. When you decide — on your own, without being "
+                "asked — that a state is worth reaching (a half-finished piece of work, "
+                "something you noticed is wrong, an improvement the person would want), "
+                "record it with `set_goal` and say why in their terms. A goal authorises "
+                "nothing: reaching it still goes through the same tool permissions. "
+                "Do not set a goal for what they asked for (just do it) or for what you "
+                "promised (that is `commit`). Close goals you reach or drop — a list that "
+                "only grows teaches the person to stop reading it."
+            )
         if "schedule_runs" in builtin_names:
             lines.append(
                 "A scheduled task runs with nobody watching, so read back what "

@@ -333,6 +333,15 @@ export interface HomeActivity {
 //: columns use it for three different facts (when it started / when it failed /
 //: when it will fire) and a single unlabelled timestamp would be ambiguous.
 //: One goal being worked on: the long-running unit of work.
+//: One goal the agent set for itself: what it intends, and why.
+export interface GoalRow {
+  goal_id: string
+  goal: string
+  why: string
+  attempts: number
+  created_at: string
+}
+
 //: One promise: what it said it would do, and when it comes due.
 export interface CommitmentRow {
   task_id: string
@@ -394,6 +403,8 @@ export interface HomeOverview {
     working?: WorkingRow[]
     //: Promises it made in conversation and has not kept yet.
     commitments?: CommitmentRow[]
+    //: Goals it set for itself, on its own initiative.
+    goals?: GoalRow[]
   }
   activity: HomeActivity[]
   //: Cursor for the next page of the timeline. Empty when the first page came

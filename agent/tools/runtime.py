@@ -367,6 +367,12 @@ class ToolRegistry:
         # state write -- but not `requires_intent`: a promise may be the
         # agent's own initiative, and there is no user sentence to quote.
         ("builtin", "commit"): frozenset({"state_write"}),
+        ("builtin", "list_goals"): frozenset({"read"}),
+        # A goal is a row in the autonomy store: a state write, and like
+        # `commit` it is not `requires_intent` -- setting a goal is the agent's
+        # own initiative, so there is no user sentence to quote.
+        ("builtin", "set_goal"): frozenset({"state_write"}),
+        ("builtin", "close_goal"): frozenset({"state_write"}),
         ("builtin", "web_search"): frozenset({"read"}),
         ("builtin", "web_fetch"): frozenset({"read"}),
         ("builtin", "tavily_search"): frozenset({"read"}),

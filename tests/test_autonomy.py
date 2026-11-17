@@ -991,3 +991,81 @@ def test_a_patrol_pass_prunes_its_own_history(store) -> None:
 
     # Only the pass that just ran is inside the window.
     assert store.tick_stats()["passes"] == 1
+
+
+# ── goals: what it decided to work towards on its own ───────────────────────
+
+
+def test_a_goal_is_recorded_and_the_same_one_restated_is_one_goal(store) -> None:
+    """An agent that restates its intention every turn would fill the list."""
+    first = store.set_goal(
+        "把广告循环做成可复用的脚本",
+        why="你昨天说想每天自动跑",
+        done_when="脚本能独立跑完一轮",
+    )
+    second = store.set_goal(
+        "把广告循环做成可复用的脚本", why="理由说得更清楚了"
+    )
+
+    assert first == second
+    (row,) = store.list_goals()
+    assert row["why"] == "理由说得更清楚了", "a restatement refreshes the reason"
+    assert row["attempts"] == 0, "restating is not progress"
+
+
+def test_a_goal_is_abandoned_after_the_attempt_cap(store) -> None:
+    """A goal offered forever is not persistence, it is a loop."""
+    goal_id = store.set_goal("做一件一直做不完的事")
+
+    for _ in range(store.MAX_GOAL_ATTEMPTS):
+        store.note_goal_attempt(goal_id)
+
+    assert store.list_goals() == [], "no longer open"
+    abandoned = store.list_goals(status="abandoned")
+    assert len(abandoned) == 1
+    assert abandoned[0]["closed_at"]
+
+
+def test_closing_a_goal_twice_does_nothing_the_second_time(store) -> None:
+    """The first closing is the record; a second must not rewrite it."""
+    goal_id = store.set_goal("一件做完的事")
+
+    assert store.close_goal(goal_id, status="done") is True
+    assert store.close_goal(goal_id, status="abandoned") is False
+
+
+def test_a_goal_produces_one_proposal_per_pass_not_one_per_attempt(store) -> None:
+    """The proposal table dedupes; the patrol must not fight it.
+
+    Without this the same goal would appear as a new row every ten minutes and
+    the person's review queue would be one goal repeated forever.
+    """
+    from agent.autonomy.patrol import PatrolService
+
+    store.set_goal("让脚本能在早上自动跑")
+    patrol = PatrolService(store=store, sessions_provider=lambda: [])
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    first = patrol.raise_goal_proposals(now)
+    second = patrol.raise_goal_proposals(now)
+
+    assert first == 1
+    assert second == 0, "the live proposal already exists"
+    assert len(store.list_proposals(state="proposed")) == 1
+
+
+def test_the_board_shows_a_goal_the_moment_it_is_set(store) -> None:
+    """Before any proposal: the moment it decided is what the person wants to see."""
+    from agent.channels import web_home
+
+    store.set_goal("整理一下这个项目的 README", why="它现在过时了")
+
+    payload = web_home.build_home_overview(
+        scheduler_store=None, proposal_store=store
+    )
+
+    goals = payload["board"]["goals"]
+    assert len(goals) == 1
+    assert goals[0]["goal"] == "整理一下这个项目的 README"
+    assert goals[0]["why"] == "它现在过时了"

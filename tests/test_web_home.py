@@ -376,6 +376,9 @@ def test_no_stores_is_an_empty_page_not_a_crash() -> None:
         # nothing is being worked on, and that is the honest answer.
         "working": [],
         "commitments": [],
+        # Nothing was ever set, which is different from "it decided nothing" --
+        # the list is empty because there is no autonomy store to hold one.
+        "goals": [],
     }
     assert body["activity"] == []
 

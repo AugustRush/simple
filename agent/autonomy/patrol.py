@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from . import PatrolOptions, patrol_tick
+from . import PatrolOptions, Proposal, patrol_tick
 from .admission import AdmissionPolicy
 from .execute import execute_proposal
 from .rules import rule_candidates
@@ -253,6 +253,88 @@ class PatrolService:
         )
         return True
 
+    def raise_goal_proposals(self, now: Any) -> int:
+        """Offer to continue each open goal the agent set for itself.
+
+        Goals ride *outside* the session rules on purpose. Every rule in
+        ``rules.py`` reads a session row and is gated on how recently that
+        session was touched -- warm sessions are left alone, stale ones are
+        dropped. A goal has no such shape: it is an intention with no deadline,
+        and a goal set three weeks ago is exactly as live as one set yesterday.
+        Running it through the same gates would mean the agent forgets what it
+        decided to do precisely because it waited, which is the opposite of
+        persistence.
+
+        The proposal is the same kind every other rule produces, so the same
+        permission walls apply: continuing a goal means running agent work, and
+        that is not something a goal authorises by existing.
+
+        Returns how many proposals this pass wrote.
+        """
+        try:
+            goals = self.store.list_goals()
+        except Exception:  # noqa: BLE001 - a broken goal table is not a failed pass
+            logger.exception("patrol could not read its own goals")
+            return 0
+        written = 0
+        for goal in goals:
+            goal_id = str(goal.get("id") or "")
+            text = str(goal.get("goal") or "").strip()
+            if not goal_id or not text:
+                continue
+            why = str(goal.get("why") or "").strip()
+            proposal = Proposal(
+                source=f"goal:{goal_id}",
+                reason=why or "这是它给自己定的目标",
+                action=f"继续这个目标：{text}",
+                tool="",
+                reversibility="irreversible",
+                confidence=0.6,
+            )
+            # The context is what the page and the executor both need: which
+            # goal this is about, so answering "yes" continues *that* one.
+            proposal.context["goal_id"] = goal_id
+            proposal.context["admission"] = {
+                "answer": "prepare",
+                "reason": "继续一个目标要跑 agent 工作，不是一条可逆的小动作",
+            }
+            try:
+                recorded = self.store.record(proposal)
+            except Exception:  # noqa: BLE001
+                logger.exception("patrol could not propose continuing a goal")
+                continue
+            if not recorded:
+                continue
+            written += 1
+            try:
+                attempts = self.store.note_goal_attempt(goal_id, now=now)
+            except Exception:  # noqa: BLE001
+                attempts = 0
+            if attempts >= getattr(self.store, "MAX_GOAL_ATTEMPTS", 3):
+                # Saying it out loud is the whole point: a goal that quietly
+                # stops being pursued is worse than one that was never set,
+                # because the person believed something was in hand.
+                self._report_goal_abandoned(text, attempts)
+        return written
+
+    def _report_goal_abandoned(self, goal: str, attempts: int) -> None:
+        """Say that a goal is being dropped, where the person will see it."""
+        try:
+            from agent import reports
+
+            reports.publish(
+                {
+                    "kind": "goal_abandoned",
+                    "title": "放弃了一个目标",
+                    "text": (
+                        f"我给自己定的目标「{goal}」提了 {attempts} 次都没推进，"
+                        "先放下了。想要的话，跟我说一声，我重新捡起来。"
+                    ),
+                }
+            )
+        except Exception:  # noqa: BLE001 - a report must not fail a pass
+            logger.exception("patrol could not report an abandoned goal")
+
     def read_back_outcomes(self) -> int:
         """Attach each acted-on proposal's run result to the proposal. Returns how many.
 
@@ -342,6 +424,13 @@ class PatrolService:
             suggest=rule_candidates,
             on_auto=self._act_on_auto,
         )
+        # The agent's own intentions, offered once per pass. Outside the session
+        # rules because a goal has no session shape -- see raise_goal_proposals.
+        try:
+            result["goals_proposed"] = self.raise_goal_proposals(now)
+        except Exception:  # noqa: BLE001 - a broken goal table is not a failed pass
+            logger.exception("patrol could not raise its own goals")
+            result["goals_proposed"] = 0
         # Expiry is part of the pass: a proposal nobody answered is not live
         # forever, and the table is what the next pass reads.
         try:
