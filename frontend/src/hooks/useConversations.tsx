@@ -5,7 +5,7 @@ import { parseRoute } from '../lib/route'
 import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
 import { isInTurnUserMessage, isSessionBusy, sessionStateBusy } from '../lib/tools'
-import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState } from '../types'
+import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState, TurnVersion } from '../types'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
@@ -2187,6 +2187,7 @@ export function useConversations(deps: Deps) {
     item => item.role === 'user' && !isInTurnUserMessage(item),
   )
 
+
   // Keep a calm rhythm for short conversations, then compress the rail as
   // history grows so the indicator remains a compact page-edge affordance.
   const conversationGap = Math.max(
@@ -2269,5 +2270,86 @@ export function useConversations(deps: Deps) {
     !isStreaming &&
     String(sessionState?.operation_state || 'idle') === 'idle'
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, deliverMode, deliverModeLabel, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDeliverMode, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPermissionLevel, setQueuedMessages, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  // ── versions of the newest turn ────────────────────────────────────────────
+  //
+  // Rewinding used to delete the turn it replaced, so editing a sentence
+  // destroyed the answer it replaced. The server now keeps that version; this is
+  // what lets the reader see it and switch back.
+  //
+  // Fetched only when it can exist -- a rewind happened -- because asking for
+  // every turn on every load would be a request per turn for a list that is
+  // empty on nearly all of them.
+  const [turnVersions, setTurnVersions] = useState<TurnVersion[]>([])
+  const [switchingVersion, setSwitchingVersion] = useState(false)
+
+  const loadTurnVersions = useCallback(
+    async (turnIndex: number): Promise<void> => {
+      const sid = activeSessionRef.current
+      if (!sid || turnIndex < 1) {
+        setTurnVersions([])
+        return
+      }
+      try {
+        const resp = await api(
+          `/api/sessions/${encodeURIComponent(sid)}/turns/${turnIndex}/versions`,
+        )
+        if (!resp.ok) {
+          setTurnVersions([])
+          return
+        }
+        const body = await resp.json().catch(() => ({}))
+        const versions: TurnVersion[] = Array.isArray(body?.versions) ? body.versions : []
+        // One version is not a choice: the switcher renders nothing for it, and
+        // holding it in state would keep a re-render scheduled for no reason.
+        setTurnVersions(versions.length > 1 ? versions : [])
+      } catch {
+        setTurnVersions([])
+      }
+    },
+    [api],
+  )
+
+  const switchTurnVersion = useCallback(
+    async (turnIndex: number, branchId: string): Promise<void> => {
+      const sid = activeSessionRef.current
+      if (!sid || !branchId) return
+      setSwitchingVersion(true)
+      try {
+        const resp = await api(
+          `/api/sessions/${encodeURIComponent(sid)}/turns/${turnIndex}/switch`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ branch_id: branchId }),
+          },
+        )
+        const body = await resp.json().catch(() => ({}))
+        if (!resp.ok) {
+          messageApi.error(String(body?.error || `切换失败（${resp.status}）`))
+          return
+        }
+        // Re-read the transcript rather than patching it: a switch swaps a whole
+        // turn (its request, its answer and its tool rows), which is more than a
+        // local edit can describe.
+        await loadMessages(sid)
+        await loadTurnVersions(turnIndex)
+      } catch {
+        messageApi.error('切换失败')
+      } finally {
+        setSwitchingVersion(false)
+      }
+    },
+    [api, loadMessages, loadTurnVersions, messageApi],
+  )
+
+  // The newest turn is the only one that can have versions (only it can be
+  // rewound), so that is the only index asked about. Re-fetched when the count
+  // changes -- a rewind creates one, and a new turn moves the position.
+  const turnCount = conversationTurns.length
+  useEffect(() => {
+    if (isStreaming) return
+    void loadTurnVersions(turnCount)
+  }, [activeSession, turnCount, isStreaming, loadTurnVersions])
+
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, refreshSessionTitles, openConversation, canRewind, editLastTurn, regenerateLastTurn, rewindLastTurn, activeSession, activeSessionRef, activity, addFiles, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, currentModelRef, deliverMode, deliverModeLabel, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDeliverMode, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPermissionLevel, setQueuedMessages, setResumingTaskId, setSandboxMode, setSendShortcut, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, taskGuidanceVisible, toggleTraceExpanded, turnRefs, turnVersions, switchTurnVersion, switchingVersion, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

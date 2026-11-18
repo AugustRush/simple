@@ -28,6 +28,7 @@ import { formatDateTime, relativeTime } from '../lib/format'
 import { markdownToHtml } from '../lib/markdown'
 import { fileHref, mediaKindForUrl } from '../lib/media'
 import { subagentCounts } from '../lib/subagent'
+import type { TurnVersion } from '../types'
 import { isInTurnUserMessage, countToolStates, describeToolStates, summariseToolDots, toolAttentionLabel, toolStateLabel } from '../lib/tools'
 import type { Message, SubAgentNote } from '../types'
 import { REVERSIBILITY_LABEL, RUN_STATUS_LABEL } from '../views/board'
@@ -44,6 +45,11 @@ export interface MessageListProps {
   canRewind: boolean
   onEditLast: () => void
   onRegenerateLast: () => void
+  //: Versions of the newest turn, when a rewind left more than one. Empty for
+  //: every conversation that was never edited -- which is most of them.
+  turnVersions?: TurnVersion[]
+  onSwitchVersion?: (branchId: string) => void
+  switchingVersion?: boolean
 }
 
 
@@ -375,6 +381,62 @@ const MemoReasoningNote = memo(ReasoningNote)
 const MemoSystemNote = memo(SystemNote)
 const MemoReportRow = memo(ReportRow)
 const MemoProposalNoticeRow = memo(ProposalNoticeRow)
+/** ``‹ 2 / 3 ›`` — the versions of one turn, when a rewind left more than one.
+
+ * A rewind used to delete the turn it replaced, so editing a sentence destroyed
+ * the answer it replaced. The server keeps that version now; this is the only
+ * affordance that makes it reachable.
+ *
+ * It reads as a *position*, not a list: the person does not want to see three
+ * request sentences side by side, they want "there is another answer here, show
+ * it to me". The request text is the tooltip, because it is what tells the
+ * versions apart when the answers look alike.
+ */
+function VersionSwitcher({
+  versions,
+  disabled,
+  onSelect,
+}: {
+  versions: TurnVersion[]
+  disabled: boolean
+  onSelect: (branchId: string) => void
+}) {
+  if (versions.length <= 1) return null
+  const index = versions.findIndex(item => item.selected)
+  const current = index < 0 ? versions.length - 1 : index
+  const go = (next: number) => {
+    const target = versions[next]
+    if (!target || target.selected) return
+    onSelect(target.branch_id)
+  }
+  return (
+    <span className="message-versions" aria-label="这一轮的版本">
+      <button
+        type="button"
+        className="message-versions-step"
+        aria-label="上一个版本"
+        disabled={disabled || current <= 0}
+        onClick={() => go(current - 1)}
+      >
+        ‹
+      </button>
+      <span className="message-versions-count" title={versions[current]?.request_text || ''}>
+        {current + 1} / {versions.length}
+      </span>
+      <button
+        type="button"
+        className="message-versions-step"
+        aria-label="下一个版本"
+        disabled={disabled || current >= versions.length - 1}
+        onClick={() => go(current + 1)}
+      >
+        ›
+      </button>
+    </span>
+  )
+}
+
+
 const MemoInterjectionRow = memo(InterjectionRow)
 
 
@@ -454,7 +516,7 @@ function ToolTrace({ tools, expanded, onToggle, traceId, activeSession, token }:
 const MemoToolTrace = memo(ToolTrace)
 
 
-function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyMessage, toggleTraceExpanded, traceTools, traceId, traceExpanded, subagentNotes, canEdit, canRegenerate, onEditLast, onRegenerateLast }: {
+function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyMessage, toggleTraceExpanded, traceTools, traceId, traceExpanded, subagentNotes, canEdit, canRegenerate, onEditLast, onRegenerateLast, versionSwitcher }: {
   item: Message
   activeSession: string | null
   token: string
@@ -470,6 +532,7 @@ function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyM
   canRegenerate?: boolean
   onEditLast?: () => void
   onRegenerateLast?: () => void
+  versionSwitcher?: React.ReactNode
 }) {
   if (item.role === 'tool') {
     return <MemoToolEvent item={item} activeSession={activeSession} token={token} />
@@ -532,6 +595,10 @@ function MessageRow({ item, activeSession, token, turnRefs, updateMessage, copyM
           )}
           {item.queued && <span className="message-queued">排队中</span>}
           {item.streaming && <span className="message-streaming">正在生成</span>}
+          {/* The versions of this turn, when a rewind left more than one. In the
+              meta line rather than beside the bubble: it is a property of the
+              turn ("which answer is this"), not an action on the text. */}
+          {versionSwitcher}
           {traceSummary}
         </div>
         {!isUser && <MemoReasoningNote item={item} updateMessage={updateMessage} />}
@@ -681,6 +748,9 @@ export function MessageList(props: MessageListProps) {
     canRewind,
     onEditLast,
     onRegenerateLast,
+    turnVersions,
+    onSwitchVersion,
+    switchingVersion,
   } = props
 
   // Grouped once per transcript, not once per render. This is what makes the
@@ -715,6 +785,19 @@ export function MessageList(props: MessageListProps) {
           toggleTraceExpanded={toggleTraceExpanded}
           canEdit={canRewind && user.id === lastUserId}
           onEditLast={onEditLast}
+          // Only the newest turn can have versions, and only while nothing is
+          // running: switching mid-turn would swap the history under the loop.
+          versionSwitcher={
+            user.id === lastUserId && turnVersions && turnVersions.length > 1 && onSwitchVersion
+              ? (
+                  <VersionSwitcher
+                    versions={turnVersions}
+                    disabled={!canRewind || Boolean(switchingVersion)}
+                    onSelect={onSwitchVersion}
+                  />
+                )
+              : undefined
+          }
         />,
       )
     }

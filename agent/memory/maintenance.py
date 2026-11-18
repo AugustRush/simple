@@ -21,6 +21,7 @@ _CLEAR_FRAME_FILES = ("maintenance.py", "store.py", "palace.py")
 
 __all__ = [
     "apply_retention",
+    "prune_archived_versions",
     "apply_decay",
     "clear_persistent_memory",
 ]
@@ -135,6 +136,33 @@ def apply_decay(
             pruned,
         )
     invalidate(set())
+
+
+def prune_archived_versions(conn, *, invalidate=None, days: int = 0) -> int:
+    """Drop replaced turns older than the retention window. Returns rows removed.
+
+    Nothing else deletes these: a version is written whenever a turn is replaced
+    and read only when somebody asks, so without this the archive is append-only
+    for the life of the install -- the same shape ``patrol_ticks`` had.
+
+    Retention is by *time*, not by count: "how far back can I go" should not
+    change because somebody edited more or less this month.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+
+    horizon_days = int(days or _helpers._ARCHIVED_VERSION_RETENTION_DAYS)
+    cutoff = (_dt.now(timezone.utc) - _td(days=horizon_days)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    removed = conn.execute(
+        "DELETE FROM conversation_turns_archive WHERE archived_at < ?", (cutoff,)
+    ).rowcount
+    conn.execute(
+        "DELETE FROM agent_events_archive WHERE archived_at < ?", (cutoff,)
+    )
+    if callable(invalidate):
+        invalidate(set())
+    return int(removed or 0)
 
 
 def apply_retention(

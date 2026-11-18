@@ -492,6 +492,13 @@ def list_turn_versions(
         SELECT branch_id,
                MIN(id) AS first_id,
                MIN(archived_at) AS archived_at,
+               -- When the version was *written*, not when it was archived.
+               -- Ordering by archival time mixes two clocks: a version that has
+               -- been live since Monday and was parked today would sort after a
+               -- version written this morning and parked this morning, so the
+               -- switcher's position depended on the switch history rather than
+               -- on the order the person wrote things in.
+               MIN(created_at) AS created_at,
                MAX(CASE WHEN role = 'user' THEN content END) AS request_text
         FROM conversation_turns_archive
         WHERE session_id = ? AND turn_index = ?
@@ -505,6 +512,7 @@ def list_turn_versions(
             "branch_id": str(row["branch_id"]),
             "request_text": str(row["request_text"] or ""),
             "archived_at": str(row["archived_at"] or ""),
+            "created_at": str(row["created_at"] or ""),
         }
         for row in rows
     ]

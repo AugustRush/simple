@@ -1234,3 +1234,44 @@ html[data-theme='light'] .tool-trace-items {
 .message-interjection.is-deferred .message-interjection-mark {
   color: var(--text-muted);
 }
+
+/* ── versions of a turn ───────────────────────────────────────────────────────
+   `‹ 2 / 3 ›` in the message meta line. A rewind used to delete the turn it
+   replaced; the version it replaced is now kept, and this is the only way back
+   to it. Deliberately quiet: it appears on the rare turn that was edited, and a
+   loud control there would draw the eye to the wrong thing. */
+.message-versions {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  margin-left: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.message-versions-step {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0 5px;
+  height: 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color .14s ease;
+}
+.message-versions-step:hover:not(:disabled) { color: var(--text); }
+.message-versions-step:disabled { opacity: .35; cursor: default; }
+.message-versions-step:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: 999px;
+}
+.message-versions-count {
+  padding: 0 2px;
+  color: var(--text-secondary);
+  cursor: default;
+}

@@ -58,7 +58,7 @@ function App() {
 
   const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
-  const { activateTurnIndex, activeSession, openConversation, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, deliverMode, deliverModeLabel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setDeliverMode, setInput, setPendingAttachments, setSendShortcut, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
+  const { activateTurnIndex, activeSession, openConversation, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, deliverMode, deliverModeLabel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setDeliverMode, setInput, setPendingAttachments, setSendShortcut, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, turnVersions, switchTurnVersion, switchingVersion, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
@@ -92,6 +92,9 @@ function App() {
     updateMessage,
     activeSession,
     canRewind,
+    turnVersions,
+    switchTurnVersion,
+    switchingVersion,
     editLastTurn,
     regenerateLastTurn,
     token,

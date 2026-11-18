@@ -262,7 +262,8 @@ def test_switching_moves_both_directions(store) -> None:
     versions = service.turn_versions(session, 2)
     assert [item["request_text"] for item in versions if not item["selected"]] == ["新提问"]
 
-    back = service.switch_turn_version(session, 2, versions[0]["branch_id"])
+    parked = [item["branch_id"] for item in versions if not item["selected"]][0]
+    back = service.switch_turn_version(session, 2, parked)
     assert back is not None
     assert _active(store, session)[-2:] == ["新提问", "新回答"]
 
@@ -282,3 +283,60 @@ def test_switching_to_a_version_that_is_gone_leaves_the_conversation_alone(store
 
     assert result is None
     assert _active(store, session) == before
+
+
+def test_the_order_is_stable_across_a_switch(store) -> None:
+    """The counter must name a position, not "whatever is showing now".
+
+    Measured in a browser: the archived versions always sorted first and the live
+    one was appended last, so the switcher read "2 / 2" no matter which version
+    was on screen -- the › button was permanently disabled and the ‹ button was
+    the only one that ever worked.
+    """
+    from agent.session_service import SessionService
+
+    session = "s1"
+    _turn(store, session, "第一句", "第一答", mid="m1")
+    _turn(store, session, "原提问", "原回答", mid="m2")
+    service = SessionService(store=store)
+    service._store_for_session = lambda _sid: store  # type: ignore[attr-defined]
+
+    rewound = service.rewind_last_turn(session)
+    _turn(store, session, "新提问", "新回答", mid="m3")
+
+    before = [(v["request_text"], v["selected"]) for v in service.turn_versions(session, 2)]
+    service.switch_turn_version(session, 2, rewound["branch_id"])
+    after = [(v["request_text"], v["selected"]) for v in service.turn_versions(session, 2)]
+
+    assert [text for text, _ in before] == [text for text, _ in after], (
+        "the list order must not depend on which version is showing"
+    )
+    # And exactly one is selected, in both directions.
+    assert [selected for _, selected in before] == [False, True]
+    assert [selected for _, selected in after] == [True, False]
+
+
+def test_the_archive_does_not_grow_forever(store) -> None:
+    """A version is written on every replace and read only on request.
+
+    Without a retention the archive is append-only for the life of the install --
+    the same shape `patrol_ticks` had before it grew one.
+    """
+    session = "s1"
+    _turn(store, session, "第一句", "第一答", mid="m1")
+    _turn(store, session, "第二句", "第二答", mid="m2")
+    seq = _seq_of_last_request(store, session)
+    _t, _e, branch_id, _i = store.archive_tail_from(session_id=session, from_seq=seq)
+
+    # Backdate the archived rows past the window, then run retention.
+    from agent.memory import maintenance
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE conversation_turns_archive SET archived_at = '2000-01-01 00:00:00'"
+        )
+        removed = maintenance.prune_archived_versions(conn)
+        conn.commit()
+
+    assert removed == 2
+    assert store.turn_versions(session_id=session, turn_index=2) == []

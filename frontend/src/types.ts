@@ -333,6 +333,14 @@ export interface HomeActivity {
 //: columns use it for three different facts (when it started / when it failed /
 //: when it will fire) and a single unlabelled timestamp would be ambiguous.
 //: One goal being worked on: the long-running unit of work.
+//: One version of a turn: what was asked, and whether it is the one showing.
+export interface TurnVersion {
+  branch_id: string
+  request_text: string
+  archived_at: string
+  selected: boolean
+}
+
 //: One goal the agent set for itself: what it intends, and why.
 export interface GoalRow {
   goal_id: string

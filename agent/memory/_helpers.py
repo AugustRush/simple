@@ -36,6 +36,13 @@ _RUN_SCRATCH_MAX_ACTIVE = 500
 # table without bound. 90 days keeps quarter-over-quarter comparisons
 # while staying bounded.
 _USAGE_EVENT_RETENTION_DAYS = 90
+
+#: How long a replaced turn is kept. Longer than the retention for scratch data,
+#: because the whole point of keeping a version is that somebody might want it
+#: back -- a week is not long enough to notice a question was edited and regret
+#: it. Bounded rather than forever: the archive is a convenience, and an
+#: unbounded table of every version ever written is a second transcript.
+_ARCHIVED_VERSION_RETENTION_DAYS = 90
 _FACT_QUERY_SUBJECT_ALIASES: dict[str, tuple[str, ...]] = {
     "assistant": (
         "assistant",

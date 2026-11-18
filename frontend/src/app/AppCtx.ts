@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, RunTranscriptRow, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage } from '../types'
+import type { AttachmentInfo, AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, RunTranscriptRow, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage, TurnVersion } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -19,6 +19,10 @@ export interface AppCtx {
   turnRefs: MutableRefObject<Record<string, HTMLDivElement | null>>
   copyMessage: (content: string) => void
   /** Whether the newest turn may be cut (idle, not streaming). */
+  /** Versions of the newest turn, when a rewind left more than one. */
+  turnVersions: TurnVersion[]
+  switchTurnVersion: (turnIndex: number, branchId: string) => Promise<void>
+  switchingVersion: boolean
   canRewind: boolean
   /** Rewind the newest turn and put its text back in the composer. */
   editLastTurn: () => void

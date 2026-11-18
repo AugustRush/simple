@@ -1461,22 +1461,31 @@ class SessionService:
         versions = read(session_id=clean, turn_index=int(turn_index))
         for item in versions:
             item["selected"] = False
-        live = self._live_turn_request(store, clean, int(turn_index))
+        live = self._live_turn_row(store, clean, int(turn_index))
         if live is not None:
             versions.append(
                 {
                     "branch_id": "",
-                    "request_text": live,
+                    "request_text": str(getattr(live, "content", "") or ""),
+                    # The live version's own creation time, so the list can be
+                    # ordered by *when each version was written* rather than by
+                    # "archived first, live last".  Without it the position of
+                    # the selected version is always the last one, and the
+                    # switcher reads "2 / 2" no matter which version is showing.
                     "archived_at": "",
+                    "created_at": str(getattr(live, "created_at", "") or ""),
                     "selected": True,
                 }
             )
+        # Oldest first, so "1 / 3" means "the first version written". The
+        # ordering has to be stable across switches or the counter is a lie --
+        # and it has to be by *creation* time on both sides, because an archived
+        # version's archival time is on a different clock from the live one's.
+        versions.sort(key=lambda item: str(item.get("created_at") or ""))
         return versions
 
-    def _live_turn_request(
-        self, store: Any, session_id: str, turn_index: int
-    ) -> Optional[str]:
-        """The request text of the turn currently showing at *turn_index*."""
+    def _live_turn_row(self, store: Any, session_id: str, turn_index: int) -> Any:
+        """The user row currently showing at *turn_index*, or ``None``."""
         rows = store.recent_conversation_turns(session_id=session_id, limit=500)
         seen = 0
         for row in rows:
@@ -1487,8 +1496,15 @@ class SessionService:
                 continue
             seen += 1
             if seen == turn_index:
-                return str(getattr(row, "content", "") or "")
+                return row
         return None
+
+    def _live_turn_request(
+        self, store: Any, session_id: str, turn_index: int
+    ) -> Optional[str]:
+        """The request text of the turn currently showing at *turn_index*."""
+        row = self._live_turn_row(store, session_id, turn_index)
+        return str(getattr(row, "content", "") or "") if row is not None else None
 
     def switch_turn_version(
         self, session_id: str, turn_index: int, branch_id: str
@@ -1503,8 +1519,20 @@ class SessionService:
         """
         clean = str(session_id or "").strip()
         branch = str(branch_id or "").strip()
-        if not clean or not branch:
+        if not clean:
             return None
+        if not branch:
+            # The live version has no branch id; asking to show it is asking for
+            # what is already on screen. A 404 would read as "that version is
+            # gone", which is the opposite of the truth.
+            return {
+                "session_id": clean,
+                "turn_index": int(turn_index),
+                "branch_id": "",
+                "already_showing": True,
+                "restored_turns": 0,
+                "restored_events": 0,
+            }
         live = self._live_states.get(clean)
         if live is not None:
             busy = str(getattr(live, "operation_state", "idle") or "idle") != "idle"

@@ -1086,12 +1086,19 @@ class LTMStore:
 
 
     def apply_retention(self) -> None:
-        """Apply locus-aware retention: decay episodes in-database, leave others untouched."""
+        """Apply locus-aware retention: decay episodes in-database, leave others untouched.
+
+        Also prunes replaced turns past their retention window, because the
+        archive is written by ``archive_tail_from`` and read only on request:
+        without this it is append-only, which is the shape ``patrol_ticks`` had
+        before it grew a retention of its own.
+        """
         with self._connect() as conn:
             maintenance.apply_retention(
                 conn,
                 invalidate=self._sync_after_mutation,
             )
+            maintenance.prune_archived_versions(conn)
 
 
     def maintenance_snapshot(self, limit: int = 20) -> str:
