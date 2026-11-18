@@ -1446,6 +1446,14 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "person plans around promises. Ask yourself: if this process restarted "
                 "right after this turn, would this still be owed?"
             )
+        lines.append(
+            "Each turn's context carries the current time twice: local first "
+            "(date, 星期, zone, offset) and UTC after it. Resolve 今天 / 明天 / "
+            "下周三 and every other relative date from the **local** one -- the UTC "
+            "date is the previous day for eight hours of every day in +08:00, so "
+            "computing from it silently answers about the wrong day. Use "
+            "`current_time` only when the person asks about a zone other than theirs."
+        )
         if "set_goal" in builtin_names:
             lines.append(
                 "You are not only reactive. When you decide — on your own, without being "

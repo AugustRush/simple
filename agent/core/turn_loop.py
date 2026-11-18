@@ -50,6 +50,7 @@ from agent.core.turn_context import (
     trace_latency as _trace_latency,
 )
 from agent.core.outstanding import outstanding_block
+from agent.core.clock import clock_line
 from agent.core.turn_state import _ContentFilterRecovery, _TurnLoopState
 from agent.core.event_domains import TurnStarted
 from agent.core.tool_watchdog import ToolLoopWatchdog
@@ -502,10 +503,7 @@ def prepare_turn(
         # at whatever precedes it for every request in the session.  Here it is
         # also more accurate -- the time of *this* turn, not of whichever turn
         # last re-rendered the prompt.
-        turn_blocks.append(
-            f"Current UTC time: {_now()}. "
-            "Use the current_time tool when the user asks about local time or timezone conversions."
-        )
+        turn_blocks.append(clock_line())
         # Size retrieval against the message it will actually ride in.  Sizing it
         # from the raw user message charged the window for a message that is
         # never sent: what goes out is `turn_context + "\n\n" + user_message`, so

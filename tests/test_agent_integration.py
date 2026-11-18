@@ -620,7 +620,7 @@ def test_a_turns_context_never_reaches_the_system_prompt(monkeypatch):
     # The volatile content is in the body, frozen -- and it is what the model
     # actually saw, which is the honest record of the turn.
     first_turn, second_turn = ctx.messages[0]["content"], ctx.messages[2]["content"]
-    for marker in ("<session_checkpoint", "<retrieved_context", "Current UTC time:"):
+    for marker in ("<session_checkpoint", "<retrieved_context", "Current time:"):
         assert marker in first_turn, marker
         assert marker in second_turn, marker
 
