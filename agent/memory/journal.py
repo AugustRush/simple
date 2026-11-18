@@ -327,3 +327,184 @@ def recent_agent_events_for_turns(
         (*ids, limit),
     ).fetchall()
     return [_row_mappers._row_to_agent_runtime_event(row) for row in reversed(rows)]
+
+
+# ── versions: where a replaced turn goes instead of being deleted ────────────
+#
+# Rewinding used to DELETE the tail, so editing a sentence destroyed the answer
+# it replaced.  The active table still holds exactly one path -- every reader is
+# unchanged -- and the replaced version is *moved* here.
+#
+# Both directions are moves, never deletes: switching to an older version keeps
+# the newer one, so a person cannot lose a branch by looking at it.
+
+
+def turn_index_of(conn, *, session_id: str, from_seq: int) -> int:
+    """Which turn (1-based, counted by requests) ``from_seq`` opens.
+
+    Counted from the *active* table, at archive time, and written down on the
+    archived rows: after the move the count changes, so "which turn was this"
+    would otherwise be unrecoverable.
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM conversation_turns
+        WHERE session_id = ? AND role = 'user' AND seq < ?
+        """,
+        (str(session_id or "").strip(), int(from_seq or 0)),
+    ).fetchone()
+    return int(row["n"] if row is not None else 0) + 1
+
+
+def archive_tail(
+    conn,
+    *,
+    session_id: str,
+    from_seq: int,
+    branch_id: str,
+    turn_index: int,
+    archived_by: str = "rewind",
+    now: str = "",
+) -> tuple[int, int]:
+    """Move every active row at or after ``from_seq`` into the archive.
+
+    Returns ``(turns_moved, events_moved)``.  The active table afterwards holds
+    exactly what a delete would have left -- which is what makes this invisible
+    to the 29 places that read it.
+    """
+    clean = str(session_id or "").strip()
+    start = int(from_seq or 0)
+    if not clean or start <= 0:
+        return 0, 0
+    moment = now or _now()
+    turns = conn.execute(
+        """
+        INSERT INTO conversation_turns_archive (
+            session_id, role, content, channel, message_id, reply_to_id,
+            metadata_json, created_at, seq, turn_index, branch_id,
+            archived_at, archived_by
+        )
+        SELECT session_id, role, content, channel, message_id, reply_to_id,
+               metadata_json, created_at, seq, ?, ?, ?, ?
+        FROM conversation_turns
+        WHERE session_id = ? AND seq >= ?
+        ORDER BY id
+        """,
+        (int(turn_index), str(branch_id), moment, str(archived_by), clean, start),
+    ).rowcount
+    events = conn.execute(
+        """
+        INSERT INTO agent_events_archive (
+            session_id, event_type, payload_json, turn_id, created_at, seq,
+            branch_id, archived_at
+        )
+        SELECT session_id, event_type, payload_json, turn_id, created_at, seq, ?, ?
+        FROM agent_events
+        WHERE session_id = ? AND seq >= ?
+        ORDER BY id
+        """,
+        (str(branch_id), moment, clean, start),
+    ).rowcount
+    conn.execute(
+        "DELETE FROM conversation_turns WHERE session_id = ? AND seq >= ?",
+        (clean, start),
+    )
+    conn.execute(
+        "DELETE FROM agent_events WHERE session_id = ? AND seq >= ?",
+        (clean, start),
+    )
+    return int(turns or 0), int(events or 0)
+
+
+def restore_branch(
+    conn,
+    *,
+    session_id: str,
+    branch_id: str,
+    now: str = "",
+) -> tuple[int, int]:
+    """Move one archived version back into the active tables.
+
+    The rows keep their original ``seq``: a position is an identity, and the
+    paging cursor already tolerates the gaps a rewind leaves (see
+    ``queries.truncate_transcript``).  Nothing is deleted from the archive until
+    the move has succeeded, so a failure half-way leaves the version where it
+    was rather than losing it.
+    """
+    clean = str(session_id or "").strip()
+    branch = str(branch_id or "").strip()
+    if not clean or not branch:
+        return 0, 0
+    turns = conn.execute(
+        """
+        INSERT INTO conversation_turns (
+            session_id, role, content, channel, message_id, reply_to_id,
+            metadata_json, created_at, seq
+        )
+        SELECT session_id, role, content, channel, message_id, reply_to_id,
+               metadata_json, created_at, seq
+        FROM conversation_turns_archive
+        WHERE session_id = ? AND branch_id = ?
+        ORDER BY id
+        """,
+        (clean, branch),
+    ).rowcount
+    events = conn.execute(
+        """
+        INSERT INTO agent_events (
+            session_id, event_type, payload_json, turn_id, created_at, seq
+        )
+        SELECT session_id, event_type, payload_json, turn_id, created_at, seq
+        FROM agent_events_archive
+        WHERE session_id = ? AND branch_id = ?
+        ORDER BY id
+        """,
+        (clean, branch),
+    ).rowcount
+    conn.execute(
+        "DELETE FROM conversation_turns_archive WHERE session_id = ? AND branch_id = ?",
+        (clean, branch),
+    )
+    conn.execute(
+        "DELETE FROM agent_events_archive WHERE session_id = ? AND branch_id = ?",
+        (clean, branch),
+    )
+    return int(turns or 0), int(events or 0)
+
+
+def list_turn_versions(
+    conn,
+    *,
+    session_id: str,
+    turn_index: int,
+) -> list[dict[str, Any]]:
+    """The replaced versions of one turn, oldest first.
+
+    One row per ``branch_id``: its request text (for the switcher's label) and
+    when it was replaced.  The version currently showing is not in here -- it is
+    in the active table -- and the caller adds it.
+    """
+    clean = str(session_id or "").strip()
+    if not clean:
+        return []
+    rows = conn.execute(
+        """
+        SELECT branch_id,
+               MIN(id) AS first_id,
+               MIN(archived_at) AS archived_at,
+               MAX(CASE WHEN role = 'user' THEN content END) AS request_text
+        FROM conversation_turns_archive
+        WHERE session_id = ? AND turn_index = ?
+        GROUP BY branch_id
+        ORDER BY first_id
+        """,
+        (clean, int(turn_index)),
+    ).fetchall()
+    return [
+        {
+            "branch_id": str(row["branch_id"]),
+            "request_text": str(row["request_text"] or ""),
+            "archived_at": str(row["archived_at"] or ""),
+        }
+        for row in rows
+    ]

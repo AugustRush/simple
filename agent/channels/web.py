@@ -2249,6 +2249,49 @@ class WebChannel(Channel):
             return JSONResponse({"error": "没有可以回退的一轮"}, status_code=404)
         return JSONResponse({"ok": True, **result})
 
+    async def _turn_versions(self, request: Any) -> Any:
+        """Which versions of one turn exist, and which is showing."""
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        try:
+            turn_index = int(request.path_params["turn_index"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "turn_index must be a number"}, status_code=400)
+        versions = self._service().turn_versions(session_id, turn_index)
+        return JSONResponse({"turn_index": turn_index, "versions": versions})
+
+    async def _switch_turn_version(self, request: Any) -> Any:
+        """Show a different version of one turn, keeping the one on screen."""
+        from starlette.responses import JSONResponse
+        from agent.session_service import SessionBusyError
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        try:
+            turn_index = int(request.path_params["turn_index"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "turn_index must be a number"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        branch_id = str((body or {}).get("branch_id") or "").strip()
+        if not branch_id:
+            return JSONResponse({"error": "branch_id is required"}, status_code=400)
+        try:
+            result = self._service().switch_turn_version(
+                session_id, turn_index, branch_id
+            )
+        except SessionBusyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        if result is None:
+            return JSONResponse({"error": "没有这个版本"}, status_code=404)
+        return JSONResponse({"ok": True, **result})
+
     async def _dismiss_task_guidance(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -3339,6 +3382,19 @@ class WebChannel(Channel):
             Route(
                 "/api/sessions/{session_id}/rewind",
                 self._rewind_session,
+                methods=["POST"],
+            ),
+            # The versions a rewind leaves behind. Rewinding used to delete the
+            # turn it replaced; these two endpoints are what makes that
+            # recoverable -- read which versions exist, then show a different one.
+            Route(
+                "/api/sessions/{session_id}/turns/{turn_index}/versions",
+                self._turn_versions,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/turns/{turn_index}/switch",
+                self._switch_turn_version,
                 methods=["POST"],
             ),
             Route(

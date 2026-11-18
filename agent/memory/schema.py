@@ -59,6 +59,53 @@ def _ensure_schema(conn) -> None:
             ON conversation_turns(session_id, id);
         CREATE INDEX IF NOT EXISTS idx_conversation_turns_created_at
             ON conversation_turns(created_at);
+        -- Where a replaced turn goes instead of being deleted.
+        --
+        -- Rewinding used to DELETE the tail, so editing a sentence destroyed the
+        -- answer it replaced.  The active table still holds exactly one path --
+        -- every reader is unchanged -- and the versions live beside it.
+        --
+        -- ``turn_index`` is written at archive time because it cannot be
+        -- recomputed later: the active table's row count changes, and "which
+        -- turn was this" has to survive that.  ``branch_id`` groups one version
+        -- (its request, its answer, its interjections) so switching moves a
+        -- whole version rather than guessing which rows belonged together.
+        CREATE TABLE IF NOT EXISTS conversation_turns_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT '',
+            message_id TEXT NOT NULL DEFAULT '',
+            reply_to_id TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            seq INTEGER NOT NULL DEFAULT 0,
+            turn_index INTEGER NOT NULL DEFAULT 0,
+            branch_id TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            archived_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_archive_session_turn
+            ON conversation_turns_archive(session_id, turn_index);
+        CREATE INDEX IF NOT EXISTS idx_archive_branch
+            ON conversation_turns_archive(branch_id);
+        -- The tool trace belongs to the version that produced it: switching back
+        -- to an answer whose tool calls were deleted would show a reply that
+        -- came from nowhere.
+        CREATE TABLE IF NOT EXISTS agent_events_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            turn_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            seq INTEGER NOT NULL DEFAULT 0,
+            branch_id TEXT NOT NULL,
+            archived_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_archive_branch
+            ON agent_events_archive(branch_id);
         CREATE TABLE IF NOT EXISTS session_meta (
             session_id TEXT PRIMARY KEY,
             title TEXT NOT NULL DEFAULT '',

@@ -1161,6 +1161,58 @@ class SqliteFtsStore:
                 ).rowcount
         return int(turns or 0), int(events or 0)
 
+    def archive_tail_from(
+        self, *, session_id: str, from_seq: int, archived_by: str = "rewind"
+    ) -> tuple[int, int, str, int]:
+        """Move the tail aside instead of deleting it.
+
+        Delegated to the same journal functions the built-in store uses: the two
+        stores share one schema, and a second copy of this logic is a second
+        place for "which turn was that" to be computed differently.
+        """
+        import uuid
+
+        from .. import journal
+
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                turn_index = journal.turn_index_of(
+                    conn, session_id=session_id, from_seq=from_seq
+                )
+                branch_id = uuid.uuid4().hex
+                turns, events = journal.archive_tail(
+                    conn,
+                    session_id=session_id,
+                    from_seq=from_seq,
+                    branch_id=branch_id,
+                    turn_index=turn_index,
+                    archived_by=archived_by,
+                )
+        return int(turns or 0), int(events or 0), branch_id, turn_index
+
+    def turn_versions(self, *, session_id: str, turn_index: int) -> list[dict]:
+        from .. import journal
+
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                return journal.list_turn_versions(
+                    conn, session_id=session_id, turn_index=turn_index
+                )
+
+    def restore_turn_version(
+        self, *, session_id: str, branch_id: str
+    ) -> tuple[int, int]:
+        from .. import journal
+
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                return journal.restore_branch(
+                    conn, session_id=session_id, branch_id=branch_id
+                )
+
     # ── working state, checkpoints, usage ───────────────────────────────────
 
     def save_session_working_state(

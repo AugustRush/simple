@@ -1410,10 +1410,21 @@ class SessionService:
                     live_cut = len(messages) - index
                     del messages[index:]
 
-        removed_turns, removed_events = store.truncate_transcript(
-            session_id=clean,
-            from_seq=seq,
-        )
+        # Moved aside, not deleted.  Rewinding is the only operation that
+        # replaces a turn, so this is the only place a version is created; the
+        # active table afterwards holds exactly what a delete would have left,
+        # which is why none of the transcript's readers changed.
+        archive_tail = getattr(store, "archive_tail_from", None)
+        if callable(archive_tail):
+            removed_turns, removed_events, branch_id, turn_index = archive_tail(
+                session_id=clean, from_seq=seq, archived_by="rewind"
+            )
+        else:  # a store predating versions: still correct, just not recoverable
+            removed_turns, removed_events = store.truncate_transcript(
+                session_id=clean,
+                from_seq=seq,
+            )
+            branch_id, turn_index = "", 0
         return {
             "session_id": clean,
             "user_text": text,
@@ -1421,9 +1432,131 @@ class SessionService:
             "seq": seq,
             "removed_turns": removed_turns,
             "removed_events": removed_events,
+            # The version this turn just became, so the client can offer it
+            # straight away instead of waiting for the next read to find it.
+            "branch_id": branch_id,
+            "turn_index": turn_index,
             "checkpoint_messages_removed": checkpoint_cut,
             "live_messages_removed": live_cut,
         }
+
+    def turn_versions(self, session_id: str, turn_index: int) -> list[dict[str, Any]]:
+        """The versions of one turn, oldest first, with which one is showing.
+
+        A version exists only where a turn was replaced -- which is only ever the
+        newest one, because that is the only turn ``rewind_last_turn`` will cut.
+        The selected version is the one in the active table; the rest are in the
+        archive. Both are reported here so the client renders one list rather
+        than merging two.
+        """
+        clean = str(session_id or "").strip()
+        if not clean:
+            return []
+        store = self._store_for_session(clean)
+        if store is None:
+            return []
+        read = getattr(store, "turn_versions", None)
+        if not callable(read):
+            return []
+        versions = read(session_id=clean, turn_index=int(turn_index))
+        for item in versions:
+            item["selected"] = False
+        live = self._live_turn_request(store, clean, int(turn_index))
+        if live is not None:
+            versions.append(
+                {
+                    "branch_id": "",
+                    "request_text": live,
+                    "archived_at": "",
+                    "selected": True,
+                }
+            )
+        return versions
+
+    def _live_turn_request(
+        self, store: Any, session_id: str, turn_index: int
+    ) -> Optional[str]:
+        """The request text of the turn currently showing at *turn_index*."""
+        rows = store.recent_conversation_turns(session_id=session_id, limit=500)
+        seen = 0
+        for row in rows:
+            if str(getattr(row, "role", "") or "") != "user":
+                continue
+            metadata = getattr(row, "metadata", {})
+            if isinstance(metadata, dict) and metadata.get("interjection"):
+                continue
+            seen += 1
+            if seen == turn_index:
+                return str(getattr(row, "content", "") or "")
+        return None
+
+    def switch_turn_version(
+        self, session_id: str, turn_index: int, branch_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Show a different version of one turn.
+
+        Symmetric with ``rewind_last_turn``: the version currently showing is
+        archived under a fresh id before the requested one is restored, so
+        looking at an old answer cannot lose the new one.  Only the newest turn
+        has versions, and only while nothing is running -- the same two refusals
+        a rewind has, for the same reasons.
+        """
+        clean = str(session_id or "").strip()
+        branch = str(branch_id or "").strip()
+        if not clean or not branch:
+            return None
+        live = self._live_states.get(clean)
+        if live is not None:
+            busy = str(getattr(live, "operation_state", "idle") or "idle") != "idle"
+            if busy or getattr(live, "restart_queue", None):
+                raise SessionBusyError("会话正在运行，结束这一轮之后再重试")
+        store = self._store_for_session(clean)
+        if store is None:
+            return None
+        archive = getattr(store, "archive_tail_from", None)
+        restore = getattr(store, "restore_turn_version", None)
+        if not callable(archive) or not callable(restore):
+            return None
+        request = self._live_turn_request(store, clean, int(turn_index))
+        if request is None:
+            return None
+        seq = self._seq_of_turn(store, clean, int(turn_index))
+        if seq <= 0:
+            return None
+        # Park the version that is showing, then bring the requested one back.
+        _t, _e, parked, _i = archive(
+            session_id=clean, from_seq=seq, archived_by="switch"
+        )
+        turns, events = restore(session_id=clean, branch_id=branch)
+        if turns <= 0:
+            # Nothing came back: put the showing version where it was rather than
+            # leaving an empty conversation behind a failed switch.
+            if parked:
+                restore(session_id=clean, branch_id=parked)
+            return None
+        return {
+            "session_id": clean,
+            "turn_index": int(turn_index),
+            "branch_id": branch,
+            "parked_branch_id": parked,
+            "restored_turns": turns,
+            "restored_events": events,
+        }
+
+    def _seq_of_turn(self, store: Any, session_id: str, turn_index: int) -> int:
+        """The seq the *turn_index*-th request sits at, counted in the active table."""
+        rows = store.recent_conversation_turns(session_id=session_id, limit=500)
+        seen = 0
+        for row in rows:
+            if str(getattr(row, "role", "") or "") != "user":
+                continue
+            metadata = getattr(row, "metadata", {})
+            if isinstance(metadata, dict) and metadata.get("interjection"):
+                continue
+            seen += 1
+            if seen == turn_index:
+                return int(getattr(row, "seq", 0) or 0)
+        return 0
 
     def session_data_path(self, session_id: str) -> Optional[Path]:
         """Materialize and return a Finder-friendly file for one session.

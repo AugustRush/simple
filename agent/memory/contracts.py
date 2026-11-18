@@ -237,6 +237,27 @@ class MemoryStore(Protocol):
         without the request it answered.
         """
 
+    def archive_tail_from(
+        self, *, session_id: str, from_seq: int, archived_by: str = "rewind"
+    ) -> "tuple[int, int, str, int]":
+        """Move the timeline's tail aside as one version; return what moved.
+
+        The same cut as :meth:`truncate_transcript`, except the rows are kept --
+        editing a sentence used to destroy the answer it replaced, and the only
+        way back is to have kept it.  Returns ``(turns, events, branch_id,
+        turn_index)``: the id names this version for a later switch, and the
+        index says which turn it replaced, which cannot be recomputed after the
+        move.
+        """
+
+    def turn_versions(self, *, session_id: str, turn_index: int) -> "list[dict]":
+        """The replaced versions of one turn, oldest first."""
+
+    def restore_turn_version(
+        self, *, session_id: str, branch_id: str
+    ) -> "tuple[int, int]":
+        """Move one archived version back into the active tables."""
+
     def message_has_answer(self, *, session_id: str, message_id: str) -> bool:
         """Whether this user message already has an assistant answer on disk."""
 

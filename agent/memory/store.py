@@ -601,12 +601,65 @@ class LTMStore:
             )
 
     def truncate_transcript(self, *, session_id: str, from_seq: int) -> tuple[int, int]:
-        """Cut this session's timeline at ``from_seq``; return what was removed."""
+        """Cut this session's timeline at ``from_seq``; return what was removed.
+
+        Kept for callers that really mean "discard" (a rewind that is *not* kept
+        as a version). The conversation's own rewind goes through
+        :meth:`archive_tail_from` instead, which moves the same rows aside so
+        they can be switched back to.
+        """
         with self._connect() as conn:
             return queries.truncate_transcript(
                 conn,
                 session_id=session_id,
                 from_seq=from_seq,
+            )
+
+
+    def archive_tail_from(
+        self, *, session_id: str, from_seq: int, archived_by: str = "rewind"
+    ) -> tuple[int, int, str, int]:
+        """Move the tail aside as one version; return what moved and its ids.
+
+        The active table afterwards holds exactly what a delete would have left,
+        which is what makes this invisible to every reader.  The version it came
+        from is identified by a fresh ``branch_id`` and the ``turn_index`` the
+        cut opened, both of which have to be written down now: after the move
+        the active row count no longer says which turn it was.
+        """
+        import uuid
+
+        with self._connect() as conn:
+            turn_index = journal.turn_index_of(
+                conn, session_id=session_id, from_seq=from_seq
+            )
+            branch_id = uuid.uuid4().hex
+            turns, events = journal.archive_tail(
+                conn,
+                session_id=session_id,
+                from_seq=from_seq,
+                branch_id=branch_id,
+                turn_index=turn_index,
+                archived_by=archived_by,
+            )
+        return turns, events, branch_id, turn_index
+
+
+    def turn_versions(self, *, session_id: str, turn_index: int) -> list[dict[str, Any]]:
+        """The replaced versions of one turn, oldest first."""
+        with self._connect() as conn:
+            return journal.list_turn_versions(
+                conn, session_id=session_id, turn_index=turn_index
+            )
+
+
+    def restore_turn_version(
+        self, *, session_id: str, branch_id: str
+    ) -> tuple[int, int]:
+        """Move one archived version back into the active tables."""
+        with self._connect() as conn:
+            return journal.restore_branch(
+                conn, session_id=session_id, branch_id=branch_id
             )
 
     def _rows_at_seqs(
