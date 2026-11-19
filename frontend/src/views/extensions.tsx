@@ -16,13 +16,14 @@ import {
   ApiOutlined,
   CopyOutlined,
   DeleteOutlined,
+  ExclamationCircleOutlined,
   SearchOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import { Button, Card, Col, Empty, Input, Row, Skeleton, Switch, Tag } from 'antd'
 
 export function renderCapabilities(ctx: AppCtx) {
-  const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
+  const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, unavailablePlugins, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
 
 
   // The two bodies behind the merged 扩展 page.  Each keeps its own toolbar
@@ -40,6 +41,31 @@ export function renderCapabilities(ctx: AppCtx) {
           className="workspace-search"
         />
       </div>
+
+      {/* The plugins that never came up, before the list of those that did.
+          A plugin waiting for a service and a plugin whose setup raised both used
+          to be *absent* from this page, which reads exactly like "not installed"
+          -- and the two need different fixes, so each says which it is. */}
+      {unavailablePlugins.length > 0 && (
+        <div className="plugin-unavailable" role="status">
+          <ExclamationCircleOutlined className="plugin-unavailable-icon" />
+          <div className="plugin-unavailable-body">
+            <strong>{unavailablePlugins.length} 个插件没有启动</strong>
+            <ul>
+              {unavailablePlugins.map(item => (
+                <li key={item.name}>
+                  <span className="plugin-unavailable-name">{item.name}</span>
+                  {item.state === 'pending' ? (
+                    <span>在等：{item.missing.join('、') || '（未记录依赖）'}</span>
+                  ) : (
+                    <span className="plugin-unavailable-error">{item.error || '启动时出错'}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 6 }} />

@@ -186,6 +186,22 @@ export interface PluginInfo {
   description?: string
   source?: string
   enabled?: boolean
+  /** `active` is the ordinary case; `pending` and `failed` are the ones worth showing. */
+  state?: 'active' | 'pending' | 'failed' | string
+  /** Services a pending plugin is waiting for. */
+  missing?: string[]
+  /** Why a failed plugin's setup raised. */
+  error?: string
+}
+
+//: A plugin the catalog knows about but that never loaded -- no version, no
+//: description, only a reason. Kept apart from `PluginInfo` because rendering it
+//: as a card would invent facts it does not have.
+export interface UnavailablePlugin {
+  name: string
+  state: 'pending' | 'failed' | string
+  missing: string[]
+  error: string
 }
 
 

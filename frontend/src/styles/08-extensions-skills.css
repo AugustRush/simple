@@ -336,3 +336,35 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
   font-weight: 700;
   letter-spacing: .1em;
 }
+
+/* Plugins that never came up.
+ *
+ * A plugin waiting for a service and a plugin whose setup raised were both
+ * *absent* from this list, which reads exactly like "not installed" -- and the
+ * two need different fixes. Amber, not red: nothing is broken, something is
+ * waiting or refused, and the row says which. */
+.plugin-unavailable {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: 10px;
+  background: var(--amber-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.plugin-unavailable-icon { flex: 0 0 auto; margin-top: 2px; color: var(--amber); }
+.plugin-unavailable-body { min-width: 0; }
+.plugin-unavailable-body strong { display: block; color: var(--text); font-weight: 600; }
+.plugin-unavailable-body ul { margin: 4px 0 0; padding-left: 18px; }
+.plugin-unavailable-body li { margin-top: 2px; }
+.plugin-unavailable-name {
+  margin-right: 6px;
+  color: var(--text);
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.plugin-unavailable-error { color: var(--red); }

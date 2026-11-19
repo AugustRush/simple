@@ -731,23 +731,48 @@ class WebChannel(Channel):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         plugins: list[dict[str, Any]] = []
         catalog = resolve(self._components, "plugin_catalog")
+        states: dict[str, dict[str, Any]] = {}
         if catalog is not None:
+            read_states = getattr(catalog, "plugin_states", None)
+            if callable(read_states):
+                try:
+                    states = read_states()
+                except Exception:
+                    states = {}
             list_plugins = getattr(catalog, "list_plugins", None)
             if callable(list_plugins):
                 try:
                     for meta in list_plugins():
+                        name = getattr(meta, "name", "unknown")
+                        state = states.get(str(name)) or {}
                         plugins.append(
                             {
-                                "name": getattr(meta, "name", "unknown"),
+                                "name": name,
                                 "version": getattr(meta, "version", "") or "",
                                 "description": getattr(meta, "description", "") or "",
                                 "source": getattr(meta, "source", "") or "",
                                 "enabled": bool(getattr(meta, "enabled", True)),
+                                # Active is the ordinary case; the other two are
+                                # the ones a person needs to see, because a plugin
+                                # that never came up registers nothing and looks
+                                # exactly like one that was never installed.
+                                "state": str(state.get("state") or "active"),
+                                "missing": [str(item) for item in (state.get("missing") or [])],
+                                "error": str(state.get("error") or ""),
                             }
                         )
                 except Exception:
                     plugins = []
-        return JSONResponse({"plugins": plugins})
+        # The ones that are *not* in the list above, because they never loaded.
+        # Reported separately rather than invented as entries: a pending plugin has
+        # no version or description to show, only a reason.
+        unavailable = [
+            {"name": name, **payload}
+            for name, payload in sorted(states.items())
+            if payload.get("state") in ("pending", "failed")
+            and not any(item["name"] == name for item in plugins)
+        ]
+        return JSONResponse({"plugins": plugins, "unavailable": unavailable})
 
     async def _skills(self, request: Any) -> Any:
         from starlette.responses import JSONResponse

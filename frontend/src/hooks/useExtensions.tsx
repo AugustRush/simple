@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react'
-import type { PluginInfo, SkillInfo } from '../types'
+import type { PluginInfo, SkillInfo, UnavailablePlugin } from '../types'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -24,6 +24,10 @@ export function useExtensions(deps: Deps) {
   const [skillSearch, setSkillSearch] = useState('')
 
   const [skillFilter, setSkillFilter] = useState<'all' | 'callable' | 'internal'>('all')
+  //: Plugins the catalog knows about but that never loaded. Separate from
+  //: `plugins`: a pending plugin has no version or description to show, only the
+  //: service it is waiting for, and drawing it as a card would invent the rest.
+  const [unavailablePlugins, setUnavailablePlugins] = useState<UnavailablePlugin[]>([])
 
   const loadPlugins = useCallback(async () => {
     try {
@@ -31,6 +35,7 @@ export function useExtensions(deps: Deps) {
       const resp = await api('/api/plugins')
       const data = await resp.json()
       setPlugins(data.plugins || [])
+      setUnavailablePlugins(data.unavailable || [])
     } catch {
       // Handled by api helper.
     } finally {
@@ -139,5 +144,5 @@ export function useExtensions(deps: Deps) {
     })
   }, [skills, skillSearch, skillFilter])
 
-  return { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadPlugins, loadSkills, pluginSearch, plugins, setExtensionsTab, setPluginSearch, setPlugins, setSkillFilter, setSkillSearch, setSkills, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } as const
+  return { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadPlugins, loadSkills, pluginSearch, plugins, setExtensionsTab, setPluginSearch, setPlugins, unavailablePlugins, setUnavailablePlugins, setSkillFilter, setSkillSearch, setSkills, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } as const
 }

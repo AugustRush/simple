@@ -2562,6 +2562,36 @@ class PluginCatalog:
             if src_dir == dir_name
         }
 
+    def plugin_states(self) -> dict[str, dict[str, Any]]:
+        """Every plugin this catalog knows about, and what state it is in.
+
+        ``list_plugins`` answers only the *loaded* ones, so a plugin waiting for a
+        service and a plugin whose setup raised were both simply absent -- and
+        absent is indistinguishable from "never installed". The three states are
+        different facts with different fixes, and a person looking at the
+        capabilities page needs to know which one they are in.
+        """
+        states: dict[str, dict[str, Any]] = {}
+        # Read from the host's own three collections rather than from
+        # ``self._plugins``: that one holds *discovered* plugins with metadata, so
+        # a plugin the composition mounted itself (the agent loop, a test double)
+        # was invisible here even while it was running.
+        for name in self._installs:
+            states[str(name)] = {"state": "active", "missing": [], "error": ""}
+        for name, missing in self.pending_report().items():
+            states[str(name)] = {
+                "state": "pending",
+                "missing": [str(item) for item in missing],
+                "error": "",
+            }
+        for name, error in self.failed_report().items():
+            states[str(name)] = {
+                "state": "failed",
+                "missing": [],
+                "error": str(error),
+            }
+        return states
+
     def list_plugins(self) -> list[PluginMeta]:
         """Return metadata for all loaded plugins."""
         return [meta for _, meta in self._plugins.values()]

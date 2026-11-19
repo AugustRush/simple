@@ -400,6 +400,13 @@ class PluginHost:
             #: wrong place.
             install.missing = tuple(unmet)
             self._pending[install.name] = install
+            # Logged, not only recorded.  A plugin that waits for a service
+            # nobody supplies registers nothing and, until this line existed,
+            # said nothing either -- the composition simply had fewer tools than
+            # its author expected, with no way to notice from the log.
+            logger.info(
+                "plugin %r is waiting for: %s", install.name, ", ".join(unmet)
+            )
             return False
 
         ctx = self.context_for(install)
@@ -444,6 +451,11 @@ class PluginHost:
         # A name that now works is not a failure any more, and a report that kept saying
         # so would be one somebody learns to ignore.
         self._failed.pop(install.name, None)
+        # The one transition that was completely silent, and the one a person
+        # actually looks for: "did my plugin come up". Its absence made a
+        # successful composition and a composition missing a plugin look the same
+        # in the log -- both had nothing to say.
+        logger.info("plugin %r active", install.name)
         return True
 
     def _fail(self, install: Install, exc: BaseException) -> None:
@@ -523,6 +535,7 @@ class PluginHost:
         install.unloaded = True
         install.pending = False
         self._failed.pop(name, None)
+        logger.info("plugin %r unloaded", name)
 
         # The children go with the parent, as a consequence of the parent's scope
         # owning the records that installed them.

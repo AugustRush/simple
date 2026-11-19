@@ -10,7 +10,7 @@ import type { FormInstance } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, RunTranscriptRow, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage, TurnVersion } from '../types'
+import type { AttachmentInfo, AttentionRun, AutomationRow, AutonomyFunnel, HomeOverview, ProposalRow, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PluginInfo, ScheduleArtifact, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, RunTranscriptRow, SessionInfo, SessionState, SkillInfo, WorkflowInfo, MemoryDraft, MemoryEntry, MemoryFact, MemoryOverview, SessionUsage, TurnVersion, UnavailablePlugin } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -139,6 +139,8 @@ export interface AppCtx {
   setPluginSearch: Dispatch<SetStateAction<string>>
   loadingView: boolean
   filteredPlugins: PluginInfo[]
+  /** Plugins the catalog knows about that never loaded, with the reason. */
+  unavailablePlugins: UnavailablePlugin[]
   togglePlugin: (plugin: PluginInfo, enabled: boolean) => Promise<void>
   deletePlugin: (plugin: PluginInfo) => MessageType | undefined
   skills: SkillInfo[]
