@@ -683,3 +683,42 @@ html[data-theme='light'] .settings-json {
   text-decoration: none;
   flex: 0 0 auto;
 }
+
+/* ── a page a plugin contributed ─────────────────────────────────────────────
+ * The shell is ours (heading, padding, ground); the frame's interior is the
+ * plugin's. `height` is fixed rather than measured: measuring needs postMessage,
+ * which this step deliberately does not add, and a 100vh frame is a scrollbar
+ * inside a scrollbar. */
+.plugin-page-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 26px 28px 28px;
+  gap: 14px;
+}
+.plugin-page-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.plugin-page-back.ant-btn {
+  color: var(--text-secondary);
+  padding-inline: 6px;
+}
+.plugin-page-title {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.plugin-page-title strong { color: var(--text); font-size: 14px; font-weight: 600; }
+.plugin-page-title span { color: var(--text-muted); font-size: 12px; }
+.plugin-page-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-surface);
+  background: var(--surface);
+}

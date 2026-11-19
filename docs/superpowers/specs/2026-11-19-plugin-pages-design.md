@@ -74,9 +74,19 @@ class ScreenerPlugin:
   摘掉 sandbox 属性）。这是整个方案唯一的硬边界，不能为了"省事读个 localStorage"松掉。
 - 主题通过**查询参数**传进去（`?theme=dark`），插件自己决定用不用。不用 postMessage：
   双向通道是第二套 API，而第一步只需要一个方向。
-- 插件页面自己的数据走 `fetch('/api/plugin/...')`——同源，cookie 在（iframe 是不透明
-  源，但**请求仍然带本页 cookie**，因为 URL 是同源地址）。这正好是刚做完的
-  `web_routes` 的用途。
+- ~~插件页面自己的数据走 `fetch('/api/plugin/...')`——同源，cookie 在~~
+
+  **这条设计是错的，实现时被浏览器否掉了。** 不含 `allow-same-origin` 的 iframe 是
+  不透明源，`fetch` 一个相对 URL 会被当作跨源请求、`Origin: null`，服务端不认，浏览器
+  直接 `TypeError: Failed to fetch`。实测确认（cookie / parent / localStorage 都被
+  正确拒绝的同时，fetch 也拒绝了）。
+
+  **正确做法：数据在生成 HTML 时内联。** `html` 可以是 `(request) -> str`，服务端把
+  数据渲染进去。交互用导航（`<a href="?max_pe=15">`、`<form method=get>`），服务端
+  重新渲染整页。这保住了沙箱的完整性，代价是页面不能做局部刷新——第一步够用。
+
+  要客户端取数据，正确的路是给页面一个短期 token、服务端接受 `Origin: null` 但校验
+  token。那是另一个机制，不混进来。
 
 ### 导航
 

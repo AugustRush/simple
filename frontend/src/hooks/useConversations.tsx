@@ -1373,7 +1373,14 @@ export function useConversations(deps: Deps) {
       if (main) {
         // Stay on the page the address names: a reload of `#/schedules` is a
         // reload of 自动化, not a jump into the conversation behind it.
-        selectSession(main, { stayOnView: route.view !== 'home' })
+        //
+        // `deepLink` rather than `view !== 'home'`: a plugin page (`#/p/<id>`)
+        // keeps `home` as its view -- it has no fixed view name to be -- so the
+        // first version treated it as "no page asked for" and the boot cleared
+        // the address before the page could render. Measured in a browser: the
+        // hash became `#/` and the conversation showed instead.
+        const deepLink = route.view !== 'home' || Boolean(route.page)
+        selectSession(main, { stayOnView: deepLink })
         return
       }
       activeSessionRef.current = null

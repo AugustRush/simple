@@ -22,7 +22,19 @@ export function useUi() {
   //: that set the view after the first render would paint 对话 for a frame over
   //: a page that asked for 设置, and the address-bar writer would then record
   //: the wrong address before the correction.
-  const [view, setView] = useState<string>(() => parseRoute(window.location.hash).view)
+  const [route, setRoute] = useState<{ view: string; page?: string }>(
+    () => parseRoute(window.location.hash),
+  )
+  const view = route.view
+  const setView = (next: string) => setRoute({ view: next })
+  //: Navigating by name leaves any plugin page: the two are different screens
+  //: and `#/p/<id>` is not a view, so a stale id would re-open the page the
+  //: person just navigated away from.
+  const openPage = (pageId: string | null) =>
+    setRoute(prev => ({ view: prev.view, page: pageId || undefined }))
+  //: The plugin page the address names, if any. `#/p/<id>` has no fixed view
+  //: behind it -- the set of pages is whatever the installed plugins declare.
+  const pluginPage = route.page
   //: Whether the board panel is pulled out. Shell state, not page state, because
   //: pages here are plain render functions rather than components: a `useState`
   //: inside one runs only while that view is current, and React counts hooks per
@@ -132,5 +144,5 @@ export function useUi() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, chooseTheme, setThemeMode, setView, resolvedTheme, themeMode, view } as const
+  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, chooseTheme, setThemeMode, setView, openPage, pluginPage, resolvedTheme, themeMode, view } as const
 }

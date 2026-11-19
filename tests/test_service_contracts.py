@@ -73,6 +73,13 @@ SERVICE_CONTRACTS: tuple[tuple[str, str, str, str, str], ...] = (
         "commands",
     ),
     (
+        "agent.channels.web_pages",
+        "WebPageRegistry",
+        "agent.channels.protocols",
+        "WebPageService",
+        "web_pages",
+    ),
+    (
         "agent.channels.web_routes",
         "WebRouteRegistry",
         "agent.channels.protocols",

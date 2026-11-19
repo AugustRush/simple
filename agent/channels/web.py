@@ -2201,6 +2201,70 @@ class WebChannel(Channel):
             _os.unlink(path)
 
 
+    def _web_pages_registry(self) -> Any:
+        registry = resolve(self._components, "web_pages")
+        # A composition may not have the plugin: fall back to the process-wide
+        # registry the core plugin provides, which is what a channel built
+        # without that plugin still serves.
+        if registry is None:
+            from agent.channels.web_pages import shared_registry
+
+            registry = shared_registry()
+        return registry
+
+    async def _plugin_page_list(self, request: Any) -> Any:
+        """Every contributed page as ``{id, title, description}``."""
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        registry = self._web_pages_registry()
+        listing = getattr(registry, "listing", None)
+        pages = listing() if callable(listing) else []
+        return JSONResponse({"pages": pages})
+
+    async def _plugin_page(self, request: Any) -> Any:
+        """Serve one contributed page as HTML.
+
+        Two headers are the whole security story:
+
+        * ``CSP: sandbox allow-scripts allow-forms`` -- the frame already has the
+          attribute, and this is the second lock: a person who opens the URL
+          directly gets a sandboxed document too, not a same-origin page that can
+          read the app's cookies.
+        * ``no-store`` -- a page may be built per request from live data, and a
+          cached copy would show somebody yesterday's numbers.
+        """
+        from starlette.responses import HTMLResponse, JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        page_id = str(request.path_params.get("page_id") or "").strip()
+        registry = self._web_pages_registry()
+        lookup = getattr(registry, "page", None)
+        entry = lookup(page_id) if callable(lookup) else None
+        if not entry:
+            return JSONResponse({"error": f"没有这个页面：{page_id}"}, status_code=404)
+        html = entry.get("html")
+        try:
+            body = html(request) if callable(html) else html
+            if inspect.isawaitable(body):
+                body = await body
+        except Exception as exc:  # noqa: BLE001 - the page's failure is its answer
+            logger.exception("contributed page %r failed to render", page_id)
+            return HTMLResponse(
+                f"<!doctype html><meta charset=utf-8>"
+                f"<body style='font:13px system-ui;padding:16px;color:#888'>"
+                f"这个页面渲染失败：{exc}</body>",
+                status_code=500,
+            )
+        response = HTMLResponse(str(body or ""))
+        response.headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts allow-forms"
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     async def _import_data(self, request: Any) -> Any:
         """Merge an exported archive into this install.
 
@@ -3466,6 +3530,15 @@ class WebChannel(Channel):
             # The other half: an export nobody can put back is a file, not a
             # backup. Additive on purpose -- see agent/import_data.py.
             Route("/api/import", self._import_data, methods=["POST"]),
+            # Whole pages plugins contribute, served as HTML for a sandboxed
+            # frame. GET-only and one path shape: a page is not a REST resource.
+            Route(
+                "/api/plugin/pages/{page_id}",
+                self._plugin_page,
+                methods=["GET"],
+            ),
+            # What the app needs to build its navigation: names, never bodies.
+            Route("/api/plugin/pages", self._plugin_page_list, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
             # The one conversation, as opposed to a list of them. See
             # agent/main_session.py for why the app has one at all.

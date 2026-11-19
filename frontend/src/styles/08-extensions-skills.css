@@ -368,3 +368,20 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .plugin-unavailable-error { color: var(--red); }
+
+/* Pages a plugin contributed, shown above its switches: the visible half of a
+ * plugin belongs with the plugin, one click from the page itself. */
+.plugin-pages {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.plugin-page-card .entity-card-head { display: flex; align-items: center; gap: 8px; }
+.plugin-page-desc {
+  display: block;
+  margin: 6px 0 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}

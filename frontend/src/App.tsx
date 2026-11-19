@@ -10,6 +10,7 @@ import './index.css'
 import type { AppCtx } from './app/AppCtx'
 import { renderHome } from './views/home'
 import { renderBoardPanel } from './views/board'
+import { renderPluginPage } from './views/plugin_page'
 import { renderMemory } from './views/memory'
 import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
@@ -53,7 +54,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage } = ui
 
   const { contextHolder, messageApi, token } = apiClient
 
@@ -61,7 +62,7 @@ function App() {
 
   const { activateTurnIndex, activeSession, openConversation, activity, awayFromLatest, canRewind, chatScrollRef, editLastTurn, regenerateLastTurn, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, deliverMode, deliverModeLabel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, selectSession, sendMessage, sendShortcut, sendShortcutLabel, sessionState, sessions, setDeliverMode, setInput, setPendingAttachments, setSendShortcut, stopStreaming, taskGuidanceVisible, toggleTraceExpanded, turnRefs, turnVersions, switchTurnVersion, switchingVersion, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
-  const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, unavailablePlugins, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
+  const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, unavailablePlugins, pluginPages, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
   const { activateProvider, applyToken, config, configText, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, notifyTesting, testNotification, importing, importArchive, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, testProvider, setConfigText, setSettingsDirty, setTokenDraft, settingsDirty, settingsModelOptions, thinkingEffortOptions, tokenDirty, tokenDraft } = settings
 
@@ -185,6 +186,10 @@ function App() {
     sessions,
     pluginSearch,
     unavailablePlugins,
+    pluginPages,
+    pluginPage,
+    openPage,
+    resolvedTheme,
     setPluginSearch,
     loadingView,
     filteredPlugins,
@@ -322,6 +327,10 @@ function App() {
   const boardWaiting = Number((home as { board?: { waiting?: unknown[] } })?.board?.waiting?.length || 0)
 
   const renderCurrentView = () => {
+    // A plugin page comes first: `#/p/<id>` keeps the view "home" underneath it
+    // (the top bar highlights nothing in particular), so checking the view first
+    // would render the conversation over the page the address asked for.
+    if (pluginPage) return renderPluginPage(ctx)
     if (view === 'home') return renderHome(ctx)
     if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)

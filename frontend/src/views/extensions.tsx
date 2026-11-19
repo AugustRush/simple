@@ -14,6 +14,7 @@
 import type { AppCtx } from '../app/AppCtx'
 import {
   ApiOutlined,
+  AppstoreOutlined,
   CopyOutlined,
   DeleteOutlined,
   ExclamationCircleOutlined,
@@ -23,7 +24,7 @@ import {
 import { Button, Card, Col, Empty, Input, Row, Skeleton, Switch, Tag } from 'antd'
 
 export function renderCapabilities(ctx: AppCtx) {
-  const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, unavailablePlugins, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
+  const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, unavailablePlugins, pluginPages, openPage, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
 
 
   // The two bodies behind the merged 扩展 page.  Each keeps its own toolbar
@@ -64,6 +65,27 @@ export function renderCapabilities(ctx: AppCtx) {
               ))}
             </ul>
           </div>
+        </div>
+      )}
+
+      {pluginPages.length > 0 && (
+        <div className="plugin-pages" role="list">
+          {pluginPages.map((page: any) => (
+            <Card key={page.id} size="small" className="entity-card plugin-page-card">
+              <div className="entity-card-head">
+                <span className="entity-icon">
+                  <AppstoreOutlined />
+                </span>
+                <strong>{page.title}</strong>
+              </div>
+              {page.description && (
+                <span className="plugin-page-desc">{page.description}</span>
+              )}
+              <Button size="small" onClick={() => openPage(page.id)}>
+                打开
+              </Button>
+            </Card>
+          ))}
         </div>
       )}
 

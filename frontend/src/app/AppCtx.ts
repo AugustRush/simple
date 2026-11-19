@@ -141,6 +141,13 @@ export interface AppCtx {
   filteredPlugins: PluginInfo[]
   /** Plugins the catalog knows about that never loaded, with the reason. */
   unavailablePlugins: UnavailablePlugin[]
+  /** The plugin page the address names, if any. `#/p/<id>` is not a view. */
+  pluginPage?: string
+  /** Which theme is actually showing, for the page frame's `?theme=`. */
+  resolvedTheme: "light" | "dark"
+  openPage: (pageId: string | null) => void
+  /** Pages plugins declared: id, title, description. No HTML -- names only. */
+  pluginPages: { id: string; title: string; description?: string }[]
   togglePlugin: (plugin: PluginInfo, enabled: boolean) => Promise<void>
   deletePlugin: (plugin: PluginInfo) => MessageType | undefined
   skills: SkillInfo[]

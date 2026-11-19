@@ -114,6 +114,12 @@ def _memory_tidy_job(_: CoreContext) -> Any:
     return MemoryTidyJobPlugin()
 
 
+def _web_pages(_: CoreContext) -> Any:
+    from agent.channels.web_pages_plugin import WebPagesPlugin
+
+    return WebPagesPlugin()
+
+
 def _web_routes(_: CoreContext) -> Any:
     from agent.channels.web_routes_plugin import WebRoutesPlugin
 
@@ -227,6 +233,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         ),
         factory=_web_routes,
         provides=("web_routes",),
+    ),
+    CorePlugin(
+        name="web_pages",
+        summary=(
+            "the whole pages plugins contribute; provides `web_pages`, which a "
+            "plugin adds to with `ctx.web_pages.add(id, title=, html=)`"
+        ),
+        factory=_web_pages,
+        provides=("web_pages",),
     ),
     CorePlugin(
         name="system_jobs",

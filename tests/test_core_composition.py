@@ -32,6 +32,7 @@ def test_the_declaration_names_every_core_plugin() -> None:
         # branch in `SchedulerDelivery`, so a plugin can add a target type the
         # way it can add a channel or a tool.
         "web_routes",
+        "web_pages",
         "system_jobs",
         "system_job.memory_tidy",
         "delivery_targets",

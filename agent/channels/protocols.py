@@ -75,3 +75,37 @@ class WebRouteService(Protocol):
 
     def scoped(self, ctx: Any) -> Any:
         """A per-plugin view: ``add`` is attributed and unwinds with the plugin."""
+
+
+@runtime_checkable
+class WebPageService(Protocol):
+    """What a provider of ``web_pages`` has to offer.
+
+    ``page`` and ``listing`` are the server's lookup and the navigation's list;
+    ``register``/``unregister`` are the contribution and its undo; ``scoped`` is
+    how a plugin reaches this as ``ctx.web_pages``.
+    """
+
+    def register(
+        self,
+        page_id: str,
+        *,
+        title: str,
+        html: Any,
+        description: str = "",
+        owner: str = "",
+        replace: bool = False,
+    ) -> Any:
+        """Add one page; returns the undo that removes or restores it."""
+
+    def unregister(self, page_id: str) -> None:
+        """Drop one page, whatever registered it."""
+
+    def page(self, page_id: str) -> Any:
+        """One page's entry, or ``None``."""
+
+    def listing(self) -> Any:
+        """Every page's id, title and description -- never its HTML."""
+
+    def scoped(self, ctx: Any) -> Any:
+        """A per-plugin view: ``add`` is attributed and unwinds with the plugin."""

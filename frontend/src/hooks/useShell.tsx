@@ -4,7 +4,7 @@ import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
 import { BulbOutlined, ClockCircleOutlined, HomeOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
-import { parseRoute, routeFor } from '../lib/route'
+import { parseRoute, routeFor, routeForPage } from '../lib/route'
 import { useUi } from './useUi'
 import { useConversations } from './useConversations'
 import { useExtensions } from './useExtensions'
@@ -14,7 +14,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, settingsDirty, tokenDirty, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, pluginPage, settingsDirty, tokenDirty, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -134,6 +134,13 @@ export function useShell(deps: Deps) {
       loadPlugins()
       loadSkills()
     }
+    // A plugin page needs the plugin list for its *name* in the bar. Without
+    // this a deep link showed the page's id (`stock-screener`) until the person
+    // happened to open 设置, which then reloaded the list -- measured in a
+    // browser on a fresh load of `#/p/stock-screener`.
+    if (pluginPage) {
+      loadPlugins()
+    }
     if (view === 'schedules') {
       // Three readers of the same facts: the task list, the chain list, and the
       // unified list the page actually opens on. The last one used to load only
@@ -195,7 +202,9 @@ export function useShell(deps: Deps) {
   // (nav, palette, a session row, a creating/deleting session) gets an address
   // without being taught about it. The reader is the browser's popstate, which
   // is the only source of change the app does not own.
-  const route = routeFor(view)
+  // The address names the plugin page when one is open, and the view otherwise.
+  // One writer, one reader, as before -- the page is part of what is on screen.
+  const route = pluginPage ? routeForPage(pluginPage) : routeFor(view)
 
   // The entry the app was opened on is replaced, not pushed: a click on 设置
   // straight after load should leave one "back" press between the two pages,
@@ -212,7 +221,7 @@ export function useShell(deps: Deps) {
     // of the page you are on is not.
     const from = parseRoute(current)
     const to = parseRoute(route)
-    const sameScreen = from.view === to.view
+    const sameScreen = from.view === to.view && from.page === to.page
     if (firstRouteRef.current || sameScreen) {
       firstRouteRef.current = false
       window.history.replaceState(null, '', route)
@@ -233,8 +242,19 @@ export function useShell(deps: Deps) {
     // fires neither, so this cannot feed back into itself.
     const applyAddress = () => {
       const target = parseRoute(window.location.hash)
+      if (target.page !== undefined) {
+        // A pasted `#/p/<id>` opens that page; the view underneath is whatever
+        // it was, since a plugin page is a screen of its own.
+        openPage(target.page)
+        return
+      }
       if (target.view !== view) {
         navigateTo(target.view, { fromHistory: true })
+        return
+      }
+      if (pluginPage) {
+        // Moving to a named view from a plugin page: the page goes away with it.
+        openPage(null)
         return
       }
       // The bare chat entry while a conversation is open. Closing that
@@ -376,5 +396,5 @@ export function useShell(deps: Deps) {
     },
   }
 
-  return { navItems, navigateTo, pageMeta, paletteCommands, paletteEntries, paletteIndex, setPaletteIndex, handlePaletteKeyDown, runPaletteEntry } as const
+  return { navItems, navigateTo, openPage, pluginPage, pageMeta, paletteCommands, paletteEntries, paletteIndex, setPaletteIndex, handlePaletteKeyDown, runPaletteEntry } as const
 }

@@ -223,6 +223,16 @@ SERVICES: tuple[ServiceDeclaration, ...] = (
         ),
     ),
     ServiceDeclaration(
+        name="web_pages",
+        plugin_visible=True,
+        contract="agent/channels/protocols.py:WebPageService",
+        summary=(
+            "The whole pages plugins contribute, shown in a sandboxed frame.  A "
+            "plugin adds one with ``ctx.web_pages.add(id, title=, html=)``, which "
+            "is what lets \"my plugin has a page\" stop being an edit to the frontend."
+        ),
+    ),
+    ServiceDeclaration(
         name="system_jobs",
         plugin_visible=True,
         contract="agent/scheduler/protocols.py:SystemJobService",

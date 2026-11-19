@@ -28,6 +28,11 @@ export function useExtensions(deps: Deps) {
   //: `plugins`: a pending plugin has no version or description to show, only the
   //: service it is waiting for, and drawing it as a card would invent the rest.
   const [unavailablePlugins, setUnavailablePlugins] = useState<UnavailablePlugin[]>([])
+  //: Pages plugins declared. Loaded with the plugin list because they appear in
+  //: the same place (the capability card) and change for the same reason.
+  const [pluginPages, setPluginPages] = useState<
+    { id: string; title: string; description?: string }[]
+  >([])
 
   const loadPlugins = useCallback(async () => {
     try {
@@ -36,6 +41,13 @@ export function useExtensions(deps: Deps) {
       const data = await resp.json()
       setPlugins(data.plugins || [])
       setUnavailablePlugins(data.unavailable || [])
+      try {
+        const pagesResp = await api('/api/plugin/pages')
+        const pagesBody = await pagesResp.json()
+        setPluginPages(pagesBody.pages || [])
+      } catch {
+        setPluginPages([])
+      }
     } catch {
       // Handled by api helper.
     } finally {
@@ -144,5 +156,5 @@ export function useExtensions(deps: Deps) {
     })
   }, [skills, skillSearch, skillFilter])
 
-  return { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadPlugins, loadSkills, pluginSearch, plugins, setExtensionsTab, setPluginSearch, setPlugins, unavailablePlugins, setUnavailablePlugins, setSkillFilter, setSkillSearch, setSkills, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } as const
+  return { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadPlugins, loadSkills, pluginSearch, plugins, setExtensionsTab, setPluginSearch, setPlugins, unavailablePlugins, setUnavailablePlugins, pluginPages, setPluginPages, setSkillFilter, setSkillSearch, setSkills, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } as const
 }

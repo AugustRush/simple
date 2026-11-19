@@ -32,9 +32,20 @@ export function isViewName(value: string): value is ViewName {
 }
 
 
-export function parseRoute(hash: string): { view: ViewName } {
+//: A page a plugin contributed: ``#/p/<id>``. A prefix of its own rather than a
+//: fifth view name, because the set of them is not fixed -- it is whatever the
+//: installed plugins declare -- and a fixed list cannot hold a changing set.
+export const PLUGIN_PAGE_PREFIX = 'p'
+
+
+export function parseRoute(hash: string): { view: ViewName; page?: string } {
   const raw = String(hash || '').replace(/^#\/?/, '')
-  const [head] = raw.split('/')
+  const [head, second] = raw.split('/')
+  if (head === PLUGIN_PAGE_PREFIX && second) {
+    // The nav still highlights something, and "no page in the bar" is the
+    // honest answer: the top bar's title will name the plugin's page instead.
+    return { view: 'home', page: decodeURIComponent(second) }
+  }
   // An old `#/t/<id>` link lands on the conversation: that is the only screen it
   // could have meant, and `t` is not a view name.
   const view = isViewName(head) ? head : 'home'
@@ -44,4 +55,9 @@ export function parseRoute(hash: string): { view: ViewName } {
 
 export function routeFor(view: string): string {
   return view === 'home' ? '#/' : `#/${view}`
+}
+
+
+export function routeForPage(pageId: string): string {
+  return `#/${PLUGIN_PAGE_PREFIX}/${encodeURIComponent(pageId)}`
 }
