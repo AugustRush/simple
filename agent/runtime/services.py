@@ -212,6 +212,17 @@ SERVICES: tuple[ServiceDeclaration, ...] = (
         ),
     ),
     ServiceDeclaration(
+        name="web_routes",
+        plugin_visible=True,
+        contract="agent/channels/protocols.py:WebRouteService",
+        summary=(
+            "The HTTP endpoints plugins contribute.  A plugin adds one with "
+            "``ctx.web_routes.add(method, path, handler)``, which is what turns "
+            "\"my plugin answers this request\" from an edit to the web channel "
+            "into a contribution."
+        ),
+    ),
+    ServiceDeclaration(
         name="system_jobs",
         plugin_visible=True,
         contract="agent/scheduler/protocols.py:SystemJobService",

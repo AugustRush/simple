@@ -31,6 +31,7 @@ def test_the_declaration_names_every_core_plugin() -> None:
         # Where a run's output can be delivered. A core plugin rather than a
         # branch in `SchedulerDelivery`, so a plugin can add a target type the
         # way it can add a channel or a tool.
+        "web_routes",
         "system_jobs",
         "system_job.memory_tidy",
         "delivery_targets",

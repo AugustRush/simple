@@ -114,6 +114,12 @@ def _memory_tidy_job(_: CoreContext) -> Any:
     return MemoryTidyJobPlugin()
 
 
+def _web_routes(_: CoreContext) -> Any:
+    from agent.channels.web_routes_plugin import WebRoutesPlugin
+
+    return WebRoutesPlugin()
+
+
 def _delivery_targets(_: CoreContext) -> Any:
     from agent.scheduler.delivery_targets_plugin import DeliveryTargetsPlugin
 
@@ -212,6 +218,15 @@ CORE_PLUGINS: tuple[CorePlugin, ...] = (
         name="channel.feishu",
         summary="the Feishu channel; contributes when `channels.feishu.enabled` is set",
         factory=_feishu_channel,
+    ),
+    CorePlugin(
+        name="web_routes",
+        summary=(
+            "the HTTP endpoints plugins contribute; provides `web_routes`, which a "
+            "plugin adds to with `ctx.web_routes.add(method, path, handler)`"
+        ),
+        factory=_web_routes,
+        provides=("web_routes",),
     ),
     CorePlugin(
         name="system_jobs",

@@ -40,6 +40,7 @@ def test_a_default_composition_is_unchanged() -> None:
         "channels",
         "channel.web",
         "channel.feishu",
+        "web_routes",
         "system_jobs",
         "system_job.memory_tidy",
         "delivery_targets",

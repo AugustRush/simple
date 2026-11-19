@@ -17,6 +17,7 @@ from agent.channels import web_autonomy, web_home, web_memory
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -274,6 +275,13 @@ class WebChannel(Channel):
         """Receive the channel runner's live-session dict and components."""
         self._sessions = sessions
         self._components = components
+        # Contributed endpoints are mounted *here*, not in `_build_app`, because
+        # the app is built in `__init__` -- before this method hands over the
+        # components. Measured: building them there found no registry, so a
+        # plugin's route was silently missing while the plugin itself reported
+        # `active`. Appending is safe because Starlette resolves `routes` per
+        # request and the server has not started yet.
+        self._mount_contributed_routes()
         # The store **as a service**.  Both real implementations build their context manager
         # from this same service (``session_plugin`` and ``record_only`` both inject
         # ``ltm_store``), so this is the identical object -- and it is the one with a declared
@@ -3501,3 +3509,68 @@ class WebChannel(Channel):
         if (dist_dir / "assets").is_dir():
             routes.append(Mount("/assets", StaticFiles(directory=dist_dir / "assets")))
         return Starlette(routes=routes, middleware=middleware)
+
+    def _mount_contributed_routes(self) -> None:
+        """Append the endpoints plugins added to the already-built app."""
+        from starlette.routing import Route as _Route
+
+        built = self._contributed_routes(_Route)
+        if built:
+            self._app.routes.extend(built)
+
+    def _contributed_routes(self, route_class: Any) -> list[Any]:
+        """The endpoints plugins added, each wrapped in this channel's auth check.
+
+        The wrap is not a convenience: an unwrapped handler on a gateway bound to
+        a LAN address is an open endpoint the operator has no reason to suspect,
+        and the plugin author's omission is invisible. A route that genuinely
+        wants to be public passes ``public=True``, which is a decision somebody
+        wrote down.
+        """
+        registry = resolve(self._components, "web_routes")
+        if registry is None:
+            return []
+        read = getattr(registry, "routes", None)
+        if not callable(read):
+            return []
+        try:
+            declared = list(read())
+        except Exception:  # noqa: BLE001 - a broken registry is no extra routes
+            logger.exception("could not read contributed web routes")
+            return []
+        built: list[Any] = []
+        for method, path, handler, public in declared:
+            built.append(
+                route_class(
+                    path,
+                    self._authorized_route(handler, public=bool(public)),
+                    methods=[str(method).upper()],
+                )
+            )
+        if built:
+            logger.info(
+                "mounted %d contributed route(s): %s",
+                len(built),
+                ", ".join(f"{item[0]} {item[1]}" for item in declared),
+            )
+        return built
+
+    def _authorized_route(self, handler: Any, *, public: bool) -> Any:
+        """Wrap *handler* so a contributed endpoint is authenticated by default."""
+        if public:
+            return handler
+
+        async def guarded(request: Any) -> Any:
+            if not self._authorized(request):
+                from starlette.responses import JSONResponse
+
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            result = handler(request)
+            # A plugin author may write either an `async def` or a plain
+            # function; both are accepted here so the registry's one-line
+            # signature stays true.
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        return guarded

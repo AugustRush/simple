@@ -43,3 +43,35 @@ class ChannelRegistryService(Protocol):
 
     def scoped(self, ctx: Any) -> ChannelContributionView:
         """The view for one plugin (the kernel calls this by name for ``ctx.channels``)."""
+
+
+@runtime_checkable
+class WebRouteService(Protocol):
+    """What a provider of ``web_routes`` has to offer.
+
+    Three members and the view factory, each with a caller: ``routes`` is the
+    channel building its route table, ``register``/``unregister`` are the
+    contribution and its undo, and ``scoped`` is how a plugin reaches this as
+    ``ctx.web_routes``.
+    """
+
+    def register(
+        self,
+        method: str,
+        path: str,
+        handler: Any,
+        *,
+        owner: str = "",
+        public: bool = False,
+        replace: bool = False,
+    ) -> Any:
+        """Add one endpoint; returns the undo that removes or restores it."""
+
+    def unregister(self, method: str, path: str) -> None:
+        """Drop one endpoint, whatever registered it."""
+
+    def routes(self) -> Any:
+        """Every contributed route as ``(method, path, handler, public)``."""
+
+    def scoped(self, ctx: Any) -> Any:
+        """A per-plugin view: ``add`` is attributed and unwinds with the plugin."""
