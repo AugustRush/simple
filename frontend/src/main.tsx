@@ -2,9 +2,14 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
+import { applyTheme, readThemePreference, resolveTheme } from './lib/theme'
 
 const root = document.getElementById('root')!
-root.dataset.theme = localStorage.getItem('agent_theme') || 'dark'
+
+// Before the first paint, on `html` -- which is what every theme rule selects on.
+// This used to set the attribute on `#root`, which no rule matches, so a
+// light-theme reader got one frame of the dark `:root` tokens on every reload.
+applyTheme(resolveTheme(readThemePreference()))
 
 //: How the last interaction arrived: pointer or keyboard.
 //:

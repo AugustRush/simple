@@ -179,3 +179,44 @@ def test_the_composer_cannot_be_stretched_by_its_own_footer() -> None:
     narrow = composer[composer.index("@media (max-width: 640px)") :][:400]
     assert ".deliver-mode-button.ant-btn" in narrow
     assert ".deliver-mode-label { display: none; }" in narrow
+
+
+def test_the_theme_is_written_where_the_stylesheets_look() -> None:
+    """Every theme rule selects `html[data-theme]`; the entry point wrote `#root`.
+
+    So the first paint applied nothing: a light-theme reader got one frame of the
+    dark `:root` tokens on every reload, then React's first effect flipped it.
+    Measured by reading the selectors and the entry point, because the symptom is
+    a single frame nobody can catch reliably in a screenshot.
+    """
+    entry = (STYLES.parent / "main.tsx").read_text()
+    theme_module = (STYLES.parent / "lib" / "theme.ts").read_text()
+
+    assert "#root" not in entry.split("ReactDOM")[0], (
+        "the entry point must not theme #root: no rule selects on it"
+    )
+    # `applyTheme` writes it on `document.documentElement`; the assertion is on
+    # the element the rules select, not on one particular spelling of it.
+    assert "document.documentElement" in theme_module
+    assert "html.dataset.theme = theme" in theme_module
+    # And the selectors really are html-scoped, so the fix is aimed at the right
+    # element rather than at a convention that changed.
+    scoped = sum(
+        line.count("html[data-theme")
+        for path in STYLES.glob("*.css")
+        for line in path.read_text().splitlines()
+    )
+    assert scoped >= 10, scoped
+
+
+def test_theme_has_three_modes_and_a_switch_that_cannot_flash() -> None:
+    """`system` is a rule for choosing a theme, not a third theme."""
+    theme_module = (STYLES.parent / "lib" / "theme.ts").read_text()
+
+    assert "'light' | 'dark' | 'system'" in theme_module
+    assert "prefers-color-scheme: dark" in theme_module
+    assert "watchSystemTheme" in theme_module
+    # The flash fix: transitions are suppressed for the frame that changes them.
+    assert "theme-switching" in theme_module
+    tokens = (STYLES / "01-theme-tokens.css").read_text()
+    assert "html.theme-switching" in tokens

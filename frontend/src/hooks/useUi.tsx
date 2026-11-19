@@ -1,9 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { parseRoute } from '../lib/route'
+import {
+  applyTheme,
+  readThemePreference,
+  resolveTheme,
+  THEME_STORAGE_KEY,
+  watchSystemTheme,
+  type ResolvedTheme,
+  type ThemePreference,
+} from '../lib/theme'
 
 export function useUi() {
-  const [themeMode, setThemeMode] = useState<string>(
-    () => localStorage.getItem('agent_theme') || 'dark',
+  const [themeMode, setThemeMode] = useState<ThemePreference>(readThemePreference)
+  //: What the stylesheets should show. `system` is not a theme, it is a rule for
+  //: choosing one, and every consumer wants the answer rather than the rule.
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() =>
+    resolveTheme(readThemePreference()),
   )
 
   //: The hash is read once, here, rather than applied by an effect: an effect
@@ -65,11 +77,31 @@ export function useUi() {
 
   const commandItemRefs = useRef<Record<string, HTMLButtonElement | null>>({})
 
+  // The theme actually applied: resolved from the preference, and re-resolved
+  // when the OS changes under a `system` preference. Applying it goes through
+  // one function so the first paint, a manual switch and an OS switch cannot
+  // disagree about where the attribute goes.
   useEffect(() => {
-    document.documentElement.dataset.theme = themeMode
-    document.body.dataset.theme = themeMode
-    document.body.style.background = ''
+    const theme = resolveTheme(themeMode)
+    setResolvedTheme(theme)
+    applyTheme(theme, { suppressTransitions: true })
+    return watchSystemTheme(() => {
+      if (themeMode !== 'system') return
+      const next = resolveTheme('system')
+      setResolvedTheme(next)
+      applyTheme(next, { suppressTransitions: true })
+    })
   }, [themeMode])
+
+  /** Persist a preference and apply it. Not a toggle: there are three answers. */
+  const chooseTheme = useCallback((next: ThemePreference) => {
+    setThemeMode(next)
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, next)
+    } catch {
+      // A blocked storage is not a reason to refuse the switch for this visit.
+    }
+  }, [])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -100,5 +132,5 @@ export function useUi() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, setThemeMode, setView, themeMode, view } as const
+  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, chooseTheme, setThemeMode, setView, resolvedTheme, themeMode, view } as const
 }

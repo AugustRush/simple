@@ -183,3 +183,17 @@ html[data-theme='light'] {
   overflow: hidden;
   background: transparent;
 }
+
+/* One frame with transitions off, while the theme changes.
+ *
+ * `background`, `color` and `border` all animate, so a theme switch used to
+ * sweep through the page for 150ms -- every surface repainting at a slightly
+ * different moment. The class is added and removed in the same tick by
+ * `lib/theme.ts`, so it swallows only the switch, not the transition of whatever
+ * the person does next. */
+html.theme-switching,
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition: none !important;
+}

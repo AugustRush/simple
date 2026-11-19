@@ -1,6 +1,7 @@
-import { ArrowLeftOutlined, CodeOutlined, SearchOutlined, MoonOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined, SunOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, BgColorsOutlined, CheckOutlined, CodeOutlined, SearchOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
 import { Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Modal, theme } from 'antd'
+import type { ThemePreference } from './lib/theme'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
 import React from 'react'
@@ -52,7 +53,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, setThemeMode, themeMode, view } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view } = ui
 
   const { contextHolder, messageApi, token } = apiClient
 
@@ -333,18 +334,26 @@ function App() {
     ...navItems.filter(item => item.key !== 'home' && item.key !== 'schedules'),
     { type: 'divider' },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+    // Three answers, not a toggle. `system` is what most people actually want --
+    // a laptop that dims at sunset should take the app with it -- and a toggle
+    // cannot express it. The check mark is the current preference, which is a
+    // different fact from which theme is showing (under `system` the showing one
+    // changes without the preference changing).
     {
       key: 'theme',
-      icon: themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />,
-      label: themeMode === 'dark' ? '切到浅色模式' : '切到深色模式',
+      icon: <BgColorsOutlined />,
+      label: '主题',
+      children: [
+        { key: 'theme:system', label: '跟随系统', icon: themeMode === 'system' ? <CheckOutlined /> : null },
+        { key: 'theme:light', label: '浅色', icon: themeMode === 'light' ? <CheckOutlined /> : null },
+        { key: 'theme:dark', label: '深色', icon: themeMode === 'dark' ? <CheckOutlined /> : null },
+      ],
     },
   ]
 
   const handleTopbarMenu: MenuProps['onClick'] = ({ key }) => {
-    if (key === 'theme') {
-      const next = themeMode === 'dark' ? 'light' : 'dark'
-      setThemeMode(next)
-      localStorage.setItem('agent_theme', next)
+    if (key.startsWith('theme:')) {
+      chooseTheme(key.slice('theme:'.length) as ThemePreference)
       return
     }
     // `navigateTo` keeps the unsaved-edits guard, so a menu entry refuses to lose
@@ -357,13 +366,13 @@ function App() {
     <ConfigProvider
       locale={zhCN}
       theme={{
-        algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+        algorithm: resolvedTheme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
         token: {
-          colorPrimary: themeMode === 'dark' ? '#e4e4e7' : '#27272a',
-          colorInfo: themeMode === 'dark' ? '#d4d4d8' : '#52525b',
-          colorSuccess: themeMode === 'dark' ? '#d4d4d8' : '#52525b',
-          colorWarning: themeMode === 'dark' ? '#d6c7a3' : '#806f4b',
-          colorError: themeMode === 'dark' ? '#f0a3a3' : '#a16262',
+          colorPrimary: resolvedTheme === 'dark' ? '#e4e4e7' : '#27272a',
+          colorInfo: resolvedTheme === 'dark' ? '#d4d4d8' : '#52525b',
+          colorSuccess: resolvedTheme === 'dark' ? '#d4d4d8' : '#52525b',
+          colorWarning: resolvedTheme === 'dark' ? '#d6c7a3' : '#806f4b',
+          colorError: resolvedTheme === 'dark' ? '#f0a3a3' : '#a16262',
           // 10, not antd's 6: the surfaces here are glassy (see 10-secondary-
           // glass.css) and a 6px corner on a translucent card pinches the glass
           // into a hard point. 10px reads as one soft sheet; controls inherit
