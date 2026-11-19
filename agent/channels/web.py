@@ -2179,6 +2179,53 @@ class WebChannel(Channel):
             return JSONResponse({"error": "file not found"}, status_code=404)
         return FileResponse(resolved)
 
+    @staticmethod
+    def _discard_export(path: Any) -> None:
+        """Remove the archive once the response has been streamed.
+
+        A leftover copy in the temp directory is everything the person ever said
+        to this agent, in a file anything on the machine can read.
+        """
+        import contextlib
+        import os as _os
+
+        with contextlib.suppress(OSError):
+            _os.unlink(path)
+
+
+    async def _export_data(self, request: Any) -> Any:
+        """Build the archive and stream it; delete the temp file afterwards."""
+        import contextlib
+        import os as _os
+
+        from starlette.background import BackgroundTask
+        from starlette.responses import FileResponse, JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent import shared
+        from agent.export import build_archive
+
+        home = shared.AGENT_HOME
+        try:
+            path, manifest = build_archive(
+                context_dir=home / "context",
+                tasks_dir=home / "tasks",
+                autonomy_dir=home / "autonomy",
+                web_sessions_dir=home / "web" / "sessions",
+            )
+        except Exception as exc:  # noqa: BLE001 - the reason is the answer
+            return JSONResponse({"error": f"导出失败：{exc}"}, status_code=500)
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=path.name,
+            # Deleted once the response has been sent. A leftover archive in the
+            # temp directory is a copy of everything the person said, sitting
+            # where anything on the machine can read it.
+            background=BackgroundTask(self._discard_export, path),
+        )
+
     async def _list_sessions(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -3363,6 +3410,10 @@ class WebChannel(Channel):
             Route("/api/schedules/{task_id}", self._update_schedule, methods=["PUT"]),
             Route("/api/sessions/{session_id}/attachments", self._upload_attachment, methods=["POST"]),
             Route("/api/files", self._file, methods=["GET"]),
+            # Everything the person said and everything the agent kept, as one
+            # downloadable archive. There was no way to get the data out: the only
+            # verbs were "read it here" and "delete it".
+            Route("/api/export", self._export_data, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
             # The one conversation, as opposed to a list of them. See
             # agent/main_session.py for why the app has one at all.

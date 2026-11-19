@@ -5,7 +5,7 @@ import type { AppCtx } from '../app/AppCtx'
 import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
 import { renderCapabilities } from './extensions'
-import { ApiOutlined, CheckCircleFilled, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
+import { ApiOutlined, CheckCircleFilled, DownloadOutlined, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
   Affix,
   Button,
@@ -888,6 +888,33 @@ export function createSettingsView(ctx: AppCtx) {
               and a page whose entire content is switches and deletes is a
               settings section wearing a page's clothes. */}
           {renderCapabilities(ctx)}
+
+          {/* The counterpart to every delete button in this app. Before it, the
+              only verbs were "read it here" and "delete it" -- a mistake was
+              unrecoverable and moving machines meant starting over. */}
+          <Card
+            className="settings-card settings-card-wide"
+            title="数据"
+            extra={<span className="card-kicker">EXPORT</span>}
+          >
+            <div className="settings-pref">
+              <div className="settings-pref-copy">
+                <span className="settings-pref-name">导出全部数据</span>
+                <span className="settings-pref-desc">
+                  对话、记忆、定时任务、提议与目标，以及它产出的文件，打成一个 ZIP。
+                  <strong>不含 API 密钥与访问令牌</strong>——那些不会被写进任何备份。
+                </span>
+              </div>
+              <a
+                className="settings-pref-control"
+                href="/api/export"
+                download
+                onClick={() => messageApi.success('正在打包，文件会出现在下载里')}
+              >
+                <Button icon={<DownloadOutlined />}>下载 ZIP</Button>
+              </a>
+            </div>
+          </Card>
 
           <Card
             className="settings-card settings-card-wide settings-json-card"

@@ -674,3 +674,12 @@ html[data-theme='light'] .settings-json {
   color: var(--accent-contrast);
   background: var(--accent);
 }
+
+/* The export link is an `<a download>` wrapped around a button: the browser's own
+ * download machinery is what puts the file in the right place, and a fetch() that
+ * buffered 24MB in memory to hand it to a blob URL would be the same file with
+ * more ways to fail. */
+.settings-pref a[download] {
+  text-decoration: none;
+  flex: 0 0 auto;
+}
