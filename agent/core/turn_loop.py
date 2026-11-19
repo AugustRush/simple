@@ -50,6 +50,7 @@ from agent.core.turn_context import (
     trace_latency as _trace_latency,
 )
 from agent.core.outstanding import outstanding_block
+from agent.core.resume import resume_nudge
 from agent.core.clock import clock_line
 from agent.core.turn_state import _ContentFilterRecovery, _TurnLoopState
 from agent.core.event_domains import TurnStarted
@@ -471,6 +472,21 @@ def prepare_turn(
             scheduled_run=bool(ctx.metadata.get("scheduler_run_id")),
         )
         context_manager = deps.context_manager_for(ctx)
+        # A turn that stopped mid-task, named back at the one moment the model
+        # can do something about it. The trigger is a fact this code can read;
+        # whether to keep the task is still the model's decision -- see
+        # agent/core/resume.py for why the system does not set the goal itself.
+        #
+        nudge = resume_nudge(session_id=str(ctx.metadata.get("session_id") or ""))
+        if nudge:
+            # Logged, because this is otherwise invisible: the block goes into a
+            # message the person never reads, and "the model did not set a goal"
+            # is unanswerable without knowing whether it was ever offered one.
+            logger.info(
+                "offered a resume nudge for session %s",
+                str(ctx.metadata.get("session_id") or "")[:12],
+            )
+            turn_blocks.append(nudge)
         # Retrieval's place in the block list is reserved now and filled in
         # below, because its *size* cannot be decided until every other block
         # that rides in this same message has been built: they share one window.
