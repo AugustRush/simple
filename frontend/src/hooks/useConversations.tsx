@@ -2262,6 +2262,19 @@ export function useConversations(deps: Deps) {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
   }
 
+  // An import writes conversations, memory and tasks straight into the store,
+  // so everything on screen is stale afterwards. One event rather than a
+  // callback threaded through two hooks that otherwise do not know each other.
+  useEffect(() => {
+    const reload = () => {
+      void loadSessions()
+      const sid = activeSessionRef.current
+      if (sid) void loadMessages(sid)
+    }
+    window.addEventListener('agent:data-imported', reload)
+    return () => window.removeEventListener('agent:data-imported', reload)
+  }, [loadSessions, loadMessages])
+
   //: The newest turn can be cut only while nothing is running and nothing is
   //: queued: the server refuses otherwise, and a button that exists and is
   //: refused is worse than one that is disabled.

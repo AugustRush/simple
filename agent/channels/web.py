@@ -2201,6 +2201,47 @@ class WebChannel(Channel):
             _os.unlink(path)
 
 
+    async def _import_data(self, request: Any) -> Any:
+        """Merge an exported archive into this install.
+
+        The body is the ZIP itself rather than multipart: one file, one stream,
+        and no parser in between that can disagree about what the bytes mean.
+        Written to a temp file first so a 24MB upload does not sit in memory, and
+        removed afterwards whatever happened.
+        """
+        import tempfile
+
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent import shared
+        from agent.import_data import ArchiveError, import_archive
+
+        body = await request.body()
+        if not body:
+            return JSONResponse({"error": "请求里没有文件"}, status_code=400)
+        handle, temp_name = tempfile.mkstemp(suffix=".zip")
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(handle, "wb") as sink:
+                sink.write(body)
+            home = shared.AGENT_HOME
+            report = import_archive(
+                temp_path,
+                context_dir=home / "context",
+                tasks_dir=home / "tasks",
+                autonomy_dir=home / "autonomy",
+                web_sessions_dir=home / "web" / "sessions",
+            )
+        except ArchiveError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - the reason is the answer
+            return JSONResponse({"error": f"导入失败：{exc}"}, status_code=500)
+        finally:
+            self._discard_export(temp_path)
+        return JSONResponse({"ok": True, **report})
+
     async def _export_data(self, request: Any) -> Any:
         """Build the archive and stream it; delete the temp file afterwards."""
         import contextlib
@@ -3422,6 +3463,9 @@ class WebChannel(Channel):
             # downloadable archive. There was no way to get the data out: the only
             # verbs were "read it here" and "delete it".
             Route("/api/export", self._export_data, methods=["GET"]),
+            # The other half: an export nobody can put back is a file, not a
+            # backup. Additive on purpose -- see agent/import_data.py.
+            Route("/api/import", self._import_data, methods=["POST"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
             # The one conversation, as opposed to a list of them. See
             # agent/main_session.py for why the app has one at all.

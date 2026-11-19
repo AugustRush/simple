@@ -27,6 +27,7 @@ export function useSettings(deps: Deps) {
 
   const [feishuTesting, setFeishuTesting] = useState(false)
   const [notifyTesting, setNotifyTesting] = useState(false)
+  const [importing, setImporting] = useState(false)
 
   const [pickingDirectory, setPickingDirectory] = useState(false)
 
@@ -143,6 +144,35 @@ export function useSettings(deps: Deps) {
       // The server's own message already surfaced as a toast.
     } finally {
       setNotifyTesting(false)
+    }
+  }, [api, messageApi])
+
+  /** Merge an exported archive. Additive: the server never deletes, and its
+   * report says per section what was added and what was skipped. */
+  const importArchive = useCallback(async (file: File) => {
+    setImporting(true)
+    try {
+      const resp = await api('/api/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip' },
+        body: file,
+      })
+      const body = await resp.json().catch(() => ({}))
+      if (!resp.ok) {
+        messageApi.error(String(body?.error || `导入失败（${resp.status}）`))
+        return
+      }
+      const added = Number(body?.sessions_added || 0)
+      const skipped = Number(body?.sessions_skipped || 0)
+      messageApi.success(
+        `导入了 ${added} 个对话` + (skipped ? `，跳过 ${skipped} 个已存在的` : ''),
+      )
+      // The conversation list and the board both changed underneath.
+      window.dispatchEvent(new CustomEvent('agent:data-imported'))
+    } catch {
+      messageApi.error('导入失败')
+    } finally {
+      setImporting(false)
     }
   }, [api, messageApi])
 
@@ -530,5 +560,5 @@ export function useSettings(deps: Deps) {
     setCurrentModel(model)
   }
 
-  return { activateProvider, activeProviderName, applyToken, config, configText, currentProvider, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, notifyTesting, testNotification, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, loadSettings, mergeSettingsForm, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, setConfig, setConfigText, setCurrentProvider, setFeishuChats, setFeishuChatsError, setFeishuChatsLoaded, setFeishuChatsLoading, setFeishuTesting, setPickingDirectory, setSettingsDirty, setThinkingEffortOptions, setTokenDraft, settingsDirty, settingsModelOptions, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } as const
+  return { activateProvider, activeProviderName, applyToken, config, configText, currentProvider, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, notifyTesting, testNotification, importing, importArchive, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, loadSettings, mergeSettingsForm, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, setConfig, setConfigText, setCurrentProvider, setFeishuChats, setFeishuChatsError, setFeishuChatsLoaded, setFeishuChatsLoading, setFeishuTesting, setPickingDirectory, setSettingsDirty, setThinkingEffortOptions, setTokenDraft, settingsDirty, settingsModelOptions, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } as const
 }

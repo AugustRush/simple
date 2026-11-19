@@ -5,7 +5,7 @@ import type { AppCtx } from '../app/AppCtx'
 import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
 import { renderCapabilities } from './extensions'
-import { ApiOutlined, CheckCircleFilled, DownloadOutlined, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
+import { ApiOutlined, CheckCircleFilled, DownloadOutlined, MessageOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons'
 import {
   Affix,
   Button,
@@ -612,7 +612,7 @@ function ProvidersCard({
 }
 
 export function createSettingsView(ctx: AppCtx) {
-  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, importing, importArchive, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   // The save controls must survive a scroll: the page is longer than the
@@ -621,6 +621,8 @@ export function createSettingsView(ctx: AppCtx) {
   // had to hunt for the way to keep it. The Affix holds the controls at the
   // top of the scrolling column, not the window (the column is the scroller).
   const scrollRef = useRef<HTMLDivElement | null>(null)
+
+  const importInputRef = useRef<HTMLInputElement | null>(null)
 
   const renderSettings = () => {
     // "Unsaved" has to mean everything pending on this page, or the badge
@@ -913,6 +915,35 @@ export function createSettingsView(ctx: AppCtx) {
               >
                 <Button icon={<DownloadOutlined />}>下载 ZIP</Button>
               </a>
+            </div>
+            <div className="settings-pref">
+              <div className="settings-pref-copy">
+                <span className="settings-pref-name">从备份导入</span>
+                <span className="settings-pref-desc">
+                  只增加、从不删除：这里已经有的对话、记忆和任务会跳过并如实报告。
+                  导入一个旧备份不会动你现在的东西。
+                </span>
+              </div>
+              <div className="settings-pref-control">
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept=".zip,application/zip"
+                  style={{ display: 'none' }}
+                  onChange={event => {
+                    const file = event.target.files?.[0]
+                    event.target.value = ''
+                    if (file) void importArchive(file)
+                  }}
+                />
+                <Button
+                  icon={<UploadOutlined />}
+                  loading={importing}
+                  onClick={() => importInputRef.current?.click()}
+                >
+                  选择 ZIP
+                </Button>
+              </div>
             </div>
           </Card>
 

@@ -216,6 +216,9 @@ export interface AppCtx {
   sendFeishuTest: (chatId: string) => Promise<void>
   /** Send one real notification down every configured path and report each. */
   testNotification: () => Promise<void>
+  /** Merge an exported archive; additive, never destructive. */
+  importArchive: (file: File) => Promise<void>
+  importing: boolean
   notifyTesting: boolean
   feishuChatsError: string
   loadFeishuChats: () => Promise<void>
