@@ -145,6 +145,9 @@ export interface AppCtx {
   pluginPage?: string
   /** Which theme is actually showing, for the page frame's `?theme=`. */
   resolvedTheme: "light" | "dark"
+  /** The authenticated client. A plugin page is fetched through it -- a frame's
+   * own navigation cannot carry the Authorization header. */
+  api: (path: string, options?: RequestInit) => Promise<Response>
   openPage: (pageId: string | null) => void
   /** Pages plugins declared: id, title, description. No HTML -- names only. */
   pluginPages: { id: string; title: string; description?: string }[]

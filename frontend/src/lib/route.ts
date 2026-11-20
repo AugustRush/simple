@@ -44,7 +44,17 @@ export function parseRoute(hash: string): { view: ViewName; page?: string } {
   if (head === PLUGIN_PAGE_PREFIX && second) {
     // The nav still highlights something, and "no page in the bar" is the
     // honest answer: the top bar's title will name the plugin's page instead.
-    return { view: 'home', page: decodeURIComponent(second) }
+    //
+    // Decoded defensively: `decodeURIComponent('%')` throws, and this runs inside
+    // a `useState` initialiser -- a malformed hash would take the whole app down
+    // to a blank page instead of landing on the conversation.
+    let page = second
+    try {
+      page = decodeURIComponent(second)
+    } catch {
+      page = second
+    }
+    return { view: 'home', page }
   }
   // An old `#/t/<id>` link lands on the conversation: that is the only screen it
   // could have meant, and `t` is not a view name.

@@ -92,6 +92,7 @@ def _read_sessions(conn: Any) -> list[dict[str, Any]]:
                 "turns": [],
                 "events": [],
                 "replaced_versions": [],
+                "replaced_events": [],
             }
         return sessions[key]
 
@@ -134,6 +135,21 @@ def _read_sessions(conn: Any) -> list[dict[str, Any]]:
         except ValueError:
             row["metadata"] = {}
         entry["replaced_versions"].append(row)
+
+    # The tool trace of a turn that was replaced. `restore_branch` needs it to
+    # bring a version back with the calls that produced it; an export that kept
+    # the turn and dropped its events left the restored version mute.
+    for row in _rows(
+        conn,
+        "SELECT session_id, event_type, payload_json, turn_id, created_at, seq, "
+        "branch_id, archived_at FROM agent_events_archive ORDER BY session_id, seq, id",
+    ):
+        entry = bucket(row.pop("session_id"))
+        try:
+            row["payload"] = json.loads(row.pop("payload_json") or "{}")
+        except ValueError:
+            row["payload"] = {}
+        entry["replaced_events"].append(row)
 
     return [sessions[key] for key in sorted(sessions)]
 
@@ -186,6 +202,12 @@ def _output_files(session_root: Path) -> list[Path]:
     if not session_root.is_dir():
         return []
     for path in sorted(session_root.rglob("*")):
+        # Never follow a symlink. `archive.write` reads through it, so a link
+        # pointing at `~/.agent/config.json` (or anything else on the disk) would
+        # be copied into an archive that promises not to contain credentials.
+        # Measured: a link to a file outside the tree was packed verbatim.
+        if path.is_symlink():
+            continue
         if not path.is_file():
             continue
         try:
@@ -255,6 +277,16 @@ def build_archive(
 
     included_output: list[str] = []
     omitted_output = 0
+    # A stale `.part` from a crash is inert (nothing reads that suffix), but it
+    # is still a full copy of the person's data sitting in /tmp. Removed on
+    # entry, and the finished file is made owner-only before it is served: the
+    # default 0644 let any local account read every conversation.
+    try:
+        staging.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
     with zipfile.ZipFile(staging, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("sessions.json", json.dumps(sessions, ensure_ascii=False, indent=1))
         archive.writestr("memory.json", json.dumps(memory, ensure_ascii=False, indent=1))
@@ -294,6 +326,7 @@ def build_archive(
                 "sessions": len(sessions),
                 "turns": sum(len(item["turns"]) for item in sessions),
                 "replaced_versions": sum(len(item["replaced_versions"]) for item in sessions),
+                "replaced_events": sum(len(item["replaced_events"]) for item in sessions),
                 "memory_entries": len(memory),
                 "tasks": len(tasks.get("tasks") or []),
                 "task_runs": len(tasks.get("runs") or []),
@@ -313,5 +346,7 @@ def build_archive(
         }
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=1))
 
+    # chmod the file that exists (the staging one), then move it into place.
+    os.chmod(staging, 0o600)
     os.replace(staging, target)
     return target, manifest

@@ -152,7 +152,7 @@ export function useShell(deps: Deps) {
       loadSkills(true)
       loadSchedulerHealth()
     }
-  }, [view, activeSession, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions])
+  }, [view, activeSession, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSettings, loadHome, loadSessions, pluginPage])
 
   // The board panel is where a proposal is answered now -- 自主 was a second
   // screen showing the same rows. So the panel fetches them when it opens, and
@@ -170,7 +170,11 @@ export function useShell(deps: Deps) {
    * -- and coming back showed the saved values, as though nothing had happened.
    */
   const navigateTo = (next: string, options: { fromHistory?: boolean } = {}) => {
-    if (next === view) return
+    // `!pluginPage` is not decoration: a plugin page (`#/p/<id>`) keeps `home`
+    // as its view, so navigating to 对话 from one hit this early return and did
+    // nothing -- clicking the app title while on a plugin page left the person
+    // where they were. Measured in a browser.
+    if (next === view && !pluginPage) return
     if (view !== 'settings' || !(settingsDirty || tokenDirty)) {
       setView(next)
       return

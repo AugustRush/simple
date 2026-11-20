@@ -89,6 +89,10 @@ export function useExtensions(deps: Deps) {
       } else {
         messageApi.success(enabled ? '插件已启用' : '插件已停用')
       }
+      // Both lists, because a plugin's *pages* come and go with it: without this
+      // the capability card kept showing a page for a plugin that had just been
+      // switched off, and 打开 on it could only 404.
+      void loadPlugins()
     } catch {
       setPlugins(prev =>
         prev.map(item =>
@@ -105,6 +109,8 @@ export function useExtensions(deps: Deps) {
     confirmResourceDeletion('插件', plugin.name, async () => {
       await api(`/api/plugins/${encodeURIComponent(plugin.name)}`, { method: 'DELETE' })
       setPlugins(prev => prev.filter(item => item.name !== plugin.name))
+      // Its pages went with it; the card must stop offering them.
+      void loadPlugins()
       messageApi.success('插件已删除')
     })
   }

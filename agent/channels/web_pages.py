@@ -51,6 +51,9 @@ class WebPageRegistry:
     def __init__(self) -> None:
         self._pages: dict[str, dict[str, Any]] = {}
         self._owners: dict[str, str] = {}
+        #: Owners whose undo has run -- an exact "this plugin is going away"
+        #: signal, for the same reason the route registry keeps one.
+        self._gone: set[str] = set()
 
     def register(
         self,
@@ -88,11 +91,18 @@ class WebPageRegistry:
             "html": html,
         }
         self._owners[clean] = str(owner or "")
+        if owner:
+            self._gone.discard(str(owner))
 
         def undo() -> None:
+            if owner:
+                self._gone.add(owner)
             if self._pages.get(clean, {}).get("html") is not html:
                 return
-            if previous is not None:
+            # Same rule as the route registry: a previous page is only put back
+            # while the plugin that declared it is still here.
+            restore = previous is not None and previous_owner not in self._gone
+            if restore:
                 self._pages[clean] = previous
                 self._owners[clean] = previous_owner
             else:

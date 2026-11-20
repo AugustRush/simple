@@ -56,7 +56,7 @@ function App() {
 
   const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage } = ui
 
-  const { contextHolder, messageApi, token } = apiClient
+  const { api, contextHolder, messageApi, token } = apiClient
 
   const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmSession, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
@@ -190,6 +190,7 @@ function App() {
     pluginPage,
     openPage,
     resolvedTheme,
+    api,
     setPluginSearch,
     loadingView,
     filteredPlugins,
@@ -340,7 +341,18 @@ function App() {
 
   // The thread name is the screen's title when one is open -- it is the only
   // place that answers "which conversation is this", now that no column does.
-  const currentMeta = pageMeta[view] || pageMeta.home
+  // A plugin page has no entry in `pageMeta` -- the set of them is whatever the
+  // installed plugins declare -- so the bar names the page instead of the view
+  // underneath it, which would otherwise read 对话 over a stock screener.
+  const pluginPageMeta = pluginPage
+    ? (pluginPages || []).find((item: any) => item.id === pluginPage)
+    : undefined
+  const currentMeta = pluginPage
+    ? {
+        title: pluginPageMeta?.title || pluginPage,
+        subtitle: pluginPageMeta?.description || '插件页面',
+      }
+    : pageMeta[view] || pageMeta.home
 
   const topbarMenu: MenuProps['items'] = [
     ...navItems.filter(item => item.key !== 'home' && item.key !== 'schedules'),
@@ -430,7 +442,9 @@ function App() {
             opened once a week. */}
         <Header className="app-topbar">
           <div className="topbar-left">
-            {view !== 'home' && (
+            {/* `pluginPage` too: a plugin page keeps `home` as its view, so this
+                button used to be hidden exactly where it was most needed. */}
+            {(view !== 'home' || pluginPage) && (
               <Button
                 type="text"
                 className="topbar-back"

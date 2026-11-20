@@ -10,9 +10,9 @@ it to the specific situation the habit is for.
 
 What is deterministic here, and what is not
 -------------------------------------------
-The **trigger** is: the person's session has an unfinished task (the state the
-"继续任务" card is built from), and no open goal already covers it. That is a fact
-this code can read, not a judgement.
+The **trigger** is: the session's most recent ``turn_finished`` event carries a
+cancellation, no open goal already covers it, and the person has not dismissed the
+"继续任务" card for it. Those are facts this code can read, not judgements.
 
 The **decision** stays with the model. It may judge that the unfinished thing
 should be dropped, or that it was not really a task, or that it is about to be
@@ -45,10 +45,13 @@ sentence the person can disagree with.
 
 When it stops
 -------------
-Two exits, both real: the model records the goal (an open goal then matches, so
-the nudge stops), or the person dismisses the card (the status becomes
-`dismissed`, which is not an interrupted status). A nudge that outlived both
-would be the kind of background noise that teaches a reader to skip the block.
+Three exits, all real. The turn that answers the nudge writes its own
+``turn_finished`` with an empty error, so the next call sees a finished turn --
+that is the one-shot guarantee, and it needs no counter. Before that, an open goal
+covering the task silences it (the model already acted), and so does a dismissal
+from the person: dismissing the "继续任务" card writes ``dismissed`` into the
+working state, which is an explicit "not this one". A nudge that outlived any of
+the three would be the background noise that teaches a reader to skip the block.
 """
 
 from __future__ import annotations
@@ -90,7 +93,8 @@ def resume_nudge(
     clean = str(session_id or "").strip()
     if not clean:
         return ""
-    event = _last_finished_turn(_store(store), clean)
+    store_ = _store(store)
+    event = _last_finished_turn(store_, clean)
     if not event:
         return ""
     payload = getattr(event, "payload", None)
@@ -109,6 +113,8 @@ def resume_nudge(
     if not goal:
         return ""
     if _already_a_goal(goal_store, goal, since=str(getattr(event, "created_at", "") or "")):
+        return ""
+    if _dismissed(store_, clean, goal):
         return ""
     return (
         "## 上一轮没有做完\n"
@@ -159,6 +165,47 @@ def _last_finished_turn(store: Optional[Any], session_id: str) -> Optional[Any]:
         if str(getattr(event, "event_type", "") or "") == "turn_finished":
             return event
     return None
+
+
+def _dismissed(store: Optional[Any], session_id: str, goal: str) -> bool:
+    """Whether the person answered the 继续任务 card with "don't continue".
+
+    The card's dismiss writes only to ``session_working_state``, and this block
+    deliberately does not read that state for its *trigger* (it is a projection of
+    the current turn, so the previous turn's status is already gone by the time
+    this runs). But a dismissal is an explicit answer from the person, and a nudge
+    that ignored it would set a goal for the exact task they just waved away --
+    which is the one thing worse than never reminding them at all.
+
+    Matched on the task text rather than on time: the dismiss writes the *task
+    entry's* own ``updated_at``, not the moment of dismissal, so a timestamp
+    comparison has nothing to compare against.
+    """
+    if store is None:
+        return False
+    load = getattr(store, "load_session_working_state", None)
+    if not callable(load):
+        return False
+    try:
+        snapshot = load(session_id)
+    except Exception:
+        return False
+    state = getattr(snapshot, "state", None)
+    if not isinstance(state, dict):
+        return False
+    entries: list[Any] = list(state.get("tasks") or [])
+    if str(state.get("active_goal") or "").strip():
+        entries.append(state)
+    wanted = _normalized(goal)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "").strip().lower() != "dismissed":
+            continue
+        text = _normalized(str(entry.get("active_goal") or ""))
+        if text and (text in wanted or wanted in text):
+            return True
+    return False
 
 
 def _already_a_goal(goal_store: Optional[Any], goal: str, since: str = "") -> bool:

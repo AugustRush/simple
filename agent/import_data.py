@@ -155,6 +155,12 @@ def _import_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) -
         for row in session.get("replaced_versions") or []:
             if not isinstance(row, dict):
                 continue
+            # These carry positions too. Leaving them out of `highest` let the
+            # next turn reuse one: measured a session whose active turns sat at
+            # seq 1,2 and whose kept-aside versions sat at 3,4 imported with
+            # next_seq=3, after which restoring a version produced two rows at
+            # seq 3 and two at seq 4 -- the transcript stopped being one order.
+            highest = max(highest, int(row.get("seq") or 0))
             conn.execute(
                 "INSERT INTO conversation_turns_archive "
                 "(session_id, role, content, channel, message_id, reply_to_id, "
@@ -175,6 +181,25 @@ def _import_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) -
                     str(row.get("branch_id") or ""),
                     str(row.get("archived_at") or ""),
                     str(row.get("archived_by") or "import"),
+                ),
+            )
+        for row in session.get("replaced_events") or []:
+            if not isinstance(row, dict):
+                continue
+            conn.execute(
+                "INSERT INTO agent_events_archive "
+                "(session_id, event_type, payload_json, turn_id, created_at, seq, "
+                " branch_id, archived_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    str(row.get("event_type") or ""),
+                    json.dumps(row.get("payload") or {}, ensure_ascii=False),
+                    str(row.get("turn_id") or ""),
+                    str(row.get("created_at") or ""),
+                    int(row.get("seq") or 0),
+                    str(row.get("branch_id") or ""),
+                    str(row.get("archived_at") or ""),
                 ),
             )
         title = str(session.get("title") or "").strip()
@@ -301,9 +326,14 @@ def _import_output(
         parts = Path(relative).parts
         if len(parts) < 2:
             continue
-        target = web_sessions_dir.joinpath(*parts)
+        # `relative_to` alone is a *lexical* check: `/a/b/../../../x` passes it
+        # against `/a/b` because the parts still start with `a`. Measured: an
+        # archive entry `output/s1/output/../../../pwned.txt` was written outside
+        # `web/sessions`. Resolve both sides first, then compare.
+        target = (web_sessions_dir / Path(*parts)).resolve()
+        root = web_sessions_dir.resolve()
         try:
-            target.relative_to(web_sessions_dir)
+            target.relative_to(root)
         except ValueError:
             # A path that escapes the directory is not a file this archive is
             # allowed to write.
@@ -369,6 +399,11 @@ def import_archive(
         LTMStore(context_dir).close()
         palace = Path(context_dir) / "palace.db"
         conn = sqlite3.connect(str(palace))
+        # Row access by name, because `fts._sync_fts_row` reads `row["status"]`
+        # to decide how to index the entry. A bare connection returns tuples, so
+        # the whole import died with `TypeError: tuple indices must be integers`
+        # the moment an archive contained one memory entry -- measured.
+        conn.row_factory = sqlite3.Row
         try:
             with conn:
                 report.update(_import_sessions(conn, sessions))

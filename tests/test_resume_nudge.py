@@ -24,11 +24,22 @@ class _Event:
 
 
 class _Store:
-    def __init__(self, events: list[_Event]) -> None:
+    def __init__(self, events: list[_Event], working_state: dict | None = None) -> None:
         self._events = events
+        self._working_state = working_state
 
     def recent_agent_events(self, *, session_id: str, limit: int = 20):
         return self._events
+
+    def load_session_working_state(self, session_id: str):
+        if self._working_state is None:
+            return None
+
+        class _Snapshot:
+            state = self._working_state
+            updated_at = ""
+
+        return _Snapshot()
 
 
 class _Goals:
@@ -40,9 +51,9 @@ class _Goals:
         return [{"goal": item, "created_at": self._created_at} for item in self._goals]
 
 
-def _nudge(events, goals=(), *, created_at="", goal_created_at=""):
+def _nudge(events, goals=(), *, created_at="", goal_created_at="", working_state=None):
     return resume_nudge(
-        store=_Store(events),
+        store=_Store(events, working_state),
         goal_store=_Goals(list(goals), goal_created_at),
         session_id="s1",
     )
@@ -134,3 +145,30 @@ def test_it_reaches_the_rendered_turn() -> None:
 
     assert "resume_nudge(" in source
     assert "turn_blocks.append(nudge)" in source
+
+
+def test_dismissing_the_card_silences_the_nudge() -> None:
+    """Measured against the code: the dismiss writes only to the working state,
+    and this block reads events -- so without an explicit check, a person who
+    clicked "不用继续" would get a goal set for the exact task they waved away.
+    """
+    state = {
+        "status": "dismissed",
+        "active_goal": "归档旧截图",
+        "tasks": [
+            {"status": "dismissed", "active_goal": "归档旧截图"},
+            {"status": "in_progress", "active_goal": ""},
+        ],
+    }
+
+    assert _nudge([_finished("cancelled_by_user", "归档旧截图")], working_state=state) == ""
+
+
+def test_a_dismissal_of_a_different_task_does_not_silence_it() -> None:
+    state = {"tasks": [{"status": "dismissed", "active_goal": "写周报"}]}
+
+    block = _nudge(
+        [_finished("cancelled_by_user", "归档旧截图")], working_state=state
+    )
+
+    assert "归档旧截图" in block

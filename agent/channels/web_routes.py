@@ -65,6 +65,11 @@ class WebRouteRegistry:
         #: practice; the flag exists so "public" is a written decision rather than
         #: a missing one.
         self._public: dict[tuple[str, str], bool] = {}
+        #: Owners whose undo has run. An exact liveness signal: a plugin's scope
+        #: unwinds its contributions in order, so "my undo ran" means "I am
+        #: going away". The first attempt asked whether the owner still had other
+        #: routes -- which is wrong for a plugin whose only route was replaced.
+        self._gone: set[str] = set()
 
     def register(
         self,
@@ -87,12 +92,42 @@ class WebRouteRegistry:
             )
         if not clean_path.startswith("/api/plugin/"):
             # Not a style rule: a namespace is what lets the app promise that its
-            # own endpoints mean what the frontend thinks they mean. `/api/plugin/`
-            # is the one prefix no built-in route uses.
+            # own endpoints mean what the frontend thinks they mean.
             raise ValueError(
                 "contributed routes live under /api/plugin/: "
                 f"{clean_path!r} would sit in the app's own namespace"
             )
+        # `/api/plugin/` is no longer empty: the page endpoints live there too,
+        # and a contributed route on the same path would be appended *after* the
+        # built-in and never match. Measured: the plugin's handler was registered,
+        # logged as mounted, and silently ignored. Refusing is the only outcome
+        # the author can see.
+        reserved = clean_path == "/api/plugin/pages" or clean_path.startswith(
+            "/api/plugin/pages/"
+        )
+        if reserved:
+            raise ValueError(
+                f"{clean_path!r} is reserved for plugin pages; use another path "
+                "under /api/plugin/"
+            )
+        if not isinstance(public, bool):
+            # `bool("false")` is True. A plugin reading `public` from JSON config
+            # would have published a route it meant to keep private.
+            raise ValueError(
+                f"route {verb} {clean_path}: public must be True or False, "
+                f"not {public!r}"
+            )
+        try:
+            from starlette.routing import compile_path
+
+            compile_path(clean_path)
+        except Exception as exc:  # noqa: BLE001 - the reason is the message
+            # Checked here rather than where the Route is built: a typo in a
+            # plugin's path used to surface inside `bind_runtime`, where it takes
+            # the whole web channel down instead of failing that one plugin.
+            raise ValueError(
+                f"route {verb} {clean_path} is not a valid path: {exc}"
+            ) from None
         if not callable(handler):
             raise ValueError(f"route {verb} {clean_path} needs a callable handler")
         key = (verb, clean_path)
@@ -103,16 +138,36 @@ class WebRouteRegistry:
             )
         previous = self._routes.get(key)
         previous_owner = self._owners.get(key, "")
+        # The public flag is part of what a replacement replaces. Captured and
+        # restored with the handler: without this, plugin B replacing plugin A's
+        # *private* route with a public one and then unloading left A's handler
+        # served with `public=True` -- an endpoint A never published, reachable
+        # without the auth check. Measured with a two-registry repro.
+        previous_public = self._public.get(key, False)
         self._routes[key] = handler
         self._owners[key] = str(owner or "")
+        if owner:
+            # A plugin that registers again is loaded again.
+            self._gone.discard(str(owner))
         self._public[key] = bool(public)
 
         def undo() -> None:
+            # Recorded first: A's undo runs while B still owns the key, so it
+            # returns at the identity check below -- but A is still going away.
+            if owner:
+                self._gone.add(owner)
             if self._routes.get(key) is not handler:
                 return
-            if previous is not None:
+            # Restoring the previous handler only makes sense while its plugin is
+            # still loaded. Measured: A registers, B replaces it, A is unloaded
+            # first and B second -- B's undo then put A's handler back, and an
+            # endpoint belonging to an unloaded plugin kept answering (publicly,
+            # if A had said so).
+            restore = previous is not None and previous_owner not in self._gone
+            if restore:
                 self._routes[key] = previous
                 self._owners[key] = previous_owner
+                self._public[key] = previous_public
             else:
                 self._routes.pop(key, None)
                 self._owners.pop(key, None)

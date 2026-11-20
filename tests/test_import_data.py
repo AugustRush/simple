@@ -229,3 +229,257 @@ def test_importing_the_same_archive_twice_is_idempotent(tmp_path) -> None:
     assert second["sessions_added"] == 0
     assert second["sessions_skipped"] == 1
     assert _turns(target) == ["问题一", "回答一"]
+
+
+# ── regressions found by review ─────────────────────────────────────────────
+
+
+def test_an_archive_with_memory_imports_instead_of_crashing(tmp_path) -> None:
+    """Measured: `TypeError: tuple indices must be integers or slices, not str`.
+
+    `fts._sync_fts_row` reads `row["status"]` to decide how to index an entry,
+    and the import opened a bare connection -- which returns tuples. Every
+    archive containing one memory entry died, taking the session import in the
+    same transaction with it.
+    """
+    import sqlite3
+
+    from agent.memory.models import LTMEntry
+    from agent.memory.store import LTMStore
+
+    source = _home(tmp_path / "src", with_data=False)
+    store = LTMStore(source / "context")
+    store.add_entry(
+        LTMEntry(
+            id="m1",
+            content="记住的事",
+            importance=0.5,
+            category="concepts",
+            created_at="2026-01-01 00:00:00",
+            updated_at="2026-01-01 00:00:00",
+        )
+    )
+    store.close()
+    archive, manifest = _export(source, tmp_path / "a.zip")
+    assert manifest["counts"]["memory_entries"] == 1
+
+    target = _home(tmp_path / "dst", with_data=False)
+    report = _import(target, archive)
+
+    assert report["memory_added"] == 1
+    conn = sqlite3.connect(target / "context" / "palace.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 1
+        # And the index retrieval reads: a row without one is a memory the agent
+        # will never find.
+        assert conn.execute("SELECT COUNT(*) FROM memory_items_fts").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_an_archive_cannot_write_outside_the_sessions_directory(tmp_path) -> None:
+    """`relative_to` is lexical: `/a/b/../../../x` passes it against `/a/b`.
+
+    Measured: an entry named `output/s1/output/../../../pwned.txt` was written
+    outside `web/sessions`. A malicious archive could drop files anywhere the
+    gateway can write.
+    """
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("manifest.json", json.dumps({"archive_version": 1}))
+        handle.writestr("sessions.json", "[]")
+        handle.writestr("memory.json", "[]")
+        handle.writestr("output/s1/output/../../../pwned.txt", "ESCAPED")
+
+    target = _home(tmp_path / "dst", with_data=False)
+    report = _import(target, archive)
+
+    assert report["output_copied"] == 0
+    assert report["output_skipped"] >= 1
+    assert not list((tmp_path / "dst").rglob("pwned.txt")), "wrote outside the root"
+
+
+def _task_home(base: Path):
+    """A home with one scheduled task, made through the scheduler's own API.
+
+    Not hand-written INSERTs: `scheduled_tasks` has a dozen NOT NULL columns and
+    a hand-written row breaks on the next one somebody adds.
+    """
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    home = _home(base, with_data=False)
+    scheduler = SchedulerStore(db_path=home / "tasks" / "scheduler.db")
+    scheduler.create_task(
+        NewScheduledTask(
+            name="周报",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-12-01T09:00:00+00:00", "UTC"),
+            payload={"prompt": "写周报"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            workspace_root=str(home),
+        )
+    )
+    scheduler.close()
+    return home
+
+
+def test_a_task_exported_while_running_is_not_left_unrunnable(tmp_path) -> None:
+    """A task carries `active_run_id`; if that run is not in the archive the
+    imported task points at nothing. `claim_due_tasks` requires the column to be
+    NULL and stale-run recovery needs a run row to join, so it never runs again.
+    """
+    import sqlite3
+
+    source = _task_home(tmp_path / "src")
+    conn = sqlite3.connect(source / "tasks" / "scheduler.db")
+    with conn:
+        task_id = conn.execute("SELECT id FROM scheduled_tasks").fetchone()[0]
+        conn.execute(
+            "UPDATE scheduled_tasks SET active_run_id='run-gone', "
+            "lease_until='2030-01-01 00:00:00' WHERE id=?",
+            (task_id,),
+        )
+    conn.close()
+
+    archive, _manifest = _export(source, tmp_path / "a.zip")
+    target = _home(tmp_path / "dst", with_data=False)
+    _import(target, archive)
+
+    conn = sqlite3.connect(target / "tasks" / "scheduler.db")
+    try:
+        row = conn.execute(
+            "SELECT active_run_id, lease_until FROM scheduled_tasks"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (None, None), "a dangling claim must be cleared or the task never runs"
+
+
+def test_task_run_history_survives_the_round_trip(tmp_path) -> None:
+    """The export listed runs and the manifest counted them; the import dropped
+    them, so a restored task showed no history at all."""
+    import sqlite3
+
+    source = _task_home(tmp_path / "src")
+    conn = sqlite3.connect(source / "tasks" / "scheduler.db")
+    with conn:
+        task_id = conn.execute("SELECT id FROM scheduled_tasks").fetchone()[0]
+        conn.execute(
+            "INSERT INTO scheduled_task_runs (id, task_id, scheduled_for, started_at, "
+            " status, created_at, updated_at) "
+            "VALUES ('r1', ?, '2026-01-01', '2026-01-01', 'succeeded', "
+            "        '2026-01-01', '2026-01-01')",
+            (task_id,),
+        )
+    conn.close()
+
+    archive, manifest = _export(source, tmp_path / "a.zip")
+    assert manifest["counts"]["task_runs"] == 1
+
+    target = _home(tmp_path / "dst", with_data=False)
+    report = _import(target, archive)
+
+    assert report["task_runs_added"] == 1
+    conn = sqlite3.connect(target / "tasks" / "scheduler.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM scheduled_task_runs").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_the_tool_trace_of_a_replaced_turn_survives(tmp_path) -> None:
+    """`restore_branch` reads `agent_events_archive` to bring a version back with
+    the calls that produced it. Exporting only the turns left it mute: the turn
+    came back, the tool calls that made it did not.
+    """
+    import sqlite3
+
+    source = _home(tmp_path / "src")
+    conn = sqlite3.connect(source / "context" / "palace.db")
+    with conn:
+        conn.execute(
+            "INSERT INTO conversation_turns_archive (session_id, role, content, "
+            " created_at, seq, turn_index, branch_id, archived_at) "
+            "VALUES ('s1','user','被换下的一问','2026-01-01 00:00:00', 9, 1, "
+            "        'branch-1', '2026-01-01 00:00:01')"
+        )
+        conn.execute(
+            "INSERT INTO agent_events_archive (session_id, event_type, payload_json, "
+            " turn_id, created_at, seq, branch_id, archived_at) "
+            "VALUES ('s1','tool_started','{\"tool_name\": \"list_files\"}', 'm1', "
+            "        '2026-01-01 00:00:00', 8, 'branch-1', '2026-01-01 00:00:01')"
+        )
+    conn.close()
+
+    archive, manifest = _export(source, tmp_path / "a.zip")
+    assert manifest["counts"]["replaced_versions"] == 1
+    assert manifest["counts"]["replaced_events"] == 1
+
+    target = _home(tmp_path / "dst", with_data=False)
+    _import(target, archive)
+
+    conn = sqlite3.connect(target / "context" / "palace.db")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_turns_archive"
+        ).fetchone()[0] == 1
+        row = conn.execute(
+            "SELECT event_type, payload_json, branch_id FROM agent_events_archive"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "the replaced turn's tool trace was dropped"
+    assert row[0] == "tool_started"
+    assert "list_files" in row[1]
+    assert row[2] == "branch-1"
+
+
+def test_the_sequence_counter_covers_the_versions_kept_aside(tmp_path) -> None:
+    """Measured: active turns at seq 1,2 and kept-aside versions at 3,4 imported
+    with next_seq=3, after which restoring a version produced two rows at seq 3
+    and two at seq 4 -- the transcript stopped being one order."""
+    import sqlite3
+
+    from agent.memory.store import LTMStore
+
+    source = _home(tmp_path / "src", with_data=False)
+    store = LTMStore(source / "context")
+    for index in range(1, 5):
+        store.write_conversation_exchange(
+            session_id="s1",
+            user_content=f"问题{index}",
+            assistant_content=f"回答{index}",
+            channel="web",
+            message_id=f"m{index}",
+        )
+    store.close()
+
+    # Keep the last two turns aside, leaving two active.
+    store = LTMStore(source / "context")
+    rows = store.recent_conversation_turns(session_id="s1", limit=10)
+    users = [row for row in rows if row.role == "user"]
+    store.archive_tail_from(session_id="s1", from_seq=users[2].seq)
+    store.close()
+
+    archive, _manifest = _export(source, tmp_path / "a.zip")
+    target = _home(tmp_path / "dst", with_data=False)
+    _import(target, archive)
+
+    conn = sqlite3.connect(target / "context" / "palace.db")
+    try:
+        highest = max(
+            conn.execute("SELECT COALESCE(MAX(seq),0) FROM conversation_turns_archive").fetchone()[0],
+            conn.execute("SELECT COALESCE(MAX(seq),0) FROM conversation_turns").fetchone()[0],
+        )
+        next_seq = conn.execute(
+            "SELECT next_seq FROM transcript_seq_counters WHERE session_id='s1'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert next_seq > highest, f"next_seq={next_seq} would reuse a position <= {highest}"

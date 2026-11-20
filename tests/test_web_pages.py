@@ -137,3 +137,18 @@ def test_the_theme_travels_in_the_url_not_a_channel() -> None:
         line for line in source.splitlines() if not line.strip().startswith(("*", "/*", "//"))
     )
     assert "postMessage" not in code
+
+
+def test_a_page_replacement_chain_does_not_resurrect_an_unloaded_plugin() -> None:
+    """Same rule as contributed routes: a page only comes back while the plugin
+    that declared it is still loaded."""
+    registry = WebPageRegistry()
+    a, b = _Ctx("a"), _Ctx("b")
+
+    registry.scoped(a).add("x", title="A", html="a")
+    registry.scoped(b).add("x", title="B", html="b", replace=True)
+
+    a.unload()
+    b.unload()
+
+    assert registry.listing() == []

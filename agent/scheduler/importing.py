@@ -38,10 +38,30 @@ def import_tasks(db_path: Path, payload: Any) -> dict[str, int]:
 
     SchedulerStore(db_path=path).close()
 
-    added = skipped = 0
+    added = skipped = runs_added = 0
     conn = sqlite3.connect(str(path))
     try:
         with conn:
+            # Runs first: a task's `active_run_id` refers to one, and the check
+            # below needs the runs to exist before it can tell a live claim from
+            # a stale one.
+            for run in payload.get("runs") or []:
+                if not isinstance(run, dict):
+                    continue
+                run_id = str(run.get("id") or "").strip()
+                if not run_id:
+                    continue
+                if conn.execute(
+                    "SELECT 1 FROM scheduled_task_runs WHERE id = ?", (run_id,)
+                ).fetchone():
+                    continue
+                columns = [key for key in run if key != "id"]
+                conn.execute(
+                    f"INSERT INTO scheduled_task_runs (id, {', '.join(columns)}) "
+                    f"VALUES (?, {', '.join('?' for _ in columns)})",
+                    (run_id, *[run[column] for column in columns]),
+                )
+                runs_added += 1
             for task in payload.get("tasks") or []:
                 if not isinstance(task, dict):
                     continue
@@ -54,12 +74,26 @@ def import_tasks(db_path: Path, payload: Any) -> dict[str, int]:
                     skipped += 1
                     continue
                 columns = [key for key in task if key != "id"]
+                values = [task[column] for column in columns]
+                # A task exported while it was running carries an `active_run_id`
+                # and a `lease_until`. If that run row is not in the archive, the
+                # imported task points at nothing: `claim_due_tasks` requires
+                # `active_run_id IS NULL` and stale-run recovery needs a run row
+                # to join, so the task would never run again. Measured. Clearing
+                # the claim is the only honest repair -- the work was not done.
+                active = str(task.get("active_run_id") or "").strip()
+                if active and not conn.execute(
+                    "SELECT 1 FROM scheduled_task_runs WHERE id = ?", (active,)
+                ).fetchone():
+                    for name in ("active_run_id", "lease_until"):
+                        if name in columns:
+                            values[columns.index(name)] = None
                 conn.execute(
                     f"INSERT INTO scheduled_tasks (id, {', '.join(columns)}) "
                     f"VALUES (?, {', '.join('?' for _ in columns)})",
-                    (task_id, *[task[column] for column in columns]),
+                    (task_id, *values),
                 )
                 added += 1
     finally:
         conn.close()
-    return {"tasks_added": added, "tasks_skipped": skipped}
+    return {"tasks_added": added, "tasks_skipped": skipped, "task_runs_added": runs_added}

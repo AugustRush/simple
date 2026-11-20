@@ -17,6 +17,7 @@ from agent.channels import web_autonomy, web_home, web_memory
 
 import asyncio
 import contextlib
+import html
 import inspect
 import json
 import logging
@@ -203,6 +204,12 @@ def _session_token_budget(cfg: Any) -> int:
         return 0
 
 
+#: The largest archive the import endpoint will read. Exports of this install are
+#: ~24MB; 512MB leaves room for a decade of history without letting one request
+#: exhaust the process's memory.
+_MAX_IMPORT_BYTES = 512 * 1024 * 1024
+
+
 class WebChannel(Channel):
     """Starlette-based channel for a browser frontend."""
 
@@ -234,6 +241,11 @@ class WebChannel(Channel):
         #: connect cannot tell this server from whatever else holds the port.
         self._server: Any = None
         self._app = self._build_app()
+        #: The Route objects contributed endpoints were mounted as. Kept so a
+        #: recomposition can take them back out: an unloaded plugin's endpoint
+        #: otherwise stayed alive, and a reload appended a second Route for the
+        #: same path that shadowed the new handler. Measured both.
+        self._contributed_route_objects: list[Any] = []
 
     @property
     def app(self) -> Any:
@@ -1734,6 +1746,11 @@ class WebChannel(Channel):
             shutil.rmtree(path)
             reload_fn = getattr(catalog, "reload", None)
             if callable(reload_fn): await reload_fn(self._components)
+            # The removed plugin's endpoints go with it. `reload` unwinds its
+            # contributions, but a Route already appended to the app is not a
+            # contribution the scope knows about -- measured: the endpoint kept
+            # answering after the plugin was deleted.
+            self._mount_contributed_routes()
             self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
             return JSONResponse({"ok": True, "name": name})
         except Exception as exc: return JSONResponse({"error": str(exc)}, status_code=500)
@@ -2252,12 +2269,23 @@ class WebChannel(Channel):
                 body = await body
         except Exception as exc:  # noqa: BLE001 - the page's failure is its answer
             logger.exception("contributed page %r failed to render", page_id)
-            return HTMLResponse(
-                f"<!doctype html><meta charset=utf-8>"
-                f"<body style='font:13px system-ui;padding:16px;color:#888'>"
-                f"这个页面渲染失败：{exc}</body>",
+            # The failure page carries the same sandbox header as a success, and
+            # the exception is escaped. Measured: without either, a page whose
+            # renderer raised would hand back an *unsandboxed* same-origin
+            # document containing the raw exception text -- a plugin could raise
+            # `ValueError("<script>…")` and the error page became a way out of the
+            # sandbox, reading the app's token out of localStorage.
+            failure = HTMLResponse(
+                "<!doctype html><meta charset=utf-8>"
+                "<body style='font:13px system-ui;padding:16px;color:#888'>"
+                f"这个页面渲染失败：{html.escape(str(exc))}</body>",
                 status_code=500,
             )
+            failure.headers["Content-Security-Policy"] = (
+                "sandbox allow-scripts allow-forms"
+            )
+            failure.headers["Cache-Control"] = "no-store"
+            return failure
         response = HTMLResponse(str(body or ""))
         response.headers["Content-Security-Policy"] = (
             "sandbox allow-scripts allow-forms"
@@ -2268,10 +2296,16 @@ class WebChannel(Channel):
     async def _import_data(self, request: Any) -> Any:
         """Merge an exported archive into this install.
 
-        The body is the ZIP itself rather than multipart: one file, one stream,
-        and no parser in between that can disagree about what the bytes mean.
-        Written to a temp file first so a 24MB upload does not sit in memory, and
-        removed afterwards whatever happened.
+        The body is the ZIP itself rather than multipart: one file, no parser in
+        between that can disagree about what the bytes mean.
+
+        Size-capped before it is read. `await request.body()` buffers the whole
+        body in memory, and neither uvicorn nor Starlette imposes a limit by
+        default -- an authenticated client sending a multi-gigabyte body would
+        take the gateway down. The first version's docstring claimed the upload
+        was written to a temp file *so it would not sit in memory*, while the code
+        right below it did exactly that; the cap is what makes the claim true
+        enough to be worth writing down.
         """
         import tempfile
 
@@ -2282,9 +2316,21 @@ class WebChannel(Channel):
         from agent import shared
         from agent.import_data import ArchiveError, import_archive
 
+        declared = str(request.headers.get("content-length") or "").strip()
+        if declared.isdigit() and int(declared) > _MAX_IMPORT_BYTES:
+            return JSONResponse(
+                {"error": f"归档太大（上限 {_MAX_IMPORT_BYTES // (1024 * 1024)}MB）"},
+                status_code=413,
+            )
         body = await request.body()
         if not body:
             return JSONResponse({"error": "请求里没有文件"}, status_code=400)
+        if len(body) > _MAX_IMPORT_BYTES:
+            # A chunked upload declares no length; checked again after reading.
+            return JSONResponse(
+                {"error": f"归档太大（上限 {_MAX_IMPORT_BYTES // (1024 * 1024)}MB）"},
+                status_code=413,
+            )
         handle, temp_name = tempfile.mkstemp(suffix=".zip")
         temp_path = Path(temp_name)
         try:
@@ -3628,12 +3674,26 @@ class WebChannel(Channel):
         return Starlette(routes=routes, middleware=middleware)
 
     def _mount_contributed_routes(self) -> None:
-        """Append the endpoints plugins added to the already-built app."""
+        """Make the app's contributed endpoints match the registry, now.
+
+        Removes what was mounted last time before adding the current set. The
+        mount used to be a one-time snapshot taken in `bind_runtime`: a plugin
+        unloaded afterwards kept answering requests, and a reload appended a
+        second Route for the same path -- the first one, now stale, still won the
+        match, so updated plugin code never took effect.
+        """
         from starlette.routing import Route as _Route
 
+        for stale in self._contributed_route_objects:
+            try:
+                self._app.routes.remove(stale)
+            except ValueError:
+                pass
+        self._contributed_route_objects = []
         built = self._contributed_routes(_Route)
         if built:
             self._app.routes.extend(built)
+            self._contributed_route_objects = list(built)
 
     def _contributed_routes(self, route_class: Any) -> list[Any]:
         """The endpoints plugins added, each wrapped in this channel's auth check.

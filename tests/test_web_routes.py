@@ -107,3 +107,128 @@ def test_contributed_routes_are_mounted_after_the_built_ins() -> None:
     assert "routes.extend(self._contributed_routes(" not in build, (
         "mounting at build time is the bug: components are empty there"
     )
+
+
+def test_unloading_a_replacement_restores_the_auth_setting_too() -> None:
+    """Measured with a two-plugin repro: B replaces A's *private* route with a
+    public one, then unloads. The handler went back to A's, the flag did not --
+    so A's endpoint stayed reachable without the auth check it was declared with.
+    The public flag is part of what a replacement replaces.
+    """
+    registry = WebRouteRegistry()
+    a, b = _Ctx("a"), _Ctx("b")
+
+    async def private_handler(request):
+        return None
+
+    async def public_handler(request):
+        return None
+
+    registry.scoped(a).add("GET", "/api/plugin/x", private_handler)
+    registry.scoped(b).add(
+        "GET", "/api/plugin/x", public_handler, replace=True, public=True
+    )
+    assert registry.routes()[0][2] is public_handler
+
+    b.unload()
+
+    _verb, _path, handler, public = registry.routes()[0]
+    assert handler is private_handler
+    assert public is False, "A's route must not come back published"
+
+
+# ── regressions found by review ─────────────────────────────────────────────
+
+
+def test_a_replacement_chain_does_not_resurrect_an_unloaded_plugin() -> None:
+    """A registers, B replaces, A unloads first, then B unloads.
+
+    B's undo would put A's handler back -- from a plugin that is gone, and
+    publicly if A had said so. Measured with a two-plugin repro.
+    """
+    registry = WebRouteRegistry()
+    a, b = _Ctx("a"), _Ctx("b")
+
+    async def handler_a(request):
+        return None
+
+    async def handler_b(request):
+        return None
+
+    registry.scoped(a).add("GET", "/api/plugin/x", handler_a)
+    registry.scoped(b).add("GET", "/api/plugin/x", handler_b, replace=True)
+
+    a.unload()
+    b.unload()
+
+    assert registry.routes() == []
+
+
+def test_the_page_endpoints_are_reserved() -> None:
+    """`/api/plugin/pages` is a built-in now. A contributed route there was
+    registered, logged as mounted, and silently never matched -- the built-in
+    comes first."""
+    registry = WebRouteRegistry()
+
+    for path in ("/api/plugin/pages", "/api/plugin/pages/thing"):
+        with pytest.raises(ValueError, match="reserved for plugin pages"):
+            registry.register("GET", path, _handler)
+
+
+def test_a_path_that_starlette_cannot_compile_is_refused_at_registration() -> None:
+    """A typo used to surface inside `bind_runtime`, where it takes the whole
+    web channel down instead of failing that one plugin."""
+    registry = WebRouteRegistry()
+
+    for path in ("/api/plugin/{x}/{x}", "/api/plugin/{x:unknown}"):
+        with pytest.raises(ValueError, match="not a valid path"):
+            registry.register("GET", path, _handler)
+
+
+def test_public_must_be_a_real_boolean() -> None:
+    """`bool("false")` is True: a plugin reading the flag out of JSON config
+    would have published a route it meant to keep private."""
+    registry = WebRouteRegistry()
+
+    for value in ("false", 0, 1, None):
+        with pytest.raises(ValueError, match="must be True or False"):
+            registry.register("GET", "/api/plugin/x", _handler, public=value)
+
+
+def test_remounting_replaces_the_previous_routes_instead_of_appending() -> None:
+    """The mount used to be a one-time snapshot: an unloaded plugin's endpoint
+    kept answering, and a reload appended a second Route for the same path that
+    the first, stale one shadowed."""
+    import types
+
+    from agent.channels import web as web_module
+
+    async def first(request):
+        return None
+
+    async def second(request):
+        return None
+
+    channel = object.__new__(web_module.WebChannel)
+    channel._app = types.SimpleNamespace(routes=["builtin"])
+    channel._contributed_route_objects = []
+    channel._components = {}
+
+    state = {"handler": first}
+    channel._contributed_routes = types.MethodType(
+        lambda self, route_class: [("route", state["handler"])]
+        if state["handler"]
+        else [],
+        channel,
+    )
+    channel._mount_contributed_routes()
+    assert channel._app.routes == ["builtin", ("route", first)]
+
+    # Simulate the plugin being unloaded: the registry now has nothing.
+    state["handler"] = None
+    channel._mount_contributed_routes()
+    assert channel._app.routes == ["builtin"], "the stale route was not removed"
+
+    state["handler"] = second
+    channel._mount_contributed_routes()
+    assert channel._app.routes == ["builtin", ("route", second)]
