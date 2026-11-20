@@ -21,6 +21,12 @@ class WebRoutesPlugin:
     inject = ()
 
     def setup(self, ctx: Any) -> None:
-        from agent.channels.web_routes import shared_registry
+        from agent.channels.web_routes import WebRouteRegistry
 
-        ctx.provide("web_routes", shared_registry())
+        # One registry per composition, not the process-wide fallback -- the same
+        # rule `DeliveryTargetsPlugin` follows, for the same measured reason: two
+        # compositions in one process (a test suite is the obvious one, and
+        # `bootstrap.channels_only()` builds a second PluginHost) would share one
+        # registry, so a route or page contributed in one would appear in the
+        # other's channel.
+        ctx.provide("web_routes", WebRouteRegistry())

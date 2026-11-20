@@ -232,3 +232,29 @@ def test_remounting_replaces_the_previous_routes_instead_of_appending() -> None:
     state["handler"] = second
     channel._mount_contributed_routes()
     assert channel._app.routes == ["builtin", ("route", second)]
+
+
+def test_each_composition_gets_its_own_registry() -> None:
+    """Two compositions in one process must not share contributions.
+
+    `bootstrap.channels_only()` builds a second PluginHost with the same core
+    plugins, so a process-wide singleton meant a route one composition's plugin
+    added would answer in the other's channel. Same rule (and same measured
+    reason) as `DeliveryTargetsPlugin` and `SystemJobsPlugin`.
+    """
+    from agent.channels.web_routes_plugin import WebRoutesPlugin
+    from agent.kernel.plugin import PluginHost
+
+    first, second = PluginHost(), PluginHost()
+    first.load(WebRoutesPlugin())
+    second.load(WebRoutesPlugin())
+
+    one = first.services.get("web_routes")
+    two = second.services.get("web_routes")
+
+    assert one is not None and two is not None
+    assert one is not two, "two compositions shared one registry"
+
+    one.register("GET", "/api/plugin/only-in-one", _handler)
+    assert one.routes()
+    assert two.routes() == []

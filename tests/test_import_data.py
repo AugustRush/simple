@@ -483,3 +483,88 @@ def test_the_sequence_counter_covers_the_versions_kept_aside(tmp_path) -> None:
     finally:
         conn.close()
     assert next_seq > highest, f"next_seq={next_seq} would reuse a position <= {highest}"
+
+
+def test_a_failing_section_is_reported_and_the_rest_still_lands(tmp_path) -> None:
+    """Partial is a real outcome, not a server fault.
+
+    Measured before this: a valid archive with one malformed task wrote the
+    conversations, then raised -- the caller got a 500 and had no way to know
+    half of it had landed. Now the sections are isolated, the report says which
+    one failed, and `complete` is false.
+    """
+    import sqlite3
+
+    source = _home(tmp_path / "src")
+    archive, _manifest = _export(source, tmp_path / "a.zip")
+
+    # Rebuild the archive with a task row that violates a NOT NULL constraint.
+    broken = tmp_path / "broken.zip"
+    with zipfile.ZipFile(archive) as original, zipfile.ZipFile(broken, "w") as out:
+        for name in original.namelist():
+            if name == "tasks.json":
+                out.writestr(
+                    name,
+                    json.dumps({"tasks": [{"id": "t1", "name": "x", "kind": None}]}),
+                )
+            else:
+                out.writestr(name, original.read(name))
+
+    target = _home(tmp_path / "dst", with_data=False)
+    report = _import(target, broken)
+
+    assert report["complete"] is False
+    assert report["sections"]["tasks"]["ok"] is False
+    assert report["sections"]["tasks"]["error"]
+    # The conversations are the part somebody actually misses; they still landed.
+    assert report["sections"]["conversations"]["ok"] is True
+    assert _turns(target) == ["问题一", "回答一"]
+
+
+def test_a_complete_import_says_so(tmp_path) -> None:
+    source = _home(tmp_path / "src")
+    archive, _manifest = _export(source, tmp_path / "a.zip")
+
+    report = _import(_home(tmp_path / "dst", with_data=False), archive)
+
+    assert report["complete"] is True
+    assert all(section["ok"] for section in report["sections"].values())
+
+
+def test_re_running_a_partial_import_converges(tmp_path) -> None:
+    """The documented recovery path: everything is deduped by id, so importing
+    the same archive again finishes what the first attempt missed instead of
+    doubling it."""
+    source = _home(tmp_path / "src")
+    archive, _manifest = _export(source, tmp_path / "a.zip")
+    target = _home(tmp_path / "dst", with_data=False)
+
+    first = _import(target, archive)
+    second = _import(target, archive)
+
+    assert first["sessions_added"] == 1
+    assert second["sessions_added"] == 0
+    assert second["sessions_skipped"] == 1
+    assert _turns(target) == ["问题一", "回答一"]
+
+
+def test_a_half_written_output_file_is_not_treated_as_finished(tmp_path) -> None:
+    """The one failure a retry could not repair: a truncated file left at the
+    destination, which `exists()` then skips forever. Files are written through
+    a `.part` and renamed, so an interrupted copy leaves a `.part` -- never a
+    destination file that looks finished.
+    """
+    source = _home(tmp_path / "src")
+    archive, _manifest = _export(source, tmp_path / "a.zip")
+    target = _home(tmp_path / "dst", with_data=False)
+
+    # Simulate a crash mid-copy of `a.txt`: only the `.part` exists.
+    output = target / "web" / "sessions" / "s1" / "output"
+    output.mkdir(parents=True)
+    (output / "a.txt.part").write_text("hel")
+
+    report = _import(target, archive)
+
+    assert report["output_copied"] == 1
+    assert (output / "a.txt").read_text() == "hello"
+    assert not (output / "a.txt.part").exists(), "the interrupted copy was left behind"

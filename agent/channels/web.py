@@ -2219,15 +2219,11 @@ class WebChannel(Channel):
 
 
     def _web_pages_registry(self) -> Any:
-        registry = resolve(self._components, "web_pages")
-        # A composition may not have the plugin: fall back to the process-wide
-        # registry the core plugin provides, which is what a channel built
-        # without that plugin still serves.
-        if registry is None:
-            from agent.channels.web_pages import shared_registry
-
-            registry = shared_registry()
-        return registry
+        # No process-wide fallback: each composition provides its own registry
+        # (`WebPagesPlugin.setup`), and a channel without that plugin serves no
+        # pages. Falling back to a module-level singleton would let two
+        # compositions in one process see each other's pages.
+        return resolve(self._components, "web_pages")
 
     async def _plugin_page_list(self, request: Any) -> Any:
         """Every contributed page as ``{id, title, description}``."""
@@ -2350,7 +2346,10 @@ class WebChannel(Channel):
             return JSONResponse({"error": f"导入失败：{exc}"}, status_code=500)
         finally:
             self._discard_export(temp_path)
-        return JSONResponse({"ok": True, **report})
+        # `ok` mirrors `complete`: a partial import is not a success, and the
+        # two flags disagreeing is exactly the kind of thing a client reads
+        # whichever one it happens to check first.
+        return JSONResponse({"ok": bool(report.get("complete", True)), **report})
 
     async def _export_data(self, request: Any) -> Any:
         """Build the archive and stream it; delete the temp file afterwards."""

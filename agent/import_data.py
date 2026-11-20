@@ -16,6 +16,14 @@ does not exist. The report says, per section, what was added and what was left
 alone -- an import that silently skipped half an archive is a restore that fails
 later.
 
+**It is not atomic, and this module does not pretend otherwise.** The data lives
+in three SQLite files plus a directory; SQLite cannot commit across attached
+databases while any is in WAL mode, and swapping files would need the gateway
+restarted. What it guarantees instead: each section either applies or reports
+that it failed, the sections are independent, and the whole thing is idempotent
+-- so running the same archive again finishes a partial import rather than
+doubling it. `complete` in the result says whether every section applied.
+
 What it refuses
 ---------------
 * An archive whose ``archive_version`` is newer than this code understands. The
@@ -29,6 +37,7 @@ What it refuses
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -100,10 +109,21 @@ def _import_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) -
         session_id = str(session.get("session_id") or "").strip()
         if not session_id:
             continue
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM conversation_turns WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0]
+        # Checked across every table the session can live in. Asking only about
+        # `conversation_turns` meant a session whose archive held nothing but a
+        # tool trace, or nothing but replaced versions, was imported again on a
+        # retry -- and the retry is the documented recovery path for a partial
+        # import, so it has to converge.
+        existing = 0
+        for table in (
+            "conversation_turns",
+            "agent_events",
+            "conversation_turns_archive",
+            "agent_events_archive",
+        ):
+            existing += conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
         if existing:
             # Present means present: merging into a live conversation would put
             # two different timelines at the same positions.
@@ -343,8 +363,20 @@ def _import_output(
             skipped += 1
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        with archive.open(name) as source, target.open("wb") as sink:
-            shutil.copyfileobj(source, sink)
+        # Written beside the target and renamed into place. A half-copied file
+        # used to be left at the destination, where `target.exists()` then
+        # treated it as finished -- the one failure a re-run could never repair.
+        partial = target.with_name(target.name + ".part")
+        try:
+            with archive.open(name) as source, partial.open("wb") as sink:
+                shutil.copyfileobj(source, sink)
+            os.replace(partial, target)
+        except OSError:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise
         copied += 1
     return {"output_copied": copied, "output_skipped": skipped}
 
@@ -357,7 +389,30 @@ def import_archive(
     autonomy_dir: Path,
     web_sessions_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Merge one archive into this install; return what happened per section."""
+    """Merge one archive into this install; return what happened per section.
+
+    **Not all-or-nothing, and it says so.** The data lives in three SQLite files
+    plus a directory of output files, and SQLite cannot commit atomically across
+    attached databases when any of them is in WAL mode -- measured on this
+    install: two of the three are. Staging copies and swapping files would need
+    the gateway restarted, because a running process keeps writing to the inode
+    it already opened.
+
+    What is offered instead, and why it is enough: **the import is additive and
+    idempotent**, so re-running the same archive finishes a partial one. That is
+    a real recovery path, not a reassurance -- everything is deduped by id, and
+    output files are written through a temporary and renamed into place so a
+    half-copied file is never mistaken for a finished one.
+
+    The sections run in order of **value**, not convenience: conversations and
+    memory first, then scheduled work, then proposals, then output files. A
+    failure is caught per section (so a malformed task does not cost the
+    conversations), and an abrupt kill leaves whichever sections had already
+    finished -- which should be the part somebody would miss.
+
+    ``complete`` is part of the result: false means at least one section failed,
+    and ``sections`` says which. The caller must not report success on it.
+    """
     path = Path(archive_path)
     if not path.is_file():
         raise ArchiveError("找不到这个文件")
@@ -381,45 +436,91 @@ def import_archive(
         memory = _read_json(archive, "memory.json", [])
         tasks = _read_json(archive, "tasks.json", {})
         autonomy = _read_json(archive, "autonomy.json", {})
-        # Validated before anything is written: a malformed archive must leave
-        # nothing behind rather than half of it.
+        # Shape checks only -- what can be refused without writing anything.
+        # They catch a file that is not an export; they cannot promise the
+        # *contents* satisfy every constraint, which is why `complete` exists.
         if not isinstance(sessions, list):
             raise ArchiveError("sessions.json 不是列表")
         if not isinstance(memory, list):
             raise ArchiveError("memory.json 不是列表")
+        if not isinstance(tasks, dict):
+            raise ArchiveError("tasks.json 不是对象")
+        if not isinstance(autonomy, dict):
+            raise ArchiveError("autonomy.json 不是对象")
 
         report: dict[str, Any] = {}
-        # The store owns its schema; this module owns only the writes. Opening
-        # and closing each store first is what makes importing into a *fresh*
-        # install work -- measured: a raw connection to a home that had never run
-        # the agent found no `conversation_turns` table at all.
-        from agent.memory.store import LTMStore
+        sections: dict[str, dict[str, Any]] = {}
 
-        Path(context_dir).mkdir(parents=True, exist_ok=True)
-        LTMStore(context_dir).close()
-        palace = Path(context_dir) / "palace.db"
-        conn = sqlite3.connect(str(palace))
-        # Row access by name, because `fts._sync_fts_row` reads `row["status"]`
-        # to decide how to index the entry. A bare connection returns tuples, so
-        # the whole import died with `TypeError: tuple indices must be integers`
-        # the moment an archive contained one memory entry -- measured.
-        conn.row_factory = sqlite3.Row
-        try:
-            with conn:
-                report.update(_import_sessions(conn, sessions))
-                report.update(_import_memory(conn, memory))
-        finally:
-            conn.close()
+        def run(name: str, action: Any) -> None:
+            """Run one section, record its outcome, keep going after a failure.
 
+            Continuing is deliberate: a section that fails must not stop the
+            sections after it from succeeding, because the sum of what *did*
+            import is still worth having and the report says exactly what is
+            missing.
+            """
+            try:
+                result = action()
+            except Exception as exc:  # noqa: BLE001 - the reason is the report
+                sections[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                return
+            if isinstance(result, dict):
+                report.update(result)
+            sections[name] = {"ok": True, "error": ""}
+
+        # 1. Conversations and memory, in one transaction (same database).
+        def _sessions_and_memory() -> dict[str, Any]:
+            # The store owns its schema; this module owns only the writes.
+            # Opening one first is what makes importing into a *fresh* install
+            # work -- measured: a raw connection to a home that had never run the
+            # agent found no `conversation_turns` table at all.
+            from agent.memory.store import LTMStore
+
+            Path(context_dir).mkdir(parents=True, exist_ok=True)
+            LTMStore(context_dir).close()
+            conn = sqlite3.connect(str(Path(context_dir) / "palace.db"))
+            # Row access by name, because `fts._sync_fts_row` reads `row["status"]`
+            # to decide how to index the entry. A bare connection returns tuples,
+            # so the whole import died with `TypeError: tuple indices must be
+            # integers` the moment an archive contained one memory entry.
+            conn.row_factory = sqlite3.Row
+            try:
+                with conn:
+                    merged = _import_sessions(conn, sessions)
+                    merged.update(_import_memory(conn, memory))
+                return merged
+            finally:
+                conn.close()
+
+        run("conversations", _sessions_and_memory)
+
+        # 2. Scheduled work and proposals. Small and fast; they also disagree
+        #    with a newer schema more often than conversations do, and a failure
+        #    here is caught so it cannot cost the section above.
         from agent.scheduler.importing import import_tasks
 
-        report.update(import_tasks(Path(tasks_dir) / "scheduler.db", tasks))
-        report.update(_import_autonomy(Path(autonomy_dir) / "proposals.db", autonomy))
+        run("tasks", lambda: import_tasks(Path(tasks_dir) / "scheduler.db", tasks))
+        run("autonomy", lambda: _import_autonomy(Path(autonomy_dir) / "proposals.db", autonomy))
+
+
+        # 3. Output files last: the only section whose failure cannot be undone by
+        #    re-running if a half-written file were treated as finished.
         if web_sessions_dir is not None:
-            report.update(
-                _import_output(archive, archive.namelist(), Path(web_sessions_dir))
+            run(
+                "output",
+                lambda: _import_output(
+                    archive, archive.namelist(), Path(web_sessions_dir)
+                ),
             )
 
     report["archive_version"] = version
     report["exported_at"] = str(manifest.get("exported_at") or "")
+    report["sections"] = sections
+    report["complete"] = all(section["ok"] for section in sections.values())
+    if not report["complete"]:
+        report["error"] = "; ".join(
+            f"{name}: {section['error']}"
+            for name, section in sections.items()
+            if not section["ok"]
+        )
     return report

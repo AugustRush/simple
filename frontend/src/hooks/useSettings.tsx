@@ -164,9 +164,20 @@ export function useSettings(deps: Deps) {
       }
       const added = Number(body?.sessions_added || 0)
       const skipped = Number(body?.sessions_skipped || 0)
-      messageApi.success(
-        `导入了 ${added} 个对话` + (skipped ? `，跳过 ${skipped} 个已存在的` : ''),
-      )
+      const summary = `导入了 ${added} 个对话` + (skipped ? `，跳过 ${skipped} 个已存在的` : '')
+      if (body?.complete === false) {
+        // A partial import is a real outcome, not a server fault: the sections
+        // that did run are in place, and re-running the same archive finishes
+        // the rest (everything is deduped by id). Saying "成功" here would be
+        // the界面 lying about what is on disk.
+        const why = String(body?.error || '').trim()
+        messageApi.warning(
+          `部分导入：${summary}。${why ? `原因：${why}。` : ''}可以再导入一次继续。`,
+          8,
+        )
+      } else {
+        messageApi.success(summary)
+      }
       // The conversation list and the board both changed underneath.
       window.dispatchEvent(new CustomEvent('agent:data-imported'))
     } catch {
