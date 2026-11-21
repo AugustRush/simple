@@ -7,6 +7,23 @@
    * locally. Before this token the same card could be 8px (12-sessions) or
    * 20px (10-glass) depending on which partial won the cascade. */
   --radius-surface: 12px;
+  /* One control-height scale. Before this the same interactive control was
+   * 42/40/38/34/32/30/28/25/22 depending on which partial won the cascade --
+   * nine heights for five jobs. Five steps, each with a named user:
+   *
+   *   lg 44  sidebar navigation and the primary sidebar actions
+   *   md 40  default: header menu, search fields, the send button
+   *   sm 36  secondary buttons (empty-state suggestions, sidebar footer)
+   *   xs 32  compact toolbars: deliver mode, segmented control, model/permission
+   *   2xs 28 dense inline controls: row actions, "fetch models"
+   *
+   * A control gets a token, never a number. Icons, avatars and badges keep
+   * their own sizes: they are not on this scale and should not be. */
+  --control-lg: 44px;
+  --control-md: 40px;
+  --control-sm: 36px;
+  --control-xs: 32px;
+  --control-2xs: 28px;
   --bg: #0e0e0f;
   --bg-soft: #151516;
   --surface: #1b1b1d;

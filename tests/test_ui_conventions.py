@@ -220,3 +220,83 @@ def test_theme_has_three_modes_and_a_switch_that_cannot_flash() -> None:
     assert "theme-switching" in theme_module
     tokens = (STYLES / "01-theme-tokens.css").read_text()
     assert "html.theme-switching" in tokens
+
+
+def test_every_control_height_comes_from_the_scale() -> None:
+    """Nine heights (42/40/38/34/32/30/28/25/22) for five jobs, decided by
+    whichever partial won the cascade.
+
+    A control measured its own way is how a row of button + input + select ends
+    up three different heights, and how the same control changes height when a
+    later stylesheet loads. The scale lives in 01-theme-tokens.css; every other
+    partial names a step.
+    """
+    import re
+
+    tokens = (STYLES / "01-theme-tokens.css").read_text(encoding="utf-8")
+    declared = {
+        name: int(value)
+        for name, value in re.findall(r"(--control-[\w-]+):\s*(\d+)px", tokens)
+    }
+    assert declared == {
+        "--control-lg": 44,
+        "--control-md": 40,
+        "--control-sm": 36,
+        "--control-xs": 32,
+        "--control-2xs": 28,
+    }, declared
+
+    control_markers = (
+        ".ant-btn",
+        ".ant-input",
+        ".ant-select",
+        ".ant-menu-item",
+        ".send-button",
+        ".segmented-control",
+        ".workspace-search",
+        ".deliver-mode-button",
+        ".permission-button",
+        ".workspace-picker",
+        ".brand-action",
+        ".header-menu",
+    )
+    offenders: list[str] = []
+    for path in sorted(STYLES.glob("*.css")):
+        if path.name == "01-theme-tokens.css":
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", text):
+            selector = " ".join(match.group(1).split())
+            if not any(marker in selector for marker in control_markers):
+                continue
+            if ".workspace-status-dot" in selector:
+                continue  # a dot, not a control
+            if ".composer" in selector and ".ant-input" in selector:
+                # The composer's textarea. Its min-height is the *empty* height
+                # and it grows with what is typed -- not a control size, and
+                # pinning it to the scale would stop it growing.
+                continue
+            body = match.group(2)
+            literal = re.search(r"(?<!-)(min-)?height:\s*(\d+)px", body)
+            if literal:
+                line = text[: match.start()].count("\n") + 1
+                offenders.append(
+                    f"{path.name}:{line} {selector[-48:]} = {literal.group(2)}px"
+                )
+
+    assert not offenders, "control heights outside the scale:\n  " + "\n  ".join(offenders)
+
+
+def test_the_antd_scale_is_the_same_scale() -> None:
+    """A control's height must not depend on whether it happens to be an antd one.
+
+    `controlHeight` alone left SM and LG at antd's defaults, so a compact button
+    beside a token-sized one disagreed by a step.
+    """
+    import re
+
+    app = (STYLES.parent / "App.tsx").read_text(encoding="utf-8")
+
+    assert re.search(r"controlHeight:\s*40\b", app)
+    assert re.search(r"controlHeightSM:\s*32\b", app)
+    assert re.search(r"controlHeightLG:\s*44\b", app)

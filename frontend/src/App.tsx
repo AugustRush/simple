@@ -402,12 +402,20 @@ function App() {
           // into a hard point. 10px reads as one soft sheet; controls inherit
           // it and stay visibly rounder than the cards they sit in.
           borderRadius: 10,
-          // One control height for every control. Raising only `Button` to 38
-          // left Input/Select/InputNumber/DatePicker at antd's 32, so any row
-          // holding two of them disagreed about its own height -- and inside a
+          // One control height for every control, and the same scale the
+          // stylesheets use. Raising only `Button` to 38 left
+          // Input/Select/InputNumber/DatePicker at antd's 32, so any row holding
+          // two of them disagreed about its own height -- and inside a
           // `Space.Compact` the taller half overhung the shorter one it was
           // supposed to join. Pages patched the rows they noticed.
-          controlHeight: 38,
+          //
+          // 40 / 32 / 44 are `--control-md` / `--control-xs` / `--control-lg`
+          // from 01-theme-tokens.css; SM and LG are bound too, because a compact
+          // antd button beside a token-sized one is the same disagreement one
+          // step down.
+          controlHeight: 40,
+          controlHeightSM: 32,
+          controlHeightLG: 44,
           fontFamily:
             "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif",
         },

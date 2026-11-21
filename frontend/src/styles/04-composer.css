@@ -312,7 +312,7 @@
   display: grid;
   place-items: center;
   width: 32px;
-  height: 32px;
+  height: var(--control-xs);
   flex: 0 0 32px;
   border-radius: 6px;
   color: var(--text-secondary);
@@ -389,7 +389,7 @@
 
 .send-button {
   min-width: 70px;
-  height: 34px !important;
+  height: var(--control-md) !important;
   padding: 0 13px !important;
   border-radius: 7px !important;
   font-weight: 600;
@@ -510,7 +510,7 @@
    composed rather than as a modal decision. */
 .deliver-mode-button.ant-btn {
   flex: 0 0 auto;
-  height: 32px;
+  height: var(--control-xs);
   padding: 0 9px;
   border-radius: 999px !important;
   color: var(--text-secondary) !important;

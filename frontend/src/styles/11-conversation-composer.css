@@ -89,7 +89,7 @@ html[data-theme='light'] .app-main {
 .send-button {
   min-width: 32px;
   width: 32px;
-  height: 32px !important;
+  height: var(--control-md) !important;
   padding: 0 !important;
   border-radius: 8px !important;
   display: inline-flex;
@@ -382,7 +382,7 @@ html[data-theme='light'] .app-main {
   display: grid;
   place-items: center;
   width: 32px;
-  height: 32px;
+  height: var(--control-md);
   flex: 0 0 auto;
   border-radius: 9px;
   color: var(--text-secondary);
@@ -466,7 +466,7 @@ html[data-theme='light'] .app-main {
   flex: 0 0 32px;
   width: 32px;
   min-width: 32px;
-  height: 32px !important;
+  height: var(--control-md) !important;
   border-radius: 9px !important;
   overflow: visible;
   transition: transform .16s ease, background .16s ease, border-color .16s ease;
@@ -519,7 +519,7 @@ html[data-theme='light'] .app-main {
     flex-basis: 34px;
     width: 34px;
     min-width: 34px;
-    height: 34px !important;
+    height: var(--control-md) !important;
   }
 }
 

@@ -36,7 +36,7 @@
 
 .entity-icon {
   width: 34px;
-  height: 34px;
+  height: var(--control-sm);
   border: 1px solid var(--border);
   border-radius: 8px;
   background: transparent;
@@ -197,7 +197,7 @@ html[data-theme='light'] .app-main {
 
 .brand-logo {
   width: 38px;
-  height: 38px;
+  height: var(--control-md);
   border-radius: 14px;
   color: var(--bg);
   background: var(--primary);
@@ -214,7 +214,7 @@ html[data-theme='light'] .app-main {
 }
 
 .sider-nav .ant-menu-item {
-  height: 42px;
+  height: var(--control-lg);
   margin-block: 4px;
   border-radius: 14px;
 }
@@ -229,7 +229,7 @@ html[data-theme='light'] .app-main {
 }
 
 .sider-actions .ant-btn {
-  height: 42px;
+  height: var(--control-lg);
   border-radius: 14px !important;
 }
 
@@ -238,7 +238,7 @@ html[data-theme='light'] .app-main {
    slabs at the bottom read as a second toolbar, which is not what a rarely
    visited settings entry is meant to be. */
 .sider-footer .ant-btn {
-  height: 34px;
+  height: var(--control-sm);
   padding-inline: 8px;
   border-radius: 10px !important;
   font-size: 12px;
@@ -410,7 +410,7 @@ html[data-theme='light'] .composer {
 
 .send-button {
   min-width: 78px;
-  height: 38px !important;
+  height: var(--control-md) !important;
   border-radius: 13px !important;
   font-weight: 650;
 }
@@ -497,7 +497,7 @@ html[data-theme='light'] .global-search-modal .ant-modal-content {
 }
 
 .segmented-control button {
-  height: 32px;
+  height: var(--control-xs);
   border-radius: 10px;
 }
 

@@ -159,7 +159,7 @@
  * stealing clicks when the sidebar toggle is used. */
 .app-header .header-menu {
   width: 40px !important;
-  height: 40px !important;
+  height: var(--control-md) !important;
   margin: 0 2px 0 -4px;
   padding: 0 !important;
   display: inline-flex;
@@ -186,7 +186,7 @@
 /* Shared workspace search control. */
 .workspace-search {
   width: 280px;
-  height: 40px;
+  height: var(--control-md);
 }
 .workspace-search.ant-input-affix-wrapper {
   padding-inline: 12px;

@@ -212,7 +212,7 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
 
 .segmented-control button {
   min-width: 58px;
-  height: 28px;
+  height: var(--control-xs);
   border: 0;
   border-radius: 6px;
   color: var(--text-muted);
