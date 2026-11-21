@@ -42,7 +42,7 @@ export function useExtensions(deps: Deps) {
       setPlugins(data.plugins || [])
       setUnavailablePlugins(data.unavailable || [])
       try {
-        const pagesResp = await api('/api/plugin/pages')
+        const pagesResp = await api('/api/pages')
         const pagesBody = await pagesResp.json()
         setPluginPages(pagesBody.pages || [])
       } catch {

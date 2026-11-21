@@ -60,7 +60,8 @@ class ScreenerPlugin:
 
 跟 `web_routes` 同一个形状（`ScopedContribution` + 协议 + 核心插件），两个区别：
 
-- **只允许 GET，只有一条路径**：`/api/plugin/pages/{id}`。页面不是 REST 资源。
+- **只允许 GET，只有一条路径**：`/api/pages/{id}`。页面不是 REST 资源。
+  （不在 `/api/plugin/` 下：那个前缀是插件专用的，内置端点占进去等于把承诺作废。）
 - **响应头固定**：`Content-Type: text/html; charset=utf-8`，外加
   `Content-Security-Policy: sandbox allow-scripts allow-forms`。CSP 是给"有人在
   iframe 之外直接打开这个 URL"准备的——那样它也是一个沙箱，而不是一个能读 cookie 的
@@ -69,7 +70,7 @@ class ScreenerPlugin:
 ### 前端
 
 - 新视图 `#/p/<id>`，一个 iframe：`<iframe sandbox="allow-scripts allow-forms"
-  src="/api/plugin/pages/<id>">`。
+  src="/api/pages/<id>">`。
 - **不加 `allow-same-origin`**：加了它就等于没沙箱（同源 + allow-scripts 可以自己
   摘掉 sandbox 属性）。这是整个方案唯一的硬边界，不能为了"省事读个 localStorage"松掉。
 - 主题通过**查询参数**传进去（`?theme=dark`），插件自己决定用不用。不用 postMessage：

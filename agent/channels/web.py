@@ -3577,13 +3577,18 @@ class WebChannel(Channel):
             Route("/api/import", self._import_data, methods=["POST"]),
             # Whole pages plugins contribute, served as HTML for a sandboxed
             # frame. GET-only and one path shape: a page is not a REST resource.
+            #
+            # `/api/pages`, not `/api/plugin/pages`: `/api/plugin/` is the one
+            # prefix a plugin may register under, and the first version put these
+            # built-ins inside it -- which made the promise "that namespace is
+            # yours" false and reserved a path plugins could not see.
             Route(
-                "/api/plugin/pages/{page_id}",
+                "/api/pages/{page_id}",
                 self._plugin_page,
                 methods=["GET"],
             ),
             # What the app needs to build its navigation: names, never bodies.
-            Route("/api/plugin/pages", self._plugin_page_list, methods=["GET"]),
+            Route("/api/pages", self._plugin_page_list, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
             # The one conversation, as opposed to a list of them. See
             # agent/main_session.py for why the app has one at all.

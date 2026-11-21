@@ -97,19 +97,6 @@ class WebRouteRegistry:
                 "contributed routes live under /api/plugin/: "
                 f"{clean_path!r} would sit in the app's own namespace"
             )
-        # `/api/plugin/` is no longer empty: the page endpoints live there too,
-        # and a contributed route on the same path would be appended *after* the
-        # built-in and never match. Measured: the plugin's handler was registered,
-        # logged as mounted, and silently ignored. Refusing is the only outcome
-        # the author can see.
-        reserved = clean_path == "/api/plugin/pages" or clean_path.startswith(
-            "/api/plugin/pages/"
-        )
-        if reserved:
-            raise ValueError(
-                f"{clean_path!r} is reserved for plugin pages; use another path "
-                "under /api/plugin/"
-            )
         if not isinstance(public, bool):
             # `bool("false")` is True. A plugin reading `public` from JSON config
             # would have published a route it meant to keep private.

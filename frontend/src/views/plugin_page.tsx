@@ -18,7 +18,7 @@
  * Why the HTML arrives via `srcDoc` and not `src`
  * ----------------------------------------------
  * A frame navigates with the browser's own request machinery, which cannot set
- * an `Authorization` header. With `src="/api/plugin/pages/…"` every contributed
+ * an `Authorization` header. With `src="/api/pages/…"` every contributed
  * page was a 401 the moment somebody configured `auth_token` -- the list rendered,
  * the page inside it did not. Fetching here instead means the request goes
  * through the same client (and the same header) as every other call, and the
@@ -51,7 +51,7 @@ function PluginFrame(props: {
     let cancelled = false
     setHtml(null)
     setError('')
-    api(`/api/plugin/pages/${encodeURIComponent(pageId)}?theme=${encodeURIComponent(theme)}`)
+    api(`/api/pages/${encodeURIComponent(pageId)}?theme=${encodeURIComponent(theme)}`)
       .then(async response => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         return response.text()

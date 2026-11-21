@@ -164,15 +164,33 @@ def test_a_replacement_chain_does_not_resurrect_an_unloaded_plugin() -> None:
     assert registry.routes() == []
 
 
-def test_the_page_endpoints_are_reserved() -> None:
-    """`/api/plugin/pages` is a built-in now. A contributed route there was
-    registered, logged as mounted, and silently never matched -- the built-in
-    comes first."""
+def test_the_whole_api_plugin_namespace_belongs_to_plugins() -> None:
+    """`/api/plugin/pages` used to be a built-in route, so a plugin registering
+    it was silently shadowed. The built-ins moved to `/api/pages`; the promise
+    that this prefix is the plugin's own is true again.
+    """
     registry = WebRouteRegistry()
 
-    for path in ("/api/plugin/pages", "/api/plugin/pages/thing"):
-        with pytest.raises(ValueError, match="reserved for plugin pages"):
-            registry.register("GET", path, _handler)
+    # The path that used to be reserved is registrable again.
+    registry.register("GET", "/api/plugin/pages", _handler)
+    assert [(verb, path) for verb, path, _h, _p in registry.routes()] == [
+        ("GET", "/api/plugin/pages")
+    ]
+
+
+def test_the_built_in_page_routes_are_not_in_the_plugin_namespace() -> None:
+    """Otherwise "this prefix is yours" is a promise the app breaks itself."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "agent" / "channels" / "web.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'Route("/api/pages", self._plugin_page_list' in source
+    assert '"/api/pages/{page_id}"' in source
+    assert '"/api/plugin/pages' not in source, (
+        "a built-in route is back inside the namespace plugins register under"
+    )
 
 
 def test_a_path_that_starlette_cannot_compile_is_refused_at_registration() -> None:

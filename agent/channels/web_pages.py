@@ -39,7 +39,7 @@ __all__ = [
 
 #: Where pages are served. One prefix, one shape: a page is not a REST resource,
 #: so this is GET-only and the id is a name rather than a path.
-PAGE_ROUTE_PREFIX = "/api/plugin/pages/"
+PAGE_ROUTE_PREFIX = "/api/pages/"
 
 #: ``str`` for a static page, or ``(request) -> str`` for one built per request.
 PageRenderer = Any
