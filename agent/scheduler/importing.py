@@ -24,6 +24,48 @@ from typing import Any
 __all__ = ["import_tasks"]
 
 
+def import_workflows(db_path: Path, payload: Any) -> dict[str, int]:
+    """Merge ``payload['workflows']`` into the scheduler store.
+
+    Before tasks, because a task can name a ``workflow_id``: importing the tasks
+    first left that column pointing at a row the archive had but the database did
+    not, so the task either failed to load or ran nothing.
+    """
+    if not isinstance(payload, dict):
+        return {"workflows_added": 0, "workflows_skipped": 0}
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    from .store import SchedulerStore
+
+    SchedulerStore(db_path=path).close()
+
+    added = skipped = 0
+    conn = sqlite3.connect(str(path))
+    try:
+        with conn:
+            for workflow in payload.get("workflows") or []:
+                if not isinstance(workflow, dict):
+                    continue
+                workflow_id = str(workflow.get("id") or "").strip()
+                if not workflow_id:
+                    continue
+                if conn.execute(
+                    "SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)
+                ).fetchone():
+                    skipped += 1
+                    continue
+                columns = [key for key in workflow if key != "id"]
+                conn.execute(
+                    f"INSERT INTO workflows (id, {', '.join(columns)}) "
+                    f"VALUES (?, {', '.join('?' for _ in columns)})",
+                    (workflow_id, *[workflow[column] for column in columns]),
+                )
+                added += 1
+    finally:
+        conn.close()
+    return {"workflows_added": added, "workflows_skipped": skipped}
+
+
 def import_tasks(db_path: Path, payload: Any) -> dict[str, int]:
     """Merge ``payload['tasks']`` into the scheduler store; return what happened."""
     if not isinstance(payload, dict):
@@ -81,6 +123,12 @@ def import_tasks(db_path: Path, payload: Any) -> dict[str, int]:
                 # `active_run_id IS NULL` and stale-run recovery needs a run row
                 # to join, so the task would never run again. Measured. Clearing
                 # the claim is the only honest repair -- the work was not done.
+                workflow_ref = str(task.get("workflow_id") or "").strip()
+                if workflow_ref and not conn.execute(
+                    "SELECT 1 FROM workflows WHERE id = ?", (workflow_ref,)
+                ).fetchone():
+                    if "workflow_id" in columns:
+                        values[columns.index("workflow_id")] = None
                 active = str(task.get("active_run_id") or "").strip()
                 if active and not conn.execute(
                     "SELECT 1 FROM scheduled_task_runs WHERE id = ?", (active,)

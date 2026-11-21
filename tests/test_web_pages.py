@@ -90,7 +90,8 @@ def test_the_server_serves_a_page_with_a_sandbox_header() -> None:
     source = (
         pathlib.Path(__file__).resolve().parents[1] / "agent" / "channels" / "web.py"
     ).read_text(encoding="utf-8")
-    body = source[source.index("async def _plugin_page(") :][:2600]
+    start = source.index("async def _plugin_page(")
+    body = source[start : start + 4000]
 
     assert "Content-Security-Policy" in body
     assert "sandbox allow-scripts allow-forms" in body
@@ -152,3 +153,20 @@ def test_a_page_replacement_chain_does_not_resurrect_an_unloaded_plugin() -> Non
     b.unload()
 
     assert registry.listing() == []
+
+
+def test_a_page_renderer_that_returns_bytes_renders_the_html_not_a_repr() -> None:
+    """`HTMLResponse(str(body))` on bytes yields `b'<h1>…'` -- the page showed a
+    Python repr. Decoded instead; a non-text return is a plugin bug and gets an
+    error rather than a blank 200."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "agent" / "channels" / "web.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("async def _plugin_page(")
+    body = source[start : start + 4000]
+
+    assert 'isinstance(body, (bytes, bytearray))' in body
+    assert 'decode("utf-8", "replace")' in body
+    assert "isinstance(body, str)" in body

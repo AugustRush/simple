@@ -530,7 +530,10 @@ function App() {
           notice says which conversation is waiting and offers the way back --
           the deadline keeps running, so saying nothing would be the silent
           auto-deny this replaced. */}
-      {view !== 'home' && activeConfirm && confirmRemaining > 0 && (
+      {/* `pluginPage` too: a plugin page keeps `home` as its view, so the one
+          notice that says "something is waiting for you" was hidden exactly when
+          somebody was looking somewhere else. */}
+      {(view !== 'home' || pluginPage) && activeConfirm && confirmRemaining > 0 && (
         <div className="approval-notice" role="status" aria-live="polite">
           <SafetyCertificateOutlined className="approval-notice-icon" />
           <span>

@@ -381,6 +381,44 @@ def _import_output(
     return {"output_copied": copied, "output_skipped": skipped}
 
 
+def _import_scheduler_output(
+    archive: zipfile.ZipFile, names: list[str], output_root: Path
+) -> dict[str, int]:
+    """Copy run reports back, never overwriting and never leaving a half file."""
+    copied = skipped = 0
+    root = output_root.resolve()
+    for name in names:
+        if not name.startswith("scheduler-output/") or name.endswith("/"):
+            continue
+        relative = name[len("scheduler-output/") :]
+        parts = Path(relative).parts
+        if len(parts) < 2:
+            continue
+        target = (output_root / Path(*parts)).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            skipped += 1
+            continue
+        if target.exists():
+            skipped += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + ".part")
+        try:
+            with archive.open(name) as source, partial.open("wb") as sink:
+                shutil.copyfileobj(source, sink)
+            os.replace(partial, target)
+        except OSError:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise
+        copied += 1
+    return {"scheduler_reports_copied": copied, "scheduler_reports_skipped": skipped}
+
+
 def import_archive(
     archive_path: Path,
     *,
@@ -388,6 +426,7 @@ def import_archive(
     tasks_dir: Path,
     autonomy_dir: Path,
     web_sessions_dir: Optional[Path] = None,
+    scheduler_output_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Merge one archive into this install; return what happened per section.
 
@@ -497,14 +536,23 @@ def import_archive(
         # 2. Scheduled work and proposals. Small and fast; they also disagree
         #    with a newer schema more often than conversations do, and a failure
         #    here is caught so it cannot cost the section above.
-        from agent.scheduler.importing import import_tasks
+        from agent.scheduler.importing import import_tasks, import_workflows
 
-        run("tasks", lambda: import_tasks(Path(tasks_dir) / "scheduler.db", tasks))
+        scheduler_db = Path(tasks_dir) / "scheduler.db"
+        run("workflows", lambda: import_workflows(scheduler_db, tasks))
+        run("tasks", lambda: import_tasks(scheduler_db, tasks))
         run("autonomy", lambda: _import_autonomy(Path(autonomy_dir) / "proposals.db", autonomy))
 
 
         # 3. Output files last: the only section whose failure cannot be undone by
         #    re-running if a half-written file were treated as finished.
+        if scheduler_output_dir is not None:
+            run(
+                "scheduler_output",
+                lambda: _import_scheduler_output(
+                    archive, archive.namelist(), Path(scheduler_output_dir)
+                ),
+            )
         if web_sessions_dir is not None:
             run(
                 "output",

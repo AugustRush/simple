@@ -2282,7 +2282,19 @@ class WebChannel(Channel):
             )
             failure.headers["Cache-Control"] = "no-store"
             return failure
-        response = HTMLResponse(str(body or ""))
+        # `bytes` through `str()` is a repr: the page rendered as `b'<h1>…'`.
+        # Decoded; anything else that is not text is a plugin bug, and saying so
+        # beats showing a blank 200.
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8", "replace")
+        if body is None:
+            body = ""
+        if not isinstance(body, str):
+            return JSONResponse(
+                {"error": f"页面 {page_id} 的渲染器返回了 {type(body).__name__}，需要返回 HTML 字符串"},
+                status_code=500,
+            )
+        response = HTMLResponse(body)
         response.headers["Content-Security-Policy"] = (
             "sandbox allow-scripts allow-forms"
         )
@@ -2303,6 +2315,7 @@ class WebChannel(Channel):
         right below it did exactly that; the cap is what makes the claim true
         enough to be worth writing down.
         """
+        import asyncio as _asyncio
         import tempfile
 
         from starlette.responses import JSONResponse
@@ -2333,12 +2346,14 @@ class WebChannel(Channel):
             with os.fdopen(handle, "wb") as sink:
                 sink.write(body)
             home = shared.AGENT_HOME
-            report = import_archive(
+            report = await _asyncio.to_thread(
+                import_archive,
                 temp_path,
                 context_dir=home / "context",
                 tasks_dir=home / "tasks",
                 autonomy_dir=home / "autonomy",
                 web_sessions_dir=home / "web" / "sessions",
+                scheduler_output_dir=home / "output" / "scheduler",
             )
         except ArchiveError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2361,17 +2376,25 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+        import asyncio as _asyncio
+
         from agent import shared
-        from agent.export import build_archive
+        from agent.export import ExportUnsupported, build_archive
 
         home = shared.AGENT_HOME
         try:
-            path, manifest = build_archive(
+            # In a worker thread: this walks the output trees and writes a ZIP,
+            # and doing that inline blocks every other request on the event loop.
+            path, manifest = await _asyncio.to_thread(
+                build_archive, 
                 context_dir=home / "context",
                 tasks_dir=home / "tasks",
                 autonomy_dir=home / "autonomy",
                 web_sessions_dir=home / "web" / "sessions",
+                scheduler_output_dir=home / "output" / "scheduler",
             )
+        except ExportUnsupported as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
         except Exception as exc:  # noqa: BLE001 - the reason is the answer
             return JSONResponse({"error": f"导出失败：{exc}"}, status_code=500)
         return FileResponse(

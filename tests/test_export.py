@@ -82,6 +82,7 @@ def _build(home: Path, destination: Path):
         tasks_dir=home / "tasks",
         autonomy_dir=home / "autonomy",
         web_sessions_dir=home / "web" / "sessions",
+        scheduler_output_dir=home / "output" / "scheduler",
         destination=destination,
     )
 
@@ -180,3 +181,97 @@ def test_a_missing_database_is_an_empty_section_not_a_crash(tmp_path) -> None:
     assert manifest["counts"]["tasks"] == 0
     with zipfile.ZipFile(path) as archive:
         assert "manifest.json" in archive.namelist()
+
+
+# ── regressions found by review ─────────────────────────────────────────────
+
+
+def test_scheduled_run_reports_are_in_the_archive(home) -> None:
+    """The docstring promised "the files those runs and conversations produced"
+    and only conversations were packed. A run's `.md` report is the result; its
+    `artifacts/` working tree is scratch and is excluded on purpose."""
+    reports = home / "output" / "scheduler" / "task-1"
+    (reports / "run-1").mkdir(parents=True)
+    (reports / "run-1.md").write_text("# 周报\n做完了\n", encoding="utf-8")
+    (reports / "run-1" / "artifacts").mkdir()
+    (reports / "run-1" / "artifacts" / "big.bin").write_bytes(b"x" * 1024)
+
+    path, manifest = _build(home, home / "out.zip")
+
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        body = archive.read("scheduler-output/task-1/run-1.md").decode()
+
+    assert "scheduler-output/task-1/run-1.md" in names
+    assert "做完了" in body
+    assert manifest["counts"]["scheduler_reports"] == 1
+    assert not any("artifacts" in name for name in names), (
+        "a run's working tree is not a backup target"
+    )
+    assert any("artifacts" in item for item in manifest["excluded"])
+
+
+def test_workflows_survive_and_dangling_task_references_are_cleared(home) -> None:
+    import json as _json
+    import sqlite3
+
+    source = home
+    db = source / "tasks" / "scheduler.db"
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            "INSERT INTO workflows (id, name, enabled, created_at, updated_at) "
+            "VALUES ('w1','流水线',1,'2026-01-01','2026-01-01')"
+        )
+        task_id = conn.execute("SELECT id FROM scheduled_tasks").fetchone()[0]
+        conn.execute(
+            "UPDATE scheduled_tasks SET workflow_id='w1' WHERE id=?", (task_id,)
+        )
+    conn.close()
+
+    path, manifest = _build(source, source / "out.zip")
+    assert manifest["counts"]["workflows"] == 1
+
+    from agent.import_data import import_archive
+
+    target = source.parent / "dst"
+    for name in ("context", "tasks", "autonomy"):
+        (target / name).mkdir(parents=True, exist_ok=True)
+    report = import_archive(
+        path,
+        context_dir=target / "context",
+        tasks_dir=target / "tasks",
+        autonomy_dir=target / "autonomy",
+    )
+
+    assert report["workflows_added"] == 1
+    conn = sqlite3.connect(target / "tasks" / "scheduler.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM workflows").fetchone()[0] == 1
+        assert conn.execute("SELECT workflow_id FROM scheduled_tasks").fetchone()[0] == "w1"
+    finally:
+        conn.close()
+
+
+def test_an_install_whose_memory_is_somewhere_else_is_refused_not_half_exported(
+    tmp_path,
+) -> None:
+    """`sqlite-fts-memory` keeps entries in `palace-fts.db`; the queries here are
+    written against the built-in schema. Measured on that profile:
+    `no such table: session_meta`. A backup that silently omits the memory is the
+    failure it exists to prevent."""
+    from agent.export import ExportUnsupported
+
+    home = tmp_path / "fts"
+    (home / "context").mkdir(parents=True)
+    (home / "tasks").mkdir()
+    (home / "autonomy").mkdir()
+    import sqlite3
+
+    conn = sqlite3.connect(home / "context" / "palace.db")
+    conn.execute("CREATE TABLE staging_turns (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ExportUnsupported, match="sqlite-fts-memory"):
+        _build(home, home / "out.zip")

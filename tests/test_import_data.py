@@ -59,7 +59,7 @@ def _export(home: Path, destination: Path):
     )
 
 
-def _import(home: Path, archive: Path):
+def _import(home: Path, archive: Path, *, scheduler_output_dir=None):
     from agent.import_data import import_archive
 
     return import_archive(
@@ -68,6 +68,7 @@ def _import(home: Path, archive: Path):
         tasks_dir=home / "tasks",
         autonomy_dir=home / "autonomy",
         web_sessions_dir=home / "web" / "sessions",
+        scheduler_output_dir=scheduler_output_dir,
     )
 
 
@@ -568,3 +569,53 @@ def test_a_half_written_output_file_is_not_treated_as_finished(tmp_path) -> None
     assert report["output_copied"] == 1
     assert (output / "a.txt").read_text() == "hello"
     assert not (output / "a.txt.part").exists(), "the interrupted copy was left behind"
+
+
+def test_scheduled_run_reports_come_back(tmp_path) -> None:
+    reports = tmp_path / "src" / "output" / "scheduler" / "task-1"
+    (tmp_path / "src" / "context").mkdir(parents=True)
+    (tmp_path / "src" / "tasks").mkdir()
+    (tmp_path / "src" / "autonomy").mkdir()
+    reports.mkdir(parents=True)
+    (reports / "run-1.md").write_text("# 周报\n做完了", encoding="utf-8")
+
+    from agent.export import build_archive
+
+    archive, manifest = build_archive(
+        context_dir=tmp_path / "src" / "context",
+        tasks_dir=tmp_path / "src" / "tasks",
+        autonomy_dir=tmp_path / "src" / "autonomy",
+        scheduler_output_dir=tmp_path / "src" / "output" / "scheduler",
+        destination=tmp_path / "a.zip",
+    )
+    assert manifest["counts"]["scheduler_reports"] == 1
+
+    target = _home(tmp_path / "dst", with_data=False)
+    report = _import(
+        target,
+        archive,
+        scheduler_output_dir=target / "output" / "scheduler",
+    )
+
+    assert report["scheduler_reports_copied"] == 1
+    restored = target / "output" / "scheduler" / "task-1" / "run-1.md"
+    assert restored.read_text(encoding="utf-8").endswith("做完了")
+
+
+def test_a_scheduler_report_cannot_escape_its_directory(tmp_path) -> None:
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("manifest.json", json.dumps({"archive_version": 1}))
+        handle.writestr("sessions.json", "[]")
+        handle.writestr("memory.json", "[]")
+        handle.writestr("scheduler-output/../../../pwned.md", "ESCAPED")
+
+    target = _home(tmp_path / "dst", with_data=False)
+    report = _import(
+        target,
+        archive,
+        scheduler_output_dir=target / "output" / "scheduler",
+    )
+
+    assert report["scheduler_reports_copied"] == 0
+    assert not list(target.rglob("pwned.md"))
