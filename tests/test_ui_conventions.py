@@ -300,3 +300,33 @@ def test_the_antd_scale_is_the_same_scale() -> None:
     assert re.search(r"controlHeight:\s*40\b", app)
     assert re.search(r"controlHeightSM:\s*32\b", app)
     assert re.search(r"controlHeightLG:\s*44\b", app)
+
+
+def test_settings_is_split_into_tabs_and_hidden_panels_actually_hide() -> None:
+    """Six cards in one column: finding one setting meant scrolling past five.
+
+    Four panels now, switched by the same tab strip the 自动化 page uses. The
+    `hidden` attribute is the mechanism, and it is *not* enough on its own:
+    `.settings-grid` sets `display: grid` and an author rule beats the UA
+    stylesheet's `[hidden] { display: none }`, so a hidden panel stayed visible.
+    Measured in a browser -- all four panels rendered at once until the explicit
+    rule was added.
+    """
+    settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
+
+    for key in ("'general'", "'model'", "'capabilities'", "'advanced'"):
+        assert key in settings, key
+    assert settings.count("settings-grid\" hidden={settingsTab") == 4
+
+    css = (STYLES / "05-pages-settings.css").read_text(encoding="utf-8")
+    assert ".settings-grid[hidden]" in css
+    assert ".settings-affix-bar[hidden]" in css
+    assert "display: none" in css.split(".settings-grid[hidden]")[1][:120]
+
+
+def test_the_save_bar_is_only_hidden_when_nothing_is_pending() -> None:
+    """Switching tabs must never hide the fact that the model form has unsaved
+    edits -- the bar stays whenever something is pending, from any panel."""
+    settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
+
+    assert "settingsTab !== 'model' && settingsTab !== 'advanced' && !unsaved" in settings

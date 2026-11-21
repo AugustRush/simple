@@ -621,6 +621,12 @@ export function createSettingsView(ctx: AppCtx) {
   // had to hunt for the way to keep it. The Affix holds the controls at the
   // top of the scrolling column, not the window (the column is the scroller).
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  //: Which panel of 设置 is showing. Local rather than in the URL: the four
+  //: panels are one page's sections, not four destinations, and a hash per
+  //: panel would fill the back button with stops nobody asked for.
+  const [settingsTab, setSettingsTab] = useState<
+    'general' | 'model' | 'capabilities' | 'advanced'
+  >('general')
 
   const importInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -640,7 +646,14 @@ export function createSettingsView(ctx: AppCtx) {
           target={() => scrollRef.current}
           offsetTop={0}
         >
-          <div className="settings-affix-bar">
+          {/* The save controls belong to the panels that have anything to
+              save. They stay visible from any panel while something is
+              pending -- switching tabs must never hide the fact that the
+              model form has unsaved edits. */}
+          <div
+            className="settings-affix-bar"
+            hidden={settingsTab !== 'model' && settingsTab !== 'advanced' && !unsaved}
+          >
             <Space>
               <span className={`save-state ${unsaved ? 'dirty' : ''} ${blocked ? 'blocked' : ''}`}>
                 <span className="save-state-dot" />
@@ -670,7 +683,30 @@ export function createSettingsView(ctx: AppCtx) {
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 10 }} />
       ) : (
-        <div className="settings-grid">
+        <>
+        <div className="schedule-tabs settings-tabs" role="tablist" aria-label="设置">
+          {(
+            [
+              ['general', '常规'],
+              ['model', '模型'],
+              ['capabilities', '能力'],
+              ['advanced', '高级'],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={settingsTab === key}
+              className={settingsTab === key ? 'active' : ''}
+              onClick={() => setSettingsTab(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="settings-grid" hidden={settingsTab !== 'general'}>
           {/* One card, two rows. These used to be two half-empty 480px cards,
               each holding a single control in a 225px frame, while the model
               form below was squeezed for the width they were wasting. A row
@@ -734,6 +770,65 @@ export function createSettingsView(ctx: AppCtx) {
             </div>
           </Card>
 
+          {/* The counterpart to every delete button in this app. Before it, the
+              only verbs were "read it here" and "delete it" -- a mistake was
+              unrecoverable and moving machines meant starting over. */}
+          <Card
+            className="settings-card settings-card-wide"
+            title="数据"
+            extra={<span className="card-kicker">EXPORT</span>}
+          >
+            <div className="settings-pref">
+              <div className="settings-pref-copy">
+                <span className="settings-pref-name">导出全部数据</span>
+                <span className="settings-pref-desc">
+                  对话、记忆、定时任务、提议与目标，以及它产出的文件，打成一个 ZIP。
+                  <strong>不含 API 密钥与访问令牌</strong>——那些不会被写进任何备份。
+                </span>
+              </div>
+              <a
+                className="settings-pref-control"
+                href="/api/export"
+                download
+                onClick={() => messageApi.success('正在打包，文件会出现在下载里')}
+              >
+                <Button icon={<DownloadOutlined />}>下载 ZIP</Button>
+              </a>
+            </div>
+            <div className="settings-pref">
+              <div className="settings-pref-copy">
+                <span className="settings-pref-name">从备份导入</span>
+                <span className="settings-pref-desc">
+                  只增加、从不删除：这里已经有的对话、记忆和任务会跳过并如实报告。
+                  导入一个旧备份不会动你现在的东西。
+                </span>
+              </div>
+              <div className="settings-pref-control">
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept=".zip,application/zip"
+                  style={{ display: 'none' }}
+                  onChange={event => {
+                    const file = event.target.files?.[0]
+                    event.target.value = ''
+                    if (file) void importArchive(file)
+                  }}
+                />
+                <Button
+                  icon={<UploadOutlined />}
+                  loading={importing}
+                  onClick={() => importInputRef.current?.click()}
+                >
+                  选择 ZIP
+                </Button>
+              </div>
+            </div>
+          </Card>
+
+        </div>
+
+        <div className="settings-grid" hidden={settingsTab !== 'model'}>
           <ProvidersCard
             config={config}
             fields={providerFields}
@@ -886,67 +981,17 @@ export function createSettingsView(ctx: AppCtx) {
             </Form>
           </Card>
 
+        </div>
+
+        <div className="settings-grid" hidden={settingsTab !== 'capabilities'}>
           {/* Capability belongs with configuration: 扩展 was a page of its own,
               and a page whose entire content is switches and deletes is a
               settings section wearing a page's clothes. */}
           {renderCapabilities(ctx)}
 
-          {/* The counterpart to every delete button in this app. Before it, the
-              only verbs were "read it here" and "delete it" -- a mistake was
-              unrecoverable and moving machines meant starting over. */}
-          <Card
-            className="settings-card settings-card-wide"
-            title="数据"
-            extra={<span className="card-kicker">EXPORT</span>}
-          >
-            <div className="settings-pref">
-              <div className="settings-pref-copy">
-                <span className="settings-pref-name">导出全部数据</span>
-                <span className="settings-pref-desc">
-                  对话、记忆、定时任务、提议与目标，以及它产出的文件，打成一个 ZIP。
-                  <strong>不含 API 密钥与访问令牌</strong>——那些不会被写进任何备份。
-                </span>
-              </div>
-              <a
-                className="settings-pref-control"
-                href="/api/export"
-                download
-                onClick={() => messageApi.success('正在打包，文件会出现在下载里')}
-              >
-                <Button icon={<DownloadOutlined />}>下载 ZIP</Button>
-              </a>
-            </div>
-            <div className="settings-pref">
-              <div className="settings-pref-copy">
-                <span className="settings-pref-name">从备份导入</span>
-                <span className="settings-pref-desc">
-                  只增加、从不删除：这里已经有的对话、记忆和任务会跳过并如实报告。
-                  导入一个旧备份不会动你现在的东西。
-                </span>
-              </div>
-              <div className="settings-pref-control">
-                <input
-                  ref={importInputRef}
-                  type="file"
-                  accept=".zip,application/zip"
-                  style={{ display: 'none' }}
-                  onChange={event => {
-                    const file = event.target.files?.[0]
-                    event.target.value = ''
-                    if (file) void importArchive(file)
-                  }}
-                />
-                <Button
-                  icon={<UploadOutlined />}
-                  loading={importing}
-                  onClick={() => importInputRef.current?.click()}
-                >
-                  选择 ZIP
-                </Button>
-              </div>
-            </div>
-          </Card>
+        </div>
 
+        <div className="settings-grid" hidden={settingsTab !== 'advanced'}>
           <Card
             className="settings-card settings-card-wide settings-json-card"
             title="高级 JSON"
@@ -988,6 +1033,7 @@ export function createSettingsView(ctx: AppCtx) {
             />
           </Card>
         </div>
+        </>
       )}
     </div>
     )

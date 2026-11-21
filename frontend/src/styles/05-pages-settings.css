@@ -722,3 +722,17 @@ html[data-theme='light'] .settings-json {
   border-radius: var(--radius-surface);
   background: var(--surface);
 }
+
+/* The settings tab strip, and the panels it switches.
+ *
+ * `.settings-grid` sets `display: grid`, and an author rule beats the UA
+ * stylesheet's `[hidden] { display: none }` -- so a `hidden` panel would have
+ * stayed visible. The explicit rule is what makes the attribute work. */
+.settings-tabs {
+  max-width: 920px;
+  margin-top: 4px;
+}
+.settings-grid[hidden],
+.settings-affix-bar[hidden] {
+  display: none;
+}

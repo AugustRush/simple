@@ -235,7 +235,14 @@ def test_the_capability_lists_live_on_the_settings_page(page):
     better manners.
     """
     page.goto(page.url.split("#")[0] + "#/settings", wait_until="networkidle")
-    page.wait_for_selector(".capabilities-card", timeout=20_000)
+    # 设置 is four panels now, and the capability card lives behind 能力. It is
+    # in the DOM from load (panels are hidden, not unmounted) -- so waiting for
+    # it is not enough; the tab has to be selected for it to be visible.
+    settings_tabs = page.locator(".settings-tabs button")
+    assert settings_tabs.count() == 4
+    settings_tabs.nth(2).click()
+    page.wait_for_selector(".capabilities-card", state="visible", timeout=20_000)
+    assert page.locator(".capabilities-card").is_visible()
 
     tabs = page.locator(".capabilities-card .extensions-tabs button")
     assert tabs.count() == 2
