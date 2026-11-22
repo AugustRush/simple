@@ -613,7 +613,9 @@ function ProvidersCard({
 }
 
 export function createSettingsView(ctx: AppCtx) {
-  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, importing, importArchive, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  //: Held by the shell, not here: the ⋯ menu opens 设置 straight on 能力, and a
+  //: panel only this view can name is a panel nothing else can link to.
+  const { settingsTab, setSettingsTab, activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, importing, importArchive, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   // The save controls must survive a scroll: the page is longer than the
@@ -622,12 +624,6 @@ export function createSettingsView(ctx: AppCtx) {
   // had to hunt for the way to keep it. The Affix holds the controls at the
   // top of the scrolling column, not the window (the column is the scroller).
   const scrollRef = useRef<HTMLDivElement | null>(null)
-  //: Which panel of 设置 is showing. Local rather than in the URL: the four
-  //: panels are one page's sections, not four destinations, and a hash per
-  //: panel would fill the back button with stops nobody asked for.
-  const [settingsTab, setSettingsTab] = useState<
-    'general' | 'model' | 'capabilities' | 'advanced'
-  >('general')
 
   const importInputRef = useRef<HTMLInputElement | null>(null)
 

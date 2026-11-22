@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined, BgColorsOutlined, CheckOutlined, CodeOutlined, SearchOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, ArrowLeftOutlined, CheckOutlined, CodeOutlined, SearchOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
 import { Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Modal, theme } from 'antd'
 import type { ThemePreference } from './lib/theme'
@@ -54,7 +54,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage, settingsTab, setSettingsTab, openSettings } = ui
 
   const { api, contextHolder, messageApi, token } = apiClient
 
@@ -189,6 +189,9 @@ function App() {
     pluginPages,
     pluginPage,
     openPage,
+    settingsTab,
+    setSettingsTab,
+    openSettings,
     resolvedTheme,
     api,
     setPluginSearch,
@@ -358,14 +361,19 @@ function App() {
     ...navItems.filter(item => item.key !== 'home' && item.key !== 'schedules'),
     { type: 'divider' },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+    // 能力 is a panel of 设置, two clicks in. It is also the thing people open
+    // 设置 for most often ("can it do X?"), so it gets its own entry.
+    { key: 'capabilities', icon: <AppstoreOutlined />, label: '能力' },
     // Three answers, not a toggle. `system` is what most people actually want --
     // a laptop that dims at sunset should take the app with it -- and a toggle
     // cannot express it. The check mark is the current preference, which is a
     // different fact from which theme is showing (under `system` the showing one
     // changes without the preference changing).
+    // A group, not a submenu: the three answers are visible the moment the menu
+    // opens. A submenu made the most-changed setting in the app a two-click
+    // detour, and there are only three answers -- nothing to hide.
     {
-      key: 'theme',
-      icon: <BgColorsOutlined />,
+      type: 'group',
       label: '主题',
       children: [
         { key: 'theme:system', label: '跟随系统', icon: themeMode === 'system' ? <CheckOutlined /> : null },
@@ -378,6 +386,10 @@ function App() {
   const handleTopbarMenu: MenuProps['onClick'] = ({ key }) => {
     if (key.startsWith('theme:')) {
       chooseTheme(key.slice('theme:'.length) as ThemePreference)
+      return
+    }
+    if (key === 'capabilities') {
+      openSettings('capabilities')
       return
     }
     // `navigateTo` keeps the unsaved-edits guard, so a menu entry refuses to lose

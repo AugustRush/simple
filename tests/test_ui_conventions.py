@@ -330,3 +330,38 @@ def test_the_save_bar_is_only_hidden_when_nothing_is_pending() -> None:
     settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
 
     assert "(settingsTab === 'model' || settingsTab === 'advanced' || unsaved)" in settings
+
+
+def test_capabilities_and_theme_have_a_direct_entry() -> None:
+    """Both were two clicks deep: 能力 behind 设置→tab, 主题 behind a submenu.
+
+    The ⋯ menu now carries 能力 straight to the panel, and the three theme
+    answers are a group rather than a submenu -- there are three of them, and
+    hiding them made the most-changed setting in the app a detour.
+    """
+    app = (STYLES.parent / "App.tsx").read_text(encoding="utf-8")
+
+    assert "{ key: 'capabilities'" in app
+    assert "openSettings('capabilities')" in app
+    # A group renders its items inline; `children` under a `key` would be a
+    # submenu, which is what this replaced.
+    assert "type: 'group'" in app
+    assert "label: '主题'" in app
+
+    shell = (STYLES.parent / "hooks" / "useShell.tsx").read_text(encoding="utf-8")
+    assert "tab: 'capabilities' as const" in shell, "the palette lost its 能力 destination"
+    assert "if (entry.tab) openSettings(entry.tab)" in shell
+
+
+def test_the_settings_panel_is_shell_state_so_other_surfaces_can_open_it() -> None:
+    """A panel only the settings view can name is a panel nothing else can link
+    to. The tab lives with the shell and the view reads it."""
+    ui = (STYLES.parent / "hooks" / "useUi.tsx").read_text(encoding="utf-8")
+    settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
+
+    assert "const [settingsTab, setSettingsTab] = useState<SettingsTab>" in ui
+    assert "const openSettings = useCallback" in ui
+    assert "settingsTab, setSettingsTab" in settings
+    assert "useState<" not in settings.split("createSettingsView")[1][:600], (
+        "the settings view still keeps its own tab state"
+    )

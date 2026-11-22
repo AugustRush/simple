@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { BulbOutlined, ClockCircleOutlined, HomeOutlined, SettingOutlined } from '@ant-design/icons'
+import {
+  AppstoreOutlined,
+  BulbOutlined,
+  ClockCircleOutlined,
+  HomeOutlined,
+  SettingOutlined,
+} from '@ant-design/icons'
 import { Modal } from 'antd'
 import type { CommandInfo } from '../types'
 import { parseRoute, routeFor, routeForPage } from '../lib/route'
@@ -14,7 +20,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, pluginPage, settingsDirty, tokenDirty, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, openSettings, pluginPage, settingsDirty, tokenDirty, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -313,7 +319,15 @@ export function useShell(deps: Deps) {
   // promises that navigation is searchable too.
   type PaletteEntry =
     | { kind: 'command'; key: string; command: CommandInfo }
-    | { kind: 'nav'; key: string; view: string; label: string; icon: ReactNode }
+    | {
+        kind: 'nav'
+        key: string
+        view: string
+        /** A settings panel to open instead of the page's default. */
+        tab?: 'general' | 'model' | 'capabilities' | 'advanced'
+        label: string
+        icon: ReactNode
+      }
 
   const paletteEntries = useMemo<PaletteEntry[]>(() => {
     const query = paletteQuery.trim().toLowerCase()
@@ -321,11 +335,19 @@ export function useShell(deps: Deps) {
       { view: 'home', label: '主页', icon: <HomeOutlined />, terms: 'home 主页 首页 对话 chat' },
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
       { view: 'memory', label: '记忆', icon: <BulbOutlined />, terms: '记忆 memory 事实' },
-      { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings 插件 技能 plugins skills' },
+      { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings 设置' },
+      { view: 'settings', tab: 'capabilities' as const, label: '能力', icon: <AppstoreOutlined />, terms: '能力 插件 技能 plugins skills capabilities' },
     ].filter(item => !query || `${item.label} ${item.terms}`.toLowerCase().includes(query))
     return [
       ...paletteCommands.slice(0, 8).map(command => ({ kind: 'command' as const, key: `command:${command.name}`, command })),
-      ...destinations.map(({ view, label, icon }) => ({ kind: 'nav' as const, key: `nav:${view}`, view, label, icon })),
+      ...destinations.map(({ view, tab, label, icon }) => ({
+        kind: 'nav' as const,
+        key: `nav:${view}:${tab || ''}`,
+        view,
+        tab,
+        label,
+        icon,
+      })),
     ]
   }, [paletteCommands, paletteQuery])
 
@@ -342,7 +364,8 @@ export function useShell(deps: Deps) {
       applyCommand(entry.command)
       return
     }
-    navigateTo(entry.view)
+    if (entry.tab) openSettings(entry.tab)
+    else navigateTo(entry.view)
     setCommandPaletteOpen(false)
     setPaletteQuery('')
   }
