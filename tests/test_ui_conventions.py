@@ -329,4 +329,4 @@ def test_the_save_bar_is_only_hidden_when_nothing_is_pending() -> None:
     edits -- the bar stays whenever something is pending, from any panel."""
     settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
 
-    assert "settingsTab !== 'model' && settingsTab !== 'advanced' && !unsaved" in settings
+    assert "(settingsTab === 'model' || settingsTab === 'advanced' || unsaved)" in settings

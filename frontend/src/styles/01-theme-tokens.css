@@ -30,6 +30,14 @@
   --surface-raised: #222225;
   --surface-hover: rgba(255, 255, 255, 0.06);
   --border: rgba(255, 255, 255, 0.09);
+  /* Quieter than --border, for edges that separate rather than outline: a card
+   * on a surface, a row in a list. --border stays for things that must read as
+   * a boundary (inputs, focus targets). */
+  --border-subtle: rgba(255, 255, 255, 0.055);
+  /* One reading column for every page view. Before this each screen picked its
+   * own (920 for the settings tab strip, 1016 for the settings cards, 1016 for
+   * memory) -- two panes of the same page had different widths. */
+  --content-max: 960px;
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #f2f2f3;
   --text-secondary: #b4b4b8;
@@ -75,6 +83,7 @@ html[data-theme='light'] {
   --surface-raised: #ffffff;
   --surface-hover: rgba(17, 18, 21, 0.045);
   --border: rgba(17, 18, 21, 0.1);
+  --border-subtle: rgba(17, 18, 21, 0.08);
   --border-strong: rgba(17, 18, 21, 0.18);
   --text: #18181b;
   --text-secondary: #52525b;

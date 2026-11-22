@@ -1,0 +1,179 @@
+/* The visual pass: one column, quieter edges, a real type scale, a rhythm.
+ *
+ * Why this is a layer of its own
+ * ------------------------------
+ * Fifteen partials accumulated a second and third pass each; every surface is
+ * outlined because each redesign added the outline its author wanted. Reading
+ * it as a whole gave the impression of a page that was dirty rather than dark:
+ * boxes inside boxes, five type sizes between 10 and 14px, and two panes of the
+ * settings page 96px different in width.
+ *
+ * This file does not add components. It only settles what is shared: the
+ * column, the edge, the type, the space between blocks. It loads last so those
+ * decisions win, which is the point -- a shared decision that loses the cascade
+ * is not shared.
+ *
+ * Kept as one file with one reason per block, so the next person can see what
+ * the design decisions are instead of reconstructing them from the cascade.
+ */
+
+/* ── one reading column ─────────────────────────────────────────────────────
+ * Every page view puts its blocks in the same 960px column. Before this the
+ * settings tab strip was 920 and the settings cards 1016 -- two panes of the
+ * same page, visibly out of line.
+ */
+.page-view > *,
+.page-view .settings-grid,
+.page-view .settings-tabs {
+  width: 100%;
+  max-width: var(--content-max);
+  margin-inline: auto;
+}
+
+/* `.settings-view .settings-grid { max-width: none }` (15-shell.css) and the
+ * tab strip's own 920px were the two caps that disagreed. Both are answered
+ * above; this note is here so nobody re-adds either without noticing. */
+
+/* ── quieter edges ──────────────────────────────────────────────────────────
+ * A card sits on a surface one step lighter than the page; the 1px outline on
+ * top of that is a second, competing edge. Inputs keep --border because for
+ * them the edge IS the affordance.
+ */
+.settings-card,
+.entity-card,
+.schedule-card,
+.workflow-card {
+  border-color: var(--border-subtle);
+}
+.ant-card-head {
+  border-bottom-color: var(--border-subtle);
+}
+
+/* ── a type scale ───────────────────────────────────────────────────────────
+ * Four sizes, each with a job. Before: page leads at 12, card titles at 13,
+ * body at 13.5-14, meta at 10-11 -- adjacent sizes that read as noise rather
+ * than as hierarchy.
+ */
+.page-lead {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+.ant-card-head-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.card-kicker {
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  color: var(--text-muted);
+}
+
+/* ── a list is one surface, not a stack of boxes ────────────────────────────
+ * Twelve bordered rows eight pixels apart read as twelve competing frames. One
+ * container and hairline dividers read as a list -- and the row hover stops
+ * lifting, which was the busiest thing on the page.
+ */
+.memory-list {
+  gap: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.memory-row {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.memory-row + .memory-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.memory-row:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: transparent;
+  background: var(--surface-raised);
+}
+.memory-row.is-pinned {
+  border-left: 2px solid var(--primary-border);
+}
+
+/* ── rhythm ─────────────────────────────────────────────────────────────────
+ * Uniform 12-16px everywhere made every block equally important and the page
+ * equally dense top to bottom. Sections get more, rows get less.
+ */
+.page-view {
+  padding-top: 30px;
+  padding-bottom: 56px;
+}
+.settings-grid {
+  gap: 18px;
+}
+.memory-list,
+.schedule-list {
+  margin-top: 2px;
+}
+.list-toolbar {
+  margin-bottom: 14px;
+}
+
+/* ── the memory meta line ───────────────────────────────────────────────────
+ * Two bordered pills plus five pieces of 11-12px text under every row. The pill
+ * is a shape a reader has to parse; on a list of twenty-five that is fifty
+ * shapes competing with the sentences. One pill for the category, the rest as
+ * separated text.
+ */
+.memory-row-meta {
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.memory-tag.ant-tag {
+  height: 18px;
+  line-height: 16px;
+  padding: 0 7px;
+  border-color: transparent;
+  background: var(--primary-soft);
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+.memory-meta-sep {
+  color: var(--border-strong);
+  font-size: 11px;
+}
+.memory-meta-entity {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The settings head holds only the save controls now that the page lead is
+ * gone -- so they belong at the end of the row, not floating at its start. */
+.settings-page-head {
+  justify-content: flex-end;
+}
+
+/* Provider rows: five bordered rows, each with three bordered buttons. The
+ * border on the row is an edge on top of an already-elevated surface. */
+.provider-row.ant-card {
+  border-color: var(--border-subtle);
+}
+
+/* ── one density ────────────────────────────────────────────────────────────
+ * Card bodies were 24px, provider rows 12px, memory rows 12/14px. Three
+ * densities on two adjacent pages read as two different products. Cards keep
+ * room for a form; rows get enough to breathe without doubling their height.
+ */
+.settings-card > .ant-card-body {
+  padding: 20px;
+}
+.provider-row > .ant-card-body {
+  padding: 14px 16px;
+}
+.memory-row {
+  padding: 14px 16px;
+}

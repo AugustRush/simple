@@ -388,7 +388,7 @@ export function useShell(deps: Deps) {
     },
     memory: {
       title: '记忆',
-      subtitle: '它记得的关于你的事 —— 看得见，也改得动',
+      subtitle: '改一条，它下一轮就按新的认知来；删一条，就等于让它忘掉',
     },
     // Not "定时任务": the page now holds tasks that wait for a signal, and a
     // name that promises a time would be wrong for them. "自动化" is what the

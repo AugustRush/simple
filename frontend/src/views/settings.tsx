@@ -494,6 +494,7 @@ function ProvidersCard({
                 <Space wrap>
                   <Button
                     size="small"
+                    type="text"
                     loading={busy === name}
                     onClick={() => onTest(name)}
                   >
@@ -504,11 +505,11 @@ function ProvidersCard({
                       repeating it reads as an action that exists and is being
                       withheld -- next to 删除, which really is withheld. */}
                   {!isActive && (
-                    <Button size="small" onClick={() => onActivate(name)}>
+                    <Button size="small" type="text" onClick={() => onActivate(name)}>
                       切换到此
                     </Button>
                   )}
-                  <Button size="small" onClick={() => (open ? setEditing(null) : openEditor(name))}>
+                  <Button size="small" type="text" onClick={() => (open ? setEditing(null) : openEditor(name))}>
                     {open ? '收起' : '编辑'}
                   </Button>
                   {/* Deleting the active provider is refused by the gateway, so
@@ -639,21 +640,23 @@ export function createSettingsView(ctx: AppCtx) {
     <div className="page-view settings-view" ref={scrollRef}>
       {/* The bar above names the page; this row carries the one sentence that
           describes it and the save controls, not a second copy of the title. */}
+      {/* No page-level lead: the topbar subtitle already says what this page
+          is, and two sentences saying it 40px apart read as a page that cannot
+          decide what it is. The head carries the save controls only -- and on a
+          panel with nothing to save it is not rendered at all: `.settings-page-head`
+          draws a bottom rule, so an empty one left a 1px line across the page. */}
+      {(settingsTab === 'model' || settingsTab === 'advanced' || unsaved) && (
       <div className="page-head settings-page-head">
-        <p className="page-lead">配置访问权限、模型偏好与消息频道。</p>
         <Affix
           className="settings-affix"
           target={() => scrollRef.current}
           offsetTop={0}
         >
           {/* The save controls belong to the panels that have anything to
-              save. They stay visible from any panel while something is
-              pending -- switching tabs must never hide the fact that the
-              model form has unsaved edits. */}
-          <div
-            className="settings-affix-bar"
-            hidden={settingsTab !== 'model' && settingsTab !== 'advanced' && !unsaved}
-          >
+              save, and stay visible from any panel while something is pending
+              -- switching tabs must never hide the fact that the model form has
+              unsaved edits. */}
+          <div className="settings-affix-bar">
             <Space>
               <span className={`save-state ${unsaved ? 'dirty' : ''} ${blocked ? 'blocked' : ''}`}>
                 <span className="save-state-dot" />
@@ -679,6 +682,7 @@ export function createSettingsView(ctx: AppCtx) {
           </div>
         </Affix>
       </div>
+      )}
 
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 10 }} />

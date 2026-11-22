@@ -235,9 +235,23 @@ export function renderMemory(ctx: AppCtx) {
                   {expandedMemoryIds.includes(entry.id) ? '收起' : '展开全文'}
                 </button>
               )}
+              {/* One pill, not two, and the rest as plain separated text.
+                  Measured on a list of 25: 50 bordered tag pills plus 150
+                  pieces of 12px meta text, all the same weight -- the row read
+                  as debris under every sentence. The category is the one label
+                  worth a shape; the entity is a name, and a name is text. */}
               <div className="memory-row-meta">
                 <Tag className="memory-tag">{entry.category}</Tag>
-                {entry.entity && <Tag className="memory-tag is-quiet">{entry.entity}</Tag>}
+                {entry.entity && (
+                  <>
+                    <span className="memory-meta-plain memory-meta-entity">{entry.entity}</span>
+                    <span className="memory-meta-sep" aria-hidden="true">·</span>
+                  </>
+                )}
+                {/* Provenance is shown when it is actionable -- a link back to
+                    the conversation. An opaque eight-character id that does not
+                    open anything is a fact the reader cannot use, and there was
+                    one under every row. */}
                 {canOpenSource ? (
                   <button
                     type="button"
@@ -246,15 +260,15 @@ export function renderMemory(ctx: AppCtx) {
                   >
                     {source}
                   </button>
-                ) : (
-                  <span className="memory-meta-plain">{source}</span>
-                )}
+                ) : null}
+                {canOpenSource && <span className="memory-meta-sep" aria-hidden="true">·</span>}
                 <span className="memory-meta-plain">{relativeTime(entry.updated_at)}</span>
                 {pinned && <span className="memory-pin-flag">已钉住</span>}
                 {/* The importance number, spelled out. It used to be a 44x4px
                     bar with no label, sitting beside the row's buttons: at that
                     size it read as a stray divider rather than as a meter, and
                     a value nobody can name is a value nobody uses. */}
+                <span className="memory-meta-sep" aria-hidden="true">·</span>
                 <span className="memory-meta-plain">
                   重要度 {Math.round(entry.importance * 100)}%
                 </span>
@@ -397,7 +411,7 @@ export function renderMemory(ctx: AppCtx) {
         onChange={applyMemoryCategory}
       />
       <div className="list-toolbar-side">
-        <Button icon={<ReloadOutlined />} onClick={() => void loadMemory()}>
+        <Button type="text" icon={<ReloadOutlined />} onClick={() => void loadMemory()}>
           刷新
         </Button>
         <Button type="primary" icon={<PlusOutlined />} onClick={openMemoryCreate}>
@@ -420,7 +434,10 @@ export function renderMemory(ctx: AppCtx) {
           okButtonProps={{ danger: true }}
           onConfirm={() => void clearAllMemory()}
         >
-          <Button danger icon={<DeleteOutlined />} disabled={memoryBusy}>
+          {/* Text, not a bordered button: it is the rarest action on the page
+              and the only destructive one, so it should not carry the same
+              visual weight as 新增记忆 sitting next to it. */}
+          <Button type="text" danger icon={<DeleteOutlined />} disabled={memoryBusy}>
             清空
           </Button>
         </Popconfirm>
@@ -443,9 +460,6 @@ export function renderMemory(ctx: AppCtx) {
       {/* The bar above already says 它记得的关于你的事 —— 看得见，也改得动;
           repeating it here read like the page could not decide what it was.
           This line keeps only what the subtitle does not: what an edit means. */}
-      <p className="page-lead">
-        改一条，它下一轮就按新的认知来；删一条，就等于让它忘掉。
-      </p>
 
       {memoryUnavailable ? (
         unavailable
