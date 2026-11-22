@@ -177,3 +177,57 @@
 .memory-row {
   padding: 14px 16px;
 }
+
+/* ── no card inside a card ──────────────────────────────────────────────────
+ * The plugin cards inside 设置 drew their own surface, a `backdrop-filter:
+ * saturate(115%)` and a 30px shadow -- on top of a card that already had all
+ * three. Nested elevation is what makes a page read as dirty: two edges, two
+ * shadows, two tints, all for one tile. Inside a card, a tile is a row.
+ */
+.settings-card .entity-card {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+  border-color: var(--border-subtle);
+}
+.settings-card .entity-card:hover {
+  border-color: var(--border);
+}
+
+/* Plugin ids are hyphenated names: wrapping them at the hyphen split
+ * `huashu-mac-use` into `huashu-mac-` / `use`, which reads as a different id,
+ * and an ellipsis in the middle left the reader unable to tell two plugins
+ * apart. Neither is acceptable, so the header gives the name more room
+ * instead: a smaller mark and a smaller name, still one line. */
+.entity-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+.entity-icon .anticon {
+  font-size: 13px;
+}
+.entity-card-head {
+  gap: 8px;
+}
+.entity-title strong {
+  font-size: 12.5px;
+  letter-spacing: -0.01em;
+}
+
+/* ── a heading needs air above it ───────────────────────────────────────────
+ * `.markdown h1-h4` had `margin: 0 0 8px`. Paragraphs in a message are
+ * separated by `<br /><br />`, so the measured gap between the paragraph above
+ * and a heading was **5px** -- 我的建议 read as the tail of the sentence before
+ * it. Below 16px they are glued; above 24px the message gains a false section
+ * break every time a model uses a bold line.
+ */
+.markdown h1,
+.markdown h2 {
+  margin-top: 18px;
+}
+.markdown h3,
+.markdown h4 {
+  margin-top: 14px;
+}
