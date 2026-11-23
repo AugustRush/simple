@@ -357,3 +357,61 @@ def test_the_save_bar_covers_what_scrolls_under_it() -> None:
     # `display: block` on it collapsed the bar entirely (measured: top -1497).
     wrapper = polish.split(".settings-affix {")[1][:160] if ".settings-affix {" in polish else ""
     assert "display: block" not in wrapper
+
+
+def test_every_settings_row_uses_one_geometry() -> None:
+    """The 模型与频道 card held three row designs at once, and they ended their
+    controls at different x positions (measured: switches at 701 and 1165, the
+    select at 899, the button at 1097). Three shapes in one card is what "no
+    consistency" looks like to a reader.
+
+    Two class names remain (`settings-pref` from the older rows, `settings-row`
+    from the channel block) because rewriting four rows of markup is a bigger
+    change than the alignment is worth -- so the guard is that *both* are given
+    the same geometry: same gap, same control column, same hairline.
+    """
+    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
+
+    # Both row classes get the same gap and the same control column.
+    for cls in (".settings-row {", ".settings-pref {"):
+        block = polish.split(cls)[1][:400]
+        assert "gap: 24px" in block, f"{cls} has its own gap"
+        assert "min-height: 56px" in block, f"{cls} has its own row height"
+
+    # The control column is what makes the right edges agree.
+    assert polish.count("min-width: 320px") >= 2
+    # ...and the divider is the same token in both, not --border in one and
+    # --border-subtle in the other.
+    assert polish.count("border-top: 1px solid var(--border-subtle)") >= 3
+
+
+def test_a_settings_card_insets_its_content_once() -> None:
+    """The provider rows sat at 261..1179 inside a card body of 241..1199, so
+    the list was inset an extra 20px and stopped short of everything above it.
+    Every card's content now starts and ends on the body's own edges."""
+    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
+    # Anchored on the selector, not on the prose: the comment above it contains
+    # an apostrophe and a typographic quote, and a guard that depends on the
+    # wording fails when the wording improves.
+    # Both rules that target a provider row inside a card body.
+    rules = [
+        block for block in polish.split("}") if ".provider-row" in block
+    ]
+    assert any("margin-inline: 0" in block for block in rules)
+    assert any("border-color: var(--border-subtle)" in block for block in rules)
+    assert any("padding: 12px 14px" in block for block in rules)
+
+
+def test_a_settings_row_stacks_below_the_two_column_width() -> None:
+    """The control column is 320px. At 390px the row is 316px wide, so the fixed
+    column was wider than its row: the text collapsed to zero and the control
+    only stayed visible because flex happened to wrap it. Between 640 and 900px
+    it breaks visibly -- wide enough not to wrap, too narrow for both columns.
+    """
+    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
+
+    assert "@media (max-width: 720px)" in polish
+    section = polish.split("@media (max-width: 720px)")[1][:600]
+    assert ".settings-pref," in section and ".settings-row {" in section
+    assert "flex-direction: column" in section
+    assert "min-width: 0" in section, "the fixed control column was not released"

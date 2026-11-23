@@ -4,7 +4,7 @@ import { useRef, useState } from 'react'
 import type { AppCtx } from '../app/AppCtx'
 import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
-import { ApiOutlined, CheckCircleFilled, DownloadOutlined, MessageOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons'
+import { CheckCircleFilled, DownloadOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons'
 import {
   Affix,
   Button,
@@ -862,68 +862,55 @@ export function createSettingsView(ctx: AppCtx) {
                 </Col>
               </Row>
 
-              {/* A channel is a boolean, not a value you type, so it is not laid
-                  out like a form field. Two `md=8` columns put the name on one
-                  line and a 44px switch alone on the next, with the rest of the
-                  column empty; the switch floated in a control-height slot that
-                  nothing else was in. One row per channel instead: what it is on
-                  the left, whether it is on, on the right. */}
-              <section className="settings-channel-block">
-                <header className="settings-channel-block-head">
+              {/* Every row in this card is the same shape: a name and a
+                  sentence on the left, one control on the right, and a hairline
+                  between rows. Before this the card held three different row
+                  designs at once -- a bordered channel tile, a bare preference
+                  row, and a row whose select and button floated at a different
+                  right edge from the switches above them. Three shapes in one
+                  card is what "no consistency" looked like. */}
+              <section className="settings-rows">
+                <div className="settings-rows-head">
                   <span className="settings-field-label">消息频道</span>
                   <small>各自独立开关，随「保存设置」一起写入。</small>
-                </header>
-                <div className="settings-channels">
-                  {[
-                    {
-                      key: 'web_enabled',
-                      label: 'Web 频道',
-                      desc: '本页所在的 Web 服务，默认只绑本机',
-                      icon: <ApiOutlined />,
-                    },
-                    {
-                      key: 'feishu_enabled',
-                      label: '飞书频道',
-                      desc: '在飞书里收发消息，凭据在下方 JSON 里',
-                      icon: <MessageOutlined />,
-                    },
-                  ].map(channel => (
-                    <div className="settings-channel" key={channel.key}>
-                      {/* Everything except the switch is a `<label for>` onto
-                          it, so the whole row turns the channel on rather than
-                          just the 44px pill -- and the switch stays outside the
-                          label, so one click is one toggle. The switch keeps an
-                          `aria-label` so it is named even if that association is
-                          ever lost. */}
-                      <label className="settings-channel-hit" htmlFor={channel.key}>
-                        <span className="settings-channel-icon">{channel.icon}</span>
-                        <span className="settings-channel-copy">
-                          <span className="settings-channel-name">{channel.label}</span>
-                          <span className="settings-channel-desc">{channel.desc}</span>
-                        </span>
-                      </label>
+                </div>
+
+                {[
+                  {
+                    key: 'web_enabled',
+                    label: 'Web 频道',
+                    desc: '本页所在的 Web 服务，默认只绑本机',
+                  },
+                  {
+                    key: 'feishu_enabled',
+                    label: '飞书频道',
+                    desc: '在飞书里收发消息，凭据在下方 JSON 里',
+                  },
+                ].map(channel => (
+                  <div className="settings-row" key={channel.key}>
+                    <label className="settings-row-copy" htmlFor={`ch-${channel.key}`}>
+                      <span className="settings-row-name">{channel.label}</span>
+                      <span className="settings-row-desc">{channel.desc}</span>
+                    </label>
+                    <div className="settings-row-control">
                       <Form.Item name={channel.key} valuePropName="checked" noStyle>
-                        <Switch aria-label={channel.label} />
+                        <Switch id={`ch-${channel.key}`} />
                       </Form.Item>
                     </div>
-                  ))}
-                </div>
-                {/* Where a failure goes when nobody is looking at the page.
-                    Not per-task: a task may have no channel at all, and "warn
-                    me where I am" is a property of the person, not of the task.
-                    Empty means off -- there is no sensible default recipient. */}
-                <div className="settings-pref settings-notify-chat">
-                  <div className="settings-pref-copy">
-                    <span className="settings-pref-name">失败通知发到</span>
-                    <span className="settings-pref-desc">
+                  </div>
+                ))}
+
+                <div className="settings-row">
+                  <div className="settings-row-copy">
+                    <span className="settings-row-name">失败通知发到</span>
+                    <span className="settings-row-desc">
                       只发失败。设了它，关掉页面也能收到；不设就只有本机通知。
                     </span>
                   </div>
-                  <Space.Compact className="settings-pref-control">
+                  <div className="settings-row-control settings-row-control-wide">
                     <Form.Item name="notify_chat_id" noStyle>
                       <Select
                         allowClear
-                        className="settings-pref-select"
                         placeholder="不发送"
                         onDropdownVisibleChange={open => { if (open && !feishuChats.length) void loadFeishuChats() }}
                         options={feishuChats.map(chat => ({ value: chat.chat_id, label: chat.name || chat.chat_id }))}
@@ -938,14 +925,11 @@ export function createSettingsView(ctx: AppCtx) {
                         happened. It reads the *saved* config, which is why it
                         sits here rather than pretending to test the form. */}
                     <Tooltip title="按已保存的配置，真的发一条到每个通道">
-                      <Button
-                        loading={notifyTesting}
-                        onClick={() => void testNotification()}
-                      >
+                      <Button loading={notifyTesting} onClick={() => void testNotification()}>
                         测试通知
                       </Button>
                     </Tooltip>
-                  </Space.Compact>
+                  </div>
                 </div>
               </section>
             </Form>

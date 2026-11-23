@@ -294,3 +294,203 @@
   width: fit-content;
   margin-inline-start: auto;
 }
+
+/* ── one row shape for every setting ────────────────────────────────────────
+ * The 模型与频道 card held three row designs at once: a bordered channel tile,
+ * a bare preference row, and a row whose select and button sat at a different
+ * right edge from the switches above them (measured: switches ended at 701 and
+ * 1165, the select at 899, the button at 1097). Three shapes in one card is
+ * exactly what "no consistency" looks like from a reader's side.
+ *
+ * One shape now, used by every row on the page:
+ *
+ *   ┌──────────────────────────────────────────────┐
+ *   │ name                     [ control ]         │
+ *   │ one sentence about it                        │
+ *   └──────────────────────────────────────────────┘
+ *   with a hairline between rows and nothing else.
+ *
+ * The control column has a fixed width so every right edge lines up whether
+ * the control is a 44px switch or a 300px select+button pair.
+ */
+.settings-rows {
+  margin-top: 18px;
+  border-top: 1px solid var(--border-subtle);
+}
+.settings-rows-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 0 6px;
+}
+.settings-rows-head small {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  min-height: 56px;
+  padding: 10px 0;
+}
+.settings-row + .settings-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.settings-row-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.settings-row-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.settings-row-desc {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Every control ends on the same right edge. `min-width` rather than `width` so
+ * a narrow control (a switch) stays narrow -- it is right-aligned inside the
+ * column, which is what makes the edges agree without stretching a 44px switch
+ * across 320px. */
+.settings-row-control {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 320px;
+}
+.settings-row-control-wide {
+  min-width: 420px;
+}
+.settings-row-control .ant-select,
+.settings-row-control .ant-input,
+.settings-row-control .ant-input-number {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.settings-row-control > .ant-btn {
+  flex: 0 0 auto;
+}
+
+/* ── one inset for every card's content ─────────────────────────────────────
+ * The provider rows sat at 261..1179 inside a card whose body ran 241..1199:
+ * every other card's content started at 241, so the provider list was inset an
+ * extra 20px and its right edge stopped short of everything above it. Two
+ * insets on one page read as sloppy alignment, not as grouping.
+ *
+ * Everything in a settings card now starts and ends on the body's own edges;
+ * the separation between rows comes from hairlines, not from indentation.
+ */
+.settings-view .ant-card-body > .provider-row,
+.settings-view .provider-row.ant-card {
+  margin-inline: 0;
+}
+
+/* The provider row is a card inside a card -- the same nested-elevation problem
+ * the plugin tiles had. It gets a hairline and no shadow. */
+.settings-view .provider-row.ant-card {
+  border-color: var(--border-subtle);
+  background: var(--surface-raised);
+}
+.settings-view .provider-row.ant-card > .ant-card-body {
+  padding: 12px 14px;
+}
+
+/* ── the older row class, brought onto the same grid ────────────────────────
+ * `.settings-pref` predates `.settings-row` and was laid out with its own gaps
+ * (22px), its own divider (`--border`), and no fixed control column -- so the
+ * two rows types on one page ended their controls at different x positions and
+ * separated by different amounts. Rather than rewrite four rows of markup, the
+ * old class is given the new geometry: same gap, same hairline, same control
+ * column. Two class names, one shape.
+ */
+.settings-pref {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  min-height: 56px;
+  padding: 10px 0;
+}
+.settings-pref + .settings-pref {
+  margin-top: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+.settings-pref-copy {
+  gap: 2px;
+}
+.settings-pref-name {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.settings-pref-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  /* The text column ends where the control column begins -- the flex `gap` is
+     the only separation. A `ch` cap made it narrower than that on a wide
+     window, so every description wrapped early and the two columns read as
+     unrelated. The width is now decided by the layout, not guessed in a unit
+     that changes with the font. */
+  max-width: none;
+}
+.settings-pref-control {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 320px;
+}
+.settings-pref-control .ant-select,
+.settings-pref-control .ant-input,
+.settings-pref-control .ant-input-number {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* A bordered row-group, so two consecutive rows read as one block rather than
+   as two loose lines. */
+.settings-card > .ant-card-body > .settings-pref:first-of-type {
+  margin-top: 2px;
+}
+
+/* ── below the two-column width, a row stacks ───────────────────────────────
+ * The control column is 320px (420 for the notify pair). On a 390px phone the
+ * row is 316px wide, so the fixed column was wider than its row: the text
+ * column collapsed to zero and the control only stayed visible because flex
+ * wrapped it. That is an accident, not a layout -- measured at 390px, and it
+ * breaks visibly anywhere between 640 and 900px, where the row is wide enough
+ * not to wrap but not wide enough for both columns.
+ *
+ * Below 720px the row stacks: name and description on top, control underneath,
+ * full width. */
+@media (max-width: 720px) {
+  .settings-pref,
+  .settings-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .settings-pref-control,
+  .settings-row-control,
+  .settings-row-control-wide {
+    min-width: 0;
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .settings-pref-control > .ant-btn,
+  .settings-row-control > .ant-btn {
+    flex: 0 0 auto;
+  }
+}
