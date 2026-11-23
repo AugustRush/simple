@@ -54,10 +54,17 @@
  * body at 13.5-14, meta at 10-11 -- adjacent sizes that read as noise rather
  * than as hierarchy.
  */
+/* `.page-lead` carries `margin: 0 !important` in 05-pages-settings.css (it has
+ * to beat antd's paragraph margin), and an `!important` margin also beats the
+ * column's `margin-inline: auto` -- measured: the lead sat at x=32 while the
+ * blocks under it started at x=240. The horizontal half has to be re-asserted
+ * with the same weight, and it needs a bottom margin to separate it from them. */
 .page-lead {
   font-size: 13px;
   line-height: 1.6;
   color: var(--text-secondary);
+  margin: 0 0 16px !important;
+  margin-inline: auto !important;
 }
 .ant-card-head-title {
   font-size: 14px;
@@ -230,4 +237,28 @@
 .markdown h3,
 .markdown h4 {
   margin-top: 14px;
+}
+
+/* 能力 is a page now, so its content sits in the same column as every other
+ * page view. It was a card inside 设置, which had its own padding and its own
+ * width rule. */
+.capabilities-view .capabilities-hint {
+  max-width: 62ch;
+  margin: 0 0 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* antd's `Row` writes `margin-left: -8px; margin-right: -8px` **inline** (the
+ * gutter compensation). That inline margin beats the column's
+ * `margin-inline: auto`, so the row lost its centring: measured, the tab strip
+ * above started at x=240 and the first card at x=32.
+ *
+ * `margin-inline: auto !important` does beat an inline style (an important
+ * declaration outranks it), and that is what puts the row back in the column.
+ * Zeroing the margin instead only left-aligns it -- which is what the first
+ * attempt did. */
+.page-view > .ant-row {
+  margin-inline: auto !important;
 }

@@ -4,7 +4,6 @@ import { useRef, useState } from 'react'
 import type { AppCtx } from '../app/AppCtx'
 import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
-import { renderCapabilities } from './extensions'
 import { ApiOutlined, CheckCircleFilled, DownloadOutlined, MessageOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons'
 import {
   Affix,
@@ -689,7 +688,6 @@ export function createSettingsView(ctx: AppCtx) {
             [
               ['general', '常规'],
               ['model', '模型'],
-              ['capabilities', '能力'],
               ['advanced', '高级'],
             ] as const
           ).map(([key, label]) => (
@@ -980,14 +978,6 @@ export function createSettingsView(ctx: AppCtx) {
               </section>
             </Form>
           </Card>
-
-        </div>
-
-        <div className="settings-grid" hidden={settingsTab !== 'capabilities'}>
-          {/* Capability belongs with configuration: 扩展 was a page of its own,
-              and a page whose entire content is switches and deletes is a
-              settings section wearing a page's clothes. */}
-          {renderCapabilities(ctx)}
 
         </div>
 

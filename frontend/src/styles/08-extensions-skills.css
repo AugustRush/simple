@@ -15,7 +15,10 @@
   font-variant-numeric: tabular-nums;
 }
 .capabilities-hint { margin: 0; }
-.capabilities-card .ant-card-body { padding-top: 4px; }
+/* 能力 is a page now, not a card inside 设置 -- so there is no card body to
+ * trim. Kept as a comment rather than deleted silently: the two rules below
+ * still key off `.capabilities-card`, which no longer exists. */
+
 /* One toolbar shape for every list page (会话管理 / 扩展 / 自动化): search
    first, at one width, then whatever narrows or acts on the list.  Before
    this, the same control sat on the right of one page, the left of another
@@ -43,7 +46,7 @@
   gap: 8px;
   margin-left: auto;
 }
-.capabilities-card .skills-summary {
+.capabilities-view .skills-summary {
   justify-content: flex-end;
   margin-bottom: 16px;
 }

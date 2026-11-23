@@ -1,14 +1,19 @@
-/** The capability lists: plugins and skills, as a card on 设置.
+/** The capability lists: plugins and skills, as a page of their own.
  *
- * Why not a page
- * --------------
- * 扩展 was a destination of its own, and it was the wrong shape for what it
- * holds. A page answers "where am I"; these two lists answer "what can it do",
- * which is a question you have while changing a setting, not one you go
- * somewhere to ask. Everything on this screen is a switch or a delete -- the
- * same verbs as the settings page it now lives on. The old page also had to
- * carry its own title bar, its own lead sentence and a tab strip, three
- * affordances around two lists that each fit on a card.
+ * Why a page after all
+ * --------------------
+ * This started as 扩展, a page; it was folded into 设置 as a card ("what it can do
+ * is a question you have while changing a setting"); and it is a page again,
+ * because folding it in made the settings page jump. Its two lists are taller
+ * than every other settings panel combined, its search and switches load their
+ * own data, and putting it behind a tab meant the page height, the scroll
+ * position and the load state all changed when the tab changed -- three jumps
+ * for one click.
+ *
+ * The honest split is by *question*: 设置 answers "how should it behave" (a
+ * handful of fields, one save button); this page answers "what can it do" (two
+ * lists you scan and switch). They are different activities and they were
+ * sharing a shell.
  */
 
 import type { AppCtx } from '../app/AppCtx'
@@ -226,12 +231,8 @@ export function renderCapabilities(ctx: AppCtx) {
   )
 
   return (
-    <Card
-      className="settings-card settings-card-wide capabilities-card"
-      title="能力"
-      extra={<span className="card-kicker">即时生效</span>}
-    >
-      <p className="settings-hint capabilities-hint">
+    <div className="page-view capabilities-view">
+      <p className="page-lead">
         插件给 Agent 增加新的能力入口，技能决定这些能力怎么被调用。这一页的开关不用保存，拨完就是结果。
       </p>
       {/* The same tab idiom as the 自动化 page, so the two multi-list screens
@@ -258,6 +259,6 @@ export function renderCapabilities(ctx: AppCtx) {
         </button>
       </div>
       {extensionsTab === 'plugins' ? renderPluginsBody() : renderSkillsBody()}
-    </Card>
+    </div>
   )
 }

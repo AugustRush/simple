@@ -1,4 +1,4 @@
-import { AppstoreOutlined, ArrowLeftOutlined, CheckOutlined, CodeOutlined, SearchOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, CheckOutlined, CodeOutlined, SearchOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
 import { Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Modal, theme } from 'antd'
 import type { ThemePreference } from './lib/theme'
@@ -14,6 +14,7 @@ import { renderPluginPage } from './views/plugin_page'
 import { renderMemory } from './views/memory'
 import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
+import { renderCapabilities } from './views/extensions'
 
 import { useUi } from './hooks/useUi'
 import { useApiClient } from './hooks/useApiClient'
@@ -54,7 +55,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage, settingsTab, setSettingsTab, openSettings } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage, settingsTab, setSettingsTab } = ui
 
   const { api, contextHolder, messageApi, token } = apiClient
 
@@ -191,7 +192,6 @@ function App() {
     openPage,
     settingsTab,
     setSettingsTab,
-    openSettings,
     resolvedTheme,
     api,
     setPluginSearch,
@@ -338,6 +338,7 @@ function App() {
     if (view === 'home') return renderHome(ctx)
     if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)
+    if (view === 'capabilities') return renderCapabilities(ctx)
     if (view === 'settings') return renderSettings()
     return renderHome(ctx)
   }
@@ -361,9 +362,6 @@ function App() {
     ...navItems.filter(item => item.key !== 'home' && item.key !== 'schedules'),
     { type: 'divider' },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
-    // 能力 is a panel of 设置, two clicks in. It is also the thing people open
-    // 设置 for most often ("can it do X?"), so it gets its own entry.
-    { key: 'capabilities', icon: <AppstoreOutlined />, label: '能力' },
     // Three answers, not a toggle. `system` is what most people actually want --
     // a laptop that dims at sunset should take the app with it -- and a toggle
     // cannot express it. The check mark is the current preference, which is a
@@ -386,10 +384,6 @@ function App() {
   const handleTopbarMenu: MenuProps['onClick'] = ({ key }) => {
     if (key.startsWith('theme:')) {
       chooseTheme(key.slice('theme:'.length) as ThemePreference)
-      return
-    }
-    if (key === 'capabilities') {
-      openSettings('capabilities')
       return
     }
     // `navigateTo` keeps the unsaved-edits guard, so a menu entry refuses to lose

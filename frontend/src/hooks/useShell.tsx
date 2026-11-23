@@ -20,7 +20,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, openSettings, pluginPage, settingsDirty, tokenDirty, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, pluginPage, settingsDirty, tokenDirty, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -130,13 +130,14 @@ export function useShell(deps: Deps) {
       void loadSessions()
       loadSchedules()
     }
-    // Both lists load on entering the merged page: the counts on the tabs and
-    // the page subtitle are about both, and switching tabs is not a data
-    // event -- it is the same visit continuing.
-    // 设置 holds the capability lists now (they were a page of their own), so
-    // entering it loads plugins and skills alongside the config.
     if (view === 'settings') {
       loadSettings()
+    }
+    // The two capability lists belong to their own page now. They were loaded
+    // on entering 设置 when they lived there as a card; after the move nothing
+    // called them from their own page, and it rendered 0 plugins / 0 skills
+    // against a gateway that had two of each -- measured.
+    if (view === 'capabilities') {
       loadPlugins()
       loadSkills()
     }
@@ -306,6 +307,8 @@ export function useShell(deps: Deps) {
     // What the agent *knows*. (What it *can* do is on 设置 with the rest of the
     // configuration, which is also where you would look to change it.)
     { key: 'memory', icon: <BulbOutlined />, label: '记忆' },
+    // Its own destination: two lists you scan and switch, not a field you set.
+    { key: 'capabilities', icon: <AppstoreOutlined />, label: '能力' },
   ]
 
   // The palette's own list: one index over commands and destinations, so the
@@ -319,15 +322,7 @@ export function useShell(deps: Deps) {
   // promises that navigation is searchable too.
   type PaletteEntry =
     | { kind: 'command'; key: string; command: CommandInfo }
-    | {
-        kind: 'nav'
-        key: string
-        view: string
-        /** A settings panel to open instead of the page's default. */
-        tab?: 'general' | 'model' | 'capabilities' | 'advanced'
-        label: string
-        icon: ReactNode
-      }
+    | { kind: 'nav'; key: string; view: string; label: string; icon: ReactNode }
 
   const paletteEntries = useMemo<PaletteEntry[]>(() => {
     const query = paletteQuery.trim().toLowerCase()
@@ -336,18 +331,11 @@ export function useShell(deps: Deps) {
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
       { view: 'memory', label: '记忆', icon: <BulbOutlined />, terms: '记忆 memory 事实' },
       { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings 设置' },
-      { view: 'settings', tab: 'capabilities' as const, label: '能力', icon: <AppstoreOutlined />, terms: '能力 插件 技能 plugins skills capabilities' },
+      { view: 'capabilities', label: '能力', icon: <AppstoreOutlined />, terms: '能力 插件 技能 plugins skills capabilities' },
     ].filter(item => !query || `${item.label} ${item.terms}`.toLowerCase().includes(query))
     return [
       ...paletteCommands.slice(0, 8).map(command => ({ kind: 'command' as const, key: `command:${command.name}`, command })),
-      ...destinations.map(({ view, tab, label, icon }) => ({
-        kind: 'nav' as const,
-        key: `nav:${view}:${tab || ''}`,
-        view,
-        tab,
-        label,
-        icon,
-      })),
+      ...destinations.map(({ view, label, icon }) => ({ kind: 'nav' as const, key: `nav:${view}`, view, label, icon })),
     ]
   }, [paletteCommands, paletteQuery])
 
@@ -364,8 +352,7 @@ export function useShell(deps: Deps) {
       applyCommand(entry.command)
       return
     }
-    if (entry.tab) openSettings(entry.tab)
-    else navigateTo(entry.view)
+    navigateTo(entry.view)
     setCommandPaletteOpen(false)
     setPaletteQuery('')
   }
@@ -417,6 +404,10 @@ export function useShell(deps: Deps) {
     // name that promises a time would be wrong for them. "自动化" is what the
     // page actually is -- work that runs without being asked each time.
     schedules: { title: '自动化', subtitle: '管理定时执行与等待信号的任务。' },
+    capabilities: {
+      title: '能力',
+      subtitle: '插件给它增加入口，技能决定这些入口怎么被调用。',
+    },
     settings: {
       title: '设置',
       subtitle: '令牌、模型、频道，以及它能用的插件和技能',

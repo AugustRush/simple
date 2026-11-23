@@ -22,7 +22,7 @@
  * so "which page am I on" and "which thread am I in" stopped being two questions.
  */
 
-export const VIEW_NAMES = ['home', 'memory', 'schedules', 'settings'] as const
+export const VIEW_NAMES = ['home', 'memory', 'schedules', 'capabilities', 'settings'] as const
 
 export type ViewName = (typeof VIEW_NAMES)[number]
 

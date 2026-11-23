@@ -225,36 +225,36 @@ def test_a_message_is_answered_on_the_page(page):
     assert page.errors == [], page.errors
 
 
-def test_the_capability_lists_live_on_the_settings_page(page):
-    """扩展 was a page; its two lists are a card on 设置 now.
+def test_the_capability_lists_have_a_page_of_their_own(page):
+    """扩展 was a page, then a card on 设置, and is a page again.
 
-    That is the fold this change makes: a page whose whole content is switches
-    and deletes is configuration, and configuration already had a page. The
-    assertion is not "it moved" -- it is that both lists are still reachable and
-    still switchable, because a fold that loses the controls is a deletion with
-    better manners.
+    Folding it in made the settings page jump: its two lists are taller than
+    every other panel combined, and its search and switches load their own data,
+    so changing a tab changed the page height, the scroll position and the load
+    state at once. The split is by *question* -- 设置 answers "how should it
+    behave", this page answers "what can it do".
     """
-    page.goto(page.url.split("#")[0] + "#/settings", wait_until="networkidle")
-    # 设置 is four panels now, and the capability card lives behind 能力. It is
-    # in the DOM from load (panels are hidden, not unmounted) -- so waiting for
-    # it is not enough; the tab has to be selected for it to be visible.
-    settings_tabs = page.locator(".settings-tabs button")
-    assert settings_tabs.count() == 4
-    settings_tabs.nth(2).click()
-    page.wait_for_selector(".capabilities-card", state="visible", timeout=20_000)
-    assert page.locator(".capabilities-card").is_visible()
+    page.goto(page.url.split("#")[0] + "#/capabilities", wait_until="networkidle")
+    page.wait_for_selector(".capabilities-view", timeout=20_000)
 
-    tabs = page.locator(".capabilities-card .extensions-tabs button")
+    tabs = page.locator(".capabilities-view .extensions-tabs button")
     assert tabs.count() == 2
     assert "插件" in tabs.nth(0).inner_text() and "技能" in tabs.nth(1).inner_text()
 
     # Both tabs render something: the count on the tab is the list's whole size,
     # so a tab with a number and an empty body would be the panel lying.
-    assert page.locator(".capabilities-card .entity-card, .capabilities-card .page-empty").count() >= 1
+    assert page.locator(".capabilities-view .entity-card, .capabilities-view .page-empty").count() >= 1
     tabs.nth(1).click()
     page.wait_for_timeout(400)
     assert tabs.nth(1).get_attribute("aria-selected") == "true"
-    assert page.locator(".capabilities-card .skill-row, .capabilities-card .page-empty").count() >= 1
+    assert page.locator(".capabilities-view .skill-row, .capabilities-view .page-empty").count() >= 1
+
+    # The lists are loaded by entering this view, not by having visited 设置.
+    # Measured: after the move nothing called them from their own page and it
+    # rendered 0 plugins against a gateway that had two.
+    assert page.locator(".capabilities-view .page-empty").count() == 0 or "还没有插件" not in page.inner_text(
+        ".capabilities-view"
+    )
 
     assert page.errors == [], page.errors
 
