@@ -262,3 +262,35 @@
 .page-view > .ant-row {
   margin-inline: auto !important;
 }
+
+/* ── the save bar has to cover what scrolls under it ────────────────────────
+ * `.settings-affix-bar` is `inline-flex` with an opaque background, so it hid
+ * only its own width: scrolled to the provider rows, their buttons showed
+ * through on both sides of it (measured at scrollTop 900 -- the bar sat at
+ * y=56 with 测试/切换到此 visible either side). A sticky bar that does not
+ * occlude its own row is worse than no bar: it reads as a rendering glitch.
+ */
+/* antd's `Affix` puts the fixed-position element *inside* `.settings-affix`, so
+ * that wrapper must not be restyled: giving it `display: block; width: 100%`
+ * collapsed the fixed child and the bar scrolled away entirely (measured:
+ * position static, top -1497 after 1577px of scroll). The opaque background
+ * belongs on the fixed child, which is `.ant-affix`. */
+/* `.ant-affix` is `position: fixed`, so `width: 100%` resolves against the
+ * viewport and antd then overrides it with the measured width of the wrapper --
+ * 306px, the buttons only. `inset-inline` is what pins it to the column
+ * instead: the same 960px the content below uses. */
+/* antd writes the wrapper's measured width **inline** (`width: 305.98px`), and
+ * an inline style beats a normal rule -- so the opaque bar covered only the
+ * buttons and the provider rows showed through either side of it. `!important`
+ * is the one thing that outranks an inline declaration. */
+.settings-affix .ant-affix {
+  inset-inline: max(0px, calc((100vw - var(--content-max)) / 2));
+  width: auto !important;
+  padding-block: 6px;
+  background: var(--bg);
+}
+.settings-affix-bar {
+  display: flex;
+  width: fit-content;
+  margin-inline-start: auto;
+}

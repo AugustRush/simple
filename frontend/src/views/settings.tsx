@@ -10,6 +10,7 @@ import {
   Button,
   Card,
   Col,
+  Collapse,
   Form,
   Input,
   InputNumber,
@@ -612,9 +613,7 @@ function ProvidersCard({
 }
 
 export function createSettingsView(ctx: AppCtx) {
-  //: Held by the shell, not here: the ⋯ menu opens 设置 straight on 能力, and a
-  //: panel only this view can name is a panel nothing else can link to.
-  const { settingsTab, setSettingsTab, activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, importing, importArchive, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  const { activateProvider, applyToken, config, configText, feishuChats, loadFeishuChats, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, notifyTesting, testNotification, importing, importArchive, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   // The save controls must survive a scroll: the page is longer than the
@@ -640,7 +639,6 @@ export function createSettingsView(ctx: AppCtx) {
           decide what it is. The head carries the save controls only -- and on a
           panel with nothing to save it is not rendered at all: `.settings-page-head`
           draws a bottom rule, so an empty one left a 1px line across the page. */}
-      {(settingsTab === 'model' || settingsTab === 'advanced' || unsaved) && (
       <div className="page-head settings-page-head">
         <Affix
           className="settings-affix"
@@ -677,34 +675,11 @@ export function createSettingsView(ctx: AppCtx) {
           </div>
         </Affix>
       </div>
-      )}
 
       {loadingView ? (
         <Skeleton active paragraph={{ rows: 10 }} />
       ) : (
-        <>
-        <div className="schedule-tabs settings-tabs" role="tablist" aria-label="设置">
-          {(
-            [
-              ['general', '常规'],
-              ['model', '模型'],
-              ['advanced', '高级'],
-            ] as const
-          ).map(([key, label]) => (
-            <button
-              key={key}
-              type="button"
-              role="tab"
-              aria-selected={settingsTab === key}
-              className={settingsTab === key ? 'active' : ''}
-              onClick={() => setSettingsTab(key)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        <div className="settings-grid" hidden={settingsTab !== 'general'}>
+        <div className="settings-grid">
           {/* One card, two rows. These used to be two half-empty 480px cards,
               each holding a single control in a 225px frame, while the model
               form below was squeezed for the width they were wasting. A row
@@ -824,9 +799,6 @@ export function createSettingsView(ctx: AppCtx) {
             </div>
           </Card>
 
-        </div>
-
-        <div className="settings-grid" hidden={settingsTab !== 'model'}>
           <ProvidersCard
             config={config}
             fields={providerFields}
@@ -979,14 +951,26 @@ export function createSettingsView(ctx: AppCtx) {
             </Form>
           </Card>
 
-        </div>
-
-        <div className="settings-grid" hidden={settingsTab !== 'advanced'}>
+          {/* Collapsed by default: this is the escape hatch, and it is 744px of
+              monospace text. As a tab it was one of three destinations and took
+              a third of the page's height; on one page it would be most of it.
+              Closed, it is one line that says it exists.
+              `destroyOnHidden={false}` keeps the textarea mounted, so a
+              half-typed edit survives closing and reopening the panel. */}
           <Card
             className="settings-card settings-card-wide settings-json-card"
             title="高级 JSON"
             extra={<span className="card-kicker">RAW</span>}
           >
+            <Collapse
+              ghost
+              defaultActiveKey={jsonStatus.valid ? [] : ['json']}
+              items={[
+                {
+                  key: 'json',
+                  label: '直接编辑配置文件',
+                  children: (
+                    <>
             <p className="settings-hint">
               表单里的修改会同步写进这里，这里能识别出的字段也会同步回表单，保存发送的就是这段文本。
             </p>
@@ -1021,9 +1005,13 @@ export function createSettingsView(ctx: AppCtx) {
               spellCheck={false}
               autoSize={{ minRows: 12, maxRows: 30 }}
             />
+                    </>
+                  ),
+                },
+              ]}
+            />
           </Card>
         </div>
-        </>
       )}
     </div>
     )

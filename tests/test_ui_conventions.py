@@ -302,70 +302,58 @@ def test_the_antd_scale_is_the_same_scale() -> None:
     assert re.search(r"controlHeightLG:\s*44\b", app)
 
 
-def test_settings_is_split_into_tabs_and_hidden_panels_actually_hide() -> None:
-    """Six cards in one column: finding one setting meant scrolling past five.
+def test_settings_is_one_page_not_tabs() -> None:
+    """Three tabs of 451 / 924 / 744px were three places to re-orient.
 
-    Four panels now, switched by the same tab strip the 自动化 page uses. The
-    `hidden` attribute is the mechanism, and it is *not* enough on its own:
-    `.settings-grid` sets `display: grid` and an author rule beats the UA
-    stylesheet's `[hidden] { display: none }`, so a hidden panel stayed visible.
-    Measured in a browser -- all four panels rendered at once until the explicit
-    rule was added.
+    Every switch changed what was on screen, so finding a setting meant
+    remembering which tab held it and then scrolling to a different offset. One
+    page means one scroll and one reading order; the escape hatch at the bottom
+    is collapsed instead of occupying a third of the page.
     """
     settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
 
-    for key in ("'general'", "'model'", "'advanced'"):
-        assert key in settings, key
-    assert "'capabilities'" not in settings, (
-        "the capability lists are their own page; a panel for them here is the "
-        "jump this moved out of 设置 to fix"
-    )
-    assert settings.count("settings-grid\" hidden={settingsTab") == 3
-
-    css = (STYLES / "05-pages-settings.css").read_text(encoding="utf-8")
-    assert ".settings-grid[hidden]" in css
-    assert ".settings-affix-bar[hidden]" in css
-    assert "display: none" in css.split(".settings-grid[hidden]")[1][:120]
-
-
-def test_the_save_bar_is_only_hidden_when_nothing_is_pending() -> None:
-    """Switching tabs must never hide the fact that the model form has unsaved
-    edits -- the bar stays whenever something is pending, from any panel."""
-    settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
-
-    assert "(settingsTab === 'model' || settingsTab === 'advanced' || unsaved)" in settings
+    assert "settings-tabs" not in settings, "the tab strip is back"
+    assert "settingsTab" not in settings, "a panel switch is back"
+    assert settings.count('className="settings-grid"') == 1
+    # The JSON escape hatch is collapsed, not deleted: its textarea stays
+    # mounted so a half-typed edit survives closing the panel.
+    assert "Collapse" in settings
+    assert "defaultActiveKey" in settings
 
 
 def test_capabilities_is_a_destination_and_theme_is_not_a_submenu() -> None:
-    """Both used to be two clicks deep. 能力 is now a view of its own (its two
-    lists are taller than every settings panel combined, and putting them
-    behind a tab made the page jump); 主题's three answers are a group, because
-    hiding three items made the most-changed setting in the app a detour."""
+    """Both used to be two clicks deep. 能力 is a view of its own (its two lists
+    are taller than every settings panel combined); 主题's three answers are a
+    group, because hiding three items made the most-changed setting in the app
+    a detour."""
     app = (STYLES.parent / "App.tsx").read_text(encoding="utf-8")
     route = (STYLES.parent / "lib" / "route.ts").read_text(encoding="utf-8")
+    shell = (STYLES.parent / "hooks" / "useShell.tsx").read_text(encoding="utf-8")
 
     assert "'capabilities'" in route, "能力 is not a view"
     assert "view === 'capabilities'" in app
-    # The menu entry comes from `navItems` (so it is also a sidebar/palette
-    # destination) rather than being written twice in the menu literal -- which
-    # is what made the first attempt render 能力 twice.
-    shell = (STYLES.parent / "hooks" / "useShell.tsx").read_text(encoding="utf-8")
+    # The menu entry comes from `navItems`, not written twice in the menu
+    # literal -- which is what made the first attempt render 能力 twice.
     assert "{ key: 'capabilities'" in shell
-    assert app.count("key: 'capabilities'") == 0, "the menu literal duplicates navItems"
-    # A group renders its items inline; `children` under a `key` would be a
-    # submenu, which is what this replaced.
+    assert app.count("key: 'capabilities'") == 0
     assert "type: 'group'" in app
     assert "label: '主题'" in app
 
 
-def test_the_settings_panel_is_shell_state_so_other_surfaces_can_open_it() -> None:
-    """A panel only the settings view can name is a panel nothing else can link
-    to. The tab lives with the shell and the view reads it."""
-    ui = (STYLES.parent / "hooks" / "useUi.tsx").read_text(encoding="utf-8")
-    settings = (STYLES.parent / "views" / "settings.tsx").read_text(encoding="utf-8")
+def test_the_save_bar_covers_what_scrolls_under_it() -> None:
+    """A sticky bar that only covers its own width reads as a rendering glitch.
 
-    assert "const [settingsTab, setSettingsTab] = useState<SettingsTab>" in ui
-    assert "settingsTab, setSettingsTab" in settings
-    assert "useState<" not in settings.split("createSettingsView")[1][:600], (
-        "the settings view still keeps its own tab state"
-    )
+    antd's `Affix` writes the wrapper's measured width **inline** on the fixed
+    child (`width: 305.98px`), so the opaque background covered the buttons only
+    and the provider rows showed through either side. An inline declaration is
+    outranked by exactly one thing, which is why this rule is `!important`.
+    """
+    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
+    section = polish.split(".settings-affix .ant-affix")[1][:400]
+
+    assert "width: auto !important" in section
+    assert "background: var(--bg)" in section
+    # The wrapper itself must not be restyled: it holds the fixed child, and
+    # `display: block` on it collapsed the bar entirely (measured: top -1497).
+    wrapper = polish.split(".settings-affix {")[1][:160] if ".settings-affix {" in polish else ""
+    assert "display: block" not in wrapper

@@ -55,7 +55,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage, settingsTab, setSettingsTab } = ui
+  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage } = ui
 
   const { api, contextHolder, messageApi, token } = apiClient
 
@@ -190,8 +190,6 @@ function App() {
     pluginPages,
     pluginPage,
     openPage,
-    settingsTab,
-    setSettingsTab,
     resolvedTheme,
     api,
     setPluginSearch,

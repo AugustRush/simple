@@ -10,8 +10,6 @@ import {
   type ThemePreference,
 } from '../lib/theme'
 
-export type SettingsTab = 'general' | 'model' | 'advanced'
-
 export function useUi() {
   const [themeMode, setThemeMode] = useState<ThemePreference>(readThemePreference)
   //: What the stylesheets should show. `system` is not a theme, it is a rule for
@@ -37,10 +35,6 @@ export function useUi() {
   //: The plugin page the address names, if any. `#/p/<id>` has no fixed view
   //: behind it -- the set of pages is whatever the installed plugins declare.
   const pluginPage = route.page
-  //: Which panel of 设置 is showing. Shell state rather than view state so the
-  //: panel survives leaving the page and coming back -- and so a future entry
-  //: point can open 设置 on a named panel instead of always on 常规.
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general')
   //: Whether the board panel is pulled out. Shell state, not page state, because
   //: pages here are plain render functions rather than components: a `useState`
   //: inside one runs only while that view is current, and React counts hooks per
@@ -150,5 +144,5 @@ export function useUi() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, chooseTheme, setThemeMode, setView, openPage, pluginPage, resolvedTheme, themeMode, view, settingsTab, setSettingsTab } as const
+  return { boardOpen, clock, collapsed, commandDismissed, commandIndex, commandIndexPinned, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, searchOpen, setBoardOpen, setClock, setCollapsed, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setLoadingView, setPaletteQuery, setSearchOpen, chooseTheme, setThemeMode, setView, openPage, pluginPage, resolvedTheme, themeMode, view } as const
 }

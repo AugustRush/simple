@@ -143,9 +143,6 @@ export interface AppCtx {
   unavailablePlugins: UnavailablePlugin[]
   /** The plugin page the address names, if any. `#/p/<id>` is not a view. */
   pluginPage?: string
-  /** Which panel of 设置 is showing. */
-  settingsTab: 'general' | 'model' | 'advanced'
-  setSettingsTab: (tab: 'general' | 'model' | 'advanced') => void
   /** Which theme is actually showing, for the page frame's `?theme=`. */
   resolvedTheme: "light" | "dark"
   /** The authenticated client. A plugin page is fetched through it -- a frame's
