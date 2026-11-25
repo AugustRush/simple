@@ -236,6 +236,24 @@ export function renderChat(ctx: AppCtx) {
             </ul>
           </div>
         )}
+        {/* Work recorded while a turn was running. Shown because a message that
+            vanishes into a queue with no visible effect reads as being ignored
+            -- and the promise being made ("recorded, will do it after this") is
+            one the person has to be able to see. */}
+        {Number(sessionState?.parked?.count || 0) > 0 && (
+          <div className="parked-strip" role="status">
+            <span className="parked-strip-label">
+              记下了 {sessionState?.parked?.count} 件事，做完手头这个就办
+            </span>
+            <ul className="parked-strip-list">
+              {(sessionState?.parked?.items || []).map((item: any) => (
+                <li key={item.id}>
+                  <span className="parked-strip-text">{truncate(item.text, 48)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {taskGuidanceVisible && sessionState?.task?.active_goal && (
           // The rule itself -- recorded status, the server's snapshot, the
           // frames narrated since, this prompt already answered -- lives in the

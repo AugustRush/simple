@@ -910,6 +910,12 @@ class SessionService:
                 "items": describe_queued_messages(interjections, restarts),
             },
             "task": task,
+            # Work recorded while a turn was running, waiting for the next gap.
+            # Exposed because the person needs to see that their message was
+            # *heard*: a request that vanishes into a queue with no visible
+            # effect reads as being ignored, and the whole point of parking
+            # rather than interjecting is that the running turn is untouched.
+            "parked": self._parked_view(store, clean),
             "usage": usage,
             "workspace_root": workspace_root,
             "workspace_status": workspace_status,
@@ -924,6 +930,35 @@ class SessionService:
                     "workspace_write", persisted_workspace_meta.get("workspace_write", False)
                 )
             ) if isinstance(live_metadata, dict) else bool(persisted_workspace_meta.get("workspace_write", False)),
+        }
+
+    @staticmethod
+    def _parked_view(store: Any, session_id: str) -> dict[str, Any]:
+        """The waiting tasks, as a count and the oldest few.
+
+        Read-only and best-effort: a store without the queue (an older database,
+        a replacement memory system) reports an empty one rather than an error,
+        because this rides on a poll.
+        """
+        lister = getattr(store, "list_parked_tasks", None)
+        if not callable(lister):
+            return {"count": 0, "items": []}
+        try:
+            waiting = list(
+                lister(session_id=session_id, statuses=("waiting",), limit=50)
+            )
+        except Exception:
+            return {"count": 0, "items": []}
+        return {
+            "count": len(waiting),
+            "items": [
+                {
+                    "id": str(getattr(item, "id", "") or ""),
+                    "text": str(getattr(item, "text", "") or ""),
+                    "created_at": str(getattr(item, "created_at", "") or ""),
+                }
+                for item in waiting[:5]
+            ],
         }
 
     def dismiss_task_guidance(self, session_id: str, task_id: str = "") -> bool:

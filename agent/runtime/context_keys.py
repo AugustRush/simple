@@ -211,7 +211,15 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
         # conversation that made it, and a goal records the conversation that
         # decided it. Both are "why does this row exist" questions that cannot
         # be answered from the row's own text.
-        readers=("agent/tools/schedule_tools.py", "agent/tools/goal_tools.py"),
+        #
+        # The third is the parked queue: closing a parked task needs to know
+        # which conversation's queue to look in, and the model supplies words
+        # rather than an id.
+        readers=(
+            "agent/tools/schedule_tools.py",
+            "agent/tools/goal_tools.py",
+            "agent/tools/builtin_parked_tools.py",
+        ),
     ),
     ContextKey(
         key="live_sessions",

@@ -8,6 +8,7 @@ import re
 import time
 from typing import Any, Callable, Mapping, NotRequired, TypedDict
 
+from agent.kernel.service import resolve
 from agent.core.output import (
     OutputSink,
     RuntimeEvent,
@@ -255,6 +256,24 @@ class CommandCoordinator:
                     != "after"
                 )
                 if state.accepts_interjections and wants_interjection:
+                    # Is this about the work in progress, or a different job?
+                    # Folding a new job into the running turn derails it or
+                    # buries the request; parking an amendment costs a moment.
+                    # See `agent/core/interjection_triage.py` for the rule and
+                    # for why "unclear" parks.
+                    verdict = self._triage_interjection(turn_input, state)
+                    if verdict is not None and verdict.verdict != "amend":
+                        parked = self._park_interjection(turn_input, state, verdict)
+                        if parked:
+                            self._safe_queued_notice(
+                                sink,
+                                turn_input.text,
+                                kind="parked",
+                                message_id=str(
+                                    turn_input.metadata.get("message_id") or ""
+                                ),
+                            )
+                            return None
                     self._queue_interjection(turn_input, sink, state, ready=sink_ready)
                     self._safe_queued_notice(
                         sink,
@@ -355,6 +374,16 @@ class CommandCoordinator:
                 token = self._cancel_token_factory()
                 state.cancel_token = token
                 state.accepts_interjections = current_accepts
+                # What this turn is about, published for the triage of any
+                # message that arrives while it runs. Read from the input rather
+                # than from the model: at this point the turn has not started,
+                # and a message arriving in the first second still needs an
+                # answer to "is this about what is running".
+                state.running_goal = str(
+                    current_forward or current_input.text or ""
+                ).strip()
+                state.running_progress = ""
+                state.running_user_turns = [str(current_input.text or "")][-8:]
                 state.operation_state = "active"
             finally:
                 if turn_lock is not None:
@@ -429,10 +458,27 @@ class CommandCoordinator:
                     state.operation_state = "idle"
                     state.accepts_interjections = False
                     state.cancel_token = None
+                    # Cleared with the operation: a stale goal would make the
+                    # next turn's triage compare against work that already
+                    # finished, and call a genuine amendment a new job.
+                    state.running_goal = ""
+                    state.running_progress = ""
+                    state.running_user_turns = []
 
             if first:
                 first_action = action
                 first = False
+            # Nothing queued by the person, but something parked earlier: pick
+            # it up now. This is what makes parking a promise rather than a
+            # note -- deterministic, no judgement required, and it runs exactly
+            # when there is a gap (the turn just ended).
+            if not state.restart_queue:
+                picked = self._pick_up_parked(
+                    state, current_sink, session_id=current_input.session_id
+                )
+                if picked is None:
+                    return first_action
+                state.restart_queue.append(picked)
             if not state.restart_queue:
                 return first_action
 
@@ -1201,6 +1247,137 @@ class CommandCoordinator:
             entry["ready"] = ready
         return entry
 
+    # ── interjection triage ─────────────────────────────────────────────────
+    #
+    # A message that arrives mid-turn is either about the work in progress or a
+    # different job. The first belongs in the running turn; the second must not
+    # be folded into it. See `agent/core/interjection_triage.py`.
+
+    def _triage_interjection(
+        self, turn_input: TurnInput, state: RuntimeSessionState
+    ) -> Any:
+        """What this message is, or ``None`` when there is nothing to compare to."""
+        try:
+            from agent.core.interjection_triage import triage_interjection
+
+            goal, progress, recent = self._running_task_context(state)
+            if not goal and not progress and not recent:
+                # Nothing to compare against: no basis for calling it a new job,
+                # so it takes the old path rather than being parked on a guess.
+                return None
+            return triage_interjection(
+                turn_input.text,
+                running_goal=goal,
+                running_progress=progress,
+                recent_user_turns=recent,
+            )
+        except Exception:
+            logger.exception("interjection triage failed; treating it as an amendment")
+            return None
+
+    @staticmethod
+    def _running_task_context(
+        state: RuntimeSessionState,
+    ) -> tuple[str, str, list[str]]:
+        """The running task's goal, progress, and the person's recent messages.
+
+        Read from the live session state rather than the database: this runs
+        while a turn is in flight, and the durable projection of the *previous*
+        turn is not what is running.
+        """
+        goal = str(getattr(state, "running_goal", "") or "").strip()
+        progress = str(getattr(state, "running_progress", "") or "").strip()
+        recent = getattr(state, "running_user_turns", None)
+        turns = [str(item) for item in recent] if isinstance(recent, list) else []
+        return goal, progress, turns
+
+    def _park_interjection(
+        self, turn_input: TurnInput, state: RuntimeSessionState, verdict: Any
+    ) -> Any:
+        """Record the message as a task to pick up later. Returns the row or None.
+
+        Best-effort by design: a store that cannot be reached must not lose the
+        message, so the caller falls back to the interjection path.
+        """
+        store = resolve(self._components, "ltm_store")
+        park = getattr(store, "park_task", None)
+        if not callable(park):
+            return None
+        try:
+            return park(
+                session_id=turn_input.session_id,
+                text=turn_input.text,
+                reason=verdict.as_reason() if verdict is not None else "parked",
+                source_message_id=str(
+                    turn_input.metadata.get("message_id") or ""
+                ),
+            )
+        except Exception:
+            logger.exception("could not park the interjection; folding it in instead")
+            return None
+
+    def _pick_up_parked(
+        self,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+        *,
+        session_id: str = "",
+    ) -> "_QueueEntry | None":
+        """Turn the oldest parked task into the next turn, or ``None``.
+
+        Called when a turn ends and nothing the person queued is waiting -- the
+        gap. Claiming the task (marking it `active`) before running it is what
+        keeps one task from being handed out twice; if the turn then fails, the
+        task stays `active` rather than silently returning to the queue, which
+        would re-run it on every subsequent gap.
+        """
+        try:
+            from agent.core.parked import take_next_parked
+
+            # The session id comes from the turn that just ran, not from the
+            # state's ctx: the ctx a channel builds at session creation carries
+            # a placeholder id, so reading it there found the wrong queue --
+            # measured: the task was parked under the real session id and this
+            # looked in a queue that never had it.
+            clean_session = str(session_id or "").strip()
+            if not clean_session:
+                ctx = getattr(state, "ctx", None)
+                clean_session = str(getattr(ctx, "session_id", "") or "").strip()
+            if not clean_session:
+                return None
+            session_id = clean_session
+            picked = take_next_parked(
+                store=resolve(self._components, "ltm_store"), session_id=session_id
+            )
+            if not picked:
+                return None
+            text = str(picked.get("text") or "").strip()
+            if not text:
+                return None
+            turn_input = TurnInput(
+                text=text,
+                session_id=session_id,
+                channel_name="web",
+                metadata={
+                    "message_id": f"parked-{picked.get('id') or ''}",
+                    # Not a person's message: it must not be re-parked by the
+                    # triage if it somehow arrives during a turn.
+                    "from_parked_task": str(picked.get("id") or ""),
+                },
+            )
+            # Its own sink, not the finished turn's: a sink carries the
+            # message it narrates (`turn_id`) and accumulates `full_text`, so
+            # reusing one made the pickup's answer append to the previous
+            # answer's text and its `turn_complete` never arrive as a second
+            # event -- measured: two turns ran, the client saw one.
+            derived = self._sink_for_turn(sink, f"parked-{picked.get('id') or ''}")
+            entry = self._queue_entry(turn_input, derived or sink)
+            entry["parked_task_id"] = str(picked.get("id") or "")
+            return entry
+        except Exception:
+            logger.exception("could not pick up a parked task")
+            return None
+
     @classmethod
     def _queue_interjection(
         cls,
@@ -1253,6 +1430,30 @@ class CommandCoordinator:
         except Exception:
             logger.exception("could not tell whether a queued message was answered")
             return False
+
+    @staticmethod
+    def _sink_for_turn(sink: Any, turn_id: str) -> Any:
+        """A sink for one more turn on the same connection, or ``None``.
+
+        Best-effort: a sink type that cannot be rebuilt keeps the old one, which
+        still runs the turn -- the answer is what matters, and a merged
+        completion frame is the lesser failure.
+        """
+        try:
+            from agent.channels.web_sink import WebOutputSink
+
+            if not isinstance(sink, WebOutputSink):
+                return None
+            return WebOutputSink(
+                getattr(sink, "_websocket", None),
+                collect=getattr(sink, "_collect", False),
+                on_attachment=getattr(sink, "_on_attachment", None),
+                output_dir=getattr(sink, "_output_dir", None),
+                confirmation_handler=getattr(sink, "_confirmation_handler", None),
+                turn_id=turn_id,
+            )
+        except Exception:
+            return None
 
     @staticmethod
     def _queued_turn_input(entry: Mapping[str, Any]) -> TurnInput:

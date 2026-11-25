@@ -136,6 +136,43 @@ class SessionWorkingState:
 
 
 @dataclass(frozen=True)
+class ParkedTask:
+    """Work the person asked for while something else was running.
+
+    The point of parking rather than interjecting: the running turn is not
+    interrupted, and the new request is not lost. It is recorded now and picked
+    up at the next gap.
+    """
+
+    id: str
+    session_id: str
+    text: str
+    status: str = "waiting"
+    reason: str = ""
+    source_message_id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    outcome: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "text": self.text,
+            "status": self.status,
+            "reason": self.reason,
+            "source_message_id": self.source_message_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "outcome": self.outcome,
+        }
+
+
+@dataclass(frozen=True)
 class AgentRuntimeEvent:
     """Append-only runtime fact for one channel session."""
 

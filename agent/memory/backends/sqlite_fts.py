@@ -66,6 +66,7 @@ from ..models import (
     LTMEntry,
     LTMCategory,
     ResolvedFact,
+    ParkedTask,
     SessionWorkingState,
 )
 from ..retrieval import CorpusStats
@@ -217,6 +218,24 @@ class SqliteFtsStore:
                 state_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT ''
             );
+            -- Work parked while a turn was running. Same shape as the built-in
+            -- store's: the contract declares these four members, so this
+            -- implementation has to keep the same promise.
+            CREATE TABLE IF NOT EXISTS parked_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'waiting',
+                reason TEXT NOT NULL DEFAULT '',
+                source_message_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS parked_session_status
+                ON parked_tasks(session_id, status, created_at);
             CREATE TABLE IF NOT EXISTS provider_checkpoints (
                 session_id TEXT PRIMARY KEY,
                 messages_json TEXT NOT NULL DEFAULT '[]',
@@ -1243,6 +1262,128 @@ class SqliteFtsStore:
             session_id=row["session_id"],
             state=_json_loads(row["state_json"], {}),
             updated_at=row["updated_at"],
+        )
+
+    # ── parked tasks ────────────────────────────────────────────────────────
+
+    def park_task(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        reason: str = "",
+        source_message_id: str = "",
+        task_id: str = "",
+    ) -> Optional[ParkedTask]:
+        clean_session = str(session_id or "").strip()
+        clean_text = str(text or "").strip()
+        if not clean_session or not clean_text:
+            return None
+        message_id = str(source_message_id or "").strip()
+        if message_id:
+            existing = self.find_parked_by_message(
+                session_id=clean_session, source_message_id=message_id
+            )
+            if existing is not None:
+                return existing
+        moment = _now()
+        clean_id = str(task_id or "").strip() or f"parked-{uuid.uuid4().hex[:12]}"
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                conn.execute(
+                    "INSERT INTO parked_tasks (id, session_id, text, status, reason, "
+                    " source_message_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?)",
+                    (
+                        clean_id,
+                        clean_session,
+                        clean_text,
+                        str(reason or ""),
+                        message_id,
+                        moment,
+                        moment,
+                    ),
+                )
+        row = self._connect().execute(
+            "SELECT * FROM parked_tasks WHERE id = ?", (clean_id,)
+        ).fetchone()
+        return self._parked_from_row(row) if row else None
+
+    def list_parked_tasks(
+        self,
+        *,
+        session_id: str,
+        statuses: tuple[str, ...] = ("waiting",),
+        limit: int = 50,
+    ) -> list[ParkedTask]:
+        clean_session = str(session_id or "").strip()
+        if not clean_session:
+            return []
+        wanted = tuple(str(item) for item in statuses if str(item).strip()) or ("waiting",)
+        placeholders = ", ".join("?" for _ in wanted)
+        rows = self._connect().execute(
+            f"SELECT * FROM parked_tasks WHERE session_id = ? "
+            f"AND status IN ({placeholders}) ORDER BY created_at ASC, id ASC LIMIT ?",
+            (clean_session, *wanted, max(1, int(limit))),
+        ).fetchall()
+        return [self._parked_from_row(row) for row in rows]
+
+    def set_parked_status(
+        self, *, task_id: str, status: str, outcome: str = ""
+    ) -> bool:
+        clean_id = str(task_id or "").strip()
+        clean_status = str(status or "").strip()
+        if not clean_id or not clean_status:
+            return False
+        moment = _now()
+        assignments = "status = ?, updated_at = ?"
+        params: list[Any] = [clean_status, moment]
+        if clean_status == "active":
+            assignments += ", started_at = ?"
+            params.append(moment)
+        elif clean_status in ("done", "dropped"):
+            assignments += ", finished_at = ?"
+            params.append(moment)
+        if outcome:
+            assignments += ", outcome = ?"
+            params.append(str(outcome))
+        params.append(clean_id)
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                cursor = conn.execute(
+                    f"UPDATE parked_tasks SET {assignments} WHERE id = ?", tuple(params)
+                )
+        return bool(cursor.rowcount)
+
+    def find_parked_by_message(
+        self, *, session_id: str, source_message_id: str
+    ) -> Optional[ParkedTask]:
+        clean_session = str(session_id or "").strip()
+        clean_message = str(source_message_id or "").strip()
+        if not clean_session or not clean_message:
+            return None
+        row = self._connect().execute(
+            "SELECT * FROM parked_tasks WHERE session_id = ? AND source_message_id = ?",
+            (clean_session, clean_message),
+        ).fetchone()
+        return self._parked_from_row(row) if row else None
+
+    @staticmethod
+    def _parked_from_row(row: Any) -> ParkedTask:
+        return ParkedTask(
+            id=row["id"],
+            session_id=row["session_id"],
+            text=row["text"],
+            status=row["status"],
+            reason=row["reason"],
+            source_message_id=row["source_message_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            outcome=row["outcome"],
         )
 
     def save_provider_checkpoint(

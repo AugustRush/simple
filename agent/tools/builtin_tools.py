@@ -34,6 +34,7 @@ from . import builtin_plugin_tools
 from . import builtin_schedule_tools
 from . import builtin_memory_tools
 from . import builtin_goal_tools
+from . import builtin_parked_tools
 from . import builtin_file_tools
 from .memory_tools import MemoryTools
 from .output_tools import OutputTools
@@ -152,6 +153,11 @@ class BuiltinTools:
         self._goal_tools = GoalTools(
             self.registry, goal_store, self._ok, self._error
         )
+        # The parked queue lives in the memory store, not the autonomy one: it is
+        # per-conversation work, not the agent's own intentions.
+        self._parked_tools = builtin_parked_tools.ParkedTaskTools(
+            self.registry, lambda: self.memory, self._ok, self._error
+        )
         self._plugin_tools = PluginTools(self.registry)
         self._cached_schedule_store: Any = None
         self._register()
@@ -202,6 +208,10 @@ class BuiltinTools:
         builtin_schedule_tools.register_schedule_tools(r, schedule_tools=self._schedule_tools)
 
         builtin_goal_tools.register_goal_tools(r, goal_tools=self._goal_tools)
+
+        builtin_parked_tools.register_parked_task_tools(
+            r, parked_tools=self._parked_tools
+        )
 
         builtin_signal_tools.register_signal_tools(r, signal_tools=self._signal_tools, step_output_tools=self._step_output_tools)
 

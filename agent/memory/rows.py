@@ -19,6 +19,7 @@ from .models import (
     ConversationTurn,
     FactAssertion,
     LTMEntry,
+    ParkedTask,
     ResolvedFact,
     SessionWorkingState,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "_row_to_entry",
     "_row_to_conversation_turn",
     "_row_to_session_working_state",
+    "_row_to_parked_task",
     "_row_to_agent_runtime_event",
     "_row_to_fact_assertion",
     "_row_to_resolved_fact",
@@ -106,6 +108,22 @@ def _row_to_session_working_state(row: sqlite3.Row) -> SessionWorkingState:
         session_id=row["session_id"],
         state=state,
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_parked_task(row: sqlite3.Row) -> ParkedTask:
+    return ParkedTask(
+        id=row["id"],
+        session_id=row["session_id"],
+        text=row["text"],
+        status=row["status"],
+        reason=row["reason"],
+        source_message_id=row["source_message_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        outcome=row["outcome"],
     )
 
 

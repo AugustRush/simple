@@ -16,8 +16,8 @@ from typing import Any, Optional
 
 from . import migrations
 from . import rows as _row_mappers
-from ._helpers import _now
-from .models import AgentRuntimeEvent, SessionWorkingState
+from ._helpers import _new_id, _now
+from .models import AgentRuntimeEvent, ParkedTask, SessionWorkingState
 
 __all__ = [
     "message_has_answer",
@@ -32,6 +32,10 @@ __all__ = [
     "append_agent_event",
     "recent_agent_events",
     "recent_agent_events_for_turns",
+    "park_task",
+    "list_parked_tasks",
+    "set_parked_status",
+    "find_parked_by_message",
 ]
 
 
@@ -516,3 +520,130 @@ def list_turn_versions(
         }
         for row in rows
     ]
+
+
+# ── parked tasks ────────────────────────────────────────────────────────────
+#
+# Work recorded while something else was running. Kept in its own table rather
+# than in `session_working_state`, because that row is a projection of the
+# current turn: anything written there is gone by the next message.
+
+
+def park_task(
+    conn,
+    *,
+    session_id: str,
+    text: str,
+    reason: str = "",
+    source_message_id: str = "",
+    task_id: str = "",
+) -> Optional[ParkedTask]:
+    """Record one piece of work to pick up later. Returns the row.
+
+    Idempotent on ``source_message_id``: a resend or a reconnect replay parks
+    the same words once, not twice.
+    """
+    clean_session = str(session_id or "").strip()
+    clean_text = str(text or "").strip()
+    if not clean_session or not clean_text:
+        return None
+    message_id = str(source_message_id or "").strip()
+    if message_id:
+        existing = find_parked_by_message(
+            conn, session_id=clean_session, source_message_id=message_id
+        )
+        if existing is not None:
+            return existing
+    moment = _now()
+    clean_id = str(task_id or "").strip() or f"parked-{_new_id()[:12]}"
+    conn.execute(
+        """
+        INSERT INTO parked_tasks
+            (id, session_id, text, status, reason, source_message_id,
+             created_at, updated_at)
+        VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?)
+        """,
+        (clean_id, clean_session, clean_text, str(reason or ""), message_id, moment, moment),
+    )
+    row = conn.execute(
+        "SELECT * FROM parked_tasks WHERE id = ?", (clean_id,)
+    ).fetchone()
+    return _row_mappers._row_to_parked_task(row) if row else None
+
+
+def find_parked_by_message(
+    conn,
+    *,
+    session_id: str,
+    source_message_id: str,
+) -> Optional[ParkedTask]:
+    clean_session = str(session_id or "").strip()
+    clean_message = str(source_message_id or "").strip()
+    if not clean_session or not clean_message:
+        return None
+    row = conn.execute(
+        "SELECT * FROM parked_tasks WHERE session_id = ? AND source_message_id = ?",
+        (clean_session, clean_message),
+    ).fetchone()
+    return _row_mappers._row_to_parked_task(row) if row else None
+
+
+def list_parked_tasks(
+    conn,
+    *,
+    session_id: str,
+    statuses: tuple[str, ...] = ("waiting",),
+    limit: int = 50,
+) -> list[ParkedTask]:
+    """Tasks in the given states, oldest first -- the one waiting longest is next.
+
+    Oldest first is the queue order a person expects from a list they wrote
+    down: what was asked for first gets done first.
+    """
+    clean_session = str(session_id or "").strip()
+    if not clean_session:
+        return []
+    wanted = tuple(str(item) for item in statuses if str(item).strip()) or ("waiting",)
+    placeholders = ", ".join("?" for _ in wanted)
+    rows = conn.execute(
+        f"SELECT * FROM parked_tasks WHERE session_id = ? AND status IN ({placeholders}) "
+        "ORDER BY created_at ASC, id ASC LIMIT ?",
+        (clean_session, *wanted, max(1, int(limit))),
+    ).fetchall()
+    return [_row_mappers._row_to_parked_task(row) for row in rows]
+
+
+def set_parked_status(
+    conn,
+    *,
+    task_id: str,
+    status: str,
+    outcome: str = "",
+) -> bool:
+    """Move one task through its states. Returns whether a row changed."""
+    clean_id = str(task_id or "").strip()
+    clean_status = str(status or "").strip()
+    if not clean_id or not clean_status:
+        return False
+    moment = _now()
+    stamps = {"started_at": "", "finished_at": ""}
+    if clean_status == "active":
+        stamps["started_at"] = moment
+    elif clean_status in ("done", "dropped"):
+        stamps["finished_at"] = moment
+    assignments = "status = ?, updated_at = ?"
+    params: list[Any] = [clean_status, moment]
+    if stamps["started_at"]:
+        assignments += ", started_at = ?"
+        params.append(stamps["started_at"])
+    if stamps["finished_at"]:
+        assignments += ", finished_at = ?"
+        params.append(stamps["finished_at"])
+    if outcome:
+        assignments += ", outcome = ?"
+        params.append(str(outcome))
+    params.append(clean_id)
+    cursor = conn.execute(
+        f"UPDATE parked_tasks SET {assignments} WHERE id = ?", tuple(params)
+    )
+    return bool(cursor.rowcount)

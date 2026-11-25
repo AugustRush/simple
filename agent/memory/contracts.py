@@ -62,6 +62,7 @@ if TYPE_CHECKING:  # pragma: no cover - types only
         FactAssertion,
         LTMCategory,
         LTMEntry,
+        ParkedTask,
         ResolvedFact,
         SessionWorkingState,
     )
@@ -271,6 +272,43 @@ class MemoryStore(Protocol):
         self, session_id: str, state: "dict[str, Any]", *, updated_at: "Optional[str]" = None
     ) -> "SessionWorkingState":
         """Replace it, and return what was stored."""
+
+    # ── parked tasks ────────────────────────────────────────────────────────
+    #
+    # Work recorded while a turn was running, so the turn is not interrupted and
+    # the request is not lost. Four members and no more: park one, read the
+    # waiting ones, move one through its states, and look one up by the message
+    # that asked for it (which is what makes a resend park it once).
+
+    def park_task(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        reason: str = "",
+        source_message_id: str = "",
+        task_id: str = "",
+    ) -> "Optional[ParkedTask]":
+        """Record one piece of work to pick up later."""
+
+    def list_parked_tasks(
+        self,
+        *,
+        session_id: str,
+        statuses: "tuple[str, ...]" = ("waiting",),
+        limit: int = 50,
+    ) -> "list[ParkedTask]":
+        """Tasks in the given states, oldest first."""
+
+    def set_parked_status(
+        self, *, task_id: str, status: str, outcome: str = ""
+    ) -> bool:
+        """Move one task through its states; whether a row changed."""
+
+    def find_parked_by_message(
+        self, *, session_id: str, source_message_id: str
+    ) -> "Optional[ParkedTask]":
+        """The task one message parked, if it parked one."""
 
     def save_provider_checkpoint(
         self, session_id: str, messages: "list[dict[str, Any]]"

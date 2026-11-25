@@ -224,6 +224,15 @@ class RuntimeSessionState:
     turn_lock: Any = None
     last_activity: float = 0.0
     runtime_revision: int = 0
+    #: What the running turn is working on, for deciding whether a message that
+    #: arrives now is about it or is a different job. Set by the turn loop while
+    #: a turn is in flight and cleared when it ends; empty when idle.
+    running_goal: str = ""
+    running_progress: str = ""
+    #: The person's own recent messages in this task, oldest first. An amendment
+    #: usually refers to something said a turn or two ago ("it", "that one"), so
+    #: the vocabulary it shares is often there rather than in the goal line.
+    running_user_turns: list[str] = field(default_factory=list)
 
     def __init__(
         self,

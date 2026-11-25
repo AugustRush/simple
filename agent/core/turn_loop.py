@@ -50,6 +50,7 @@ from agent.core.turn_context import (
     trace_latency as _trace_latency,
 )
 from agent.core.outstanding import outstanding_block
+from agent.core.parked import parked_block
 from agent.core.resume import resume_nudge
 from agent.core.clock import clock_line
 from agent.core.turn_state import _ContentFilterRecovery, _TurnLoopState
@@ -455,6 +456,15 @@ def prepare_turn(
         outstanding = outstanding_block()
         if outstanding:
             turn_blocks.append(outstanding)
+        # Work the person asked for while a turn was running. Recorded instead
+        # of folded into that turn; shown here so it is not forgotten while the
+        # conversation continues. The *guarantee* that it gets done is the
+        # pickup at turn end (`agent/core/parked.py`), not this block -- a
+        # reminder that depends on the model choosing to act is the mistake the
+        # goal mechanism already made once.
+        parked = parked_block(session_id=str(ctx.metadata.get("session_id") or ""))
+        if parked:
+            turn_blocks.append(parked)
         # retrieve_implicit_context() covers both recent staging-buffer turns
         # (not yet consolidated) and historical LTM hits.  Skipping the
         # staging side would let recently-compacted turns drop from view.

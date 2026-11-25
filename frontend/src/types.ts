@@ -774,6 +774,13 @@ export interface SessionState {
     items?: QueuedQueueItem[]
   }
   task?: SessionTaskGuidance | null
+  // Work recorded while a turn was running, waiting for the next gap. The count
+  // is what the strip says out loud; the items are the oldest few, so the person
+  // can see *what* was recorded rather than only that something was.
+  parked?: {
+    count?: number
+    items?: { id: string; text: string; created_at?: string }[]
+  }
   workspace_root?: string
   workspace_status?: 'ready' | 'missing' | 'unset' | string
   workspace_exists?: boolean

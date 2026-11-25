@@ -494,3 +494,43 @@
     flex: 0 0 auto;
   }
 }
+
+/* ── parked work ────────────────────────────────────────────────────────────
+ * The strip that says "记下了 N 件事". It sits above the composer beside the
+ * queue strip, and it is deliberately quieter than the task-guidance card: a
+ * parked task is not something waiting on the person, it is a promise the agent
+ * made. A card with a border would read as one more thing to deal with. */
+.parked-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  margin: 0 auto 8px;
+  max-width: 820px;
+  padding: 7px 12px;
+  border-radius: 9px;
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.parked-strip-label {
+  color: var(--text);
+  font-weight: 600;
+}
+.parked-strip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.parked-strip-list li {
+  color: var(--text-muted);
+}
+.parked-strip-text::before {
+  content: '·';
+  margin-right: 5px;
+  color: var(--border-strong);
+}

@@ -116,6 +116,44 @@ def _ensure_schema(conn) -> None:
             state_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- Work the person asked for while something else was running.
+        --
+        -- Deliberately NOT a column on `session_working_state`: that row is a
+        -- projection of the *current* turn and is rewritten whenever a message
+        -- arrives, so anything parked there survives exactly until the next
+        -- message. Measured on the resume nudge: a status written there was
+        -- gone by the time the next turn read it.
+        --
+        -- `status` is the whole point of the table:
+        --   waiting  -- recorded, not started. What an interjection becomes.
+        --   active   -- the agent is working on it now.
+        --   done     -- finished.
+        --   dropped  -- the person said not to bother.
+        -- A row is never deleted on completion: the person may want to see what
+        -- was parked and what came of it.
+        CREATE TABLE IF NOT EXISTS parked_tasks (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            -- What the person asked for, in their words. Not summarised: the
+            -- agent reads this back to itself when it picks the task up.
+            text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'waiting',
+            -- Why it was parked rather than folded into the running turn.
+            reason TEXT NOT NULL DEFAULT '',
+            -- The message it came from, so the transcript and this row can be
+            -- matched up (and so a resend does not park the same words twice).
+            source_message_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT '',
+            finished_at TEXT NOT NULL DEFAULT '',
+            -- What came of it. Written when the agent finishes the task.
+            outcome TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_parked_session_status
+            ON parked_tasks(session_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_parked_message
+            ON parked_tasks(session_id, source_message_id);
         CREATE TABLE IF NOT EXISTS provider_checkpoints (
             session_id TEXT PRIMARY KEY,
             messages_json TEXT NOT NULL DEFAULT '[]',

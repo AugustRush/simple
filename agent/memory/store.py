@@ -58,6 +58,7 @@ from .models import (
     FactAssertion,
     LTMCategory,
     LTMEntry,
+    ParkedTask,
     ResolvedFact,
     SessionWorkingState,
 )
@@ -771,6 +772,61 @@ class LTMStore:
                 updated_at=updated_at,
             )
 
+
+    # ── parked tasks ────────────────────────────────────────────────────────
+
+    def park_task(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        reason: str = "",
+        source_message_id: str = "",
+        task_id: str = "",
+    ) -> Optional[ParkedTask]:
+        """Record one piece of work to pick up later."""
+        with self._connect() as conn:
+            return journal.park_task(
+                conn,
+                session_id=session_id,
+                text=text,
+                reason=reason,
+                source_message_id=source_message_id,
+                task_id=task_id,
+            )
+
+    def list_parked_tasks(
+        self,
+        *,
+        session_id: str,
+        statuses: tuple[str, ...] = ("waiting",),
+        limit: int = 50,
+    ) -> list[ParkedTask]:
+        """Tasks in the given states, oldest first."""
+        with self._connect() as conn:
+            return journal.list_parked_tasks(
+                conn, session_id=session_id, statuses=statuses, limit=limit
+            )
+
+    def set_parked_status(
+        self, *, task_id: str, status: str, outcome: str = ""
+    ) -> bool:
+        """Move one task through its states."""
+        with self._connect() as conn:
+            changed = journal.set_parked_status(
+                conn, task_id=task_id, status=status, outcome=outcome
+            )
+            conn.commit()
+            return changed
+
+    def find_parked_by_message(
+        self, *, session_id: str, source_message_id: str
+    ) -> Optional[ParkedTask]:
+        """The task one message parked, if it parked one."""
+        with self._connect() as conn:
+            return journal.find_parked_by_message(
+                conn, session_id=session_id, source_message_id=source_message_id
+            )
 
     def save_provider_checkpoint(
         self,
