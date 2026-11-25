@@ -333,3 +333,61 @@ def test_the_closing_tools_resolve_a_task_by_its_words() -> None:
     assert store.calls[0]["task_id"] == "parked-1"
     assert store.calls[0]["status"] == "done"
     assert store.calls[0]["outcome"] == "晴"
+
+
+# ── the board ───────────────────────────────────────────────────────────────
+
+
+def test_the_board_shows_parked_work_as_its_own_column(store) -> None:
+    """The board answers "what is still open". Work the person asked for and
+    that is being held back is open, and a strip in the conversation is gone the
+    moment they close that page."""
+    from agent.channels.web_home import build_home_overview
+
+    store.park_task(session_id="s1", text="顺便查天气", source_message_id="m1")
+
+    payload = build_home_overview(parked_store=store, session_id="s1")
+
+    (row,) = payload["board"]["parked"]
+    assert row["text"] == "顺便查天气"
+    assert row["id"].startswith("parked-")
+
+
+def test_the_board_shows_only_the_waiting_ones(store) -> None:
+    """An `active` task is running right now and belongs in 正在跑; a `done` one
+    is the timeline's business -- the same rule the board applies to runs."""
+    from agent.channels.web_home import build_home_overview
+
+    waiting = store.park_task(session_id="s1", text="排着的", source_message_id="m1")
+    running = store.park_task(session_id="s1", text="在跑的", source_message_id="m2")
+    done = store.park_task(session_id="s1", text="做完的", source_message_id="m3")
+    assert waiting and running and done
+    store.set_parked_status(task_id=running.id, status="active")
+    store.set_parked_status(task_id=done.id, status="done", outcome="好")
+
+    payload = build_home_overview(parked_store=store, session_id="s1")
+
+    assert [row["text"] for row in payload["board"]["parked"]] == ["排着的"]
+
+
+def test_a_board_without_a_memory_service_says_nothing_is_parked() -> None:
+    """Every part of the payload is optional: "this agent has no memory service"
+    is a configuration, not an error."""
+    from agent.channels.web_home import build_home_overview
+
+    payload = build_home_overview(parked_store=None)
+
+    assert payload["board"]["parked"] == []
+
+
+def test_the_board_reads_the_sessions_queue_not_the_process_wide_one(store) -> None:
+    """The queue is per conversation. A board that ignored the session id would
+    show one conversation's parked work on another's panel."""
+    from agent.channels.web_home import build_home_overview
+
+    store.park_task(session_id="s1", text="甲的事", source_message_id="m1")
+    store.park_task(session_id="s2", text="乙的事", source_message_id="m2")
+
+    payload = build_home_overview(parked_store=store, session_id="s1")
+
+    assert [row["text"] for row in payload["board"]["parked"]] == ["甲的事"]

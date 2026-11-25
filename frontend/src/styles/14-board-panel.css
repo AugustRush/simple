@@ -212,3 +212,14 @@
 .panel-row-goal { cursor: default; }
 .panel-row-dot-goal { background: var(--accent); }
 .panel-row-goal .panel-row-main span { color: var(--text-muted); }
+
+/* ── work parked while a turn was running ───────────────────────────────────
+ * A muted dot, not the accent: an accent dot on this board means "the agent
+ * decided this on its own" (a goal). A parked task is the person's own request
+ * being held, so it reads as theirs -- quieter than a promise, which carries a
+ * time they are owed. */
+.panel-row-dot-parked { background: var(--border-strong); }
+.panel-row-parked .panel-row-main strong {
+  font-weight: 500;
+  color: var(--text-secondary);
+}

@@ -358,6 +358,14 @@ export interface TurnVersion {
 }
 
 //: One goal the agent set for itself: what it intends, and why.
+/** Work parked while a turn was running. */
+export interface ParkedRow {
+  id: string
+  text: string
+  created_at?: string
+  reason?: string
+}
+
 export interface GoalRow {
   goal_id: string
   goal: string
@@ -431,6 +439,9 @@ export interface HomeOverview {
     goals?: GoalRow[]
     //: How many there are, when the preview shows fewer.
     goals_total?: number
+    //: Work the person asked for while something else was running, still
+    //: waiting. Recorded rather than folded into the running turn.
+    parked?: ParkedRow[]
   }
   activity: HomeActivity[]
   //: Cursor for the next page of the timeline. Empty when the first page came

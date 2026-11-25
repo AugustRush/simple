@@ -168,7 +168,13 @@ export function useShell(deps: Deps) {
   useEffect(() => {
     if (!boardOpen) return
     void loadAutonomy()
-  }, [boardOpen, loadAutonomy])
+    // The board's own rows come from the home payload (running / waiting /
+    // scheduled / parked), and that is read when the landing page is entered.
+    // Opening the panel from a conversation therefore showed the record from
+    // before it -- measured: a task parked seconds earlier was absent until the
+    // reader navigated away and back.
+    void loadHome()
+  }, [boardOpen, loadAutonomy, loadHome])
 
   /** Move to another view, asking first if the settings page has unsaved edits.
    *

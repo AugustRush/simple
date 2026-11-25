@@ -683,10 +683,40 @@ class WebChannel(Channel):
                 proposal_store=self._proposal_store(),
                 sessions=sessions,
                 work_store=self._work_store(),
+                # The parked queue is per conversation, so the board reads the
+                # main session's: the panel answers "what is still open" for the
+                # conversation the person actually has.
+                parked_store=self._parked_store(),
+                session_id=self._main_session_id(),
             )
         finally:
             if scheduler_store is not None:
                 scheduler_store.close()
+
+    @staticmethod
+    def _main_session_id() -> str:
+        """The conversation the person actually has, for per-session reads.
+
+        The board answers "what is still open" for one conversation, and this
+        install has exactly one. Empty when nothing has been opened yet, which
+        makes the per-session reads return nothing rather than guess.
+        """
+        try:
+            from agent.main_session import read_main_session_id
+
+            return str(read_main_session_id() or "")
+        except Exception:
+            return ""
+
+    def _parked_store(self) -> Any:
+        """The memory store, for the parked queue.
+
+        Resolved rather than built: the queue is a declared member of
+        ``MemoryStore``, so a replacement memory system answers it too. ``None``
+        when the composition has no memory service, which the board renders as
+        "nothing parked".
+        """
+        return resolve(self._components, "ltm_store")
 
     def _work_store(self) -> Any:
         """The Ralph task store, or None when nothing has ever started work.

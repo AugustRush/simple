@@ -282,6 +282,10 @@ export function renderBoardPanel(ctx: AppCtx) {
   const working = board?.working ?? []
   const promised = board?.commitments ?? []
   const goals = board?.goals ?? []
+  // Work the person asked for while something else was running, still queued.
+  // A different column from 已排期: a scheduled task runs at a time they chose,
+  // a parked one is work they already asked for and that is being held back.
+  const parked = board?.parked ?? []
   // The heading counts goals, not rows: three shown out of five is five.
   const goalsTotal = Number(board?.goals_total ?? goals.length)
   const scheduledTotal = Number(board?.scheduled_total || 0)
@@ -305,7 +309,14 @@ export function renderBoardPanel(ctx: AppCtx) {
   }
 
   const nothingToDo =
-    waiting.length + inFlight.length + working.length + promised.length + goals.length + scheduledTotal === 0
+    waiting.length +
+      inFlight.length +
+      working.length +
+      promised.length +
+      goals.length +
+      parked.length +
+      scheduledTotal ===
+    0
 
   // The panel's first line, and the only sentence most visits need.
   const rest = [
@@ -313,6 +324,7 @@ export function renderBoardPanel(ctx: AppCtx) {
     // promise is a claim on the person's plan, and it is the one number here
     // that is about *them* rather than about the machinery.
     promised.length ? `${promised.length} 件答应过你` : '',
+    parked.length ? `${parked.length} 件排着` : '',
     goalsTotal ? `${goalsTotal} 个自己的目标` : '',
     working.length ? `${working.length} 件在做` : '',
     inFlight.length ? `${inFlight.length} 个在跑` : '',
@@ -379,6 +391,31 @@ export function renderBoardPanel(ctx: AppCtx) {
                   {row.attempts > 0 && (
                     <span className="panel-row-when">提过 {row.attempts} 次</span>
                   )}
+                </div>
+              ))}
+            </section>
+          )}
+
+          {parked.length > 0 && (
+            <section className="panel-group panel-group-parked">
+              <div className="panel-group-head">
+                排着的事<span className="panel-group-count">{parked.length}</span>
+              </div>
+              {/* No click target: these live in the conversation, and the row
+                  already carries the two things that matter -- what was asked
+                  for and when. A row that opens nothing is worse than one that
+                  says what it is. */}
+              {parked.map(row => (
+                <div
+                  className="panel-row panel-row-parked"
+                  key={row.id}
+                  title={row.reason || undefined}
+                >
+                  <span className="panel-row-dot panel-row-dot-parked" aria-hidden="true" />
+                  <span className="panel-row-main">
+                    <strong>{row.text}</strong>
+                  </span>
+                  <span className="panel-row-when">{relativeTime(row.created_at)}</span>
                 </div>
               ))}
             </section>

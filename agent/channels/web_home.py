@@ -54,6 +54,8 @@ async def _home_overview(
     proposal_store,
     sessions=None,
     work_store=None,
+    parked_store=None,
+    session_id="",
 ) -> Any:
     from starlette.responses import JSONResponse
 
@@ -65,6 +67,8 @@ async def _home_overview(
             proposal_store=proposal_store,
             sessions=sessions,
             work_store=work_store,
+            parked_store=parked_store,
+            session_id=session_id,
         )
     except Exception as exc:
         return JSONResponse({"error": f"读取主页失败：{exc}"}, status_code=500)
@@ -111,6 +115,8 @@ def build_home_overview(
     proposal_store: Any = None,
     sessions: Optional[list[dict[str, Any]]] = None,
     work_store: Any = None,
+    parked_store: Any = None,
+    session_id: str = "",
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """The page's payload, from the stores that hold each fact.
@@ -141,6 +147,10 @@ def build_home_overview(
     # there are, or "它给自己定的目标 3" is a lie the moment it sets a fourth.
     # Same shape as `scheduled_total`, for the same reason.
     board["goals_total"] = goals_total
+    # What the person asked for while something else was running. On the board
+    # because it is work that is still open, and because a request held back in
+    # a queue with no visible effect reads as being ignored.
+    board["parked"] = _parked(parked_store, session_id=session_id)
     return {
         "needs": _needs(scheduler_store, proposal_store),
         "board": board,
@@ -428,6 +438,40 @@ def _due_text(due: datetime, *, now: datetime) -> str:
     if seconds < 86400:
         return f"{max(1, round(seconds / 3600))} 小时后"
     return f"{round(seconds / 86400)} 天后"
+
+
+def _parked(parked_store: Any, *, session_id: str = "", limit: int = 8) -> list[dict[str, Any]]:
+    """Work the person asked for while a turn was running, still waiting.
+
+    A different column from 已排期: a scheduled task runs at a time the person
+    chose, while a parked task is work they already asked for and that is queued
+    behind whatever was running. The board is where "what is still open" is
+    answered, and a request that is being held back belongs on it -- otherwise
+    the only sign it was heard is a strip in the conversation, which is gone the
+    moment they close that page.
+
+    Only `waiting`: an `active` one is running right now and belongs in 正在跑,
+    and a `done` one is the timeline's business (the same rule the board applies
+    to runs).
+    """
+    if parked_store is None:
+        return []
+    lister = getattr(parked_store, "list_parked_tasks", None)
+    if not callable(lister):
+        return []
+    try:
+        tasks = list(lister(session_id=session_id, statuses=("waiting",), limit=limit))
+    except Exception:
+        return []
+    return [
+        {
+            "id": str(getattr(item, "id", "") or ""),
+            "text": str(getattr(item, "text", "") or ""),
+            "created_at": str(getattr(item, "created_at", "") or ""),
+            "reason": str(getattr(item, "reason", "") or ""),
+        }
+        for item in tasks
+    ]
 
 
 def _working(work_store: Any) -> list[dict[str, Any]]:

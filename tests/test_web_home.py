@@ -380,6 +380,9 @@ def test_no_stores_is_an_empty_page_not_a_crash() -> None:
         # the list is empty because there is no autonomy store to hold one.
         "goals": [],
         "goals_total": 0,
+        # No memory service is the same kind of configuration: nothing was
+        # parked, because there is nowhere to park it.
+        "parked": [],
     }
     assert body["activity"] == []
 
