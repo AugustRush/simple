@@ -417,44 +417,44 @@ def test_a_settings_row_stacks_below_the_two_column_width() -> None:
     assert "min-width: 0" in section, "the fixed control column was not released"
 
 
-def test_the_composer_and_the_transcript_are_the_same_column() -> None:
-    """They were two columns 20px apart: messages at 310..1130, the composer at
-    330..1110. Measured. The reader's eye follows the left edge from the last
-    message down into the input, and a 20px step there is what reads as "the
-    layout is wrong" without being able to name it.
+def test_the_composer_is_wider_than_the_transcript() -> None:
+    """The box you type in is wider than the column you read, on purpose: it is
+    the one thing on the page you put something *into*, and a box that frames
+    the conversation reads as the place to type.
 
-    One width and one inset now, in tokens, so the two cannot drift apart again.
+    Measured: 900 vs 820, so it overhangs 40px on each side. The cap lives on
+    `.composer-stage`, not `.composer` -- setting `.composer { width }` changed
+    nothing, because the grid track was already 820.
     """
     polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
-    section = polish.split("one column for the conversation")[1][:1800]
 
-    assert "--chat-column: 820px" in section
-    assert "--chat-gutter: 24px" in section
-    # Both halves of the conversation read the same tokens.
-    assert ".chat-scroll > .chat-inner" in section
-    assert ".composer-wrap" in section
-    assert "padding-inline: var(--chat-gutter)" in section
+    assert "--chat-column: 820px" in polish
+    assert "--chat-column-wide: 900px" in polish
+    section = polish.split(".composer-stage {")[1][:300]
+    assert "width: min(var(--chat-column-wide), 100%)" in section
+    # The notices stay on the narrow column: a notice as wide as the box reads
+    # as part of the box.
+    assert ".message-queue-banner," in section
 
 
-def test_the_board_panel_floats_and_the_conversation_makes_room() -> None:
-    """The panel was flush to the window edge with no radius and no shadow, so
-    it read as the page being sliced rather than as something laid on top of it
-    (measured: 1040..1440, radius 0, shadow none). It also covered 102px of the
-    composer -- including the send button.
+def test_the_board_is_a_page_and_the_bar_carries_the_glance() -> None:
+    """The board was a 400px drawer over the conversation: it covered the
+    composer, and its rows had to be shortened to fit one narrow column.
 
-    Now: inset on three sides, rounded, lifted, and the conversation shifts left
-    by half its width instead of being covered.
+    A page gives it the reading width every other page has. What the bar keeps
+    is the glance -- how much is running, waiting, queued -- because most of the
+    time the question is a look, not a visit.
     """
-    board_css = (STYLES / "14-board-panel.css").read_text(encoding="utf-8")
-    panel = board_css.split(".board-drawer .ant-drawer-content-wrapper")[1][:400]
+    route = (STYLES.parent / "lib" / "route.ts").read_text(encoding="utf-8")
+    app = (STYLES.parent / "App.tsx").read_text(encoding="utf-8")
+    panel = (STYLES.parent / "views" / "status_panel.tsx").read_text(encoding="utf-8")
 
-    assert "top: 68px" in panel, "the panel covers the top bar that opens it"
-    assert "border-radius: 14px" in panel
-    assert "box-shadow" in panel
-
-    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
-    assert "--board-width: 412px" in polish
-    assert "is-board-open" in polish
-    assert "translateX(calc(var(--board-width) / -2))" in polish
-    # And it gives up on a narrow window, where the two cannot coexist.
-    assert "@media (max-width: 900px)" in polish
+    assert "'board'" in route, "看板 is not a view"
+    assert "view === 'board'" in app
+    assert "renderStatusPanel" in app
+    # No drawer left: a panel that covers the composer is not where you read a
+    # list.
+    assert "board-drawer" not in app
+    assert "Drawer" not in app.split("from 'antd'")[0]
+    # Idle is a state, not an absence -- a strip that vanishes reads as broken.
+    assert "is-idle" in panel

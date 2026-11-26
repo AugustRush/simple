@@ -20,7 +20,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationKind, automationTab, boardOpen, loadAutonomy, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, pluginPage, settingsDirty, tokenDirty, view } = deps
+  const { activeSession, applyCommand, automationKind, automationTab, loadHome, loadAutomations, loadSessions, commandPaletteOpen, commands, composerRef, connected, connecting, input, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSkills, loadWorkflows, paletteQuery, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setClock, setCommandPaletteOpen, setInput, setPaletteQuery, setView, openPage, pluginPage, settingsDirty, tokenDirty, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -141,6 +141,11 @@ export function useShell(deps: Deps) {
       loadPlugins()
       loadSkills()
     }
+    // The board's rows come from the home payload; entering the page reads it
+    // the same way the landing page does.
+    if (view === 'board') {
+      void loadHome()
+    }
     // A plugin page needs the plugin list for its *name* in the bar. Without
     // this a deep link showed the page's id (`stock-screener`) until the person
     // happened to open 设置, which then reloaded the list -- measured in a
@@ -165,16 +170,7 @@ export function useShell(deps: Deps) {
   // screen showing the same rows. So the panel fetches them when it opens, and
   // only then: a request on behalf of a panel nobody opened is a poll of a
   // screen that is not on screen.
-  useEffect(() => {
-    if (!boardOpen) return
-    void loadAutonomy()
-    // The board's own rows come from the home payload (running / waiting /
-    // scheduled / parked), and that is read when the landing page is entered.
-    // Opening the panel from a conversation therefore showed the record from
-    // before it -- measured: a task parked seconds earlier was absent until the
-    // reader navigated away and back.
-    void loadHome()
-  }, [boardOpen, loadAutonomy, loadHome])
+
 
   /** Move to another view, asking first if the settings page has unsaved edits.
    *
@@ -337,6 +333,7 @@ export function useShell(deps: Deps) {
       { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
       { view: 'memory', label: '记忆', icon: <BulbOutlined />, terms: '记忆 memory 事实' },
       { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings 设置' },
+      { view: 'board', label: '看板', icon: <AppstoreOutlined />, terms: '看板 任务 状态 board tasks status' },
       { view: 'capabilities', label: '能力', icon: <AppstoreOutlined />, terms: '能力 插件 技能 plugins skills capabilities' },
     ].filter(item => !query || `${item.label} ${item.terms}`.toLowerCase().includes(query))
     return [
@@ -410,6 +407,10 @@ export function useShell(deps: Deps) {
     // name that promises a time would be wrong for them. "自动化" is what the
     // page actually is -- work that runs without being asked each time.
     schedules: { title: '自动化', subtitle: '管理定时执行与等待信号的任务。' },
+    board: {
+      title: '看板',
+      subtitle: '它在跑什么、在等什么、欠你什么 —— 一眼看完',
+    },
     capabilities: {
       title: '能力',
       subtitle: '插件给它增加入口，技能决定这些入口怎么被调用。',

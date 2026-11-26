@@ -196,8 +196,6 @@ export interface AppCtx {
   automations: AutomationRow[]
   automationsLoaded: boolean
   answeredProposals: ProposalRow[]
-  boardOpen: boolean
-  setBoardOpen: (next: boolean) => void
   home: HomeOverview | null
   homeLoaded: boolean
   loadHome: () => Promise<void>

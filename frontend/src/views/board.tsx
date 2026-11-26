@@ -272,8 +272,15 @@ function PanelRecord({ ctx }: { ctx: AppCtx }) {
 }
 
 /** The panel's contents: one summary line, then only the groups that have cards. */
-export function renderBoardPanel(ctx: AppCtx) {
-  const { decideProposal, home, navigateTo, openScheduleDetails, schedules, setBoardOpen } = ctx
+/** The board, as a page of its own.
+ *
+ * It was a 400px drawer over the conversation. That made it a place you peek at
+ * and leave: the panel covered the composer, its rows had to be shortened to
+ * fit, and every section was a stack in one narrow column. A page gives it the
+ * same reading width as everything else and lets the sections sit side by side.
+ */
+export function renderBoardPage(ctx: AppCtx) {
+  const { decideProposal, home, navigateTo, openScheduleDetails, schedules } = ctx
 
   const board = home?.board
   const waiting = board?.waiting ?? []
@@ -300,10 +307,6 @@ export function renderBoardPanel(ctx: AppCtx) {
       navigateTo('schedules')
       return
     }
-    // Close the panel first: the task's own drawer is about to open on the same
-    // edge, and two of them stacked is a stack of close buttons with no way to
-    // tell which one goes back to what.
-    setBoardOpen(false)
     openScheduleDetails(task)
     navigateTo('schedules')
   }
@@ -332,7 +335,11 @@ export function renderBoardPanel(ctx: AppCtx) {
   ].filter(Boolean)
 
   return (
-    <div className="panel-body">
+    <div className="page-view board-page">
+      <p className="page-lead">
+        它在跑什么、在等什么、欠你什么。这里只有还没结束的事——做完的会出现在对话里。
+      </p>
+      <div className="panel-body">
       {nothingToDo ? (
         <div className="panel-empty">
           <p>现在没有要处理的事。</p>
@@ -486,7 +493,8 @@ export function renderBoardPanel(ctx: AppCtx) {
         </>
       )}
 
-      <PanelRecord ctx={ctx} />
+        <PanelRecord ctx={ctx} />
+      </div>
     </div>
   )
 }

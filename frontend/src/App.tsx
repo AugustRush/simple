@@ -1,6 +1,6 @@
 import { ArrowLeftOutlined, CheckOutlined, CodeOutlined, SearchOutlined, MoreOutlined, RobotOutlined, SafetyCertificateOutlined, SettingOutlined } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
-import { Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Modal, theme } from 'antd'
+import { Button, ConfigProvider, Dropdown, Layout, Modal, theme } from 'antd'
 import type { ThemePreference } from './lib/theme'
 import zhCN from 'antd/locale/zh_CN'
 import dayjs from 'dayjs'
@@ -9,7 +9,8 @@ import 'dayjs/locale/zh-cn'
 import './index.css'
 import type { AppCtx } from './app/AppCtx'
 import { renderHome } from './views/home'
-import { renderBoardPanel } from './views/board'
+import { renderBoardPage } from './views/board'
+import { renderStatusPanel } from './views/status_panel'
 import { renderPluginPage } from './views/plugin_page'
 import { renderMemory } from './views/memory'
 import { renderSchedules } from './views/automation'
@@ -55,7 +56,7 @@ function App() {
 
   const shell = useShell({ ...ui, ...conversations, ...extensions, ...settings, ...automation })
 
-  const { boardOpen, clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setBoardOpen, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage } = ui
+  const { clock, commandIndex, commandItemRefs, commandPaletteOpen, loadingView, paletteQuery, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setCommandPaletteOpen, setPaletteQuery, chooseTheme, resolvedTheme, themeMode, view, pluginPage, openPage } = ui
 
   const { api, contextHolder, messageApi, token } = apiClient
 
@@ -240,8 +241,6 @@ function App() {
     automationsLoaded,
     answeredProposals,
     funnel,
-    boardOpen,
-    setBoardOpen,
     home,
     homeLoaded,
     loadHome,
@@ -326,7 +325,6 @@ function App() {
    *
    * Read from the same `home` payload the panel renders: a badge counting its own
    * way is the two-numbers-disagree bug that already cost a round. */
-  const boardWaiting = Number((home as { board?: { waiting?: unknown[] } })?.board?.waiting?.length || 0)
 
   const renderCurrentView = () => {
     // A plugin page comes first: `#/p/<id>` keeps the view "home" underneath it
@@ -336,6 +334,7 @@ function App() {
     if (view === 'home') return renderHome(ctx)
     if (view === 'memory') return renderMemory(ctx)
     if (view === 'schedules') return renderSchedules(ctx)
+    if (view === 'board') return renderBoardPage(ctx)
     if (view === 'capabilities') return renderCapabilities(ctx)
     if (view === 'settings') return renderSettings()
     return renderHome(ctx)
@@ -479,6 +478,9 @@ function App() {
             </div>
           </div>
           <div className="header-right">
+            {/* The glance: what is running, what is waiting on the person, what
+                is queued. The full board is a page of its own now. */}
+            {renderStatusPanel(ctx)}
             {/* Three entries, not eight. A menu is for the pages opened once a
                 week; the ones a person moves between while working stay on the
                 bar, where they cost a click less and, more to the point, are
@@ -495,21 +497,17 @@ function App() {
             >
               自动化
             </Button>
-            {/* The board is a *state* panel rather than one page's content: it is
-                a control you open on whatever screen you are on, so it sits here
-                as one. The badge is the only thing that speaks up -- a count
-                over zero. */}
-            <Badge count={boardWaiting} size="small" offset={[-2, 4]}>
-              <Button
-                type="text"
-                className="header-board"
-                aria-label={boardOpen ? '收起看板' : '打开看板'}
-                aria-expanded={boardOpen}
-                onClick={() => setBoardOpen(!boardOpen)}
-              >
-                看板
-              </Button>
-            </Badge>
+            {/* The board is a page now. The glance lives in the status panel
+                beside it -- the badge that used to sit here was the same three
+                numbers, in one number. */}
+            <Button
+              type="text"
+              className="header-board"
+              aria-current={view === 'board' ? 'page' : undefined}
+              onClick={() => navigateTo('board')}
+            >
+              看板
+            </Button>
             <Dropdown menu={{ items: topbarMenu, onClick: handleTopbarMenu }} placement="bottomRight" trigger={['click']}>
               <Button type="text" className="topbar-more" icon={<MoreOutlined />} aria-label="更多" />
             </Dropdown>
@@ -523,20 +521,6 @@ function App() {
           header sits on the same line as the app bar and its × is the way out --
           a panel that starts below the bar leaves a band of page above it that
           reads as a mistake. */}
-      <Drawer
-        placement="right"
-        width={400}
-        open={boardOpen}
-        onClose={() => setBoardOpen(false)}
-        mask={false}
-        rootClassName="board-drawer"
-        title="任务看板"
-        // Inset from the window edges by the stylesheet, so it reads as a panel
-        // laid over the conversation rather than as the page cut in half.
-        styles={{ body: { padding: '8px 14px 18px' } }}
-      >
-        {renderBoardPanel(ctx)}
-      </Drawer>
 
       {/* Not the bar itself: an approval is answerable only in the conversation
           that raised it, and a full-width alertdialog over 设置 or 任务 takes the

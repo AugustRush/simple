@@ -552,6 +552,12 @@
  */
 :root {
   --chat-column: 820px;
+  /* The composer is wider than the transcript on purpose: it is the one thing
+   * on the page you put something *into*, and a box that frames the column
+   * below it reads as the place to type. The transcript stays at 820 because
+   * that is the measure long prose wants; the box gets 40px more on each side
+   * and reads as holding the conversation rather than being a row in it. */
+  --chat-column-wide: 900px;
   --chat-gutter: 24px;
 }
 
@@ -562,11 +568,30 @@
   margin-inline: auto;
 }
 
+/* `padding-inline` alone loses to a later `padding: 0 20px 18px` shorthand in
+ * 09-search-workspace.css -- a shorthand resets the longhands it does not
+ * mention. Both longhands are set explicitly, with `!important` because the
+ * shorthand comes later in the cascade and this file cannot reorder it. */
 .composer-wrap {
-  padding-inline: var(--chat-gutter);
+  padding-left: var(--chat-gutter) !important;
+  padding-right: var(--chat-gutter) !important;
 }
 
-.composer,
+/* `.composer-stage` is the element that actually caps the composer's width
+ * (`min(820px, 100%)` in 04-composer.css); `.composer` inherits its track. So
+ * the wider column has to be set there, not on `.composer` -- measured: setting
+ * `.composer { width }` changed nothing, because the grid track was already
+ * 820.
+ *
+ * The banners above it stay on the narrow column: they are notices about the
+ * conversation, and a notice as wide as the box you type in reads as part of
+ * the box. */
+.composer-stage {
+  width: min(var(--chat-column-wide), 100%);
+}
+.composer {
+  width: 100%;
+}
 .message-queue-banner,
 .task-guidance-card,
 .parked-strip {
@@ -622,4 +647,114 @@
   .chat-view.is-board-open .chat-scroll > .chat-turns {
     max-width: min(var(--chat-column), 100% - var(--chat-gutter) * 2);
   }
+}
+
+/* ── the status panel in the bar ────────────────────────────────────────────
+ * A glance, not a visit: how much is running, how much is waiting on the
+ * person, how much is queued. It replaced a badge that said the same thing in
+ * one number, and it opens the board (now a page) when clicked.
+ *
+ * One dot per fact, coloured by urgency rather than by category: what needs a
+ * person is amber, what is moving is the accent, what is queued is quiet. A
+ * row of four differently-coloured dots would be a legend to learn.
+ */
+.status-panel {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.status-panel:hover {
+  border-color: var(--border);
+  background: var(--surface-hover);
+}
+.status-panel:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.status-panel-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.status-panel-item i {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+.status-panel-item.is-waiting i { background: var(--amber); }
+.status-panel-item.is-running i {
+  background: var(--accent);
+  /* The one thing that moves: something is happening right now. */
+  animation: status-panel-pulse 1.6s ease-in-out infinite;
+}
+.status-panel-item.is-parked i { background: var(--text-secondary); }
+.status-panel-item.is-scheduled i { background: var(--border-strong); }
+.status-panel-count {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.status-panel-label { color: var(--text-muted); }
+@keyframes status-panel-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status-panel-item.is-running i { animation: none; }
+}
+/* On a phone the bar has no room for four facts; the board page is one tap away
+   and it has all of them. */
+@media (max-width: 640px) {
+  .status-panel { display: none; }
+}
+
+/* ── the board page ─────────────────────────────────────────────────────────
+ * It was a 400px drawer; as a page it gets the same reading width as every
+ * other page and its sections can sit side by side instead of stacking in a
+ * narrow column.
+ */
+.board-page .panel-body {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+}
+/* The empty state and the record are full-width rows in the grid; only the
+ * open-work sections are columns. Without this the empty state occupied one
+ * 300px cell and the page looked broken rather than quiet. */
+.board-page .panel-empty,
+.board-page > .panel-body > .panel-empty {
+  grid-column: 1 / -1;
+  max-width: 52ch;
+}
+.board-page .panel-empty p {
+  margin: 0 0 6px;
+}
+.board-page .panel-empty-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+/* The record (runs, conversations) is a footer, not a column: it is a reading
+ * of the past, and the sections above it are the present. */
+.board-page .panel-group-record {
+  grid-column: 1 / -1;
+}
+
+.status-panel.is-idle .status-panel-item i {
+  background: var(--green);
+}
+.status-panel.is-idle .status-panel-label {
+  color: var(--text-secondary);
 }
