@@ -534,3 +534,92 @@
   margin-right: 5px;
   color: var(--border-strong);
 }
+
+/* ── one column for the conversation, including the composer ────────────────
+ * The transcript and the box you type in were two different columns:
+ *
+ *   messages   310 .. 1130   (width: min(820px, calc(100% - 32px)))
+ *   composer   330 .. 1110   (width: min(820px, 100%) inside a 24px padding)
+ *
+ * 20px out on both edges, measured. The two are the same conversation -- the
+ * reader's eye follows the left edge from the last message down into the input,
+ * and a 20px step there is the thing that reads as "the layout is wrong" without
+ * being able to name it.
+ *
+ * The fix is one shared width and one shared inset, so the column cannot drift
+ * again: `--chat-column` is the width, and both the scroll body and the composer
+ * wrap centre it with the same padding.
+ */
+:root {
+  --chat-column: 820px;
+  --chat-gutter: 24px;
+}
+
+.chat-scroll > .chat-inner,
+.chat-scroll > .chat-turns,
+.chat-inner {
+  width: min(var(--chat-column), 100% - var(--chat-gutter) * 2);
+  margin-inline: auto;
+}
+
+.composer-wrap {
+  padding-inline: var(--chat-gutter);
+}
+
+.composer,
+.message-queue-banner,
+.task-guidance-card,
+.parked-strip {
+  width: min(var(--chat-column), 100%);
+  margin-inline: auto;
+}
+
+/* ── the conversation makes room for the board ──────────────────────────────
+ * The board is a 400px panel; the conversation column is centred in the window.
+ * Overlapping them meant the panel covered 102px of the composer -- including
+ * the send button, which is the one control a reader needs while a panel is
+ * open. So the column shifts and narrows instead: the panel sits *beside* the
+ * conversation, which is what a side panel is for.
+ *
+ * `--board-width` matches the Drawer's `width={400}` plus its 12px inset.
+ */
+:root {
+  --board-width: 412px;
+}
+
+.chat-view.is-board-open .chat-inner,
+.chat-view.is-board-open .chat-scroll > .chat-inner,
+.chat-view.is-board-open .composer-wrap,
+.chat-view.is-board-open .parked-strip,
+.chat-view.is-board-open .message-queue-banner,
+.chat-view.is-board-open .task-guidance-card {
+  /* Push the column left by half the panel, so it stays centred in the space
+   * that is actually visible. */
+  transform: translateX(calc(var(--board-width) / -2));
+  transition: transform 200ms ease;
+}
+
+.chat-view.is-board-open .composer,
+.chat-view.is-board-open .chat-scroll > .chat-turns {
+  /* And let it shrink rather than be clipped: a column that keeps its 820px
+   * would run under the panel again at any narrower window. */
+  max-width: min(var(--chat-column), calc(100vw - var(--board-width) - var(--chat-gutter) * 2));
+}
+
+@media (max-width: 900px) {
+  /* Below this the two cannot coexist: the panel wins and the column keeps its
+   * place, which is the old overlap behaviour on a screen where there is no
+   * room for anything else. */
+  .chat-view.is-board-open .chat-inner,
+  .chat-view.is-board-open .chat-scroll > .chat-inner,
+  .chat-view.is-board-open .composer-wrap,
+  .chat-view.is-board-open .parked-strip,
+  .chat-view.is-board-open .message-queue-banner,
+  .chat-view.is-board-open .task-guidance-card {
+    transform: none;
+  }
+  .chat-view.is-board-open .composer,
+  .chat-view.is-board-open .chat-scroll > .chat-turns {
+    max-width: min(var(--chat-column), 100% - var(--chat-gutter) * 2);
+  }
+}

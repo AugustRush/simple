@@ -531,7 +531,9 @@ function App() {
         mask={false}
         rootClassName="board-drawer"
         title="任务看板"
-        styles={{ body: { padding: '8px 12px 16px' } }}
+        // Inset from the window edges by the stylesheet, so it reads as a panel
+        // laid over the conversation rather than as the page cut in half.
+        styles={{ body: { padding: '8px 14px 18px' } }}
       >
         {renderBoardPanel(ctx)}
       </Drawer>

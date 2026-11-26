@@ -415,3 +415,46 @@ def test_a_settings_row_stacks_below_the_two_column_width() -> None:
     assert ".settings-pref," in section and ".settings-row {" in section
     assert "flex-direction: column" in section
     assert "min-width: 0" in section, "the fixed control column was not released"
+
+
+def test_the_composer_and_the_transcript_are_the_same_column() -> None:
+    """They were two columns 20px apart: messages at 310..1130, the composer at
+    330..1110. Measured. The reader's eye follows the left edge from the last
+    message down into the input, and a 20px step there is what reads as "the
+    layout is wrong" without being able to name it.
+
+    One width and one inset now, in tokens, so the two cannot drift apart again.
+    """
+    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
+    section = polish.split("one column for the conversation")[1][:1800]
+
+    assert "--chat-column: 820px" in section
+    assert "--chat-gutter: 24px" in section
+    # Both halves of the conversation read the same tokens.
+    assert ".chat-scroll > .chat-inner" in section
+    assert ".composer-wrap" in section
+    assert "padding-inline: var(--chat-gutter)" in section
+
+
+def test_the_board_panel_floats_and_the_conversation_makes_room() -> None:
+    """The panel was flush to the window edge with no radius and no shadow, so
+    it read as the page being sliced rather than as something laid on top of it
+    (measured: 1040..1440, radius 0, shadow none). It also covered 102px of the
+    composer -- including the send button.
+
+    Now: inset on three sides, rounded, lifted, and the conversation shifts left
+    by half its width instead of being covered.
+    """
+    board_css = (STYLES / "14-board-panel.css").read_text(encoding="utf-8")
+    panel = board_css.split(".board-drawer .ant-drawer-content-wrapper")[1][:400]
+
+    assert "top: 68px" in panel, "the panel covers the top bar that opens it"
+    assert "border-radius: 14px" in panel
+    assert "box-shadow" in panel
+
+    polish = (STYLES / "16-polish.css").read_text(encoding="utf-8")
+    assert "--board-width: 412px" in polish
+    assert "is-board-open" in polish
+    assert "translateX(calc(var(--board-width) / -2))" in polish
+    # And it gives up on a narrow window, where the two cannot coexist.
+    assert "@media (max-width: 900px)" in polish

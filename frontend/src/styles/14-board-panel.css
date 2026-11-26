@@ -223,3 +223,37 @@
   font-weight: 500;
   color: var(--text-secondary);
 }
+
+/* ── the board is a panel, not a cut-off half of the page ───────────────────
+ * It was a full-height sheet flush to the right edge with no radius and no
+ * shadow, so it read as the page being sliced rather than as something laid on
+ * top of it: the conversation column ended at its left edge mid-sentence, and
+ * nothing said "this floats". Measured: body 1040..1440, 0..900, radius 0,
+ * shadow none.
+ *
+ * A floating panel is inset from the edges, rounded, and lifted. The inset is
+ * what makes the conversation read as *behind* it rather than *beside* it.
+ */
+.board-drawer .ant-drawer-content-wrapper {
+  /* Below the top bar, not over it: a panel that covers the app's own header
+     hides the buttons that opened it, and the person loses the way back. The
+     12px gaps on the other three sides are what make it read as floating. */
+  top: 68px;
+  bottom: 12px;
+  right: 12px;
+  height: auto;
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34), 0 0 0 1px var(--border);
+}
+.board-drawer .ant-drawer-content {
+  border-radius: 14px;
+  background: var(--surface);
+}
+.board-drawer .ant-drawer-header {
+  border-bottom: 1px solid var(--border-subtle);
+}
+/* The last row of the panel must not sit under the rounded corner. */
+.board-drawer .ant-drawer-body {
+  padding-bottom: 20px;
+}
